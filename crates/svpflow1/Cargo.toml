@@ -1,0 +1,23 @@
+[package]
+name = "svpflow1"
+version = "0.1.0"
+authors = ["z1xus"]
+license = "Apache-2.0"
+edition = "2024"
+rust-version = "1.88"
+build = "build.rs"
+
+[lib]
+name = "svpflow1_vs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rayon = "1.12.0"
+svpflow-core = { path = "../svpflow-core" }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

@@ -1,0 +1,4 @@
+LIBRARY svpflow1_vs
+EXPORTS
+    VapourSynthPluginInit @1
+    svpGetVersion @2

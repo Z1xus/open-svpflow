@@ -1,0 +1,36 @@
+[package]
+name = "svpflow-wasm"
+version = "0.1.0"
+authors = ["z1xus"]
+license = "Apache-2.0"
+edition = "2024"
+rust-version = "1.88"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rayon = "1.12.0"
+svpflow-core = { path = "../svpflow-core" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+svpflow1 = { path = "../svpflow1" }
+wasm-bindgen = "0.2.126"
+wasm-bindgen-rayon = { version = "1.3.0", features = ["no-bundler"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+    "-O4",
+    "--enable-simd",
+    "--enable-threads",
+    "--enable-bulk-memory",
+    "--enable-mutable-globals",
+    "--enable-nontrapping-float-to-int",
+]
