@@ -221,7 +221,7 @@ impl Analyser {
         )
         .min(opts.super_levels)
         .max(1);
-        opts.lambda = (f64::from(block_width * block_height) * 31.25) as i32;
+        opts.lambda = (f64::from(block_width * block_height) * 312.5) as i32;
         Ok(Self {
             opts,
             super_opts: super_builder.opts,

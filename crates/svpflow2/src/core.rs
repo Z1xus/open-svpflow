@@ -1521,6 +1521,57 @@ impl FilterState {
             });
         if !used_gpu {
             cpu.set_threshold(render_threshold);
+            let render_parallel =
+                |mode, dst: renderer::FramePlanesMut<'_>, motion2, motion3, masks, final_mask| {
+                    let render = |dst, source0, source1, chroma, rows| {
+                        cpu.render_plane_rows(
+                            mode,
+                            interp,
+                            dst,
+                            renderer::PlaneRenderInput {
+                                source0,
+                                source1,
+                                motion0,
+                                motion1,
+                                motion2,
+                                motion3,
+                                masks: Some(masks),
+                                final_mask,
+                            },
+                            chroma,
+                            rows,
+                        )
+                    };
+                    let height = self.video_info.height;
+                    let middle = height / 2;
+                    let split = usize::try_from(middle)
+                        .unwrap_or_default()
+                        .saturating_mul(dst.y.stride)
+                        .min(dst.y.data.len());
+                    let (top, bottom) = dst.y.data.split_at_mut(split);
+                    let top = renderer::PlaneMut {
+                        data: top,
+                        stride: dst.y.stride,
+                    };
+                    let bottom = renderer::PlaneMut {
+                        data: bottom,
+                        stride: dst.y.stride,
+                    };
+                    rayon::join(
+                        || {
+                            rayon::join(
+                                || render(top, sources0.y, sources1.y, false, 0..middle),
+                                || render(bottom, sources0.y, sources1.y, false, middle..height),
+                            )
+                        },
+                        || {
+                            rayon::join(
+                                || render(dst.u, sources0.u, sources1.u, true, 0..middle),
+                                || render(dst.v, sources0.v, sources1.v, true, 0..middle),
+                            )
+                        },
+                    )
+                };
             match algo {
                 1 | 2 => cpu.render_mode1_or_2(
                     algo == 1,
@@ -1552,42 +1603,29 @@ impl FilterState {
                     motion1,
                     area_mask,
                 ),
-                21 | 22 => cpu.render_mode21_or_22(
-                    algo == 21,
-                    interp,
-                    dst,
-                    sources0,
-                    sources1,
-                    motion0,
-                    motion1,
-                    coverage,
-                    mode21_mask.as_deref(),
-                ),
-                23 if mode23_ready => {
-                    cpu.render_mode23(
-                        interp,
+                21 | 22 => {
+                    let _ = render_parallel(
+                        u32::try_from(algo).unwrap_or(21),
                         dst,
-                        sources0,
-                        sources1,
-                        motion0,
-                        motion1,
-                        motion2,
-                        motion3,
+                        None,
+                        None,
+                        coverage,
+                        mode21_mask.as_deref(),
+                    );
+                }
+                23 if mode23_ready => {
+                    let _ = render_parallel(
+                        23,
+                        dst,
+                        Some(motion2),
+                        Some(motion3),
                         coverage,
                         mode23_mask.as_deref(),
                     );
                 }
-                23 => cpu.render_mode21_or_22(
-                    true,
-                    interp,
-                    dst,
-                    sources0,
-                    sources1,
-                    motion0,
-                    motion1,
-                    coverage,
-                    mode21_mask.as_deref(),
-                ),
+                23 => {
+                    let _ = render_parallel(21, dst, None, None, coverage, mode21_mask.as_deref());
+                }
                 _ => return None,
             }
         }

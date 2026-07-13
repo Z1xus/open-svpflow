@@ -1,4 +1,9 @@
 use crate::super_opts::{SuperOpts, reduce_dim};
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::{
+    __m128i, _mm_add_epi16, _mm_loadl_epi64, _mm_mullo_epi16, _mm_packus_epi16, _mm_set1_epi16,
+    _mm_setzero_si128, _mm_srai_epi16, _mm_storel_epi64, _mm_sub_epi16, _mm_unpacklo_epi8,
+};
 
 pub(crate) fn build_plane(
     dst: &mut [u8],
@@ -78,9 +83,97 @@ pub(crate) fn build_plane(
         }
     }
 
-    if pel >= 2 && opts.gpu <= 1 && opts.full && opts.scale_up == 0 {
-        fill_bilinear_pel2(dst, dst_stride, level_y[0], base_w, base_h);
+    if pel >= 2 && opts.gpu <= 1 && opts.full {
+        if opts.scale_up == 0 {
+            fill_bilinear_pel2(dst, dst_stride, level_y[0], base_w, base_h);
+        } else if opts.scale_up == 2 {
+            fill_bicubic_pel2(dst, dst_stride, level_y[0], base_w, base_h);
+        }
     }
+}
+
+fn fill_bicubic_pel2(dst: &mut [u8], stride: usize, row0: usize, w: usize, h: usize) {
+    let planes = [row0, row0 + h, row0 + 2 * h, row0 + 3 * h];
+    bicubic_horizontal(dst, stride, planes[0], planes[1], w, h);
+    bicubic_vertical(dst, stride, planes[0], planes[2], w, h);
+    bicubic_horizontal(dst, stride, planes[2], planes[3], w, h);
+}
+
+fn bicubic_horizontal(buf: &mut [u8], stride: usize, src: usize, dst: usize, w: usize, h: usize) {
+    for y in 0..h {
+        let src = (src + y) * stride;
+        let dst = (dst + y) * stride;
+        let mut x = 0;
+        while x < w {
+            #[cfg(target_arch = "x86_64")]
+            if x >= 2 && x + 8 <= w.saturating_sub(4) {
+                unsafe { cubic8(buf, dst + x, src + x, 1) };
+                x += 8;
+                continue;
+            }
+            buf[dst + x] = half(buf, src + x, 1, x, w);
+            x += 1;
+        }
+    }
+}
+
+fn bicubic_vertical(buf: &mut [u8], stride: usize, src: usize, dst: usize, w: usize, h: usize) {
+    for y in 0..h {
+        let mut x = 0;
+        while x < w {
+            #[cfg(target_arch = "x86_64")]
+            if y >= 2 && y + 4 < h && x + 8 <= w {
+                unsafe { cubic8(buf, (dst + y) * stride + x, (src + y) * stride + x, stride) };
+                x += 8;
+                continue;
+            }
+            buf[(dst + y) * stride + x] = half(buf, (src + y) * stride + x, stride, y, h);
+            x += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn cubic8(buf: &mut [u8], dst: usize, src: usize, step: usize) {
+    unsafe {
+        let zero = _mm_setzero_si128();
+        let load = |i| _mm_unpacklo_epi8(_mm_loadl_epi64(buf.as_ptr().add(i).cast()), zero);
+        let outer = _mm_add_epi16(load(src - 2 * step), load(src + 3 * step));
+        let inner = _mm_mullo_epi16(
+            _mm_add_epi16(load(src), load(src + step)),
+            _mm_set1_epi16(20),
+        );
+        let near = _mm_mullo_epi16(
+            _mm_add_epi16(load(src - step), load(src + 2 * step)),
+            _mm_set1_epi16(5),
+        );
+        let value = _mm_srai_epi16::<5>(_mm_add_epi16(
+            _mm_sub_epi16(_mm_add_epi16(outer, inner), near),
+            _mm_set1_epi16(16),
+        ));
+        _mm_storel_epi64(
+            buf.as_mut_ptr().add(dst).cast::<__m128i>(),
+            _mm_packus_epi16(value, zero),
+        );
+    }
+}
+
+#[inline]
+fn half(buf: &[u8], i: usize, step: usize, p: usize, n: usize) -> u8 {
+    if p < 2 || p + 4 >= n {
+        return if p + 1 == n {
+            buf[i]
+        } else {
+            avg_epu8(buf[i], buf[i + step])
+        };
+    }
+    let value = i32::from(buf[i - 2 * step])
+        + i32::from(buf[i + 3 * step])
+        + 5 * (4 * i32::from(buf[i]) - i32::from(buf[i - step]) + 4 * i32::from(buf[i + step])
+            - i32::from(buf[i + 2 * step]))
+        + 16;
+    (value >> 5).clamp(0, 255) as u8
 }
 
 fn fill_bilinear_pel2(dst: &mut [u8], stride: usize, row0: usize, w: usize, h: usize) {
@@ -207,17 +300,9 @@ fn reduce_6tap(
         let row = &mut inter[dy * inter_w..dy * inter_w + inter_w];
         horizontal_6tap_inplace(row, dst_w, &mut row_scratch);
         let dst_base = (dst_row0 + dy) * stride;
-        let n = dst_w.min(buf.len().saturating_sub(dst_base));
+        let n = inter_w.min(buf.len().saturating_sub(dst_base));
         if n > 0 {
             buf[dst_base..dst_base + n].copy_from_slice(&row[..n]);
-        }
-        if dst_w > 0 && stride > dst_w {
-            let edge = buf.get(dst_base + dst_w - 1).copied().unwrap_or(0);
-            for p in dst_w..stride {
-                if dst_base + p < buf.len() {
-                    buf[dst_base + p] = edge;
-                }
-            }
         }
     }
 }

@@ -92,7 +92,8 @@ fn exact_search_hierarchy_bidir(
     let mut field_gh = 0;
     let mut global_fwd = (0, 0);
     let mut global_bwd = (0, 0);
-    let mut order = Vec::new();
+    let mut fwd_order = Vec::new();
+    let mut bwd_order = Vec::new();
 
     for level in (0..opts.levels.max(1)).rev() {
         let (gw, gh) = level_grid(
@@ -104,13 +105,18 @@ fn exact_search_hierarchy_bidir(
             opts.overlap_y,
         );
         let pel = if level == 0 { opts.pel.max(1) } else { 1 };
-        order = if order.is_empty() {
-            initial_search_order(gw, gh)
+        fwd_order = if fwd_order.is_empty() {
+            level_search_order(gw, gh, level)
         } else {
-            refine_search_order(&order, gw, gh)
+            refine_search_order(&fwd_order, field_gw, field_gh, gw, gh, level)
         };
-        let mut next_fwd = if fwd.is_empty() {
-            vec![unsearched_vector(); (gw * gh) as usize]
+        bwd_order = if bwd_order.is_empty() {
+            level_search_order(gw, gh, level)
+        } else {
+            refine_search_order(&bwd_order, field_gw, field_gh, gw, gh, level)
+        };
+        let (mut next_fwd, prev_fwd) = if fwd.is_empty() {
+            (vec![Vec8::default(); (gw * gh) as usize], Vec::new())
         } else {
             exact_interpolate_level(
                 &fwd,
@@ -125,8 +131,8 @@ fn exact_search_hierarchy_bidir(
                 pel,
             )
         };
-        let mut next_bwd = if bwd.is_empty() {
-            vec![unsearched_vector(); (gw * gh) as usize]
+        let (mut next_bwd, prev_bwd) = if bwd.is_empty() {
+            (vec![Vec8::default(); (gw * gh) as usize], Vec::new())
         } else {
             exact_interpolate_level(
                 &bwd,
@@ -148,11 +154,13 @@ fn exact_search_hierarchy_bidir(
                     refp,
                     opts,
                     level,
+                    0,
                     global_fwd,
+                    &prev_bwd,
                     &mut next_fwd,
                     gw,
                     gh,
-                    &order,
+                    &fwd_order,
                 );
             },
             || {
@@ -161,18 +169,34 @@ fn exact_search_hierarchy_bidir(
                     cur,
                     opts,
                     level,
+                    1,
                     global_bwd,
+                    &prev_fwd,
                     &mut next_bwd,
                     gw,
                     gh,
-                    &order,
+                    &bwd_order,
                 );
             },
         );
         if level > 0 {
-            (global_fwd, global_bwd) = reconcile_bidir_gmv(
-                exact_global_doubled(&next_fwd),
-                exact_global_doubled(&next_bwd),
+            global_fwd = exact_global_doubled(&next_fwd);
+            global_bwd = exact_global_doubled(&next_bwd);
+            reorder_search_order(
+                &mut fwd_order,
+                &next_fwd,
+                gw,
+                gh,
+                opts.block_w,
+                opts.block_h,
+            );
+            reorder_search_order(
+                &mut bwd_order,
+                &next_bwd,
+                gw,
+                gh,
+                opts.block_w,
+                opts.block_h,
             );
         }
         fwd = next_fwd;
@@ -220,12 +244,12 @@ fn exact_search_hierarchy(
         );
         let pel = if level == 0 { opts.pel.max(1) } else { 1 };
         order = if order.is_empty() {
-            initial_search_order(gw, gh)
+            level_search_order(gw, gh, level)
         } else {
-            refine_search_order(&order, gw, gh)
+            refine_search_order(&order, field_gw, field_gh, gw, gh, level)
         };
-        let mut next = if field.is_empty() {
-            vec![unsearched_vector(); (gw * gh) as usize]
+        let (mut next, prev) = if field.is_empty() {
+            (vec![Vec8::default(); (gw * gh) as usize], Vec::new())
         } else {
             exact_interpolate_level(
                 &field,
@@ -240,9 +264,12 @@ fn exact_search_hierarchy(
                 pel,
             )
         };
-        exact_search_level(src, refp, opts, level, global, &mut next, gw, gh, &order);
+        exact_search_level(
+            src, refp, opts, level, 0, global, &prev, &mut next, gw, gh, &order,
+        );
         if level > 0 {
             global = exact_global_doubled(&next);
+            reorder_search_order(&mut order, &next, gw, gh, opts.block_w, opts.block_h);
         }
         field = next;
         field_gw = gw;
@@ -286,48 +313,99 @@ fn initial_search_order(gw: i32, gh: i32) -> Vec<(i32, i32)> {
     order
 }
 
-fn refine_search_order(coarse: &[(i32, i32)], gw: i32, gh: i32) -> Vec<(i32, i32)> {
+fn level_search_order(gw: i32, gh: i32, level: i32) -> Vec<(i32, i32)> {
+    let edge = i32::from(level > 0);
+    let bw = gw - edge;
+    let bh = gh - edge;
+    let mut order = initial_search_order(bw, bh);
+    if edge != 0 {
+        order.extend((0..=bw).map(|x| (x, bh)));
+        order.extend((0..bh).map(|y| (bw, y)));
+    }
+    order
+}
+
+fn refine_search_order(
+    coarse: &[(i32, i32)],
+    cgw: i32,
+    cgh: i32,
+    gw: i32,
+    gh: i32,
+    level: i32,
+) -> Vec<(i32, i32)> {
+    if level == 0 {
+        return initial_search_order(gw, gh);
+    }
+    let sw = cgw - 1;
+    let sh = cgh - 1;
+    let dw = gw - 1;
+    let dh = gh - 1;
+    let extra_x = (dw - 2 * sw).max(0);
+    let extra_y = (dh - 2 * sh).max(0);
     let mut interior = Vec::with_capacity((gw * gh).max(0) as usize);
     let mut boundary = Vec::new();
     let mut seen = vec![false; (gw * gh).max(0) as usize];
+    let mut add = |child: (i32, i32)| {
+        let (x, y) = child;
+        if x < 0 || y < 0 || x >= dw || y >= dh {
+            return;
+        }
+        let index = (y * gw + x) as usize;
+        if seen[index] {
+            return;
+        }
+        seen[index] = true;
+        if x > 0 && y > 0 && x < dw - 1 && y < dh - 1 {
+            interior.push(child);
+        } else {
+            boundary.push(child);
+        }
+    };
     for &(x, y) in coarse {
-        for child in [
-            (2 * x, 2 * y),
-            (2 * x + 1, 2 * y),
-            (2 * x + 1, 2 * y + 1),
-            (2 * x, 2 * y + 1),
-        ] {
-            let (cx, cy) = child;
-            if cx < 0 || cy < 0 || cx >= gw || cy >= gh {
-                continue;
+        if x >= sw || y >= sh {
+            continue;
+        }
+        let left = 2 * x;
+        let top = 2 * y;
+        for offset in [(0, 0), (1, 0), (1, 1), (0, 1)] {
+            add((left + offset.0, top + offset.1));
+        }
+        if x == sw - 1 {
+            for dx in 2..2 + extra_x {
+                for dy in 0..2 + i32::from(y == sh - 1) * extra_y {
+                    add((left + dx, top + dy));
+                }
             }
-            let idx = (cy * gw + cx) as usize;
-            if seen[idx] {
-                continue;
-            }
-            seen[idx] = true;
-            let on_main_path = match (cx & 1, cy & 1) {
-                (0, 0) => x > 0 && y > 0,
-                (1, 0) => cx < gw - 1 && y > 0,
-                (1, 1) => cx < gw - 1 && cy < gh - 1,
-                _ => x > 0 && cy < gh - 1,
-            };
-            if on_main_path {
-                interior.push(child);
-            } else {
-                boundary.push(child);
+        }
+        if y == sh - 1 {
+            for dy in 2..2 + extra_y {
+                for dx in 0..2 {
+                    add((left + dx, top + dy));
+                }
             }
         }
     }
     interior.extend(boundary);
-    for child in initial_search_order(gw, gh) {
-        let idx = (child.1 * gw + child.0) as usize;
-        if !seen[idx] {
-            seen[idx] = true;
-            interior.push(child);
-        }
-    }
+    interior.extend((0..=dw).map(|x| (x, dh)));
+    interior.extend((0..dh).map(|y| (dw, y)));
     interior
+}
+
+fn reorder_search_order(
+    order: &mut [(i32, i32)],
+    field: &[Vec8],
+    gw: i32,
+    gh: i32,
+    bw: i32,
+    bh: i32,
+) {
+    let count = ((gw - 1) * (gh - 1)) as usize;
+    let shift = ((bw * bh / 8).max(1) as u32).ilog2() + 1;
+    let mut base: Vec<_> = (0..gh - 1)
+        .flat_map(|y| (0..gw - 1).map(move |x| (x, y)))
+        .collect();
+    base.sort_by_key(|&(x, y)| field[(y * gw + x) as usize].score >> shift);
+    order[..count].copy_from_slice(&base);
 }
 
 fn exact_interpolate_level(
@@ -341,99 +419,52 @@ fn exact_interpolate_level(
     ox: i32,
     oy: i32,
     pel: i32,
-) -> Vec<Vec8> {
-    let log_pel = pel.trailing_zeros() as i32;
-    let norm = (3 - log_pel).max(0);
-    let mul = (log_pel - 3).max(0);
-    let normov = ((bw - ox) * (bh - oy)).max(1);
-    let odd_x = 3 * bw - 2 * ox;
-    let even_x = 3 * bw - 4 * ox;
-    let odd_y = 3 * bh - 2 * oy;
-    let even_y = 3 * bh - 4 * oy;
+) -> (Vec<Vec8>, Vec<Vec8>) {
     let mut out = vec![Vec8::default(); (gw * gh) as usize];
-
-    let get = |x: i32, y: i32| coarse[(y * cgw + x) as usize];
-    for y in 0..gh {
-        for x in 0..gw {
-            let ix = x.min(2 * cgw - 1);
-            let iy = y.min(2 * cgh - 1);
-            let sx = 2 * (ix & 1) - 1;
-            let sy = 2 * (iy & 1) - 1;
-            let cx = ix / 2;
-            let cy = iy / 2;
-            let edge_x = ix == 0 || ix >= 2 * cgw - 1;
-            let edge_y = iy == 0 || iy >= 2 * cgh - 1;
-            let p = get(cx, cy);
-            let mut qx = if edge_x { p } else { get(cx + sx, cy) };
-            let mut qy = if edge_y { p } else { get(cx, cy + sy) };
-            if edge_y && !edge_x {
-                qy = qx;
-                qx = p;
-            }
-            let qxy = if edge_x && edge_y {
-                p
-            } else if edge_x {
-                qy
-            } else if edge_y {
-                qy
-            } else {
-                get(cx + sx, cy + sy)
-            };
-
-            let (mut vx, mut vy, sad) = if ox == 0 && oy == 0 {
-                (
-                    9 * i32::from(p.dx)
-                        + 3 * i32::from(qx.dx)
-                        + 3 * i32::from(qy.dx)
-                        + i32::from(qxy.dx),
-                    9 * i32::from(p.dy)
-                        + 3 * i32::from(qx.dy)
-                        + 3 * i32::from(qy.dy)
-                        + i32::from(qxy.dy),
-                    (9 * u64::from(p.score)
-                        + 3 * u64::from(qx.score)
-                        + 3 * u64::from(qy.score)
-                        + u64::from(qxy.score)
-                        + 8)
-                        >> 4,
-                )
-            } else {
-                let ax1 = if sx > 0 { odd_x } else { even_x };
-                let ax2 = 4 * (bw - ox) - ax1;
-                let ay1 = if sy > 0 { odd_y } else { even_y };
-                let ay2 = 4 * (bh - oy) - ay1;
-                let w11 = i64::from(ax1 * ay1);
-                let w21 = i64::from(ax2 * ay1);
-                let w12 = i64::from(ax1 * ay2);
-                let w22 = i64::from(ax2 * ay2);
-                let dx = (w11 * i64::from(p.dx)
-                    + w21 * i64::from(qx.dx)
-                    + w12 * i64::from(qy.dx)
-                    + w22 * i64::from(qxy.dx))
-                    / i64::from(normov);
-                let dy = (w11 * i64::from(p.dy)
-                    + w21 * i64::from(qx.dy)
-                    + w12 * i64::from(qy.dy)
-                    + w22 * i64::from(qxy.dy))
-                    / i64::from(normov);
-                let score = (w11 * i64::from(p.score)
-                    + w21 * i64::from(qx.score)
-                    + w12 * i64::from(qy.score)
-                    + w22 * i64::from(qxy.score))
-                    / i64::from(normov);
-                (dx as i32, dy as i32, (score.max(0) as u64) >> 4)
-            };
-            vx = (vx >> norm) << mul;
-            vy = (vy >> norm) << mul;
-            out[(y * gw + x) as usize] = Vec8 {
+    let mut projected = vec![unsearched_vector(); (gw * gh) as usize];
+    let coarse_w = cgw - 1;
+    let coarse_h = cgh - 1;
+    let get = |x: i32, y: i32| {
+        if x < 2 * coarse_w && y < 2 * coarse_h {
+            return coarse[((y >> 1) * cgw + (x >> 1)) as usize];
+        }
+        let edge = coarse_h + (x >> 1).min(coarse_w) - (y >> 1).min(coarse_h);
+        let (x, y) = if edge <= coarse_w {
+            (edge, coarse_h)
+        } else {
+            (coarse_w, coarse_w + coarse_h - edge)
+        };
+        coarse[(y * cgw + x) as usize]
+    };
+    for y in 0..gh - 1 {
+        for x in 0..gw - 1 {
+            let p = get(x, y);
+            let vx = i32::from(p.dx) * 2 * pel;
+            let vy = i32::from(p.dy) * 2 * pel;
+            let vector = Vec8 {
                 dx: vx.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
                 dy: vy.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                score: sad.min(u64::from(u32::MAX)) as u32,
+                score: p.score,
                 luma: p.luma,
             };
+            out[(y * gw + x) as usize] = vector;
+            if x >= 2 * coarse_w || y >= 2 * coarse_h {
+                continue;
+            }
+            let tx = ((vx + (bw >> 1) + (bw - ox) * x) / (bw - ox)).clamp(0, gw - 1);
+            let ty = ((vy + (bh >> 1) + (bh - oy) * y) / (bh - oy)).clamp(0, gh - 1);
+            let target = &mut projected[(ty * gw + tx) as usize];
+            if vector.score < target.score {
+                *target = Vec8 {
+                    dx: -vector.dx,
+                    dy: -vector.dy,
+                    score: vector.score,
+                    luma: 0,
+                };
+            }
         }
     }
-    out
+    (out, projected)
 }
 
 fn exact_search_level(
@@ -441,7 +472,9 @@ fn exact_search_level(
     refp: &SuperPlanes<'_>,
     opts: &AnalyseOpts,
     level: i32,
+    _direction: i32,
     global: (i32, i32),
+    prev: &[Vec8],
     field: &mut [Vec8],
     gw: i32,
     gh: i32,
@@ -452,7 +485,7 @@ fn exact_search_level(
     let step_x = (bw - opts.overlap_x).max(1);
     let step_y = (bh - opts.overlap_y).max(1);
     let pel = if level == 0 { opts.pel.max(1) } else { 1 };
-    let radius = search_radius(opts, level == 0, level, opts.levels.max(1));
+    let base_radius = search_radius(opts, level == 0, level, opts.levels.max(1));
     let search_type = if level == 0 {
         opts.search_type
     } else {
@@ -463,29 +496,71 @@ fn exact_search_level(
     } else {
         opts.coarse_satd
     };
-    let try_many = level > 0 && opts.coarse_trymany;
     let mut bad_count = 0i32;
     let mut processed = vec![false; ((gw + 1) * (gh + 1)).max(0) as usize];
 
     for &(bx, by) in order {
         let idx = (by * gw + bx) as usize;
-        let px = bx * step_x;
-        let py = by * step_y;
-        let bounds = mv_bounds(
-            px,
-            py,
-            bw,
-            bh,
-            src.level_size(level).0 as i32,
-            src.level_size(level).1 as i32,
-            pel,
-        );
-        let zero = exact_clip((0, 0), bounds);
-        let interpolated = field[idx];
+        let (level_w, level_h) = src.level_size(level);
+        let px = if level > 0 && bx == gw - 1 {
+            level_w as i32 - bw
+        } else {
+            bx * step_x
+        };
+        let py = if level > 0 && by == gh - 1 {
+            level_h as i32 - bh
+        } else {
+            by * step_y
+        };
+        let smallest = level == opts.levels - 1;
+        let (px, py, bw, bh) = if smallest {
+            (px + (bw >> 2), py + (bh >> 2), bw >> 1, bh >> 1)
+        } else {
+            (px, py, bw, bh)
+        };
+        let bounds = mv_bounds(px, py, bw, bh, level_w as i32, level_h as i32, pel);
+        let zero = (0, 0);
+        let edge = level > 0 && (bx == gw - 1 || by == gh - 1);
+        let source = (bx.min(gw - 2), by.min(gh - 2));
+        let mut interpolated = field[(source.1 * gw + source.0) as usize];
+        if edge && !smallest {
+            interpolated.score = exact_sad(
+                src,
+                refp,
+                level,
+                source.0 * step_x,
+                source.1 * step_y,
+                bw,
+                bh,
+                (interpolated.dx.into(), interpolated.dy.into()),
+                satd,
+                pel,
+                true,
+            );
+        } else if !edge {
+            interpolated = field[idx];
+        }
         let predictor = interpolated;
-        let pred_mv = exact_clip((predictor.dx.into(), predictor.dy.into()), bounds);
-        let lambda_base = exact_lambda(opts, level, pel);
-        let lambda = adapt_lambda(lambda_base, opts.lsad, predictor.score);
+        let pred_mv = (predictor.dx.into(), predictor.dy.into());
+        let lambda_base = if smallest {
+            0
+        } else {
+            exact_lambda(opts, level, pel)
+        };
+        let lambda = adapt_lambda(
+            lambda_base,
+            if smallest { opts.lsad / 3 } else { opts.lsad },
+            predictor.score,
+        );
+        let pnew = opts.pnew;
+        let radius = if level > 0 && opts.coarse_distance < 0 {
+            adaptive_radius(
+                base_radius,
+                block_activity(src, level, px, py, bw, bh, satd),
+            )
+        } else {
+            base_radius
+        };
         let mut seeds = [(0, 0); 8];
         let mut seed_count = 0;
         for ny in (by - 1).max(0)..=(by + 1).min(gh - 1) {
@@ -507,17 +582,21 @@ fn exact_search_level(
             bh,
             pel,
             satd,
+            !smallest,
             pred_mv,
             predictor.score != u32::MAX,
+            prev.get(idx)
+                .copied()
+                .filter(|v| v.score != u32::MAX && v.score > 0),
             zero,
-            exact_clip(global, bounds),
+            global,
             &seeds[..seed_count],
             bounds,
             lambda,
+            pnew,
             opts,
-            search_type,
+            if edge && level == 1 { 0 } else { search_type },
             radius,
-            try_many,
         );
         let found = best.sad;
         let bad_limit = opts
@@ -539,10 +618,11 @@ fn exact_search_level(
                         bh,
                         pel,
                         satd,
+                        !smallest,
                         pred_mv,
                         bounds,
                         lambda,
-                        opts.pnew,
+                        pnew,
                         (0, 0),
                         r,
                         pel,
@@ -564,10 +644,11 @@ fn exact_search_level(
                     bh,
                     pel,
                     satd,
+                    !smallest,
                     pred_mv,
                     bounds,
                     lambda,
-                    opts.pnew,
+                    pnew,
                     (0, 0),
                     opts.coarse_bad_range * pel,
                     &mut best,
@@ -575,14 +656,14 @@ fn exact_search_level(
             }
             let center = best.mv;
             exact_expanding(
-                src, refp, level, px, py, bw, bh, pel, satd, pred_mv, bounds, lambda, opts.pnew,
-                center, 1, 1, &mut best,
+                src, refp, level, px, py, bw, bh, pel, satd, !smallest, pred_mv, bounds, lambda,
+                pnew, center, 1, 1, &mut best,
             );
         }
         field[idx] = Vec8 {
             dx: best.mv.0 as i16,
             dy: best.mv.1 as i16,
-            score: best.sad,
+            score: best.sad.saturating_mul(if smallest { 3 } else { 1 }),
             luma: block_luma_dc(src, level, px, py, bw, bh),
         };
         processed[(by * (gw + 1) + bx) as usize] = true;
@@ -600,21 +681,22 @@ fn exact_search_block(
     bh: i32,
     pel: i32,
     satd: bool,
-    predictor: (i32, i32),
+    chroma: bool,
+    mut predictor: (i32, i32),
     field_valid: bool,
+    prev: Option<Vec8>,
     zero: (i32, i32),
     global: (i32, i32),
     neighbours: &[(i32, i32)],
     bounds: (i32, i32, i32, i32),
     lambda: i32,
+    pnew: i32,
     opts: &AnalyseOpts,
     search_type: i32,
     radius: i32,
-    try_many: bool,
 ) -> SearchBest {
     let special = |mv: (i32, i32), penalty: i32| {
-        let mv = exact_clip(mv, bounds);
-        let sad = exact_sad(src, refp, level, px, py, bw, bh, mv, satd, pel);
+        let sad = exact_sad(src, refp, level, px, py, bw, bh, mv, satd, pel, chroma);
         SearchBest {
             mv,
             sad,
@@ -622,97 +704,37 @@ fn exact_search_block(
         }
     };
     let field = field_valid.then(|| special(predictor, 0));
+    if level == 0 && opts.distance == 0 {
+        return field.unwrap_or_else(|| special(zero, 0));
+    }
+    let previous = prev.map(|v| special((v.dx.into(), v.dy.into()), opts.prev));
     let zero_best = special(zero, opts.pzero);
     let global_best = special(global, opts.pglobal);
 
-    if try_many {
-        let mut results = [zero_best; 11];
-        let mut result_count = 0;
-        for (mut start, penalty, enabled) in [
-            (zero_best, opts.pzero, true),
-            (global_best, opts.pglobal, true),
-            (field.unwrap_or(zero_best), 0, field.is_some()),
-        ] {
-            if !enabled {
-                continue;
-            }
-            exact_refine_search(
-                src,
-                refp,
-                level,
-                px,
-                py,
-                bw,
-                bh,
-                pel,
-                satd,
-                predictor,
-                bounds,
-                lambda,
-                opts.pnew,
-                search_type,
-                radius,
-                &mut start,
-            );
-            start.cost = i64::from(start.sad) + ((i64::from(penalty) * i64::from(start.sad)) >> 8);
-            results[result_count] = start;
-            result_count += 1;
-        }
-        for &mv in neighbours {
-            let mv = exact_clip(mv, bounds);
-            let sad = exact_sad(src, refp, level, px, py, bw, bh, mv, satd, pel);
-            let mut start = SearchBest {
-                mv,
-                sad,
-                cost: i64::from(sad) + ((i64::from(opts.pnbour) * i64::from(sad)) >> 8),
-            };
-            exact_refine_search(
-                src,
-                refp,
-                level,
-                px,
-                py,
-                bw,
-                bh,
-                pel,
-                satd,
-                predictor,
-                bounds,
-                lambda,
-                opts.pnew,
-                search_type,
-                radius,
-                &mut start,
-            );
-            start.cost =
-                i64::from(start.sad) + ((i64::from(opts.pnbour) * i64::from(start.sad)) >> 8);
-            results[result_count] = start;
-            result_count += 1;
-        }
-        return results[..result_count]
-            .iter()
-            .copied()
-            .min_by_key(|value| value.cost)
-            .unwrap_or(zero_best);
-    }
-
-    let mut best = zero_best;
-    if global_best.cost < best.cost {
-        best = global_best;
-    }
-    if let Some(field) = field
-        && field.cost < best.cost
+    let mut best = field.unwrap_or(SearchBest {
+        mv: zero,
+        sad: u32::MAX,
+        cost: i64::MAX,
+    });
+    if let Some(previous) = previous
+        && previous.cost < best.cost
     {
-        best = field;
+        best = previous;
+        predictor = previous.mv;
+    }
+    for candidate in [global_best, zero_best] {
+        if candidate.cost < best.cost {
+            best = candidate;
+        }
     }
     for &mv in neighbours {
-        let mv = exact_clip(mv, bounds);
-        let sad = exact_sad(src, refp, level, px, py, bw, bh, mv, satd, pel);
+        let sad = exact_sad(src, refp, level, px, py, bw, bh, mv, satd, pel, chroma);
         let cost = i64::from(sad) + ((i64::from(opts.pnbour) * i64::from(sad)) >> 8);
         if cost < best.cost {
             best = SearchBest { mv, sad, cost };
         }
     }
+    best.cost = i64::from(best.sad);
     exact_refine_search(
         src,
         refp,
@@ -723,10 +745,11 @@ fn exact_search_block(
         bh,
         pel,
         satd,
+        chroma,
         predictor,
         bounds,
         lambda,
-        opts.pnew,
+        pnew,
         search_type,
         radius,
         &mut best,
@@ -745,6 +768,7 @@ fn exact_refine_search(
     bh: i32,
     pel: i32,
     satd: bool,
+    chroma: bool,
     predictor: (i32, i32),
     bounds: (i32, i32, i32, i32),
     lambda: i32,
@@ -755,20 +779,36 @@ fn exact_refine_search(
 ) {
     match search_type {
         2 => exact_hex2(
-            src, refp, level, px, py, bw, bh, pel, satd, predictor, bounds, lambda, pnew, radius,
-            best,
+            src, refp, level, px, py, bw, bh, pel, satd, chroma, predictor, bounds, lambda, pnew,
+            radius, best,
         ),
         3 => exact_umh(
-            src, refp, level, px, py, bw, bh, pel, satd, predictor, bounds, lambda, pnew, best.mv,
-            radius, best,
+            src, refp, level, px, py, bw, bh, pel, satd, chroma, predictor, bounds, lambda, pnew,
+            best.mv, radius, best,
         ),
         4 => {
             let center = best.mv;
-            for r in 1..=radius {
-                exact_expanding(
-                    src, refp, level, px, py, bw, bh, pel, satd, predictor, bounds, lambda, pnew,
-                    center, r, 1, best,
-                );
+            for y in center.1 - radius..=center.1 + radius {
+                for x in center.0 - radius..=center.0 + radius {
+                    exact_check(
+                        src,
+                        refp,
+                        level,
+                        px,
+                        py,
+                        bw,
+                        bh,
+                        pel,
+                        satd,
+                        chroma,
+                        predictor,
+                        bounds,
+                        lambda,
+                        pnew,
+                        (x, y),
+                        best,
+                    );
+                }
             }
         }
         _ => {}
@@ -786,6 +826,7 @@ fn exact_expanding(
     bh: i32,
     pel: i32,
     satd: bool,
+    chroma: bool,
     predictor: (i32, i32),
     bounds: (i32, i32, i32, i32),
     lambda: i32,
@@ -802,8 +843,8 @@ fn exact_expanding(
             (center.0 + i, center.1 + radius),
         ] {
             exact_check(
-                src, refp, level, px, py, bw, bh, pel, satd, predictor, bounds, lambda, pnew, mv,
-                best,
+                src, refp, level, px, py, bw, bh, pel, satd, chroma, predictor, bounds, lambda,
+                pnew, mv, best,
             );
         }
         i += step;
@@ -815,8 +856,8 @@ fn exact_expanding(
             (center.0 + radius, center.1 + j),
         ] {
             exact_check(
-                src, refp, level, px, py, bw, bh, pel, satd, predictor, bounds, lambda, pnew, mv,
-                best,
+                src, refp, level, px, py, bw, bh, pel, satd, chroma, predictor, bounds, lambda,
+                pnew, mv, best,
             );
         }
         j += step;
@@ -828,7 +869,8 @@ fn exact_expanding(
         (center.0 + radius, center.1 + radius),
     ] {
         exact_check(
-            src, refp, level, px, py, bw, bh, pel, satd, predictor, bounds, lambda, pnew, mv, best,
+            src, refp, level, px, py, bw, bh, pel, satd, chroma, predictor, bounds, lambda, pnew,
+            mv, best,
         );
     }
 }
@@ -844,6 +886,7 @@ fn exact_hex2(
     bh: i32,
     pel: i32,
     satd: bool,
+    chroma: bool,
     predictor: (i32, i32),
     bounds: (i32, i32, i32, i32),
     lambda: i32,
@@ -867,6 +910,7 @@ fn exact_hex2(
                     bh,
                     pel,
                     satd,
+                    chroma,
                     predictor,
                     bounds,
                     lambda,
@@ -882,8 +926,8 @@ fn exact_hex2(
         }
     }
     exact_expanding(
-        src, refp, level, px, py, bw, bh, pel, satd, predictor, bounds, lambda, pnew, center, 1, 1,
-        best,
+        src, refp, level, px, py, bw, bh, pel, satd, chroma, predictor, bounds, lambda, pnew,
+        center, 1, 1, best,
     );
 }
 
@@ -898,6 +942,7 @@ fn exact_umh(
     bh: i32,
     pel: i32,
     satd: bool,
+    chroma: bool,
     predictor: (i32, i32),
     bounds: (i32, i32, i32, i32),
     lambda: i32,
@@ -915,8 +960,8 @@ fn exact_umh(
             (center.0, center.1 + d),
         ] {
             exact_check(
-                src, refp, level, px, py, bw, bh, pel, satd, predictor, bounds, lambda, pnew, mv,
-                best,
+                src, refp, level, px, py, bw, bh, pel, satd, chroma, predictor, bounds, lambda,
+                pnew, mv, best,
             );
         }
         d += 2;
@@ -951,6 +996,7 @@ fn exact_umh(
                 bh,
                 pel,
                 satd,
+                chroma,
                 predictor,
                 bounds,
                 lambda,
@@ -961,7 +1007,8 @@ fn exact_umh(
         }
     }
     exact_hex2(
-        src, refp, level, px, py, bw, bh, pel, satd, predictor, bounds, lambda, pnew, radius, best,
+        src, refp, level, px, py, bw, bh, pel, satd, chroma, predictor, bounds, lambda, pnew,
+        radius, best,
     );
 }
 
@@ -976,6 +1023,7 @@ fn exact_check(
     bh: i32,
     pel: i32,
     satd: bool,
+    chroma: bool,
     predictor: (i32, i32),
     bounds: (i32, i32, i32, i32),
     lambda: i32,
@@ -990,12 +1038,11 @@ fn exact_check(
     if motion >= best.cost {
         return;
     }
-    let Some(sad) = exact_sad_if_better(
-        src, refp, level, px, py, bw, bh, mv, satd, pel, motion, pnew, best.cost,
+    let Some((sad, cost)) = exact_sad_if_better(
+        src, refp, level, px, py, bw, bh, mv, satd, pel, chroma, motion, pnew, best.cost,
     ) else {
         return;
     };
-    let cost = motion + i64::from(sad) + ((i64::from(pnew) * i64::from(sad)) >> 8);
     if cost < best.cost {
         *best = SearchBest { mv, sad, cost };
     }
@@ -1013,18 +1060,24 @@ fn exact_sad_if_better(
     mv: (i32, i32),
     satd: bool,
     pel: i32,
+    chroma: bool,
     motion: i64,
     pnew: i32,
     best_cost: i64,
-) -> Option<u32> {
+) -> Option<(u32, i64)> {
     let pel = pel.max(1);
     let (lw, lh) = src.level_size(level);
-    let shifted_edge = level == 0
-        && pel >= 2
-        && (mv.0 < -pel * px || mv.1 < -pel * py)
-        && edge_shift_origins(px, py, mv.0, mv.1, bw, bh, lw as i32, lh as i32, pel).is_some();
+    let shifted_edge =
+        edge_shift_origins(px, py, mv.0, mv.1, bw, bh, lw as i32, lh as i32, pel).is_some();
     if shifted_edge || pnew < 0 {
-        return Some(exact_sad(src, refp, level, px, py, bw, bh, mv, satd, pel));
+        let (luma, mut colour) =
+            block_cost_lc(src, refp, level, px, py, bw, bh, mv.0, mv.1, satd, pel);
+        colour *= u32::from(chroma);
+        let penalty = |cost| i64::from(cost) + ((i64::from(pnew) * i64::from(cost)) >> 8);
+        return Some((
+            luma.saturating_add(colour),
+            motion + penalty(luma) + penalty(colour),
+        ));
     }
 
     let bw_u = bw as usize;
@@ -1035,6 +1088,9 @@ fn exact_sad_if_better(
     let lower_bound = motion + i64::from(luma) + ((i64::from(pnew) * i64::from(luma)) >> 8);
     if lower_bound >= best_cost {
         return None;
+    }
+    if !chroma {
+        return Some((luma, lower_bound));
     }
 
     let chroma = chroma_sad_x4(
@@ -1050,8 +1106,12 @@ fn exact_sad_if_better(
         bh_u,
         lw,
         lh,
+        satd,
     );
-    Some(luma.saturating_add(chroma))
+    Some((
+        luma.saturating_add(chroma),
+        lower_bound + i64::from(chroma) + ((i64::from(pnew) * i64::from(chroma)) >> 8),
+    ))
 }
 
 fn exact_sad(
@@ -1065,9 +1125,10 @@ fn exact_sad(
     mv: (i32, i32),
     satd: bool,
     pel: i32,
+    include_chroma: bool,
 ) -> u32 {
     let (luma, chroma) = block_cost_lc(src, refp, level, px, py, bw, bh, mv.0, mv.1, satd, pel);
-    luma.saturating_add(chroma)
+    luma.saturating_add(chroma * u32::from(include_chroma))
 }
 
 fn exact_motion_penalty(lambda: i32, predictor: (i32, i32), mv: (i32, i32)) -> i64 {
@@ -1087,13 +1148,9 @@ fn exact_ok(mv: (i32, i32), bounds: (i32, i32, i32, i32)) -> bool {
 }
 
 fn exact_lambda(opts: &AnalyseOpts, level: i32, pel: i32) -> i32 {
-    let mut value = opts.lambda / (pel * pel).max(1);
-    if opts.plevel == 1 {
-        value = value.saturating_mul(1i32 << level);
-    } else if opts.plevel == 2 {
-        value = value.saturating_mul(1i32 << (2 * level));
-    }
-    value
+    (f64::from(opts.lambda)
+        / opts.plevel.powi(opts.levels - level - 1)
+        / f64::from((pel * pel).max(1))) as i32
 }
 
 fn exact_global_doubled(field: &[Vec8]) -> (i32, i32) {
@@ -1132,7 +1189,8 @@ fn exact_global_doubled(field: &[Vec8]) -> (i32, i32) {
     if count == 0 {
         (2 * mx, 2 * my)
     } else {
-        ((2 * sx / count) as i32, (2 * sy / count) as i32)
+        let mean = |sum: i64| (sum + sum.signum() * count / 2) / count;
+        (2 * mean(sx) as i32, 2 * mean(sy) as i32)
     }
 }
 
@@ -1180,8 +1238,8 @@ fn exact_recalculate(
             let interp = |a: i64, b: i64, c: i64, d: i64| {
                 let top = a * i64::from(old_step_x) + i64::from(delta_x) * (b - a);
                 let bottom = c * i64::from(old_step_x) + i64::from(delta_x) * (d - c);
-                (top + i64::from(delta_y) * (bottom - top) / i64::from(old_step_y))
-                    / i64::from(old_step_x)
+                (top + (i64::from(delta_y) * (bottom - top)).div_euclid(i64::from(old_step_y)))
+                    .div_euclid(i64::from(old_step_x))
             };
             let mv = (
                 interp(p00.dx.into(), p10.dx.into(), p01.dx.into(), p11.dx.into()) as i32,
@@ -1224,6 +1282,7 @@ fn exact_recalculate(
                     predictor,
                     opts.refine_satd,
                     pel,
+                    true,
                 );
                 best.cost = i64::from(best.sad);
                 let lambda = if by == 0 {
@@ -1241,6 +1300,7 @@ fn exact_recalculate(
                     eval_bh,
                     pel,
                     opts.refine_satd,
+                    true,
                     predictor,
                     bounds,
                     lambda,
@@ -1254,17 +1314,11 @@ fn exact_recalculate(
                 dx: best.mv.0 as i16,
                 dy: best.mv.1 as i16,
                 score: best.sad.saturating_mul(factor as u32),
-                luma: block_luma_dc(src, 0, px, py, bw, bh),
+                luma: block_luma_dc(src, 0, eval_px, eval_py, eval_bw, eval_bh),
             };
         }
     }
     out
-}
-
-fn reconcile_bidir_gmv(fwd: (i32, i32), bwd: (i32, i32)) -> ((i32, i32), (i32, i32)) {
-    let ax = fwd.0.wrapping_add(bwd.0) / 2;
-    let ay = fwd.1.wrapping_add(bwd.1) / 2;
-    ((fwd.0 - ax, fwd.1 - ay), (bwd.0 - ax, bwd.1 - ay))
 }
 
 fn level_grid(opts: &AnalyseOpts, level: i32, bw: i32, bh: i32, ox: i32, oy: i32) -> (i32, i32) {
@@ -1276,7 +1330,7 @@ fn level_grid(opts: &AnalyseOpts, level: i32, bw: i32, bh: i32, ox: i32, oy: i32
     let end_y = oy + step_y * gh0;
     let gw = (((end_x >> level) - ox) / step_x).max(1);
     let gh = (((end_y >> level) - oy) / step_y).max(1);
-    (gw, gh)
+    (gw + i32::from(level > 0), gh + i32::from(level > 0))
 }
 
 fn search_radius(opts: &AnalyseOpts, fine: bool, level: i32, nlevels: i32) -> i32 {
@@ -1290,6 +1344,83 @@ fn search_radius(opts: &AnalyseOpts, fine: bool, level: i32, nlevels: i32) -> i3
     } else {
         d.abs()
     }
+}
+
+fn adaptive_radius(radius: i32, activity: u32) -> i32 {
+    if activity < 2 {
+        0
+    } else {
+        ((radius * (255 * activity / 150).min(255) as i32) >> 8) + 1
+    }
+}
+
+fn block_activity(
+    src: &SuperPlanes<'_>,
+    level: i32,
+    px: i32,
+    py: i32,
+    bw: i32,
+    bh: i32,
+    satd: bool,
+) -> u32 {
+    let (lw, lh) = src.level_size(level);
+    let x = px - i32::from(level > 0 && px + bw >= lw as i32);
+    let y = py - i32::from(level > 0 && py + bh >= lh as i32);
+    let plane = |data, stride, offset, x, y, w, h| {
+        plane_activity(data, stride, offset + y as usize, x as usize, w, h, satd)
+    };
+    let luma = plane(
+        src.y,
+        src.y_stride,
+        src.level_y_offset(level),
+        x,
+        y,
+        bw as usize,
+        bh as usize,
+    );
+    let cw = (bw / 2) as usize;
+    let ch = (bh / 2) as usize;
+    let offset = chroma_level_offset(src, level);
+    luma + plane(src.u, src.u_stride, offset, px / 2, py / 2, cw, ch)
+        + plane(src.v, src.v_stride, offset, px / 2, py / 2, cw, ch)
+}
+
+fn plane_activity(
+    data: &[u8],
+    stride: usize,
+    row: usize,
+    x: usize,
+    width: usize,
+    height: usize,
+    satd: bool,
+) -> u32 {
+    let area = (width * height) as u32;
+    let mean = (0..height)
+        .flat_map(|y| &data[(row + y) * stride + x..][..width])
+        .map(|&value| u32::from(value))
+        .sum::<u32>()
+        / area;
+    if !satd {
+        return (0..height)
+            .flat_map(|y| &data[(row + y) * stride + x..][..width])
+            .map(|&value| u32::from(value).abs_diff(mean))
+            .sum::<u32>()
+            / area;
+    }
+    let mut total = 0;
+    for y in (0..height).step_by(4) {
+        for x0 in (0..width).step_by(4) {
+            let mut difference = [[0; 4]; 4];
+            for dy in 0..4 {
+                for dx in 0..4 {
+                    difference[dy][dx] =
+                        i32::from(data[(row + y + dy) * stride + x + x0 + dx]) - mean as i32;
+                }
+            }
+            total += hadamard4_satd(difference);
+        }
+    }
+    (total >> 1) / area
 }
 
 fn adapt_lambda(nlambda: i32, lsad: i32, pred_score: u32) -> i32 {
@@ -1348,8 +1479,8 @@ fn mv_bounds(
     (
         -pel * px,
         -pel * py,
-        pel * (lw - px - bw).max(0),
-        pel * (lh - py - bh).max(0),
+        pel * (lw - px - bw) + 1,
+        pel * (lh - py - bh) + 1,
     )
 }
 
@@ -1414,16 +1545,10 @@ fn block_cost_lc(
     let pel = pel.max(1);
 
     let (lw, lh) = src.level_size(level);
-    if level == 0 && pel >= 2 {
-        let min_x = -pel * px;
-        let min_y = -pel * py;
-        if mvx < min_x || mvy < min_y {
-            if let Some((l, c, _)) =
-                block_cost_edge_lc(src, refp, level, px, py, bw, bh, mvx, mvy, use_satd, pel)
-            {
-                return (l, c);
-            }
-        }
+    if let Some((l, c, _)) =
+        block_cost_edge_lc(src, refp, level, px, py, bw, bh, mvx, mvy, use_satd, pel)
+    {
+        return (l, c);
     }
 
     let bw_u = bw as usize;
@@ -1435,7 +1560,7 @@ fn block_cost_lc(
     );
 
     let sad_c = chroma_sad_x4(
-        src, refp, level, pel, mvx, mvy, px_u, py_u, bw_u, bh_u, lw, lh,
+        src, refp, level, pel, mvx, mvy, px_u, py_u, bw_u, bh_u, lw, lh, use_satd,
     );
     (sad_l, sad_c)
 }
@@ -1455,6 +1580,8 @@ fn block_cost_luma_interior(
     compute_luma: bool,
 ) -> (u32, u8) {
     let (lw, lh) = src.level_size(level);
+    let px = px - i32::from(level > 0 && px + bw as i32 >= lw as i32);
+    let py = py - i32::from(level > 0 && py + bh as i32 >= lh as i32);
     let px_u = px as usize;
     let py_u = py as usize;
     let y_off = src.level_y_offset(level);
@@ -1676,8 +1803,11 @@ fn block_cost_edge_lc(
         edge_shift_origins(px, py, mvx, mvy, bw, bh, lw as i32, lh as i32, pel)?;
     let y_off = src.level_y_offset(level);
 
-    let sub_x = mvx & 1;
-    let sub_y = mvy & 1;
+    let (sub_x, sub_y) = if level == 0 && pel >= 2 {
+        (mvx & 1, mvy & 1)
+    } else {
+        (0, 0)
+    };
     let sub_idx = ((sub_y * pel) + sub_x) as usize;
     let cur_row0 = y_off;
     let ref_row0 = y_off + sub_idx * lh;
@@ -1704,8 +1834,20 @@ fn block_cost_edge_lc(
                 );
             }
         }
-        satd_luma_edge(
-            src, refp, cur_row0, ref_row0, cx, cy, rx0, ry0, lw, lh, bw_u,
+        satd_edge(
+            src.y,
+            src.y_stride,
+            cur_row0,
+            cx,
+            cy,
+            refp.y,
+            refp.y_stride,
+            ref_row0,
+            rx0,
+            ry0,
+            lw,
+            lh,
+            bw_u,
         )
     } else {
         let mut sad = 0u32;
@@ -1740,42 +1882,77 @@ fn block_cost_edge_lc(
     let cry0 = ((mvy >> 1) + 2 * ccy) >> 1;
     let c_off = chroma_level_offset(src, level);
 
-    let c_sub = (((mvy & 1) * pel) + (mvx & 1)) as usize;
+    let c_sub = if level == 0 && pel >= 2 {
+        ((mvy & 1) * pel + (mvx & 1)) as usize
+    } else {
+        0
+    };
     let c_ref = c_off + c_sub * clh;
     let clw_i = clw as i32;
     let clh_i = clh as i32;
-    let mut sad_uv = 0u32;
-    for row in 0..ch {
-        let sy = (ccy + row as i32).clamp(0, (clh_i - 1).max(0)) as usize;
-        let ry = (cry0 + row as i32).clamp(0, (clh_i - 1).max(0)) as usize;
-        for col in 0..cw {
-            let sx = (ccx + col as i32).clamp(0, (clw_i - 1).max(0)) as usize;
-            let rx = (crx0 + col as i32).clamp(0, (clw_i - 1).max(0)) as usize;
-            let au = src
-                .u
-                .get((c_off + sy) * src.u_stride + sx)
-                .copied()
-                .unwrap_or(128);
-            let av = src
-                .v
-                .get((c_off + sy) * src.v_stride + sx)
-                .copied()
-                .unwrap_or(128);
-            let bu = refp
-                .u
-                .get((c_ref + ry) * refp.u_stride + rx)
-                .copied()
-                .unwrap_or(128);
-            let bv = refp
-                .v
-                .get((c_ref + ry) * refp.v_stride + rx)
-                .copied()
-                .unwrap_or(128);
-            sad_uv = sad_uv
-                .saturating_add(u32::from(au.abs_diff(bu)))
-                .saturating_add(u32::from(av.abs_diff(bv)));
+    let sad_uv = if use_satd && cw == ch && matches!(cw, 4 | 8 | 16) {
+        satd_edge(
+            src.u,
+            src.u_stride,
+            c_off,
+            ccx,
+            ccy,
+            refp.u,
+            refp.u_stride,
+            c_ref,
+            crx0,
+            cry0,
+            clw,
+            clh,
+            cw,
+        )
+        .saturating_add(satd_edge(
+            src.v,
+            src.v_stride,
+            c_off,
+            ccx,
+            ccy,
+            refp.v,
+            refp.v_stride,
+            c_ref,
+            crx0,
+            cry0,
+            clw,
+            clh,
+            cw,
+        ))
+    } else {
+        let mut sad = 0u32;
+        for row in 0..ch {
+            let sy = (ccy + row as i32).clamp(0, (clh_i - 1).max(0)) as usize;
+            let ry = (cry0 + row as i32).clamp(0, (clh_i - 1).max(0)) as usize;
+            for col in 0..cw {
+                let sx = (ccx + col as i32).clamp(0, (clw_i - 1).max(0)) as usize;
+                let rx = (crx0 + col as i32).clamp(0, (clw_i - 1).max(0)) as usize;
+                let sample = |data: &[u8], stride, row, col| {
+                    data.get(row * stride + col).copied().unwrap_or(128)
+                };
+                sad = sad
+                    .saturating_add(u32::from(
+                        sample(src.u, src.u_stride, c_off + sy, sx).abs_diff(sample(
+                            refp.u,
+                            refp.u_stride,
+                            c_ref + ry,
+                            rx,
+                        )),
+                    ))
+                    .saturating_add(u32::from(
+                        sample(src.v, src.v_stride, c_off + sy, sx).abs_diff(sample(
+                            refp.v,
+                            refp.v_stride,
+                            c_ref + ry,
+                            rx,
+                        )),
+                    ));
+            }
         }
-    }
+        sad
+    };
     let sad_c = sad_uv.saturating_mul(4);
     let luma = (sum / (bw_u * bh_u).max(1) as u32).min(255) as u8;
     Some((sad_l, sad_c, luma))
@@ -1794,9 +1971,13 @@ fn chroma_sad_x4(
     bh: usize,
     lw: usize,
     lh: usize,
+    use_satd: bool,
 ) -> u32 {
     let cw = bw / 2;
     let ch = bh / 2;
+    if cw < 4 || ch < 4 {
+        return 0;
+    }
     let cpx = px / 2;
     let cpy = py / 2;
     let (clw, clh) = (lw / 2, lh / 2);
@@ -1847,21 +2028,24 @@ fn chroma_sad_x4(
                 && ref_v_end <= refp.v.len()
             {
                 return unsafe {
-                    sad_u8_simd(
+                    let cost = |a, a_stride, b, b_stride| {
+                        if use_satd {
+                            satd_interior(a, a_stride, b, b_stride, cw)
+                        } else {
+                            sad_u8_simd(a, a_stride, b, b_stride, cw, ch)
+                        }
+                    };
+                    cost(
                         src.u.as_ptr().add(src_u),
                         src.u_stride,
                         refp.u.as_ptr().add(ref_u),
                         refp.u_stride,
-                        cw,
-                        ch,
                     )
-                    .saturating_add(sad_u8_simd(
+                    .saturating_add(cost(
                         src.v.as_ptr().add(src_v),
                         src.v_stride,
                         refp.v.as_ptr().add(ref_v),
                         refp.v_stride,
-                        cw,
-                        ch,
                     ))
                     .saturating_mul(4)
                 };
@@ -1910,41 +2094,42 @@ fn chroma_sad_x4(
     sad_uv.saturating_mul(4)
 }
 
-fn satd_luma_edge(
-    src: &SuperPlanes<'_>,
-    refp: &SuperPlanes<'_>,
-    cur_row0: usize,
-    ref_row0: usize,
-    cx: i32,
-    cy: i32,
+fn satd_edge(
+    src: &[u8],
+    src_stride: usize,
+    src_row: usize,
+    sx0: i32,
+    sy0: i32,
+    reference: &[u8],
+    reference_stride: usize,
+    reference_row: usize,
     rx0: i32,
     ry0: i32,
-    lw: usize,
-    lh: usize,
+    width: usize,
+    height: usize,
     n: usize,
 ) -> u32 {
-    let lw_i = lw as i32;
-    let lh_i = lh as i32;
+    let width = width as i32;
+    let height = height as i32;
     let mut total = 0u32;
     let tiles = n / 4;
     for ty in 0..tiles {
         for tx in 0..tiles {
             let mut diff = [[0i32; 4]; 4];
             for r in 0..4 {
-                let sy = (cy + (ty * 4 + r) as i32).clamp(0, (lh_i - 1).max(0)) as usize;
-                let ry = (ry0 + (ty * 4 + r) as i32).clamp(0, (lh_i - 1).max(0)) as usize;
+                let sy = (sy0 + (ty * 4 + r) as i32).clamp(0, (height - 1).max(0)) as usize;
+                let ry = (ry0 + (ty * 4 + r) as i32).clamp(0, (height - 1).max(0)) as usize;
                 for c in 0..4 {
-                    let sx = (cx + (tx * 4 + c) as i32).clamp(0, (lw_i - 1).max(0)) as usize;
-                    let rx = (rx0 + (tx * 4 + c) as i32).clamp(0, (lw_i - 1).max(0)) as usize;
+                    let sx = (sx0 + (tx * 4 + c) as i32).clamp(0, (width - 1).max(0)) as usize;
+                    let rx = (rx0 + (tx * 4 + c) as i32).clamp(0, (width - 1).max(0)) as usize;
                     let a = i32::from(
-                        src.y
-                            .get((cur_row0 + sy) * src.y_stride + sx)
+                        src.get((src_row + sy) * src_stride + sx)
                             .copied()
                             .unwrap_or(0),
                     );
                     let b = i32::from(
-                        refp.y
-                            .get((ref_row0 + ry) * refp.y_stride + rx)
+                        reference
+                            .get((reference_row + ry) * reference_stride + rx)
                             .copied()
                             .unwrap_or(0),
                     );
@@ -1954,7 +2139,7 @@ fn satd_luma_edge(
             total = total.saturating_add(hadamard4_satd(diff));
         }
     }
-    total
+    total >> 1
 }
 
 fn satd_luma_clamp(
@@ -1995,7 +2180,7 @@ fn satd_luma_clamp(
         let ref_idx = (ref_row0 + ry0 as usize) * refp.y_stride + rx0 as usize;
 
         return unsafe {
-            satd_luma_interior(
+            satd_interior(
                 src.y.as_ptr().add(src_idx),
                 src.y_stride,
                 refp.y.as_ptr().add(ref_idx),
@@ -2039,11 +2224,11 @@ fn satd_luma_clamp(
             total = total.saturating_add(hadamard4_satd(diff));
         }
     }
-    total
+    total >> 1
 }
 
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "sse2"))]
-unsafe fn satd_luma_interior(
+unsafe fn satd_interior(
     src: *const u8,
     src_stride: usize,
     refp: *const u8,
@@ -2085,7 +2270,7 @@ unsafe fn satd_luma_interior(
             }
         }
     }
-    total
+    total >> 1
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2147,7 +2332,7 @@ unsafe fn hadamard4_satd_sse2(
         sums = _mm_add_epi16(sums, abs);
     }
     let pairs = _mm_madd_epi16(sums, _mm_set1_epi16(1));
-    (_mm_cvtsi128_si32(_mm_add_epi32(pairs, _mm_srli_si128::<4>(pairs))) as u32) >> 1
+    _mm_cvtsi128_si32(_mm_add_epi32(pairs, _mm_srli_si128::<4>(pairs))) as u32
 }
 
 fn hadamard4_satd(diff: [[i32; 4]; 4]) -> u32 {
@@ -2170,7 +2355,7 @@ fn hadamard4_satd(diff: [[i32; 4]; 4]) -> u32 {
         let s3 = t[2][j] - t[3][j];
         s += (s0 + s2).abs() + (s1 + s3).abs() + (s0 - s2).abs() + (s1 - s3).abs();
     }
-    (s.max(0) as u32) >> 1
+    s.max(0) as u32
 }
 
 fn chroma_level_offset(src: &SuperPlanes<'_>, level: i32) -> usize {
@@ -2252,7 +2437,7 @@ pub(crate) fn pack_vector_frame(
     write_i32(&mut out, 0x2C, oy);
     write_i32(&mut out, 0x30, gw);
     write_i32(&mut out, 0x34, gh);
-    write_i32(&mut out, 0x38, 1);
+    write_i32(&mut out, 0x38, opts.selector);
     write_i32(&mut out, 0x3C, opts.delta);
 
     let mut cursor = 0x40;
@@ -2270,7 +2455,6 @@ pub(crate) fn pack_vector_frame(
     let _ = cursor;
     out
 }
-
 fn write_vecs(out: &mut [u8], mut cursor: usize, vecs: &[Vec8], count: usize) -> usize {
     for i in 0..count {
         let v = vecs.get(i).copied().unwrap_or_default();
@@ -2308,7 +2492,7 @@ pub(crate) fn pack_vdata_header(opts: &AnalyseOpts) -> Vec<i32> {
     h[10] = oy;
     h[11] = gw;
     h[12] = gh;
-    h[13] = 1;
+    h[13] = opts.selector;
     h[14] = opts.delta;
     h
 }

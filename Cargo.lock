@@ -191,6 +191,7 @@ name = "svpflow2"
 version = "0.1.0"
 dependencies = [
  "libloading",
+ "rayon",
  "svpflow-core",
 ]
 

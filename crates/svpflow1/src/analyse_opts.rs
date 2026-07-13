@@ -12,13 +12,14 @@ pub(crate) struct AnalyseOpts {
     pub(crate) overlap_y: i32,
     pub(crate) delta: i32,
     pub(crate) pel: i32,
+    pub(crate) selector: i32,
     pub(crate) levels: i32,
     pub(crate) super_levels: i32,
     pub(crate) width: i32,
     pub(crate) height: i32,
     pub(crate) lambda: i32,
     pub(crate) lsad: i32,
-    pub(crate) plevel: i32,
+    pub(crate) plevel: f64,
     pub(crate) pnew: i32,
     pub(crate) pglobal: i32,
     pub(crate) pzero: i32,
@@ -46,7 +47,7 @@ impl AnalyseOpts {
         sdata: i64,
         super_opts_hint: Option<&SuperOpts>,
     ) -> Result<Self, String> {
-        let (width, height, pel, super_levels) = unpack_sdata(sdata, super_opts_hint)?;
+        let (width, height, pel, super_levels, selector) = unpack_sdata(sdata, super_opts_hint)?;
 
         let vectors = opt.and_then(|v| v.int_at(&["vectors"])).unwrap_or(3) as i32;
         if !(1..=3).contains(&vectors) {
@@ -72,17 +73,18 @@ impl AnalyseOpts {
             .unwrap_or(1) as i32;
 
         let lambda = opt
-            .and_then(|v| v.int_at(&["main", "penalty", "lambda"]))
-            .or_else(|| opt.and_then(|v| v.int_at(&["penalty", "lambda"])))
-            .unwrap_or(0) as i32;
+            .and_then(|v| v.float_at(&["main", "penalty", "lambda"]))
+            .or_else(|| opt.and_then(|v| v.float_at(&["penalty", "lambda"])))
+            .unwrap_or(10.0);
         let lsad = opt
             .and_then(|v| v.int_at(&["main", "penalty", "lsad"]))
             .or_else(|| opt.and_then(|v| v.int_at(&["penalty", "lsad"])))
             .unwrap_or(8000) as i32;
         let plevel = opt
-            .and_then(|v| v.int_at(&["main", "penalty", "plevel"]))
-            .or_else(|| opt.and_then(|v| v.int_at(&["penalty", "plevel"])))
-            .unwrap_or(1) as i32;
+            .and_then(|v| v.float_at(&["main", "penalty", "plevel"]))
+            .or_else(|| opt.and_then(|v| v.float_at(&["penalty", "plevel"])))
+            .unwrap_or(1.5)
+            .max(0.01);
         let pnew = opt
             .and_then(|v| v.int_at(&["main", "penalty", "pnew"]))
             .or_else(|| opt.and_then(|v| v.int_at(&["penalty", "pnew"])))
@@ -171,12 +173,8 @@ impl AnalyseOpts {
             }
         }
 
-        let lambda = if lambda <= 0 {
-            let area = (block_w * block_h).max(1) as f64;
-            (2.0 * area * 1000.0 * 0.015_625) as i32
-        } else {
-            lambda
-        };
+        let area = (block_w * block_h).max(1) as f64;
+        let lambda = (2.0 * area * 1000.0 * 0.015_625 * lambda) as i32;
         let area_scale = (block_w * block_h).max(1) / 32;
         let lsad = lsad.saturating_mul(area_scale);
         let coarse_bad_sad = coarse_bad_sad.saturating_mul(area_scale);
@@ -190,6 +188,7 @@ impl AnalyseOpts {
             overlap_y,
             delta,
             pel,
+            selector,
             levels,
             super_levels,
             width,
@@ -241,19 +240,20 @@ impl AnalyseOpts {
     }
 }
 
-fn unpack_sdata(sdata: i64, hint: Option<&SuperOpts>) -> Result<(i32, i32, i32, i32), String> {
+fn unpack_sdata(sdata: i64, hint: Option<&SuperOpts>) -> Result<(i32, i32, i32, i32, i32), String> {
     let raw = u64::from_ne_bytes(sdata.to_ne_bytes());
     let height = (raw & 0xFFFF) as i32;
     let width = ((raw >> 16) & 0xFFFF) as i32;
     let pel = ((raw >> 32) & 0xFF) as i32;
     let levels = ((raw >> 40) & 0xFF) as i32;
+    let selector = ((raw >> 48) & 0xFF) as i32;
     if width <= 0 || height <= 0 || !(1..=4).contains(&pel) || levels <= 0 {
         if let Some(h) = hint {
-            return Ok((h.width, h.height, h.pel, h.levels));
+            return Ok((h.width, h.height, h.pel, h.levels, h.gpu));
         }
         return Err("SVAnalyse: invalid super clip params".into());
     }
-    Ok((width, height, pel, levels))
+    Ok((width, height, pel, levels, selector))
 }
 
 pub(crate) fn overlap_from_mode(bw: i32, bh: i32, mode: i32) -> Result<(i32, i32), String> {
