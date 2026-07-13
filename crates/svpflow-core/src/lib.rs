@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![allow(
     clippy::missing_errors_doc,
     clippy::must_use_candidate,

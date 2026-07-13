@@ -338,7 +338,6 @@ unsafe fn collect_state(
         super_info,
         gpu,
         nvof: None,
-        merged_cache: std::sync::Mutex::new(Vec::new()),
         prep_cache: std::sync::Mutex::new(Vec::new()),
     }
 }

@@ -856,18 +856,9 @@ impl WasmRenderer {
         let (y, chroma) = source.split_at(self.layout.source_y_len);
         let (u, v) = chroma.split_at(self.layout.source_chroma_len);
         Ok(FramePlanes {
-            y: Plane {
-                data: y,
-                stride: self.layout.width * self.layout.source_step,
-            },
-            u: Plane {
-                data: u,
-                stride: self.layout.chroma_width * self.layout.source_step,
-            },
-            v: Plane {
-                data: v,
-                stride: self.layout.chroma_width * self.layout.source_step,
-            },
+            y: Plane::linear(y, self.layout.width * self.layout.source_step),
+            u: Plane::linear(u, self.layout.chroma_width * self.layout.source_step),
+            v: Plane::linear(v, self.layout.chroma_width * self.layout.source_step),
         })
     }
 }

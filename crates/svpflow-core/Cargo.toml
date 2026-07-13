@@ -10,7 +10,7 @@ rust-version = "1.88"
 crate-type = ["rlib"]
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [lints.clippy]
 all = "warn"

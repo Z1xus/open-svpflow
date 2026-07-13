@@ -78,15 +78,11 @@ pub(crate) struct FilterState {
 
     pub(crate) nvof: Option<crate::nvof::NvofContext>,
 
-    pub(crate) merged_cache: std::sync::Mutex<Vec<(i64, std::sync::Arc<MergedFrame>)>>,
-
     pub(crate) prep_cache: PrepCache,
 }
 
 type PrepCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<FramePrep>>>>;
 type PrepCache = std::sync::Mutex<Vec<(i64, PrepCell)>>;
-
-const MERGED_CACHE_CAP: usize = 16;
 
 const PREP_CACHE_CAP: usize = 24;
 
@@ -856,68 +852,6 @@ impl FilterState {
         })
     }
 
-    #[allow(
-        clippy::question_mark,
-        clippy::similar_names,
-        clippy::too_many_arguments,
-        clippy::too_many_lines
-    )]
-    unsafe fn cached_merged(
-        &self,
-        api: &frame::PlaneApi,
-        frame: vs::ConstRaw,
-        key: i64,
-    ) -> Option<std::sync::Arc<MergedFrame>> {
-        if frame.is_null() {
-            return None;
-        }
-        if std::env::var_os("SVP_NO_MERGED").is_some() {
-            let built = unsafe {
-                build_merged_source(
-                    api,
-                    frame,
-                    &self.video_info,
-                    self.super_info.as_ref(),
-                    self.sdata,
-                )
-            }?;
-            return Some(std::sync::Arc::new(built));
-        }
-
-        {
-            let mut cache = self.merged_cache.lock().ok()?;
-            if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
-                let entry = cache.remove(pos);
-                let arc = std::sync::Arc::clone(&entry.1);
-                cache.push(entry);
-                return Some(arc);
-            }
-        }
-
-        let built = unsafe {
-            build_merged_source(
-                api,
-                frame,
-                &self.video_info,
-                self.super_info.as_ref(),
-                self.sdata,
-            )
-        }?;
-        let arc = std::sync::Arc::new(built);
-        let mut cache = self.merged_cache.lock().ok()?;
-        if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
-            let entry = cache.remove(pos);
-            let existing = std::sync::Arc::clone(&entry.1);
-            cache.push(entry);
-            return Some(existing);
-        }
-        if cache.len() >= MERGED_CACHE_CAP {
-            cache.remove(0);
-        }
-        cache.push((key, std::sync::Arc::clone(&arc)));
-        Some(arc)
-    }
-
     #[allow(clippy::too_many_arguments)]
     unsafe fn cached_prep(
         &self,
@@ -1316,12 +1250,28 @@ impl FilterState {
             };
         let interp = !self.options.block_enabled();
         let gpu_candidate = interp && !scene_blend_zero_origin && self.gpu.is_some();
-        let (merged0, merged1) = if gpu_candidate {
+        let (super0, super1) = if gpu_candidate {
             (None, None)
         } else {
             (
-                unsafe { self.cached_merged(api, merged_source, i64::from(source_frame)) },
-                unsafe { self.cached_merged(api, next_merged_source, i64::from(source_frame) + 1) },
+                unsafe {
+                    super_frame_planes(
+                        api,
+                        merged_source,
+                        &self.video_info,
+                        self.super_info.as_ref(),
+                        self.sdata,
+                    )
+                },
+                unsafe {
+                    super_frame_planes(
+                        api,
+                        next_merged_source,
+                        &self.video_info,
+                        self.super_info.as_ref(),
+                        self.sdata,
+                    )
+                },
             )
         };
         if self.options.debug_zerox() {
@@ -1371,7 +1321,7 @@ impl FilterState {
                 phase,
             );
         }
-        let source_step = if merged0.is_some() || merged1.is_some() {
+        let source_step = if super0.is_some() || super1.is_some() {
             metadata::super_data(self.sdata).scale().max(1)
         } else {
             1
@@ -1418,16 +1368,8 @@ impl FilterState {
                 v: plane(src1_v, src1_v_stride, src1_v_len),
             }
         };
-        let sources0 = if let Some(merged) = merged0.as_ref() {
-            merged.frame_planes()
-        } else {
-            raw_sources0
-        };
-        let sources1 = if let Some(merged) = merged1.as_ref() {
-            merged.frame_planes()
-        } else {
-            raw_sources1
-        };
+        let sources0 = super0.unwrap_or(raw_sources0);
+        let sources1 = super1.unwrap_or(raw_sources1);
         let padding = self.options.padding(&self.video_info);
         let dst = unsafe {
             renderer::FramePlanesMut {
@@ -3030,18 +2972,6 @@ fn usize_height(value: i32) -> usize {
     usize::try_from(value.max(0)).unwrap_or(0)
 }
 
-fn usize_width(value: i32) -> usize {
-    usize::try_from(value.max(0)).unwrap_or(0)
-}
-
-pub(crate) struct MergedFrame {
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
-    y_stride: usize,
-    uv_stride: usize,
-}
-
 pub(crate) struct FramePrep {
     decoded: metadata::DecodedVectors,
     vectors_a: Vec<renderer::Vector>,
@@ -3061,25 +2991,6 @@ pub(crate) struct FramePrep {
     side_ready: bool,
     raw_scene_class: i32,
     neighbor_classes: [Option<i32>; 4],
-}
-
-impl MergedFrame {
-    fn frame_planes(&self) -> renderer::FramePlanes<'_> {
-        renderer::FramePlanes {
-            y: renderer::Plane {
-                data: &self.y,
-                stride: self.y_stride,
-            },
-            u: renderer::Plane {
-                data: &self.u,
-                stride: self.uv_stride,
-            },
-            v: renderer::Plane {
-                data: &self.v,
-                stride: self.uv_stride,
-            },
-        }
-    }
 }
 
 #[allow(
@@ -3200,76 +3111,48 @@ fn gpu_render_frame(
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss
 )]
-unsafe fn build_merged_source(
+unsafe fn super_frame_planes(
     api: &frame::PlaneApi,
     frame: vs::ConstRaw,
     info: &vs::VideoInfo,
     super_info: Option<&vs::VideoInfo>,
     sdata: i64,
-) -> Option<MergedFrame> {
+) -> Option<renderer::FramePlanes<'static>> {
     let lane = usize::try_from(metadata::super_data(sdata).scale()).ok()?;
     if frame.is_null() || !matches!(lane, 2 | 4) {
         return None;
     }
-    let y_base_w = usize_width(super_info.map_or(info.width, |info| info.width));
-    let y_base_h = usize_height(info.height);
-    let uv_base_w = y_base_w / 2;
-    let uv_base_h = y_base_h / 2;
-    let y_read_h = usize_height(super_info.map_or(info.height, |info| info.height));
-    let uv_read_h = y_read_h / 2;
-    let y_stride = y_base_w.checked_mul(lane)?;
-    let uv_stride = uv_base_w.checked_mul(lane)?;
-    Some(MergedFrame {
-        y: unsafe { merge_plane(api, frame, 0, y_base_w, y_base_h, y_read_h, lane)? },
-        u: unsafe { merge_plane(api, frame, 1, uv_base_w, uv_base_h, uv_read_h, lane)? },
-        v: unsafe { merge_plane(api, frame, 2, uv_base_w, uv_base_h, uv_read_h, lane)? },
-        y_stride,
-        uv_stride,
+    let shift = lane.trailing_zeros();
+    let y_height = usize_height(info.height);
+    let uv_height = y_height / 2;
+    let read_height = usize_height(super_info.map_or(info.height, |info| info.height));
+    let y = unsafe { api.read_plane(frame, 0, read_height) }?;
+    let u = unsafe { api.read_plane(frame, 1, read_height / 2) }?;
+    let v = unsafe { api.read_plane(frame, 2, read_height / 2) }?;
+    Some(renderer::FramePlanes {
+        y: unsafe { super_plane(y.0, y.1, y.2, y_height, shift) }?,
+        u: unsafe { super_plane(u.0, u.1, u.2, uv_height, shift) }?,
+        v: unsafe { super_plane(v.0, v.1, v.2, uv_height, shift) }?,
     })
 }
 
-unsafe fn merge_plane(
-    api: &frame::PlaneApi,
-    frame: vs::ConstRaw,
-    plane: i32,
-    base_w: usize,
-    base_h: usize,
-    read_h: usize,
-    lane: usize,
-) -> Option<Vec<u8>> {
-    if base_w == 0 || base_h == 0 {
-        return None;
-    }
-    let height = base_h.checked_mul(lane)?;
-    let width = base_w.checked_mul(lane)?;
-    let (src, src_stride, src_len) = unsafe { api.read_plane(frame, plane, read_h) }?;
-    let span = src_stride.checked_mul(base_h)?;
-    let mut out = vec![0; width.checked_mul(height)?];
-    for y in 0..base_h {
-        for row in 0..lane {
-            let dst_row = y * lane + row;
-            for x in 0..base_w {
-                for col in 0..lane {
-                    let src_plane = row * lane + col;
-                    let src_offset = src_plane
-                        .checked_mul(span)?
-                        .checked_add(y.checked_mul(src_stride)?)?
-                        .checked_add(x)?;
-                    if src_offset < src_len {
-                        out[dst_row * width + x * lane + col] = unsafe { *src.add(src_offset) };
-                    }
-                }
-            }
-        }
-    }
-    Some(out)
+unsafe fn plane(ptr: *const u8, stride: usize, len: usize) -> renderer::Plane<'static> {
+    renderer::Plane::linear(unsafe { slice::from_raw_parts(ptr, len) }, stride)
 }
 
-unsafe fn plane(ptr: *const u8, stride: usize, len: usize) -> renderer::Plane<'static> {
-    renderer::Plane {
-        data: unsafe { slice::from_raw_parts(ptr, len) },
+unsafe fn super_plane(
+    ptr: *const u8,
+    stride: usize,
+    len: usize,
+    height: usize,
+    shift: u32,
+) -> Option<renderer::Plane<'static>> {
+    renderer::Plane::super_plane(
+        unsafe { slice::from_raw_parts(ptr, len) },
         stride,
-    }
+        stride.checked_mul(height)?,
+        shift,
+    )
 }
 
 unsafe fn plane_mut(ptr: *mut u8, stride: usize, len: usize) -> renderer::PlaneMut<'static> {
