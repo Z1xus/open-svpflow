@@ -1479,45 +1479,42 @@ impl FilterState {
                     masks: Some(masks),
                     final_mask,
                 };
-                let render = |dst, source0, source1, chroma, rows| {
-                    cpu.render_plane_rows(mode, interp, dst, input(source0, source1), chroma, rows)
-                };
                 let height = self.video_info.height;
                 let middle = height / 2;
-                let [top, bottom] = split_plane(dst.y, middle);
-                let _ = rayon::join(
-                    || {
-                        let _ = rayon::join(
-                            || render(top, sources0.y, sources1.y, false, 0..middle),
-                            || render(bottom, sources0.y, sources1.y, false, middle..height),
-                        );
-                    },
-                    || {
-                        if mode == 23 {
-                            let uv_middle = middle / 2;
-                            let [u_top, u_bottom] = split_plane(dst.u, uv_middle);
-                            let [v_top, v_bottom] = split_plane(dst.v, uv_middle);
-                            let render = |dst, rows| {
-                                cpu.render_mode23_uv_rows(
-                                    interp,
-                                    dst,
-                                    input(sources0.u, sources1.u),
-                                    [sources0.v, sources1.v],
-                                    rows,
-                                )
-                            };
-                            let _ = rayon::join(
-                                || render([u_top, v_top], 0..uv_middle),
-                                || render([u_bottom, v_bottom], uv_middle..middle),
-                            );
-                        } else {
-                            let _ = rayon::join(
-                                || render(dst.u, sources0.u, sources1.u, true, 0..middle),
-                                || render(dst.v, sources0.v, sources1.v, true, 0..middle),
-                            );
-                        }
-                    },
+                let _ = cpu.render_plane_rows(
+                    mode,
+                    interp,
+                    dst.y,
+                    input(sources0.y, sources1.y),
+                    false,
+                    0..height,
                 );
+                if mode == 23 {
+                    let _ = cpu.render_mode23_uv_rows(
+                        interp,
+                        [dst.u, dst.v],
+                        input(sources0.u, sources1.u),
+                        [sources0.v, sources1.v],
+                        0..middle,
+                    );
+                } else {
+                    let _ = cpu.render_plane_rows(
+                        mode,
+                        interp,
+                        dst.u,
+                        input(sources0.u, sources1.u),
+                        true,
+                        0..middle,
+                    );
+                    let _ = cpu.render_plane_rows(
+                        mode,
+                        interp,
+                        dst.v,
+                        input(sources0.v, sources1.v),
+                        true,
+                        0..middle,
+                    );
+                }
             };
             match algo {
                 1 | 2 => cpu.render_mode1_or_2(
@@ -3168,24 +3165,6 @@ unsafe fn plane_mut(ptr: *mut u8, stride: usize, len: usize) -> renderer::PlaneM
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn split_plane(plane: renderer::PlaneMut<'_>, row: i32) -> [renderer::PlaneMut<'_>; 2] {
-    let split = usize::try_from(row)
-        .unwrap_or_default()
-        .saturating_mul(plane.stride)
-        .min(plane.data.len());
-    let (top, bottom) = plane.data.split_at_mut(split);
-    [
-        renderer::PlaneMut {
-            data: top,
-            stride: plane.stride,
-        },
-        renderer::PlaneMut {
-            data: bottom,
-            stride: plane.stride,
-        },
-    ]
-}
-
 unsafe fn offset_plane_mut(
     ptr: *mut u8,
     stride: usize,

@@ -13,7 +13,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 libloading = "0.9.0"
-rayon = "1.12.0"
 svpflow-core = { path = "../svpflow-core" }
 
 [lints.rust]
