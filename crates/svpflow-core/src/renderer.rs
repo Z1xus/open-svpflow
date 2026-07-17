@@ -172,8 +172,8 @@ pub struct PlaneRenderInput<'a> {
 
 #[derive(Clone, Copy)]
 struct Mode23PlaneInput<'a> {
-    source0: Plane<'a>,
-    source1: Plane<'a>,
+    source0: [Plane<'a>; 2],
+    source1: [Plane<'a>; 2],
     base0: MotionPlanes<'a>,
     base1: MotionPlanes<'a>,
     next0: MotionPlanes<'a>,
@@ -704,6 +704,31 @@ impl CpuRenderer {
         Ok(())
     }
 
+    pub fn render_mode23_uv_rows(
+        &self,
+        interp: bool,
+        dst: [PlaneMut<'_>; 2],
+        input: PlaneRenderInput<'_>,
+        second: [Plane<'_>; 2],
+        rows: Range<i32>,
+    ) -> Result<(), RenderError> {
+        let [dst, second_dst] = dst;
+        let [second_source0, second_source1] = second;
+        let input = Mode23PlaneInput {
+            source0: [input.source0, second_source0],
+            source1: [input.source1, second_source1],
+            base0: input.motion0,
+            base1: input.motion1,
+            next0: input.motion2.ok_or(RenderError::MissingMotion)?,
+            prev1: input.motion3.ok_or(RenderError::MissingMotion)?,
+            masks: input.masks.ok_or(RenderError::MissingMasks)?,
+            mask: input.final_mask,
+            chroma: true,
+        };
+        self.render_mode23_plane_rows_dispatch::<true>([dst, second_dst], &input, interp, rows);
+        Ok(())
+    }
+
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     fn render_selected_warp(
         &self,
@@ -979,8 +1004,8 @@ impl CpuRenderer {
         rows: Range<i32>,
     ) {
         let input = Mode23PlaneInput {
-            source0,
-            source1,
+            source0: [source0; 2],
+            source1: [source1; 2],
             base0,
             base1,
             next0,
@@ -989,23 +1014,46 @@ impl CpuRenderer {
             mask,
             chroma,
         };
-        match (interp, mask.is_some()) {
+        self.render_mode23_plane_rows_dispatch::<false>(
+            [
+                dst,
+                PlaneMut {
+                    data: &mut [],
+                    stride: 0,
+                },
+            ],
+            &input,
+            interp,
+            rows,
+        );
+    }
+
+    fn render_mode23_plane_rows_dispatch<const DUAL: bool>(
+        &self,
+        dst: [PlaneMut<'_>; 2],
+        input: &Mode23PlaneInput<'_>,
+        interp: bool,
+        rows: Range<i32>,
+    ) {
+        match (interp, input.mask.is_some()) {
             (true, false) => {
-                self.render_mode23_plane_rows_variant::<true, false>(dst, &input, rows);
+                self.render_mode23_plane_rows_variant::<true, false, DUAL>(dst, input, rows);
             }
-            (true, true) => self.render_mode23_plane_rows_variant::<true, true>(dst, &input, rows),
+            (true, true) => {
+                self.render_mode23_plane_rows_variant::<true, true, DUAL>(dst, input, rows);
+            }
             (false, false) => {
-                self.render_mode23_plane_rows_variant::<false, false>(dst, &input, rows);
+                self.render_mode23_plane_rows_variant::<false, false, DUAL>(dst, input, rows);
             }
             (false, true) => {
-                self.render_mode23_plane_rows_variant::<false, true>(dst, &input, rows);
+                self.render_mode23_plane_rows_variant::<false, true, DUAL>(dst, input, rows);
             }
         }
     }
 
-    fn render_mode23_plane_rows_variant<const INTERP: bool, const MASK: bool>(
+    fn render_mode23_plane_rows_variant<const INTERP: bool, const MASK: bool, const DUAL: bool>(
         &self,
-        dst: PlaneMut<'_>,
+        dst: [PlaneMut<'_>; 2],
         input: &Mode23PlaneInput<'_>,
         rows: Range<i32>,
     ) {
@@ -1015,22 +1063,28 @@ impl CpuRenderer {
             self.width_map >= 0 && self.height_map >= 0
         };
         if shifted {
-            self.render_mode23_plane_rows_inner::<INTERP, MASK, true>(dst, input, rows);
+            self.render_mode23_plane_rows_inner::<INTERP, MASK, true, DUAL>(dst, input, rows);
         } else {
-            self.render_mode23_plane_rows_inner::<INTERP, MASK, false>(dst, input, rows);
+            self.render_mode23_plane_rows_inner::<INTERP, MASK, false, DUAL>(dst, input, rows);
         }
     }
 
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
-    fn render_mode23_plane_rows_inner<const INTERP: bool, const MASK: bool, const SHIFTED: bool>(
+    fn render_mode23_plane_rows_inner<
+        const INTERP: bool,
+        const MASK: bool,
+        const SHIFTED: bool,
+        const DUAL: bool,
+    >(
         &self,
-        dst: PlaneMut<'_>,
+        dst: [PlaneMut<'_>; 2],
         input: &Mode23PlaneInput<'_>,
         rows: Range<i32>,
     ) {
+        let [dst, second_dst] = dst;
         let Mode23PlaneInput {
-            source0,
-            source1,
+            source0: sources0,
+            source1: sources1,
             base0,
             base1,
             next0,
@@ -1039,6 +1093,8 @@ impl CpuRenderer {
             mask,
             chroma,
         } = *input;
+        let [source0, second_source0] = sources0;
+        let [source1, second_source1] = sources1;
         let interp = INTERP;
         let mask = if MASK { mask } else { None };
         let zero_origin = !interp;
@@ -1070,12 +1126,20 @@ impl CpuRenderer {
                         motion3_samples,
                     ],
                 ) && plane_covers(source0, &params)
-                    && plane_covers(source1, &params);
+                    && plane_covers(source1, &params)
+                    && (!DUAL
+                        || plane_covers(second_source0, &params)
+                            && plane_covers(second_source1, &params));
                 for y in 0..tile.height {
                     let local_y = tile.local_y + y;
                     let source_y = (tile.y + y) * params.source_step;
                     let Some(output) = output_row(dst.data, dst.stride, &tile, y, row_start) else {
                         continue;
+                    };
+                    let second_output = if DUAL {
+                        output_row(second_dst.data, second_dst.stride, &tile, y, row_start)
+                    } else {
+                        None
                     };
                     let motion0_row = interpolate_motion_row::<SHIFTED>(
                         motion0_samples,
@@ -1106,7 +1170,7 @@ impl CpuRenderer {
                     let mask_row = mask.map_or([0; 2], |mask| {
                         alpha_row::<SHIFTED>(mask, &params, &tile, local_y, interp)
                     });
-                    for (x, output) in (0..tile.width).zip(output) {
+                    let render = |x: i32, output: &mut u8, second_output: Option<&mut u8>| {
                         let px = tile.x + x;
                         let py = tile.y + y;
                         let source_x = px * params.source_step;
@@ -1124,7 +1188,7 @@ impl CpuRenderer {
                             interpolate_motion::<SHIFTED>(motion2_row, &params, weights, interp);
                         let (dx3, dy3) =
                             interpolate_motion::<SHIFTED>(motion3_row, &params, weights, interp);
-                        let mask = mask.map(|mask| {
+                        let final_mask = mask.map(|mask| {
                             alpha_for_origin::<SHIFTED>(
                                 mask,
                                 mask_row,
@@ -1135,42 +1199,65 @@ impl CpuRenderer {
                                 weights,
                             )
                         });
-                        let (base_a, base_b) = if mask.is_some() {
-                            (
-                                sample_plane(source0, &params, source_x, source_y, 0, 0, direct),
-                                sample_plane(source1, &params, source_x, source_y, 0, 0, direct),
+                        let gather = |planes, dx, dy| {
+                            sample_plane_pair::<DUAL>(
+                                planes, &params, source_x, source_y, dx, dy, direct,
                             )
-                        } else {
-                            (0, 0)
                         };
-                        let sample = Mode23Sample {
-                            a: sample_plane(source0, &params, source_x, source_y, dx0, dy0, direct),
-                            b: sample_plane(source1, &params, source_x, source_y, dx1, dy1, direct),
-                            c: sample_plane(source0, &params, source_x, source_y, dx2, dy2, direct),
-                            d: sample_plane(source1, &params, source_x, source_y, dx3, dy3, direct),
-                            base_a,
-                            base_b,
-                            t0: alpha_for_origin::<SHIFTED>(
-                                masks.a,
-                                mask0_row,
-                                &params,
-                                mask_params.as_ref(),
-                                self.config.grid_w,
-                                pos,
-                                weights,
-                            ),
-                            t1: alpha_for_origin::<SHIFTED>(
-                                masks.b,
-                                mask1_row,
-                                &params,
-                                mask_params.as_ref(),
-                                self.config.grid_w,
-                                pos,
-                                weights,
-                            ),
-                            mask,
+                        let sources0 = [source0, second_source0];
+                        let sources1 = [source1, second_source1];
+                        let base_a = final_mask.map_or([0; 2], |_| gather(sources0, 0, 0));
+                        let base_b = final_mask.map_or([0; 2], |_| gather(sources1, 0, 0));
+                        let a = gather(sources0, dx0, dy0);
+                        let b = gather(sources1, dx1, dy1);
+                        let c = gather(sources0, dx2, dy2);
+                        let d = gather(sources1, dx3, dy3);
+                        let t0 = alpha_for_origin::<SHIFTED>(
+                            masks.a,
+                            mask0_row,
+                            &params,
+                            mask_params.as_ref(),
+                            self.config.grid_w,
+                            pos,
+                            weights,
+                        );
+                        let t1 = alpha_for_origin::<SHIFTED>(
+                            masks.b,
+                            mask1_row,
+                            &params,
+                            mask_params.as_ref(),
+                            self.config.grid_w,
+                            pos,
+                            weights,
+                        );
+                        let sample = |lane: usize| Mode23Sample {
+                            a: a[lane],
+                            b: b[lane],
+                            c: c[lane],
+                            d: d[lane],
+                            base_a: base_a[lane],
+                            base_b: base_b[lane],
+                            t0,
+                            t1,
+                            mask: final_mask,
                         };
-                        *output = mode23_pixel(sample, self.threshold, self.threshold_limit);
+                        *output = mode23_pixel(sample(0), self.threshold, self.threshold_limit);
+                        if let Some(output) = second_output {
+                            *output = mode23_pixel(sample(1), self.threshold, self.threshold_limit);
+                        }
+                    };
+                    if DUAL {
+                        if let Some(second_output) = second_output {
+                            for (x, (output, second_output)) in
+                                (0..tile.width).zip(output.iter_mut().zip(second_output))
+                            {
+                                render(x, output, Some(second_output));
+                            }
+                        }
+                    } else {
+                        for (x, output) in (0..tile.width).zip(output) {
+                            render(x, output, None);
+                        }
                     }
                 }
             },
@@ -1448,12 +1535,12 @@ pub fn mode22_pixel(
 pub fn mode23_pixel(sample: Mode23Sample, q0: i32, _q1: i32) -> u8 {
     let i0 = blend_255(
         sample.a,
-        clamp_between(sample.c, sample.a, sample.b),
+        clamp_between(sample.d, sample.a, sample.b),
         i32::from(sample.t0),
     );
     let i1 = blend_255(
         sample.b,
-        clamp_between(sample.d, sample.a, sample.b),
+        clamp_between(sample.c, sample.a, sample.b),
         i32::from(sample.t1),
     );
     let motion = blend_256(i0, i1, q0);
@@ -1833,6 +1920,12 @@ fn plane_index_checked(plane: Plane<'_>, x: usize, y: usize) -> Option<usize> {
         .checked_add(x >> plane.super_shift)
 }
 
+#[allow(clippy::inline_always, unsafe_code)]
+#[inline(always)]
+fn load_plane(plane: Plane<'_>, index: usize) -> u8 {
+    unsafe { *plane.data.get_unchecked(index) }
+}
+
 fn tile_interior(params: &PlaneParams, tile: &Tile, motions: &[MotionSamples]) -> bool {
     if params.source_step <= 0 {
         return false;
@@ -1874,7 +1967,7 @@ fn sample_plane(
     let y = source_y + dy;
     if direct {
         let index = plane_index(plane, x as usize, y as usize);
-        return unsafe { *plane.data.get_unchecked(index) };
+        return load_plane(plane, index);
     }
     let x = usize::try_from(x.clamp(0, params.max_x)).unwrap_or(0);
     let y = usize::try_from(y.clamp(0, params.max_y)).unwrap_or(0);
@@ -1883,6 +1976,39 @@ fn sample_plane(
         .get(plane_index(plane, x, y))
         .copied()
         .unwrap_or(0)
+}
+
+#[allow(clippy::cast_sign_loss, clippy::inline_always)]
+#[inline(always)]
+fn sample_plane_pair<const DUAL: bool>(
+    planes: [Plane<'_>; 2],
+    params: &PlaneParams,
+    source_x: i32,
+    source_y: i32,
+    dx: i32,
+    dy: i32,
+    direct: bool,
+) -> [u8; 2] {
+    if !DUAL {
+        return [
+            sample_plane(planes[0], params, source_x, source_y, dx, dy, direct),
+            0,
+        ];
+    }
+    let x = source_x + dx;
+    let y = source_y + dy;
+    if direct
+        && planes[0].stride == planes[1].stride
+        && planes[0].super_span == planes[1].super_span
+        && planes[0].super_shift == planes[1].super_shift
+    {
+        let index = plane_index(planes[0], x as usize, y as usize);
+        return [load_plane(planes[0], index), load_plane(planes[1], index)];
+    }
+    [
+        sample_plane(planes[0], params, source_x, source_y, dx, dy, direct),
+        sample_plane(planes[1], params, source_x, source_y, dx, dy, direct),
+    ]
 }
 
 fn output_row<'a>(
@@ -2124,7 +2250,7 @@ fn blend_255(a: u8, b: u8, weight: i32) -> u8 {
 }
 
 fn blend_256(a: u8, b: u8, weight: i32) -> u8 {
-    byte_from_i32((i32::from(a) * (256 - weight) + i32::from(b) * weight + 128) >> 8)
+    byte_from_i32((i32::from(a) * (256 - weight) + i32::from(b) * weight) >> 8)
 }
 
 fn clamp_between(value: u8, a: u8, b: u8) -> u8 {

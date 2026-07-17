@@ -1463,57 +1463,62 @@ impl FilterState {
             });
         if !used_gpu {
             cpu.set_threshold(render_threshold);
-            let render_parallel =
-                |mode, dst: renderer::FramePlanesMut<'_>, motion2, motion3, masks, final_mask| {
-                    let render = |dst, source0, source1, chroma, rows| {
-                        cpu.render_plane_rows(
-                            mode,
-                            interp,
-                            dst,
-                            renderer::PlaneRenderInput {
-                                source0,
-                                source1,
-                                motion0,
-                                motion1,
-                                motion2,
-                                motion3,
-                                masks: Some(masks),
-                                final_mask,
-                            },
-                            chroma,
-                            rows,
-                        )
-                    };
-                    let height = self.video_info.height;
-                    let middle = height / 2;
-                    let split = usize::try_from(middle)
-                        .unwrap_or_default()
-                        .saturating_mul(dst.y.stride)
-                        .min(dst.y.data.len());
-                    let (top, bottom) = dst.y.data.split_at_mut(split);
-                    let top = renderer::PlaneMut {
-                        data: top,
-                        stride: dst.y.stride,
-                    };
-                    let bottom = renderer::PlaneMut {
-                        data: bottom,
-                        stride: dst.y.stride,
-                    };
-                    rayon::join(
-                        || {
-                            rayon::join(
-                                || render(top, sources0.y, sources1.y, false, 0..middle),
-                                || render(bottom, sources0.y, sources1.y, false, middle..height),
-                            )
-                        },
-                        || {
-                            rayon::join(
+            let render_parallel = |mode,
+                                   dst: renderer::FramePlanesMut<'_>,
+                                   motion2,
+                                   motion3,
+                                   masks,
+                                   final_mask| {
+                let input = |source0, source1| renderer::PlaneRenderInput {
+                    source0,
+                    source1,
+                    motion0,
+                    motion1,
+                    motion2,
+                    motion3,
+                    masks: Some(masks),
+                    final_mask,
+                };
+                let render = |dst, source0, source1, chroma, rows| {
+                    cpu.render_plane_rows(mode, interp, dst, input(source0, source1), chroma, rows)
+                };
+                let height = self.video_info.height;
+                let middle = height / 2;
+                let [top, bottom] = split_plane(dst.y, middle);
+                let _ = rayon::join(
+                    || {
+                        let _ = rayon::join(
+                            || render(top, sources0.y, sources1.y, false, 0..middle),
+                            || render(bottom, sources0.y, sources1.y, false, middle..height),
+                        );
+                    },
+                    || {
+                        if mode == 23 {
+                            let uv_middle = middle / 2;
+                            let [u_top, u_bottom] = split_plane(dst.u, uv_middle);
+                            let [v_top, v_bottom] = split_plane(dst.v, uv_middle);
+                            let render = |dst, rows| {
+                                cpu.render_mode23_uv_rows(
+                                    interp,
+                                    dst,
+                                    input(sources0.u, sources1.u),
+                                    [sources0.v, sources1.v],
+                                    rows,
+                                )
+                            };
+                            let _ = rayon::join(
+                                || render([u_top, v_top], 0..uv_middle),
+                                || render([u_bottom, v_bottom], uv_middle..middle),
+                            );
+                        } else {
+                            let _ = rayon::join(
                                 || render(dst.u, sources0.u, sources1.u, true, 0..middle),
                                 || render(dst.v, sources0.v, sources1.v, true, 0..middle),
-                            )
-                        },
-                    )
-                };
+                            );
+                        }
+                    },
+                );
+            };
             match algo {
                 1 | 2 => cpu.render_mode1_or_2(
                     algo == 1,
@@ -1546,7 +1551,7 @@ impl FilterState {
                     area_mask,
                 ),
                 21 | 22 => {
-                    let _ = render_parallel(
+                    render_parallel(
                         u32::try_from(algo).unwrap_or(21),
                         dst,
                         None,
@@ -1556,7 +1561,7 @@ impl FilterState {
                     );
                 }
                 23 if mode23_ready => {
-                    let _ = render_parallel(
+                    render_parallel(
                         23,
                         dst,
                         Some(motion2),
@@ -1566,7 +1571,7 @@ impl FilterState {
                     );
                 }
                 23 => {
-                    let _ = render_parallel(21, dst, None, None, coverage, mode21_mask.as_deref());
+                    render_parallel(21, dst, None, None, coverage, mode21_mask.as_deref());
                 }
                 _ => return None,
             }
@@ -3160,6 +3165,25 @@ unsafe fn plane_mut(ptr: *mut u8, stride: usize, len: usize) -> renderer::PlaneM
         data: unsafe { slice::from_raw_parts_mut(ptr, len) },
         stride,
     }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn split_plane(plane: renderer::PlaneMut<'_>, row: i32) -> [renderer::PlaneMut<'_>; 2] {
+    let split = usize::try_from(row)
+        .unwrap_or_default()
+        .saturating_mul(plane.stride)
+        .min(plane.data.len());
+    let (top, bottom) = plane.data.split_at_mut(split);
+    [
+        renderer::PlaneMut {
+            data: top,
+            stride: plane.stride,
+        },
+        renderer::PlaneMut {
+            data: bottom,
+            stride: plane.stride,
+        },
+    ]
 }
 
 unsafe fn offset_plane_mut(

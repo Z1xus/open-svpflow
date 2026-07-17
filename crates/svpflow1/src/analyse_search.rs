@@ -9,8 +9,9 @@ use core::arch::wasm32::{
 use core::arch::x86_64::{
     __m128i, _mm_add_epi16, _mm_add_epi32, _mm_add_epi64, _mm_cvtsi32_si128, _mm_cvtsi128_si32,
     _mm_loadl_epi64, _mm_loadu_si128, _mm_madd_epi16, _mm_max_epi16, _mm_sad_epu8, _mm_set1_epi16,
-    _mm_setzero_si128, _mm_srli_si128, _mm_sub_epi16, _mm_unpackhi_epi32, _mm_unpacklo_epi8,
-    _mm_unpacklo_epi16, _mm_unpacklo_epi32,
+    _mm_setzero_si128, _mm_srli_si128, _mm_sub_epi16, _mm_unpackhi_epi8, _mm_unpackhi_epi16,
+    _mm_unpackhi_epi32, _mm_unpackhi_epi64, _mm_unpacklo_epi8, _mm_unpacklo_epi16,
+    _mm_unpacklo_epi32, _mm_unpacklo_epi64,
 };
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Vec8 {
@@ -1437,6 +1438,28 @@ fn adapt_lambda(nlambda: i32, lsad: i32, pred_score: u32) -> i32 {
 fn block_luma_dc(src: &SuperPlanes<'_>, level: i32, px: i32, py: i32, bw: i32, bh: i32) -> u8 {
     let (lw, lh) = src.level_size(level);
     let y_off = src.level_y_offset(level);
+
+    #[cfg(target_arch = "x86_64")]
+    if matches!(bw, 4 | 8 | 16 | 32)
+        && matches!(bh, 4 | 8 | 16 | 32)
+        && px >= 0
+        && py >= 0
+        && px as usize + bw as usize <= lw
+        && py as usize + bh as usize <= lh
+    {
+        static ZERO: [u8; 32] = [0; 32];
+        let width = bw as usize;
+        let height = bh as usize;
+        let start = (y_off + py as usize) * src.y_stride + px as usize;
+        let end = start.saturating_add((height - 1) * src.y_stride + width);
+        if let Some(data) = src.y.get(start..end) {
+            let sum = unsafe {
+                sad_u8_simd(data.as_ptr(), src.y_stride, ZERO.as_ptr(), 0, width, height)
+            };
+            return (sum / (width * height) as u32).min(255) as u8;
+        }
+    }
+
     let mut sum = 0u32;
     let mut count = 0u32;
     for row in 0..bh as usize {
@@ -2236,6 +2259,35 @@ unsafe fn satd_interior(
     n: usize,
 ) -> u32 {
     let mut total = 0u32;
+
+    #[cfg(target_arch = "x86_64")]
+    if matches!(n, 8 | 16 | 32) {
+        for y in (0..n).step_by(4) {
+            if n == 8 {
+                total = total.saturating_add(unsafe {
+                    hadamard4_satd_sse2::<8>(
+                        src.add(y * src_stride),
+                        src_stride,
+                        refp.add(y * ref_stride),
+                        ref_stride,
+                    )
+                });
+            } else {
+                for x in (0..n).step_by(16) {
+                    total = total.saturating_add(unsafe {
+                        hadamard4_satd_sse2::<16>(
+                            src.add(y * src_stride + x),
+                            src_stride,
+                            refp.add(y * ref_stride + x),
+                            ref_stride,
+                        )
+                    });
+                }
+            }
+        }
+        return total >> 1;
+    }
+
     let tiles = n / 4;
     for ty in 0..tiles {
         for tx in 0..tiles {
@@ -2245,7 +2297,7 @@ unsafe fn satd_interior(
                 let offset_b = ty * 4 * ref_stride + tx * 4;
 
                 total = total.saturating_add(unsafe {
-                    hadamard4_satd_sse2(
+                    hadamard4_satd_sse2::<4>(
                         src.add(offset_a),
                         src_stride,
                         refp.add(offset_b),
@@ -2276,7 +2328,7 @@ unsafe fn satd_interior(
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "sse2")]
-unsafe fn hadamard4_satd_sse2(
+unsafe fn hadamard4_satd_sse2<const WIDTH: usize>(
     src: *const u8,
     src_stride: usize,
     refp: *const u8,
@@ -2297,42 +2349,70 @@ unsafe fn hadamard4_satd_sse2(
         ]
     }
 
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn pair(rows: [__m128i; 4], zero: __m128i) -> u32 {
+        let vertical = unsafe { h4(rows[0], rows[1], rows[2], rows[3]) };
+        let a0 = _mm_unpacklo_epi16(vertical[0], vertical[1]);
+        let a1 = _mm_unpacklo_epi16(vertical[2], vertical[3]);
+        let b0 = _mm_unpackhi_epi16(vertical[0], vertical[1]);
+        let b1 = _mm_unpackhi_epi16(vertical[2], vertical[3]);
+        let a01 = _mm_unpacklo_epi32(a0, a1);
+        let a23 = _mm_unpackhi_epi32(a0, a1);
+        let b01 = _mm_unpacklo_epi32(b0, b1);
+        let b23 = _mm_unpackhi_epi32(b0, b1);
+        let coeff = unsafe {
+            h4(
+                _mm_unpacklo_epi64(a01, b01),
+                _mm_unpackhi_epi64(a01, b01),
+                _mm_unpacklo_epi64(a23, b23),
+                _mm_unpackhi_epi64(a23, b23),
+            )
+        };
+        let mut sums = zero;
+        for values in coeff {
+            sums = _mm_add_epi16(sums, _mm_max_epi16(values, _mm_sub_epi16(zero, values)));
+        }
+        let pairs = _mm_madd_epi16(sums, _mm_set1_epi16(1));
+        let pairs = _mm_add_epi32(pairs, _mm_srli_si128::<8>(pairs));
+        _mm_cvtsi128_si32(_mm_add_epi32(pairs, _mm_srli_si128::<4>(pairs))) as u32
+    }
+
     let zero = _mm_setzero_si128();
     let mut rows = [zero; 4];
+    let mut upper = [zero; 4];
     for (row, out) in rows.iter_mut().enumerate() {
         unsafe {
-            let a = _mm_cvtsi32_si128(std::ptr::read_unaligned(
-                src.add(row * src_stride).cast::<i32>(),
-            ));
-            let b = _mm_cvtsi32_si128(std::ptr::read_unaligned(
-                refp.add(row * ref_stride).cast::<i32>(),
-            ));
+            let a = if WIDTH == 4 {
+                _mm_cvtsi32_si128(std::ptr::read_unaligned(
+                    src.add(row * src_stride).cast::<i32>(),
+                ))
+            } else if WIDTH == 8 {
+                _mm_loadl_epi64(src.add(row * src_stride).cast())
+            } else {
+                _mm_loadu_si128(src.add(row * src_stride).cast())
+            };
+            let b = if WIDTH == 4 {
+                _mm_cvtsi32_si128(std::ptr::read_unaligned(
+                    refp.add(row * ref_stride).cast::<i32>(),
+                ))
+            } else if WIDTH == 8 {
+                _mm_loadl_epi64(refp.add(row * ref_stride).cast())
+            } else {
+                _mm_loadu_si128(refp.add(row * ref_stride).cast())
+            };
             *out = _mm_sub_epi16(_mm_unpacklo_epi8(a, zero), _mm_unpacklo_epi8(b, zero));
+            upper[row] = _mm_sub_epi16(_mm_unpackhi_epi8(a, zero), _mm_unpackhi_epi8(b, zero));
         }
     }
 
-    let vertical = unsafe { h4(rows[0], rows[1], rows[2], rows[3]) };
-    let t0 = _mm_unpacklo_epi16(vertical[0], vertical[1]);
-    let t1 = _mm_unpacklo_epi16(vertical[2], vertical[3]);
-    let cols01 = _mm_unpacklo_epi32(t0, t1);
-    let cols23 = _mm_unpackhi_epi32(t0, t1);
-
-    let coeff = unsafe {
-        h4(
-            cols01,
-            _mm_srli_si128::<8>(cols01),
-            cols23,
-            _mm_srli_si128::<8>(cols23),
-        )
-    };
-
-    let mut sums = zero;
-    for values in coeff {
-        let abs = _mm_max_epi16(values, _mm_sub_epi16(zero, values));
-        sums = _mm_add_epi16(sums, abs);
-    }
-    let pairs = _mm_madd_epi16(sums, _mm_set1_epi16(1));
-    _mm_cvtsi128_si32(_mm_add_epi32(pairs, _mm_srli_si128::<4>(pairs))) as u32
+    let total = unsafe { pair(rows, zero) };
+    total
+        + if WIDTH == 16 {
+            unsafe { pair(upper, zero) }
+        } else {
+            0
+        }
 }
 
 fn hadamard4_satd(diff: [[i32; 4]; 4]) -> u32 {
