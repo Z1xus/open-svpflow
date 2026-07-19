@@ -2119,7 +2119,6 @@ mod mode23_fast {
             } else {
                 base_step0
             };
-            let second_row = second_row;
             let weight = |x: i32| xw[usize::try_from(x).unwrap_or(0).min(MAX_BLOCK_SIZE - 1)];
             let alphas = |wv: __m128i| {
                 if any_mask {

@@ -102,6 +102,12 @@ type PrepCache = std::sync::Mutex<Vec<(i64, PrepCell)>>;
 pub(crate) struct DecodedEntry {
     decoded: metadata::DecodedVectors,
     scene_class: i32,
+    vectors_prev: Vec<renderer::Vector>,
+    vectors_cur: Vec<renderer::Vector>,
+    mvx0: Vec<u16>,
+    mvy0: Vec<u16>,
+    mvx1: Vec<u16>,
+    mvy1: Vec<u16>,
 }
 
 type DecodeCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<DecodedEntry>>>>;
@@ -905,6 +911,20 @@ impl FilterState {
             .map(std::sync::Arc::new);
         }
 
+        if self.options.scene_blend() || requested_algo == 23 {
+            let keys = neighbor_keys(source_frame);
+            if let VectorInput::Frame(frame) = vectors {
+                let _ = unsafe {
+                    self.cached_decode(api, i64::from(source_frame), frame, vector_data, vector_len)
+                };
+            }
+            for (key, frame) in keys.into_iter().zip(neighbors) {
+                if !frame.is_null() {
+                    let _ =
+                        unsafe { self.cached_decode(api, key, frame, vector_data, vector_len) };
+                }
+            }
+        }
         let cell: PrepCell = {
             let mut cache = self.prep_cache.lock().ok()?;
             if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
@@ -940,6 +960,58 @@ impl FilterState {
         .clone()
     }
 
+    fn decoded_entry(
+        &self,
+        decoded: metadata::DecodedVectors,
+        vector_data: metadata::VectorData,
+    ) -> DecodedEntry {
+        let scene_class = self.scene_class(&decoded, vector_data);
+        let previous = decoded.previous.as_deref().or(decoded.current.as_deref());
+        let current = decoded.current.as_deref().or(previous);
+        let vectors_prev = previous.map(renderer_vectors).unwrap_or_default();
+        let vectors_cur = current.map(renderer_vectors).unwrap_or_default();
+        let origin = vector_data.origin();
+        let motion_grid = vector_data.motion_grid();
+        let motion_w = usize::try_from(motion_grid.width.max(0)).unwrap_or(0);
+        let motion_h = usize::try_from(motion_grid.height.max(0)).unwrap_or(0);
+        let motion_count = motion_w.saturating_mul(motion_h);
+        let mut mvx0 = vec![0u16; motion_count];
+        let mut mvy0 = vec![0u16; motion_count];
+        let mut mvx1 = vec![0u16; motion_count];
+        let mut mvy1 = vec![0u16; motion_count];
+        if let (Ok(grid_w), Ok(grid_h)) = (
+            usize::try_from(vector_data.grid.width.max(0)),
+            usize::try_from(vector_data.grid.height.max(0)),
+        ) {
+            let ctx = renderer::VectorContext {
+                block_w: vector_data.block.width.max(1),
+                block_h: vector_data.block.height.max(1),
+                scale_shift_base: vector_data.marker.max(1),
+                frame_w: self.video_info.width,
+                frame_h: self.video_info.height,
+                origin_x: origin.width,
+                origin_y: origin.height,
+                grid_w,
+                grid_h,
+                raw: false,
+                a: &vectors_prev,
+                b: &vectors_cur,
+            };
+            renderer::vector_planes(&ctx, 0, &mut mvx0, &mut mvy0, motion_w, motion_h);
+            renderer::vector_planes(&ctx, 1, &mut mvx1, &mut mvy1, motion_w, motion_h);
+        }
+        DecodedEntry {
+            decoded,
+            scene_class,
+            vectors_prev,
+            vectors_cur,
+            mvx0,
+            mvy0,
+            mvx1,
+            mvy1,
+        }
+    }
+
     unsafe fn cached_decode(
         &self,
         api: &frame::PlaneApi,
@@ -953,11 +1025,7 @@ impl FilterState {
         }
         let decode = || {
             let decoded = unsafe { decode_frame_vectors(api, frame, vector_data, vector_len) }?;
-            let scene_class = self.scene_class(&decoded, vector_data);
-            Some(std::sync::Arc::new(DecodedEntry {
-                decoded,
-                scene_class,
-            }))
+            Some(std::sync::Arc::new(self.decoded_entry(decoded, vector_data)))
         };
         if std::env::var_os("SVP_NO_PREP").is_some() {
             return decode();
@@ -1041,11 +1109,7 @@ impl FilterState {
             VectorInput::Payload(_) => {
                 let decoded =
                     unsafe { decode_vectors_input(api, vectors, vector_data, vector_len) }?;
-                let scene_class = self.scene_class(&decoded, vector_data);
-                std::sync::Arc::new(DecodedEntry {
-                    decoded,
-                    scene_class,
-                })
+                std::sync::Arc::new(self.decoded_entry(decoded, vector_data))
             }
         };
         let decoded = &self_entry.decoded;
@@ -1060,17 +1124,12 @@ impl FilterState {
         let neighbor_classes = unsafe {
             self.neighbor_scene_classes(api, neighbors, vector_data, vector_len, source_frame)
         };
-        let vectors_a = renderer_vectors(previous);
-        let vectors_b = renderer_vectors(current);
+        let _ = (previous, current);
         let origin = vector_data.origin();
         let motion_grid = vector_data.motion_grid();
         let motion_w = usize::try_from(motion_grid.width.max(0)).ok()?;
         let motion_h = usize::try_from(motion_grid.height.max(0)).ok()?;
         let motion_count = motion_w.checked_mul(motion_h)?;
-        let mut mvx0 = vec![0u16; motion_count];
-        let mut mvy0 = vec![0u16; motion_count];
-        let mut mvx1 = vec![0u16; motion_count];
-        let mut mvy1 = vec![0u16; motion_count];
         let mut mvx2 = if requested_algo == 23 {
             vec![0u16; motion_count]
         } else {
@@ -1113,11 +1172,9 @@ impl FilterState {
                 grid_w: usize::try_from(vector_data.grid.width.max(0)).ok()?,
                 grid_h: usize::try_from(vector_data.grid.height.max(0)).ok()?,
                 raw: false,
-                a: &vectors_a,
-                b: &vectors_b,
+                a: &self_entry.vectors_prev,
+                b: &self_entry.vectors_cur,
             };
-            renderer::vector_planes(&ctx, 0, &mut mvx0, &mut mvy0, motion_w, motion_h);
-            renderer::vector_planes(&ctx, 1, &mut mvx1, &mut mvy1, motion_w, motion_h);
             if self.options.mask_area_enabled() {
                 renderer::magnitude_mask(
                     &ctx,
@@ -1160,18 +1217,17 @@ impl FilterState {
                         .as_deref()
                         .or(next_decoded.decoded.current.as_deref());
                     if next_scene < 3
-                        && let (Some(prev_side), Some(next_side)) = (prev_side, next_side)
+                        && prev_side.is_some()
+                        && next_side.is_some()
                     {
-                        let prev_side = renderer_vectors(prev_side);
-                        let next_side = renderer_vectors(next_side);
                         let prev_ctx = renderer::VectorContext {
-                            a: &vectors_a,
-                            b: &prev_side,
+                            a: &self_entry.vectors_prev,
+                            b: &prev_decoded.vectors_cur,
                             ..ctx
                         };
                         let next_ctx = renderer::VectorContext {
-                            a: &next_side,
-                            b: &vectors_b,
+                            a: &next_decoded.vectors_prev,
+                            b: &self_entry.vectors_cur,
                             ..ctx
                         };
                         renderer::vector_planes(
@@ -1193,12 +1249,6 @@ impl FilterState {
         };
         Some(FramePrep {
             decoded: self_entry,
-            vectors_a,
-            vectors_b,
-            mvx0,
-            mvy0,
-            mvx1,
-            mvy1,
             mvx2,
             mvy2,
             mvx3,
@@ -1353,14 +1403,14 @@ impl FilterState {
             grid_w: usize::try_from(vector_data.grid.width.max(0)).ok()?,
             grid_h: usize::try_from(vector_data.grid.height.max(0)).ok()?,
             raw: false,
-            a: &prep.vectors_a,
-            b: &prep.vectors_b,
+            a: &prep.decoded.vectors_prev,
+            b: &prep.decoded.vectors_cur,
         };
 
-        let mut mvx0 = Cow::Borrowed(prep.mvx0.as_slice());
-        let mut mvy0 = Cow::Borrowed(prep.mvy0.as_slice());
-        let mut mvx1 = Cow::Borrowed(prep.mvx1.as_slice());
-        let mut mvy1 = Cow::Borrowed(prep.mvy1.as_slice());
+        let mut mvx0 = Cow::Borrowed(prep.decoded.mvx0.as_slice());
+        let mut mvy0 = Cow::Borrowed(prep.decoded.mvy0.as_slice());
+        let mut mvx1 = Cow::Borrowed(prep.decoded.mvx1.as_slice());
+        let mut mvy1 = Cow::Borrowed(prep.decoded.mvy1.as_slice());
         let mut mvx2 = Cow::Borrowed(prep.mvx2.as_slice());
         let mut mvy2 = Cow::Borrowed(prep.mvy2.as_slice());
         let mut mvx3 = Cow::Borrowed(prep.mvx3.as_slice());
@@ -3164,13 +3214,6 @@ fn usize_height(value: i32) -> usize {
 
 pub(crate) struct FramePrep {
     decoded: std::sync::Arc<DecodedEntry>,
-    vectors_a: Vec<renderer::Vector>,
-    vectors_b: Vec<renderer::Vector>,
-
-    mvx0: Vec<u16>,
-    mvy0: Vec<u16>,
-    mvx1: Vec<u16>,
-    mvy1: Vec<u16>,
 
     mvx2: Vec<u16>,
     mvy2: Vec<u16>,
