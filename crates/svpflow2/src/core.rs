@@ -1727,7 +1727,7 @@ impl FilterState {
                     sources1,
                     motion0,
                     motion1,
-                    area_mask,
+                    None,
                 ),
                 11 | 13 if scene_blend_zero_origin => cpu.render_mode11_or_13_zero_origin(
                     algo == 13,
@@ -1747,7 +1747,7 @@ impl FilterState {
                     sources1,
                     motion0,
                     motion1,
-                    area_mask,
+                    None,
                 ),
                 21 | 22 => {
                     render_parallel(

@@ -1668,7 +1668,15 @@ pub fn vector_planes(
     height: usize,
 ) {
     let vectors = ctx.set(which);
+    let scale = ctx.scale_shift_base.max(1);
+    let step_x = (ctx.block_w - ctx.origin_x).saturating_mul(scale);
+    let step_y = (ctx.block_h - ctx.origin_y).saturating_mul(scale);
+    let block_x = ctx.block_w.saturating_mul(scale);
+    let block_y = ctx.block_h.saturating_mul(scale);
+    let frame_x = ctx.frame_w.saturating_mul(scale);
+    let frame_y = ctx.frame_h.saturating_mul(scale);
     for y in 0..height {
+        let pos_y = i32::try_from(y).unwrap_or(0).saturating_mul(step_y);
         for x in 0..width {
             let out = y.saturating_mul(width).saturating_add(x);
             if out >= dst_x.len() || out >= dst_y.len() {
@@ -1678,10 +1686,35 @@ pub fn vector_planes(
                 .get(sample_index(ctx, x, y))
                 .copied()
                 .unwrap_or_default();
-            let (dx, dy) = corrected_vector(ctx, vector, x, y);
+            let dx = i32::from(vector.dx);
+            let dy = i32::from(vector.dy);
+            if dx.abs() > MAX_VECTOR || dy.abs() > MAX_VECTOR {
+                dst_x[out] = NEUTRAL;
+                dst_y[out] = NEUTRAL;
+                continue;
+            }
+            let (dx, dy) = if ctx.raw {
+                (dx, dy)
+            } else {
+                let pos_x = i32::try_from(x).unwrap_or(0).saturating_mul(step_x);
+                (
+                    clamp_to_frame(dx, pos_x, block_x, frame_x),
+                    clamp_to_frame(dy, pos_y, block_y, frame_y),
+                )
+            };
             dst_x[out] = centered(dx);
             dst_y[out] = centered(dy);
         }
+    }
+}
+
+fn clamp_to_frame(value: i32, pos: i32, block: i32, frame: i32) -> i32 {
+    if value + pos < 0 {
+        -pos
+    } else if value + block + pos > frame {
+        (frame - block - pos).max(0)
+    } else {
+        value
     }
 }
 
@@ -3137,16 +3170,6 @@ fn clamp_between(value: u8, a: u8, b: u8) -> u8 {
 
 fn byte_from_i32(value: i32) -> u8 {
     u8::try_from(value.clamp(0, 255)).unwrap_or(0)
-}
-
-fn corrected_vector(ctx: &VectorContext<'_>, vector: Vector, _x: usize, _y: usize) -> (i32, i32) {
-    let raw_dx = i32::from(vector.dx);
-    let raw_dy = i32::from(vector.dy);
-    if ctx.raw || raw_dx.abs() > MAX_VECTOR || raw_dy.abs() > MAX_VECTOR {
-        return (raw_dx, raw_dy);
-    }
-    let scale = ctx.scale_shift_base.max(1);
-    (raw_dx / scale, raw_dy / scale)
 }
 
 fn centered(value: i32) -> u16 {
