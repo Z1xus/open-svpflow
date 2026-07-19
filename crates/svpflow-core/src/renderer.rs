@@ -2127,7 +2127,79 @@ mod mode23_fast {
                     rowm
                 }
             };
-            let x_start = 0i32;
+            #[allow(unused_mut)]
+            let mut x_start = 0i32;
+            #[allow(unused_mut)]
+            let mut second_row = second_row;
+            #[cfg(target_feature = "sse4.1")]
+            if BASES && DIRECT && shared && sources0[0].super_shift == 0 && !any_mask {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let stride = sources0[0].stride as i32;
+                let row_off = source_y * stride;
+                #[allow(clippy::cast_sign_loss)]
+                let take = usize::try_from(tile.width)
+                    .unwrap_or(0)
+                    .min(MAX_BLOCK_SIZE);
+                let mut sx = tile.x * params.source_step;
+                #[allow(clippy::cast_sign_loss)]
+                let mut base_off0 = row_base0 + (tile.x * base_step0) as usize;
+                #[allow(clippy::cast_sign_loss)]
+                let mut base_off1 = row_base1 + (tile.x * base_step1) as usize;
+                let mut tight = |wv: __m128i, out: &mut u8, second_out: Option<&mut u8>| {
+                    let m01 = _mm_sra_epi32(_mm_madd_epi16(wv, row01), x_shift);
+                    #[allow(clippy::cast_sign_loss)]
+                    let index0 = (row_off + sx + lane(m01, 0) + lane(m01, 1) * stride) as usize;
+                    let mv0 = load2::<DUAL>(sources0, index0);
+                    let mv1 = if TWO_FIELDS {
+                        #[allow(clippy::cast_sign_loss)]
+                        let index1 =
+                            (row_off + sx + lane(m01, 2) + lane(m01, 3) * stride) as usize;
+                        load2::<DUAL>(sources1, index1)
+                    } else {
+                        mv0
+                    };
+                    let cur0 = if BASES {
+                        load2::<DUAL>(sources0, base_off0)
+                    } else {
+                        [0; 2]
+                    };
+                    let cur1 = if BASES && TWO_FIELDS {
+                        load2::<DUAL>(sources1, base_off1)
+                    } else {
+                        cur0
+                    };
+                    *out = pixel(cur0[0], cur1[0], mv0[0], mv1[0], None, None, None);
+                    if let Some(second_out) = second_out {
+                        *second_out = pixel(cur0[1], cur1[1], mv0[1], mv1[1], None, None, None);
+                    }
+                    sx += params.source_step;
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        base_off0 += base_step0 as usize;
+                        base_off1 += base_step1 as usize;
+                    }
+                };
+                match second_row.as_deref_mut() {
+                    Some(second) => {
+                        for ((&wv, out), second_out) in xw[..take]
+                            .iter()
+                            .zip(&mut row[..take])
+                            .zip(&mut second[..take])
+                        {
+                            tight(wv, out, Some(second_out));
+                        }
+                    }
+                    None => {
+                        for (&wv, out) in xw[..take].iter().zip(&mut row[..take]) {
+                            tight(wv, out, None);
+                        }
+                    }
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                {
+                    x_start = take as i32;
+                }
+            }
             let mut pixel_at = |x: i32, out: &mut u8, second_out: Option<&mut u8>| {
                 let wv = weight(x);
                 let m01 = _mm_sra_epi32(_mm_madd_epi16(wv, row01), x_shift);
