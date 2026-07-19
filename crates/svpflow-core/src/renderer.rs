@@ -414,6 +414,7 @@ impl CpuRenderer {
             false,
             interp,
             zero_origin,
+            mode13 || max_mask.is_some(),
             &mut pixel,
         );
         self.render_dual_warp_uv(
@@ -425,6 +426,7 @@ impl CpuRenderer {
             [max_mask.as_deref(), None, None],
             interp,
             zero_origin,
+            mode13 || max_mask.is_some(),
             0..self.config.height / self.config.chroma_y_div,
             &mut pixel,
         );
@@ -441,6 +443,7 @@ impl CpuRenderer {
         masks: [Option<&[u8]>; 3],
         interp: bool,
         zero_origin: bool,
+        needs_bases: bool,
         rows: Range<i32>,
         mut pixel: impl FnMut(u8, u8, u8, u8, Option<u8>, Option<u8>, Option<u8>) -> u8,
     ) {
@@ -490,8 +493,8 @@ impl CpuRenderer {
                                 .map(|i| i32::from(m.get(i).copied().unwrap_or(0)))
                         };
                         macro_rules! fast_tile {
-                            ($direct:literal) => {
-                                mode23_fast::warp_tile::<true, $direct, true>(
+                            ($direct:literal, $bases:literal) => {
+                                mode23_fast::warp_tile::<true, $direct, true, $bases>(
                                     dst_u.data,
                                     dst_u.stride,
                                     dst_v.data,
@@ -511,10 +514,11 @@ impl CpuRenderer {
                         }
                         #[allow(unsafe_code)]
                         unsafe {
-                            if direct {
-                                fast_tile!(true);
-                            } else {
-                                fast_tile!(false);
+                            match (direct, needs_bases) {
+                                (true, true) => fast_tile!(true, true),
+                                (true, false) => fast_tile!(true, false),
+                                (false, true) => fast_tile!(false, true),
+                                (false, false) => fast_tile!(false, false),
                             }
                         }
                     },
@@ -535,6 +539,7 @@ impl CpuRenderer {
             true,
             interp,
             zero_origin,
+            needs_bases,
             rows.clone(),
             &mut pixel,
         );
@@ -550,6 +555,7 @@ impl CpuRenderer {
             true,
             interp,
             zero_origin,
+            needs_bases,
             rows,
             &mut pixel,
         );
@@ -583,6 +589,7 @@ impl CpuRenderer {
             false,
             interp,
             !interp,
+            !mode21 || final_mask.is_some(),
             &mut pixel,
         );
         self.render_dual_warp_uv(
@@ -594,6 +601,7 @@ impl CpuRenderer {
             [Some(masks.a), Some(masks.b), final_mask],
             interp,
             !interp,
+            !mode21 || final_mask.is_some(),
             0..self.config.height / self.config.chroma_y_div,
             &mut pixel,
         );
@@ -707,6 +715,7 @@ impl CpuRenderer {
                     chroma,
                     interp,
                     !interp,
+                    mode == 13 || max_mask.is_some(),
                     rows.clone(),
                     |cur0, cur1, mv0, mv1, alpha, _, _| {
                         mode11_or_13_pixel(
@@ -737,6 +746,7 @@ impl CpuRenderer {
                     chroma,
                     interp,
                     !interp,
+                    mode == 22 || input.final_mask.is_some(),
                     rows.clone(),
                     |cur0, cur1, mv0, mv1, alpha0, alpha1, final_alpha| {
                         self.mode21_or_22_pixel(
@@ -794,6 +804,7 @@ impl CpuRenderer {
             [Some(masks.a), Some(masks.b), input.final_mask],
             interp,
             !interp,
+            !mode21 || input.final_mask.is_some(),
             rows,
             &mut pixel,
         );
@@ -883,8 +894,8 @@ impl CpuRenderer {
                     };
     let mut unused = [0u8; 0];
                     macro_rules! fast_tile {
-                        ($direct:literal) => {
-                            mode23_fast::warp_tile::<false, $direct, false>(
+                        ($direct:literal, $bases:literal) => {
+                            mode23_fast::warp_tile::<false, $direct, false, $bases>(
                                 dst.data,
                                 dst.stride,
                                 &mut unused,
@@ -904,10 +915,11 @@ impl CpuRenderer {
                     }
                     #[allow(unsafe_code)]
                     unsafe {
-                        if direct {
-                            fast_tile!(true);
-                        } else {
-                            fast_tile!(false);
+                        match (direct, mask.is_some()) {
+                            (true, true) => fast_tile!(true, true),
+                            (true, false) => fast_tile!(true, false),
+                            (false, true) => fast_tile!(false, true),
+                            (false, false) => fast_tile!(false, false),
                         }
                     }
                     return;
@@ -951,7 +963,7 @@ impl CpuRenderer {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
     #[allow(clippy::needless_pass_by_value)]
     fn render_dual_warp(
         &self,
@@ -966,6 +978,7 @@ impl CpuRenderer {
         chroma: bool,
         interp: bool,
         zero_origin: bool,
+        needs_bases: bool,
         pixel: impl FnMut(u8, u8, u8, u8, Option<u8>, Option<u8>, Option<u8>) -> u8,
     ) {
         let height = if chroma {
@@ -985,12 +998,17 @@ impl CpuRenderer {
             chroma,
             interp,
             zero_origin,
+            needs_bases,
             0..height,
             pixel,
         );
     }
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::fn_params_excessive_bools
+    )]
     #[allow(clippy::needless_pass_by_value)]
     fn render_dual_warp_rows(
         &self,
@@ -1005,6 +1023,7 @@ impl CpuRenderer {
         chroma: bool,
         interp: bool,
         zero_origin: bool,
+        needs_bases: bool,
         rows: Range<i32>,
         mut pixel: impl FnMut(u8, u8, u8, u8, Option<u8>, Option<u8>, Option<u8>) -> u8,
     ) {
@@ -1036,8 +1055,8 @@ impl CpuRenderer {
                     };
     let mut unused = [0u8; 0];
                     macro_rules! fast_tile {
-                        ($direct:literal) => {
-                            mode23_fast::warp_tile::<true, $direct, false>(
+                        ($direct:literal, $bases:literal) => {
+                            mode23_fast::warp_tile::<true, $direct, false, $bases>(
                                 dst.data,
                                 dst.stride,
                                 &mut unused,
@@ -1061,10 +1080,11 @@ impl CpuRenderer {
                     }
                     #[allow(unsafe_code)]
                     unsafe {
-                        if direct {
-                            fast_tile!(true);
-                        } else {
-                            fast_tile!(false);
+                        match (direct, needs_bases) {
+                            (true, true) => fast_tile!(true, true),
+                            (true, false) => fast_tile!(true, false),
+                            (false, true) => fast_tile!(false, true),
+                            (false, false) => fast_tile!(false, false),
                         }
                     }
                     return;
@@ -2013,7 +2033,12 @@ mod mode23_fast {
     )]
     #[cfg_attr(not(target_feature = "sse4.1"), target_feature(enable = "sse2"))]
     #[cfg_attr(target_feature = "sse4.1", target_feature(enable = "sse2,sse4.1"))]
-    pub(super) fn warp_tile<const TWO_FIELDS: bool, const DIRECT: bool, const DUAL: bool>(
+    pub(super) fn warp_tile<
+        const TWO_FIELDS: bool,
+        const DIRECT: bool,
+        const DUAL: bool,
+        const BASES: bool,
+    >(
         output: &mut [u8],
         output_stride: usize,
         second: &mut [u8],
@@ -2066,9 +2091,13 @@ mod mode23_fast {
             let rowm = vertical(topm, botm);
             let source_y = (tile.y + y) * params.source_step;
             #[allow(clippy::cast_sign_loss)]
-            let row_base0 = plane_index(sources0[0], 0, source_y as usize);
+            let row_base0 = if BASES {
+                plane_index(sources0[0], 0, source_y as usize)
+            } else {
+                0
+            };
             #[allow(clippy::cast_sign_loss)]
-            let row_base1 = if TWO_FIELDS {
+            let row_base1 = if BASES && TWO_FIELDS {
                 plane_index(sources1[0], 0, source_y as usize)
             } else {
                 row_base0
@@ -2084,9 +2113,13 @@ mod mode23_fast {
                 let px = tile.x + x;
                 let source_x = px * params.source_step;
                 #[allow(clippy::cast_sign_loss)]
-                let cur0 = load2::<DUAL>(sources0, row_base0 + px as usize);
+                let cur0 = if BASES {
+                    load2::<DUAL>(sources0, row_base0 + px as usize)
+                } else {
+                    [0; 2]
+                };
                 #[allow(clippy::cast_sign_loss)]
-                let cur1 = if TWO_FIELDS {
+                let cur1 = if BASES && TWO_FIELDS {
                     load2::<DUAL>(sources1, row_base1 + px as usize)
                 } else {
                     cur0
