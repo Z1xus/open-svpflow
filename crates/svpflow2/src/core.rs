@@ -3352,7 +3352,7 @@ unsafe fn super_frame_planes(
     sdata: i64,
 ) -> Option<renderer::FramePlanes<'static>> {
     let lane = usize::try_from(metadata::super_data(sdata).scale()).ok()?;
-    if frame.is_null() || !matches!(lane, 2 | 4) {
+    if frame.is_null() || !matches!(lane, 1 | 2 | 4) {
         return None;
     }
     let shift = lane.trailing_zeros();
@@ -3380,12 +3380,11 @@ unsafe fn super_plane(
     height: usize,
     shift: u32,
 ) -> Option<renderer::Plane<'static>> {
-    renderer::Plane::super_plane(
-        unsafe { slice::from_raw_parts(ptr, len) },
-        stride,
-        stride.checked_mul(height)?,
-        shift,
-    )
+    let data = unsafe { slice::from_raw_parts(ptr, len) };
+    if shift == 0 {
+        return Some(renderer::Plane::linear(data, stride));
+    }
+    renderer::Plane::super_plane(data, stride, stride.checked_mul(height)?, shift)
 }
 
 unsafe fn plane_mut(ptr: *mut u8, stride: usize, len: usize) -> renderer::PlaneMut<'static> {
