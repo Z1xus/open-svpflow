@@ -1511,8 +1511,8 @@ impl FilterState {
             height: self.video_info.height,
             block_w: block.width,
             block_h: block.height,
-            origin_x: origin.width,
-            origin_y: origin.height,
+            origin_x: vector_data.block.width / 2,
+            origin_y: vector_data.block.height / 2,
             grid_w: motion_w,
             grid_h: motion_h,
             chroma_y_div: 2,
@@ -1727,7 +1727,7 @@ impl FilterState {
                     sources1,
                     motion0,
                     motion1,
-                    None,
+                    area_mask,
                 ),
                 11 | 13 if scene_blend_zero_origin => cpu.render_mode11_or_13_zero_origin(
                     algo == 13,
@@ -1747,7 +1747,7 @@ impl FilterState {
                     sources1,
                     motion0,
                     motion1,
-                    None,
+                    area_mask,
                 ),
                 21 | 22 => {
                     render_parallel(
