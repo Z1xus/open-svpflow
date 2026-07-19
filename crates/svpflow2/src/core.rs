@@ -79,12 +79,22 @@ pub(crate) struct FilterState {
     pub(crate) nvof: Option<crate::nvof::NvofContext>,
 
     pub(crate) prep_cache: PrepCache,
+    pub(crate) decode_cache: DecodeCache,
 }
 
 type PrepCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<FramePrep>>>>;
 type PrepCache = std::sync::Mutex<Vec<(i64, PrepCell)>>;
 
+pub(crate) struct DecodedEntry {
+    decoded: metadata::DecodedVectors,
+    scene_class: i32,
+}
+
+type DecodeCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<DecodedEntry>>>>;
+pub(crate) type DecodeCache = std::sync::Mutex<Vec<(i64, DecodeCell)>>;
+
 const PREP_CACHE_CAP: usize = 24;
+const DECODE_CACHE_CAP: usize = 16;
 
 #[derive(Clone, Copy)]
 struct SceneBlend {
@@ -875,6 +885,7 @@ impl FilterState {
                     vector_data,
                     vector_len,
                     requested_algo,
+                    source_frame,
                 )
             }
             .map(std::sync::Arc::new);
@@ -907,11 +918,53 @@ impl FilterState {
                     vector_data,
                     vector_len,
                     requested_algo,
+                    source_frame,
                 )
             }
             .map(std::sync::Arc::new)
         })
         .clone()
+    }
+
+    unsafe fn cached_decode(
+        &self,
+        api: &frame::PlaneApi,
+        key: i64,
+        frame: vs::ConstRaw,
+        vector_data: metadata::VectorData,
+        vector_len: usize,
+    ) -> Option<std::sync::Arc<DecodedEntry>> {
+        if frame.is_null() {
+            return None;
+        }
+        let decode = || {
+            let decoded = unsafe { decode_frame_vectors(api, frame, vector_data, vector_len) }?;
+            let scene_class = self.scene_class(&decoded, vector_data);
+            Some(std::sync::Arc::new(DecodedEntry {
+                decoded,
+                scene_class,
+            }))
+        };
+        if std::env::var_os("SVP_NO_PREP").is_some() {
+            return decode();
+        }
+        let cell: DecodeCell = {
+            let mut cache = self.decode_cache.lock().ok()?;
+            if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
+                let entry = cache.remove(pos);
+                let cell = std::sync::Arc::clone(&entry.1);
+                cache.push(entry);
+                cell
+            } else {
+                let cell: DecodeCell = std::sync::Arc::new(std::sync::OnceLock::new());
+                if cache.len() >= DECODE_CACHE_CAP {
+                    cache.remove(0);
+                }
+                cache.push((key, std::sync::Arc::clone(&cell)));
+                cell
+            }
+        };
+        cell.get_or_init(decode).clone()
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -924,18 +977,34 @@ impl FilterState {
         vector_data: metadata::VectorData,
         vector_len: usize,
         requested_algo: i32,
+        source_frame: i32,
     ) -> Option<FramePrep> {
-        let decoded = unsafe { decode_vectors_input(api, vectors, vector_data, vector_len) }?;
+        let self_entry = match vectors {
+            VectorInput::Frame(frame) => unsafe {
+                self.cached_decode(api, i64::from(source_frame), frame, vector_data, vector_len)
+            }?,
+            VectorInput::Payload(_) => {
+                let decoded =
+                    unsafe { decode_vectors_input(api, vectors, vector_data, vector_len) }?;
+                let scene_class = self.scene_class(&decoded, vector_data);
+                std::sync::Arc::new(DecodedEntry {
+                    decoded,
+                    scene_class,
+                })
+            }
+        };
+        let decoded = &self_entry.decoded;
         let previous = decoded.previous.as_deref().or(decoded.current.as_deref())?;
         let current = decoded.current.as_deref().or(Some(previous))?;
         let prop_scene_change = unsafe { api.scene_change_next(source) };
         let raw_scene_class = if prop_scene_change {
             3
         } else {
-            self.scene_class(&decoded, vector_data)
+            self_entry.scene_class
         };
-        let neighbor_classes =
-            unsafe { self.neighbor_scene_classes(api, neighbors, vector_data, vector_len) };
+        let neighbor_classes = unsafe {
+            self.neighbor_scene_classes(api, neighbors, vector_data, vector_len, source_frame)
+        };
         let vectors_a = renderer_vectors(previous);
         let vectors_b = renderer_vectors(current);
         let origin = vector_data.origin();
@@ -1016,20 +1085,25 @@ impl FilterState {
             }
 
             if requested_algo == 23 && !neighbors[1].is_null() && !neighbors[2].is_null() {
-                let prev_decoded =
-                    unsafe { decode_frame_vectors(api, neighbors[1], vector_data, vector_len) };
-                let next_decoded =
-                    unsafe { decode_frame_vectors(api, neighbors[2], vector_data, vector_len) };
+                let keys = neighbor_keys(source_frame);
+                let prev_decoded = unsafe {
+                    self.cached_decode(api, keys[1], neighbors[1], vector_data, vector_len)
+                };
+                let next_decoded = unsafe {
+                    self.cached_decode(api, keys[2], neighbors[2], vector_data, vector_len)
+                };
                 if let (Some(prev_decoded), Some(next_decoded)) = (prev_decoded, next_decoded) {
-                    let next_scene = self.scene_class(&next_decoded, vector_data);
+                    let next_scene = next_decoded.scene_class;
                     let prev_side = prev_decoded
+                        .decoded
                         .current
                         .as_deref()
-                        .or(prev_decoded.previous.as_deref());
+                        .or(prev_decoded.decoded.previous.as_deref());
                     let next_side = next_decoded
+                        .decoded
                         .previous
                         .as_deref()
-                        .or(next_decoded.current.as_deref());
+                        .or(next_decoded.decoded.current.as_deref());
                     if next_scene < 3
                         && let (Some(prev_side), Some(next_side)) = (prev_side, next_side)
                     {
@@ -1063,7 +1137,7 @@ impl FilterState {
             }
         };
         Some(FramePrep {
-            decoded,
+            decoded: self_entry,
             vectors_a,
             vectors_b,
             mvx0,
@@ -1167,10 +1241,11 @@ impl FilterState {
         }?;
         let previous = prep
             .decoded
+            .decoded
             .previous
             .as_deref()
-            .or(prep.decoded.current.as_deref())?;
-        let current = prep.decoded.current.as_deref().or(Some(previous))?;
+            .or(prep.decoded.decoded.current.as_deref())?;
+        let current = prep.decoded.decoded.current.as_deref().or(Some(previous))?;
         let phase = self.phase_256(frame, source_frame).clamp(0, 256);
         let raw_scene_class = prep.raw_scene_class;
         let neighbor_classes = prep.neighbor_classes;
@@ -2243,30 +2318,19 @@ impl FilterState {
         neighbors: [vs::ConstRaw; 4],
         vector_data: metadata::VectorData,
         vector_len: usize,
+        source_frame: i32,
     ) -> [Option<i32>; 4] {
         if !self.options.scene_blend() {
             return [None; 4];
         }
-        [
-            unsafe { self.neighbor_scene_class(api, neighbors[0], vector_data, vector_len) },
-            unsafe { self.neighbor_scene_class(api, neighbors[1], vector_data, vector_len) },
-            unsafe { self.neighbor_scene_class(api, neighbors[2], vector_data, vector_len) },
-            unsafe { self.neighbor_scene_class(api, neighbors[3], vector_data, vector_len) },
-        ]
-    }
-
-    unsafe fn neighbor_scene_class(
-        &self,
-        api: &frame::PlaneApi,
-        frame: vs::ConstRaw,
-        vector_data: metadata::VectorData,
-        vector_len: usize,
-    ) -> Option<i32> {
-        if frame.is_null() {
-            return None;
-        }
-        let decoded = unsafe { decode_frame_vectors(api, frame, vector_data, vector_len) }?;
-        Some(self.scene_class(&decoded, vector_data))
+        let keys = neighbor_keys(source_frame);
+        let class = |index: usize| {
+            unsafe {
+                self.cached_decode(api, keys[index], neighbors[index], vector_data, vector_len)
+            }
+            .map(|entry| entry.scene_class)
+        };
+        [class(0), class(1), class(2), class(3)]
     }
 
     fn vector_neighbors(
@@ -2320,6 +2384,15 @@ impl FilterState {
         };
         [prev2, prev1, next1, next2]
     }
+}
+
+fn neighbor_keys(source_frame: i32) -> [i64; 4] {
+    [
+        i64::from(source_frame.saturating_sub(2).max(0)),
+        i64::from(source_frame.saturating_sub(1).max(0)),
+        i64::from(source_frame.saturating_add(1)),
+        i64::from(source_frame.saturating_add(2)),
+    ]
 }
 
 fn request_node(
@@ -2975,7 +3048,7 @@ fn usize_height(value: i32) -> usize {
 }
 
 pub(crate) struct FramePrep {
-    decoded: metadata::DecodedVectors,
+    decoded: std::sync::Arc<DecodedEntry>,
     vectors_a: Vec<renderer::Vector>,
     vectors_b: Vec<renderer::Vector>,
 

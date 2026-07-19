@@ -389,6 +389,19 @@ impl CpuRenderer {
         masks: Option<MaskPlanes<'_>>,
     ) {
         let max_mask = masks.map(max_mask);
+        let mut pixel = |cur0, cur1, mv0, mv1, alpha: Option<u8>, _: Option<u8>, _: Option<u8>| {
+            mode11_or_13_pixel(
+                mode13,
+                cur0,
+                cur1,
+                mv0,
+                mv1,
+                self.threshold,
+                self.threshold_limit,
+                alpha,
+                blend_order,
+            )
+        };
         self.render_dual_warp(
             dst.y,
             source0.y,
@@ -401,71 +414,143 @@ impl CpuRenderer {
             false,
             interp,
             zero_origin,
-            |cur0, cur1, mv0, mv1, alpha, _, _| {
-                mode11_or_13_pixel(
-                    mode13,
-                    cur0,
-                    cur1,
-                    mv0,
-                    mv1,
-                    self.threshold,
-                    self.threshold_limit,
-                    alpha,
-                    blend_order,
-                )
-            },
+            &mut pixel,
         );
-        self.render_dual_warp(
-            dst.u,
-            source0.u,
-            source1.u,
+        self.render_dual_warp_uv(
+            [dst.u, dst.v],
+            [source0.u, source0.v],
+            [source1.u, source1.v],
             motion0,
             motion1,
-            max_mask.as_deref(),
-            None,
-            None,
+            [max_mask.as_deref(), None, None],
+            interp,
+            zero_origin,
+            &mut pixel,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn render_dual_warp_uv(
+        &self,
+        dst: [PlaneMut<'_>; 2],
+        sources0: [Plane<'_>; 2],
+        sources1: [Plane<'_>; 2],
+        motion0: MotionPlanes<'_>,
+        motion1: MotionPlanes<'_>,
+        masks: [Option<&[u8]>; 3],
+        interp: bool,
+        zero_origin: bool,
+        mut pixel: impl FnMut(u8, u8, u8, u8, Option<u8>, Option<u8>, Option<u8>) -> u8,
+    ) {
+        let height = self.config.height / self.config.chroma_y_div;
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+        {
+            let params = self.plane_params(true, zero_origin);
+            let [dst_u, dst_v] = &dst;
+            let fused = interp
+                && !zero_origin
+                && params.x_shift >= 0
+                && params.y_shift >= 0
+                && dst_u.stride == dst_v.stride
+                && dst_u.data.len() == dst_v.data.len()
+                && sources0
+                    .iter()
+                    .chain(sources1.iter())
+                    .all(|plane| plane_covers(*plane, &params))
+                && mode23_fast::layout_matches(sources0[0], sources0[1])
+                && mode23_fast::layout_matches(sources1[0], sources1[1]);
+            if fused {
+                let [dst_u, dst_v] = dst;
+                #[allow(unsafe_code)]
+                let xw = unsafe { mode23_fast::x_weight_table(&params) };
+                render_tiles(
+                    &params,
+                    self.config.grid_w,
+                    self.config.grid_h,
+                    interp,
+                    0..height,
+                    |tile| {
+                        let motion0_samples = Self::motion_samples(
+                            motion0,
+                            &self.threshold_lut,
+                            &params,
+                            &tile,
+                            interp,
+                        );
+                        let motion1_samples =
+                            Self::motion_samples(motion1, &self.inverse_lut, &params, &tile, interp);
+                        let direct = tile_interior(
+                            &params,
+                            &tile,
+                            &[motion0_samples, motion1_samples],
+                        );
+                        let corners = |m: &[u8]| {
+                            [tile.i00, tile.i01, tile.i10, tile.i11]
+                                .map(|i| i32::from(m.get(i).copied().unwrap_or(0)))
+                        };
+                        macro_rules! fast_tile {
+                            ($direct:literal) => {
+                                mode23_fast::warp_tile::<true, $direct, true>(
+                                    dst_u.data,
+                                    dst_u.stride,
+                                    dst_v.data,
+                                    dst_v.stride,
+                                    sources0,
+                                    sources1,
+                                    [motion0_samples, motion1_samples],
+                                    masks.map(|mask| mask.map_or([0; 4], corners)),
+                                    masks.map(|mask| mask.is_some()),
+                                    &params,
+                                    &tile,
+                                    0,
+                                    &xw,
+                                    &mut pixel,
+                                )
+                            };
+                        }
+                        #[allow(unsafe_code)]
+                        unsafe {
+                            if direct {
+                                fast_tile!(true);
+                            } else {
+                                fast_tile!(false);
+                            }
+                        }
+                    },
+                );
+                return;
+            }
+        }
+        let [dst_u, dst_v] = dst;
+        self.render_dual_warp_rows(
+            dst_u,
+            sources0[0],
+            sources1[0],
+            motion0,
+            motion1,
+            masks[0],
+            masks[1],
+            masks[2],
             true,
             interp,
             zero_origin,
-            |cur0, cur1, mv0, mv1, alpha, _, _| {
-                mode11_or_13_pixel(
-                    mode13,
-                    cur0,
-                    cur1,
-                    mv0,
-                    mv1,
-                    self.threshold,
-                    self.threshold_limit,
-                    alpha,
-                    blend_order,
-                )
-            },
+            0..height,
+            &mut pixel,
         );
-        self.render_dual_warp(
-            dst.v,
-            source0.v,
-            source1.v,
+        self.render_dual_warp_rows(
+            dst_v,
+            sources0[1],
+            sources1[1],
             motion0,
             motion1,
-            max_mask.as_deref(),
-            None,
-            None,
+            masks[0],
+            masks[1],
+            masks[2],
             true,
             interp,
             zero_origin,
-            |cur0, cur1, mv0, mv1, alpha, _, _| {
-                mode11_or_13_pixel(
-                    mode13,
-                    cur0,
-                    cur1,
-                    mv0,
-                    mv1,
-                    self.threshold,
-                    self.threshold_limit,
-                    alpha,
-                    blend_order,
-                )
-            },
+            0..height,
+            &mut pixel,
         );
     }
 
@@ -482,6 +567,9 @@ impl CpuRenderer {
         masks: MaskPlanes<'_>,
         final_mask: Option<&[u8]>,
     ) {
+        let mut pixel = |cur0, cur1, mv0, mv1, alpha0, alpha1, final_alpha| {
+            self.mode21_or_22_pixel(mode21, cur0, cur1, mv0, mv1, alpha0, alpha1, final_alpha)
+        };
         self.render_dual_warp(
             dst.y,
             source0.y,
@@ -494,41 +582,18 @@ impl CpuRenderer {
             false,
             interp,
             !interp,
-            |cur0, cur1, mv0, mv1, alpha0, alpha1, final_alpha| {
-                self.mode21_or_22_pixel(mode21, cur0, cur1, mv0, mv1, alpha0, alpha1, final_alpha)
-            },
+            &mut pixel,
         );
-        self.render_dual_warp(
-            dst.u,
-            source0.u,
-            source1.u,
+        self.render_dual_warp_uv(
+            [dst.u, dst.v],
+            [source0.u, source0.v],
+            [source1.u, source1.v],
             motion0,
             motion1,
-            Some(masks.a),
-            Some(masks.b),
-            final_mask,
-            true,
+            [Some(masks.a), Some(masks.b), final_mask],
             interp,
             !interp,
-            |cur0, cur1, mv0, mv1, alpha0, alpha1, final_alpha| {
-                self.mode21_or_22_pixel(mode21, cur0, cur1, mv0, mv1, alpha0, alpha1, final_alpha)
-            },
-        );
-        self.render_dual_warp(
-            dst.v,
-            source0.v,
-            source1.v,
-            motion0,
-            motion1,
-            Some(masks.a),
-            Some(masks.b),
-            final_mask,
-            true,
-            interp,
-            !interp,
-            |cur0, cur1, mv0, mv1, alpha0, alpha1, final_alpha| {
-                self.mode21_or_22_pixel(mode21, cur0, cur1, mv0, mv1, alpha0, alpha1, final_alpha)
-            },
+            &mut pixel,
         );
     }
 
@@ -762,6 +827,9 @@ impl CpuRenderer {
         let params = self.plane_params(chroma, zero_origin);
         let mask_params = zero_origin.then(|| self.plane_params(chroma, false));
         let row_start = rows.start;
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+        #[allow(unsafe_code)]
+        let xw = unsafe { mode23_fast::x_weight_table(&params) };
         render_tiles(
             &params,
             self.config.grid_w,
@@ -771,8 +839,48 @@ impl CpuRenderer {
             |tile| {
                 let motion_samples =
                     Self::motion_samples(motion, &self.threshold_lut, &params, &tile, interp);
-                let direct = tile_interior(&params, &tile, &[motion_samples])
-                    && plane_covers(source, &params);
+                let covers = plane_covers(source, &params);
+                let direct = covers && tile_interior(&params, &tile, &[motion_samples]);
+                #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+                if interp && params.x_shift >= 0 && params.y_shift >= 0 && covers {
+                    let corners = |m: &[u8]| {
+                        [tile.i00, tile.i01, tile.i10, tile.i11]
+                            .map(|i| i32::from(m.get(i).copied().unwrap_or(0)))
+                    };
+                    let mut pixel = |base, _, warped, _, alpha: Option<u8>, _, _| {
+                        alpha.map_or(warped, |alpha| mode1_pixel(base, warped, alpha))
+                    };
+    let mut unused = [0u8; 0];
+                    macro_rules! fast_tile {
+                        ($direct:literal) => {
+                            mode23_fast::warp_tile::<false, $direct, false>(
+                                dst.data,
+                                dst.stride,
+                                &mut unused,
+                                0,
+                                [source; 2],
+                                [source; 2],
+                                [motion_samples; 2],
+                                [mask.map_or([0; 4], corners), [0; 4], [0; 4]],
+                                [mask.is_some(), false, false],
+                                &params,
+                                &tile,
+                                row_start,
+                                &xw,
+                                &mut pixel,
+                            )
+                        };
+                    }
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        if direct {
+                            fast_tile!(true);
+                        } else {
+                            fast_tile!(false);
+                        }
+                    }
+                    return;
+                }
                 for y in 0..tile.height {
                     let local_y = tile.local_y + y;
                     let source_y = (tile.y + y) * params.source_step;
@@ -851,7 +959,7 @@ impl CpuRenderer {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     #[allow(clippy::needless_pass_by_value)]
     fn render_dual_warp_rows(
         &self,
@@ -872,6 +980,9 @@ impl CpuRenderer {
         let params = self.plane_params(chroma, zero_origin);
         let mask_params = zero_origin.then(|| self.plane_params(chroma, false));
         let row_start = rows.start;
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+        #[allow(unsafe_code)]
+        let xw = unsafe { mode23_fast::x_weight_table(&params) };
         render_tiles(
             &params,
             self.config.grid_w,
@@ -883,9 +994,50 @@ impl CpuRenderer {
                     Self::motion_samples(motion0, &self.threshold_lut, &params, &tile, interp);
                 let motion1_samples =
                     Self::motion_samples(motion1, &self.inverse_lut, &params, &tile, interp);
-                let direct = tile_interior(&params, &tile, &[motion0_samples, motion1_samples])
-                    && plane_covers(source0, &params)
-                    && plane_covers(source1, &params);
+                let covers = plane_covers(source0, &params) && plane_covers(source1, &params);
+                let direct =
+                    covers && tile_interior(&params, &tile, &[motion0_samples, motion1_samples]);
+                #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+                if interp && !zero_origin && params.x_shift >= 0 && params.y_shift >= 0 && covers {
+                    let corners = |m: &[u8]| {
+                        [tile.i00, tile.i01, tile.i10, tile.i11]
+                            .map(|i| i32::from(m.get(i).copied().unwrap_or(0)))
+                    };
+    let mut unused = [0u8; 0];
+                    macro_rules! fast_tile {
+                        ($direct:literal) => {
+                            mode23_fast::warp_tile::<true, $direct, false>(
+                                dst.data,
+                                dst.stride,
+                                &mut unused,
+                                0,
+                                [source0; 2],
+                                [source1; 2],
+                                [motion0_samples, motion1_samples],
+                                [
+                                    mask0.map_or([0; 4], corners),
+                                    mask1.map_or([0; 4], corners),
+                                    mask2.map_or([0; 4], corners),
+                                ],
+                                [mask0.is_some(), mask1.is_some(), mask2.is_some()],
+                                &params,
+                                &tile,
+                                row_start,
+                                &xw,
+                                &mut pixel,
+                            )
+                        };
+                    }
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        if direct {
+                            fast_tile!(true);
+                        } else {
+                            fast_tile!(false);
+                        }
+                    }
+                    return;
+                }
                 for y in 0..tile.height {
                     let local_y = tile.local_y + y;
                     let source_y = (tile.y + y) * params.source_step;
@@ -1101,6 +1253,9 @@ impl CpuRenderer {
         let params = self.plane_params(chroma, zero_origin);
         let mask_params = zero_origin.then(|| self.plane_params(chroma, false));
         let row_start = rows.start;
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+        #[allow(unsafe_code)]
+        let xw = unsafe { mode23_fast::x_weight_table(&params) };
         render_tiles(
             &params,
             self.config.grid_w,
@@ -1116,20 +1271,64 @@ impl CpuRenderer {
                     Self::motion_samples(next0, &self.threshold_lut, &params, &tile, interp);
                 let motion3_samples =
                     Self::motion_samples(prev1, &self.inverse_lut, &params, &tile, interp);
-                let direct = tile_interior(
-                    &params,
-                    &tile,
-                    &[
-                        motion0_samples,
-                        motion1_samples,
-                        motion2_samples,
-                        motion3_samples,
-                    ],
-                ) && plane_covers(source0, &params)
+                let covers = plane_covers(source0, &params)
                     && plane_covers(source1, &params)
                     && (!DUAL
                         || plane_covers(second_source0, &params)
                             && plane_covers(second_source1, &params));
+                let direct = covers
+                    && tile_interior(
+                        &params,
+                        &tile,
+                        &[
+                            motion0_samples,
+                            motion1_samples,
+                            motion2_samples,
+                            motion3_samples,
+                        ],
+                    );
+                #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+                if INTERP && SHIFTED && covers {
+                    let corners = |m: &[u8]| {
+                        [tile.i00, tile.i01, tile.i10, tile.i11]
+                            .map(|i| i32::from(m.get(i).copied().unwrap_or(0)))
+                    };
+                    macro_rules! fast_tile {
+                        ($direct:literal) => {
+                            mode23_fast::render_tile::<MASK, DUAL, $direct>(
+                                dst.data,
+                                dst.stride,
+                                second_dst.data,
+                                second_dst.stride,
+                                [source0, second_source0],
+                                [source1, second_source1],
+                                [
+                                    motion0_samples,
+                                    motion1_samples,
+                                    motion2_samples,
+                                    motion3_samples,
+                                ],
+                                [corners(masks.a), corners(masks.b), mask.map_or([0; 4], corners)],
+                                (self.threshold, self.threshold_limit),
+                                &params,
+                                &tile,
+                                row_start,
+                                &xw,
+                            )
+                        };
+                    }
+                    #[allow(unsafe_code)]
+                    let handled = unsafe {
+                        if direct {
+                            fast_tile!(true)
+                        } else {
+                            fast_tile!(false)
+                        }
+                    };
+                    if handled {
+                        return;
+                    }
+                }
                 for y in 0..tile.height {
                     let local_y = tile.local_y + y;
                     let source_y = (tile.y + y) * params.source_step;
@@ -1440,11 +1639,22 @@ pub fn coverage_mask(
     strength_percent: i32,
     threshold: i32,
 ) {
+    thread_local! {
+        static SCRATCH: RefCell<(Vec<i32>, Vec<i32>)> =
+            const { RefCell::new((Vec::new(), Vec::new())) };
+    }
     let stride = width.saturating_add(2);
-    let mut accum = vec![0i32; stride.saturating_mul(height.saturating_add(2))];
-    let vectors = ctx.opposite_set(which);
-    splat_coverage(ctx, vectors, &mut accum, width, height, threshold);
-    finish_coverage(ctx, &accum, out, width, height, strength_percent);
+    let len = stride.saturating_mul(height.saturating_add(2));
+    SCRATCH.with(|scratch| {
+        let (points, sums) = &mut *scratch.borrow_mut();
+        points.clear();
+        points.resize(len, 0);
+        sums.resize(len, 0);
+        let vectors = ctx.opposite_set(which);
+        splat_coverage(ctx, vectors, points, width, height, threshold);
+        window_3x3(points, sums, stride);
+        finish_coverage(ctx, sums, out, width, height, strength_percent);
+    });
 }
 
 pub fn sample_mask(
@@ -1691,6 +1901,418 @@ fn render_tiles(
                 i11: i00.saturating_add(next_y).saturating_add(next_x),
             });
         }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+mod mode23_fast {
+    use core::arch::x86_64::{
+        __m128i, _mm_add_epi16, _mm_cvtsi32_si128, _mm_extract_epi16, _mm_madd_epi16,
+        _mm_mullo_epi16, _mm_set_epi16, _mm_set1_epi16, _mm_setzero_si128, _mm_sra_epi16,
+        _mm_sra_epi32,
+    };
+    #[cfg(target_feature = "sse4.1")]
+    use core::arch::x86_64::{
+        _mm_add_epi32, _mm_and_si128, _mm_castps_si128, _mm_castsi128_ps, _mm_extract_epi32,
+        _mm_max_epi32, _mm_min_epi32, _mm_mullo_epi32, _mm_or_si128, _mm_set1_epi32,
+        _mm_shuffle_epi32, _mm_shuffle_ps, _mm_sll_epi32,
+    };
+
+    use super::{
+        MAX_BLOCK_SIZE, Mode23Sample, MotionSamples, Plane, PlaneParams, Tile, byte_from_i32,
+        load_plane, mode23_pixel, output_row, plane_index, sample_plane_pair,
+    };
+
+    #[target_feature(enable = "sse2")]
+    #[allow(clippy::cast_possible_truncation)]
+    fn pack8(v: [i32; 8]) -> __m128i {
+        _mm_set_epi16(
+            v[7] as i16,
+            v[6] as i16,
+            v[5] as i16,
+            v[4] as i16,
+            v[3] as i16,
+            v[2] as i16,
+            v[1] as i16,
+            v[0] as i16,
+        )
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) fn x_weight_table(params: &PlaneParams) -> [__m128i; MAX_BLOCK_SIZE] {
+        let mut table = [_mm_setzero_si128(); MAX_BLOCK_SIZE];
+        for (entry, &(left, right)) in table.iter_mut().zip(&params.x_weights) {
+            *entry = pack8([left, right, left, right, left, right, left, right]);
+        }
+        table
+    }
+
+    #[target_feature(enable = "sse2")]
+    fn corner_pair(a: MotionSamples, b: MotionSamples, lo: usize, hi: usize) -> __m128i {
+        pack8([
+            a.x[lo], a.x[hi], a.y[lo], a.y[hi], b.x[lo], b.x[hi], b.y[lo], b.y[hi],
+        ])
+    }
+
+    pub(super) fn layout_matches(a: Plane<'_>, b: Plane<'_>) -> bool {
+        a.stride == b.stride && a.super_span == b.super_span && a.super_shift == b.super_shift
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[allow(clippy::cast_possible_truncation)]
+    fn lane(v: __m128i, index: usize) -> i32 {
+        i32::from(match index {
+            0 => _mm_extract_epi16::<0>(v),
+            1 => _mm_extract_epi16::<2>(v),
+            2 => _mm_extract_epi16::<4>(v),
+            _ => _mm_extract_epi16::<6>(v),
+        } as i16)
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    fn gather<const DUAL: bool>(planes: [Plane<'_>; 2], x: i32, y: i32) -> [u8; 2] {
+        let index = plane_index(planes[0], x as usize, y as usize);
+        load2::<DUAL>(planes, index)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation
+    )]
+    #[cfg_attr(not(target_feature = "sse4.1"), target_feature(enable = "sse2"))]
+    #[cfg_attr(target_feature = "sse4.1", target_feature(enable = "sse2,sse4.1"))]
+    pub(super) fn warp_tile<const TWO_FIELDS: bool, const DIRECT: bool, const DUAL: bool>(
+        output: &mut [u8],
+        output_stride: usize,
+        second: &mut [u8],
+        second_stride: usize,
+        sources0: [Plane<'_>; 2],
+        sources1: [Plane<'_>; 2],
+        motion: [MotionSamples; 2],
+        mask_corners: [[i32; 4]; 3],
+        mask_present: [bool; 3],
+        params: &PlaneParams,
+        tile: &Tile,
+        row_start: i32,
+        xw: &[__m128i; MAX_BLOCK_SIZE],
+        pixel: &mut impl FnMut(u8, u8, u8, u8, Option<u8>, Option<u8>, Option<u8>) -> u8,
+    ) {
+        let top01 = corner_pair(motion[0], motion[1], 0, 1);
+        let bot01 = corner_pair(motion[0], motion[1], 2, 3);
+        let [m0, m1, m2] = mask_corners;
+        let topm = pack8([m0[0], m0[1], m1[0], m1[1], m2[0], m2[1], 0, 0]);
+        let botm = pack8([m0[2], m0[3], m1[2], m1[3], m2[2], m2[3], 0, 0]);
+        let y_shift = _mm_cvtsi32_si128(params.y_shift);
+        let x_shift = _mm_cvtsi32_si128(params.x_shift);
+        let any_mask = mask_present.iter().any(|present| *present);
+        #[cfg(target_feature = "sse4.1")]
+        let shared = layout_matches(sources0[0], sources1[0]);
+        for y in 0..tile.height {
+            let Some(row) = output_row(output, output_stride, tile, y, row_start) else {
+                continue;
+            };
+            let second_row = if DUAL {
+                match output_row(second, second_stride, tile, y, row_start) {
+                    Some(row) => Some(row),
+                    None => continue,
+                }
+            } else {
+                None
+            };
+            let local_y = usize::try_from(tile.local_y + y)
+                .unwrap_or(0)
+                .min(MAX_BLOCK_SIZE - 1);
+            let (wy0, wy1) = params.y_weights[local_y];
+            let (wy0, wy1) = (_mm_set1_epi16(wy0 as i16), _mm_set1_epi16(wy1 as i16));
+            let vertical = |top, bottom| {
+                _mm_sra_epi16(
+                    _mm_add_epi16(_mm_mullo_epi16(top, wy0), _mm_mullo_epi16(bottom, wy1)),
+                    y_shift,
+                )
+            };
+            let row01 = vertical(top01, bot01);
+            let rowm = vertical(topm, botm);
+            let source_y = (tile.y + y) * params.source_step;
+            #[allow(clippy::cast_sign_loss)]
+            let row_base0 = plane_index(sources0[0], 0, source_y as usize);
+            #[allow(clippy::cast_sign_loss)]
+            let row_base1 = if TWO_FIELDS {
+                plane_index(sources1[0], 0, source_y as usize)
+            } else {
+                row_base0
+            };
+            let mut pixel_at = |x: i32, out: &mut u8, second_out: Option<&mut u8>| {
+                let wv = xw[usize::try_from(x).unwrap_or(0).min(MAX_BLOCK_SIZE - 1)];
+                let m01 = _mm_sra_epi32(_mm_madd_epi16(wv, row01), x_shift);
+                let am = if any_mask {
+                    _mm_sra_epi32(_mm_madd_epi16(wv, rowm), x_shift)
+                } else {
+                    rowm
+                };
+                let px = tile.x + x;
+                let source_x = px * params.source_step;
+                #[allow(clippy::cast_sign_loss)]
+                let cur0 = load2::<DUAL>(sources0, row_base0 + px as usize);
+                #[allow(clippy::cast_sign_loss)]
+                let cur1 = if TWO_FIELDS {
+                    load2::<DUAL>(sources1, row_base1 + px as usize)
+                } else {
+                    cur0
+                };
+                let fetch = |planes: [Plane<'_>; 2], dx: i32, dy: i32| {
+                    if DIRECT {
+                        gather::<DUAL>(planes, source_x + dx, source_y + dy)
+                    } else {
+                        sample_plane_pair::<DUAL>(planes, params, source_x, source_y, dx, dy, false)
+                    }
+                };
+                let scattered = || {
+                    let mv0 = fetch(sources0, lane(m01, 0), lane(m01, 1));
+                    let mv1 = if TWO_FIELDS {
+                        fetch(sources1, lane(m01, 2), lane(m01, 3))
+                    } else {
+                        mv0
+                    };
+                    (mv0, mv1)
+                };
+                #[cfg(target_feature = "sse4.1")]
+                let (mv0, mv1) = if DIRECT && shared {
+                    let dxs = _mm_shuffle_epi32::<0b1000>(m01);
+                    let dys = _mm_shuffle_epi32::<0b1101>(m01);
+                    let xs = _mm_add_epi32(dxs, _mm_set1_epi32(source_x));
+                    let ys = _mm_add_epi32(dys, _mm_set1_epi32(source_y));
+                    let index = gather_indices(sources0[0], xs, ys);
+                    (
+                        load2::<DUAL>(sources0, index[0]),
+                        if TWO_FIELDS {
+                            load2::<DUAL>(sources1, index[1])
+                        } else {
+                            load2::<DUAL>(sources0, index[0])
+                        },
+                    )
+                } else {
+                    scattered()
+                };
+                #[cfg(not(target_feature = "sse4.1"))]
+                let (mv0, mv1) = scattered();
+                let alpha =
+                    |index: usize| mask_present[index].then(|| byte_from_i32(lane(am, index)));
+                *out = pixel(cur0[0], cur1[0], mv0[0], mv1[0], alpha(0), alpha(1), alpha(2));
+                if let Some(second_out) = second_out {
+                    *second_out = pixel(cur0[1], cur1[1], mv0[1], mv1[1], alpha(0), alpha(1), alpha(2));
+                }
+            };
+            if let Some(second_row) = second_row {
+                for (x, (out, second_out)) in (0..tile.width).zip(row.iter_mut().zip(second_row)) {
+                    pixel_at(x, out, Some(second_out));
+                }
+            } else {
+                for (x, out) in (0..tile.width).zip(row) {
+                    pixel_at(x, out, None);
+                }
+            }
+        }
+    }
+
+    fn load2<const DUAL: bool>(planes: [Plane<'_>; 2], index: usize) -> [u8; 2] {
+        [
+            load_plane(planes[0], index),
+            if DUAL { load_plane(planes[1], index) } else { 0 },
+        ]
+    }
+
+    #[cfg(target_feature = "sse4.1")]
+    #[target_feature(enable = "sse4.1")]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    fn gather_indices(plane: Plane<'_>, xs: __m128i, ys: __m128i) -> [usize; 4] {
+        let stride = _mm_set1_epi32(plane.stride as i32);
+        let index = if plane.super_shift == 0 {
+            _mm_add_epi32(_mm_mullo_epi32(ys, stride), xs)
+        } else {
+            let shift = _mm_cvtsi32_si128(plane.super_shift as i32);
+            let mask = _mm_set1_epi32((1i32 << plane.super_shift) - 1);
+            let sub = _mm_or_si128(
+                _mm_sll_epi32(_mm_and_si128(ys, mask), shift),
+                _mm_and_si128(xs, mask),
+            );
+            _mm_add_epi32(
+                _mm_add_epi32(
+                    _mm_mullo_epi32(sub, _mm_set1_epi32(plane.super_span as i32)),
+                    _mm_mullo_epi32(_mm_sra_epi32(ys, shift), stride),
+                ),
+                _mm_sra_epi32(xs, shift),
+            )
+        };
+        [
+            _mm_extract_epi32::<0>(index) as usize,
+            _mm_extract_epi32::<1>(index) as usize,
+            _mm_extract_epi32::<2>(index) as usize,
+            _mm_extract_epi32::<3>(index) as usize,
+        ]
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation
+    )]
+    #[cfg_attr(not(target_feature = "sse4.1"), target_feature(enable = "sse2"))]
+    #[cfg_attr(target_feature = "sse4.1", target_feature(enable = "sse2,sse4.1"))]
+    pub(super) fn render_tile<const MASK: bool, const DUAL: bool, const DIRECT: bool>(
+        output: &mut [u8],
+        output_stride: usize,
+        second: &mut [u8],
+        second_stride: usize,
+        sources0: [Plane<'_>; 2],
+        sources1: [Plane<'_>; 2],
+        motion: [MotionSamples; 4],
+        mask_corners: [[i32; 4]; 3],
+        thresholds: (i32, i32),
+        params: &PlaneParams,
+        tile: &Tile,
+        row_start: i32,
+        xw: &[__m128i; MAX_BLOCK_SIZE],
+    ) -> bool {
+        if DUAL
+            && !(layout_matches(sources0[0], sources0[1])
+                && layout_matches(sources1[0], sources1[1]))
+        {
+            return false;
+        }
+        #[cfg(target_feature = "sse4.1")]
+        let shared = layout_matches(sources0[0], sources1[0]);
+        let top01 = corner_pair(motion[0], motion[1], 0, 1);
+        let bot01 = corner_pair(motion[0], motion[1], 2, 3);
+        let top23 = corner_pair(motion[2], motion[3], 0, 1);
+        let bot23 = corner_pair(motion[2], motion[3], 2, 3);
+        let [m0, m1, mf] = mask_corners;
+        let topm = pack8([m0[0], m0[1], m1[0], m1[1], mf[0], mf[1], 0, 0]);
+        let botm = pack8([m0[2], m0[3], m1[2], m1[3], mf[2], mf[3], 0, 0]);
+        let y_shift = _mm_cvtsi32_si128(params.y_shift);
+        let x_shift = _mm_cvtsi32_si128(params.x_shift);
+        for y in 0..tile.height {
+            let Some(row) = output_row(output, output_stride, tile, y, row_start) else {
+                continue;
+            };
+            let second_row = if DUAL {
+                match output_row(second, second_stride, tile, y, row_start) {
+                    Some(row) => Some(row),
+                    None => continue,
+                }
+            } else {
+                None
+            };
+            let local_y = usize::try_from(tile.local_y + y)
+                .unwrap_or(0)
+                .min(MAX_BLOCK_SIZE - 1);
+            let (wy0, wy1) = params.y_weights[local_y];
+            let (wy0, wy1) = (_mm_set1_epi16(wy0 as i16), _mm_set1_epi16(wy1 as i16));
+            let vertical = |top, bottom| {
+                _mm_sra_epi16(
+                    _mm_add_epi16(_mm_mullo_epi16(top, wy0), _mm_mullo_epi16(bottom, wy1)),
+                    y_shift,
+                )
+            };
+            let row01 = vertical(top01, bot01);
+            let row23 = vertical(top23, bot23);
+            let rowm = vertical(topm, botm);
+            let source_y = (tile.y + y) * params.source_step;
+            let pixel = |x: i32, out: &mut u8, second_out: Option<&mut u8>| {
+                let wv = xw[usize::try_from(x).unwrap_or(0).min(MAX_BLOCK_SIZE - 1)];
+                let m01 = _mm_sra_epi32(_mm_madd_epi16(wv, row01), x_shift);
+                let m23 = _mm_sra_epi32(_mm_madd_epi16(wv, row23), x_shift);
+                let mm = _mm_sra_epi32(_mm_madd_epi16(wv, rowm), x_shift);
+                let t0 = byte_from_i32(lane(mm, 0));
+                let t1 = byte_from_i32(lane(mm, 1));
+                let final_mask = MASK.then(|| byte_from_i32(lane(mm, 2)));
+                let source_x = (tile.x + x) * params.source_step;
+                let scattered = |m01: __m128i, m23: __m128i| {
+                    let fetch = |planes, dx, dy| {
+                        if DIRECT {
+                            gather::<DUAL>(planes, source_x + dx, source_y + dy)
+                        } else {
+                            sample_plane_pair::<DUAL>(
+                                planes, params, source_x, source_y, dx, dy, false,
+                            )
+                        }
+                    };
+                    [
+                        fetch(sources0, lane(m01, 0), lane(m01, 1)),
+                        fetch(sources1, lane(m01, 2), lane(m01, 3)),
+                        fetch(sources0, lane(m23, 0), lane(m23, 1)),
+                        fetch(sources1, lane(m23, 2), lane(m23, 3)),
+                    ]
+                };
+                #[cfg(target_feature = "sse4.1")]
+                let [a, b, c, d] = if shared {
+                    let dxs = _mm_castps_si128(_mm_shuffle_ps::<0x88>(
+                        _mm_castsi128_ps(m01),
+                        _mm_castsi128_ps(m23),
+                    ));
+                    let dys = _mm_castps_si128(_mm_shuffle_ps::<0xDD>(
+                        _mm_castsi128_ps(m01),
+                        _mm_castsi128_ps(m23),
+                    ));
+                    let mut xs = _mm_add_epi32(dxs, _mm_set1_epi32(source_x));
+                    let mut ys = _mm_add_epi32(dys, _mm_set1_epi32(source_y));
+                    if !DIRECT {
+                        xs = _mm_min_epi32(
+                            _mm_max_epi32(xs, _mm_setzero_si128()),
+                            _mm_set1_epi32(params.max_x),
+                        );
+                        ys = _mm_min_epi32(
+                            _mm_max_epi32(ys, _mm_setzero_si128()),
+                            _mm_set1_epi32(params.max_y),
+                        );
+                    }
+                    let index = gather_indices(sources0[0], xs, ys);
+                    [
+                        load2::<DUAL>(sources0, index[0]),
+                        load2::<DUAL>(sources1, index[1]),
+                        load2::<DUAL>(sources0, index[2]),
+                        load2::<DUAL>(sources1, index[3]),
+                    ]
+                } else {
+                    scattered(m01, m23)
+                };
+                #[cfg(not(target_feature = "sse4.1"))]
+                let [a, b, c, d] = scattered(m01, m23);
+                let (base_a, base_b) = if MASK {
+                    (
+                        gather::<DUAL>(sources0, source_x, source_y),
+                        gather::<DUAL>(sources1, source_x, source_y),
+                    )
+                } else {
+                    ([0; 2], [0; 2])
+                };
+                let sample = |lane: usize| Mode23Sample {
+                    a: a[lane],
+                    b: b[lane],
+                    c: c[lane],
+                    d: d[lane],
+                    base_a: base_a[lane],
+                    base_b: base_b[lane],
+                    t0,
+                    t1,
+                    mask: final_mask,
+                };
+                *out = mode23_pixel(sample(0), thresholds.0, thresholds.1);
+                if let Some(second_out) = second_out {
+                    *second_out = mode23_pixel(sample(1), thresholds.0, thresholds.1);
+                }
+            };
+            if let Some(second_row) = second_row {
+                for (x, (out, second_out)) in (0..tile.width).zip(row.iter_mut().zip(second_row)) {
+                    pixel(x, out, Some(second_out));
+                }
+            } else {
+                for (x, out) in (0..tile.width).zip(row) {
+                    pixel(x, out, None);
+                }
+            }
+        }
+        true
     }
 }
 
@@ -2061,6 +2683,7 @@ fn mode11_or_13_pixel(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn splat_coverage(
     ctx: &VectorContext<'_>,
     vectors: &[Vector],
@@ -2086,74 +2709,126 @@ fn splat_coverage(
 
     let x_bias = 1i32.saturating_sub(x_step);
     let y_bias = 1i32.saturating_sub(y_step);
+    let stride = width.saturating_add(2);
+    let (denom_div, x_div, y_div) = (
+        TruncDiv::new(denom),
+        TruncDiv::new(x_step),
+        TruncDiv::new(y_step),
+    );
     let mut y = 0;
     while y < grid_h {
+        let vector_row = usize::try_from(y)
+            .ok()
+            .and_then(|y| vectors.get(y.saturating_mul(ctx.grid_w)..))
+            .unwrap_or_default();
         let mut x = 0;
         let mut x_base: i32 = 0;
-        let mut neg_x_base: i32 = 0;
         while x < grid_w {
-            let vector = vectors
-                .get(
-                    usize::try_from(y)
-                        .unwrap_or(usize::MAX)
-                        .saturating_mul(ctx.grid_w)
-                        .saturating_add(usize::try_from(x).unwrap_or(usize::MAX)),
-                )
+            let vector = usize::try_from(x)
+                .ok()
+                .and_then(|x| vector_row.get(x))
                 .copied()
                 .unwrap_or_default();
 
-            let dx = threshold.saturating_mul(i32::from(vector.dx)) / denom;
-            let dy = threshold.saturating_mul(i32::from(vector.dy)) / denom;
+            let dx = denom_div.div(threshold * i32::from(vector.dx));
+            let dy = denom_div.div(threshold * i32::from(vector.dy));
+            let shifted_x = x_base.saturating_add(dx);
             let shifted_y = y_step.saturating_mul(y).saturating_add(dy);
-            let left = div_toward_zero(
-                x_base
-                    .saturating_add(dx)
-                    .saturating_add(x_bias & ((x_base.saturating_add(dx)) >> 31)),
-                x_step,
-            );
-            let top = div_toward_zero(shifted_y.saturating_add(y_bias & (shifted_y >> 31)), y_step);
-            let right = left.saturating_add(1);
-            let bottom = top.saturating_add(1);
+            let left = x_div.div(shifted_x + (x_bias & (shifted_x >> 31)));
+            let top = y_div.div(shifted_y + (y_bias & (shifted_y >> 31)));
+            let right = left + 1;
+            let bottom = top + 1;
             let next_x = right.saturating_mul(x_step);
-            let left_weight = neg_x_base.saturating_add(next_x).saturating_sub(dx);
-            let top_weight = y_step.saturating_mul(bottom).saturating_sub(shifted_y);
-
-            if top >= 0 && top < out_h && left >= 0 && left < out_w {
-                add_3x3(
-                    accum,
-                    width,
-                    left,
-                    top,
-                    left_weight.saturating_mul(top_weight),
-                );
-            }
-            if left >= -1 && top >= 0 && top < out_h && right < out_w {
-                let weight = top_weight.saturating_mul(
-                    x_base
-                        .saturating_add(dx)
-                        .saturating_add(ctx.block_w)
-                        .saturating_sub(next_x),
-                );
-                add_3x3(accum, width, right, top, weight);
-            }
-            if top >= -1 && bottom < out_h && left >= -1 && right < out_w {
-                let weight = x_base
-                    .saturating_add(ctx.block_w)
-                    .saturating_add(dx)
-                    .saturating_sub(next_x)
-                    .saturating_mul(ctx.block_h.saturating_sub(top_weight));
-                add_3x3(accum, width, right, bottom, weight);
-            }
-            if left >= 0 && top >= -1 && bottom < out_h && left < out_w {
-                let weight = left_weight.saturating_mul(ctx.block_h.saturating_sub(top_weight));
-                add_3x3(accum, width, left, bottom, weight);
+            let left_weight = next_x - shifted_x;
+            let top_weight = y_step.saturating_mul(bottom) - shifted_y;
+            let right_weight = shifted_x + ctx.block_w - next_x;
+            let bottom_weight = ctx.block_h - top_weight;
+            let interior = left >= 0 && right < out_w && top >= 0 && bottom < out_h;
+            #[allow(clippy::cast_sign_loss)]
+            if interior
+                && let base = (top as usize)
+                    .saturating_mul(stride)
+                    .saturating_add(left as usize)
+                && let Some(rows) = accum.get_mut(base..base.saturating_add(stride).saturating_add(2))
+            {
+                let (top_row, bottom_row) = rows.split_at_mut(stride);
+                top_row[0] += left_weight * top_weight;
+                top_row[1] += top_weight * right_weight;
+                bottom_row[0] += left_weight * bottom_weight;
+                bottom_row[1] += right_weight * bottom_weight;
+            } else {
+                if top >= 0 && top < out_h && left >= 0 && left < out_w {
+                    add_point(
+                        accum,
+                        width,
+                        left,
+                        top,
+                        left_weight.saturating_mul(top_weight),
+                    );
+                }
+                if left >= -1 && top >= 0 && top < out_h && right < out_w {
+                    add_point(accum, width, right, top, top_weight.saturating_mul(right_weight));
+                }
+                if top >= -1 && bottom < out_h && left >= -1 && right < out_w {
+                    add_point(
+                        accum,
+                        width,
+                        right,
+                        bottom,
+                        right_weight.saturating_mul(bottom_weight),
+                    );
+                }
+                if left >= 0 && top >= -1 && bottom < out_h && left < out_w {
+                    add_point(
+                        accum,
+                        width,
+                        left,
+                        bottom,
+                        left_weight.saturating_mul(bottom_weight),
+                    );
+                }
             }
 
             x += 1;
             x_base = x_base.saturating_add(x_step);
-            neg_x_base = neg_x_base.saturating_sub(x_step);
         }
         y += 1;
+    }
+}
+
+fn window_3x3(points: &[i32], sums: &mut [i32], stride: usize) {
+    if stride < 2 {
+        sums.copy_from_slice(points);
+        return;
+    }
+    for (source, row) in points
+        .chunks_exact(stride)
+        .zip(sums.chunks_exact_mut(stride))
+    {
+        row[0] = source[0];
+        row[1] = source[1] + source[0];
+        for (cell, ((a, b), c)) in row[2..]
+            .iter_mut()
+            .zip(source[2..].iter().zip(&source[1..]).zip(&source[..stride - 2]))
+        {
+            *cell = a + b + c;
+        }
+    }
+    let rows = sums.len() / stride;
+    for y in (1..rows).rev() {
+        let (above, current) = sums.split_at_mut(y * stride);
+        let current = &mut current[..stride];
+        let row1 = &above[(y - 1) * stride..y * stride];
+        if y >= 2 {
+            let row2 = &above[(y - 2) * stride..(y - 1) * stride];
+            for ((cell, a), b) in current.iter_mut().zip(row1).zip(row2) {
+                *cell += a + b;
+            }
+        } else {
+            for (cell, a) in current.iter_mut().zip(row1) {
+                *cell += a;
+            }
+        }
     }
 }
 
@@ -2169,25 +2844,29 @@ fn finish_coverage(
     let area = ctx.area();
     let strength = f64::from(strength_percent) / 100.0;
     let area_f = f64::from(area);
+    let byte = |remaining: i32| coverage_byte(f64::from(remaining) * strength * 256.0 / area_f);
+    let lut: Vec<u8> = (0..=area.clamp(0, 4096)).map(byte).collect();
     for y in 0..height {
-        for x in 0..width {
-            let out_index = y.saturating_mul(width).saturating_add(x);
-            let accum_index = y
-                .saturating_add(1)
-                .saturating_mul(stride)
-                .saturating_add(x.saturating_add(1));
-            if out_index >= out.len() || accum_index >= accum.len() {
-                return;
-            }
-            let covered = accum[accum_index] >> 3;
+        let out_start = y.saturating_mul(width);
+        let accum_start = y.saturating_add(1).saturating_mul(stride).saturating_add(1);
+        let (Some(out_row), Some(accum_row)) = (
+            out.get_mut(out_start..out_start.saturating_add(width)),
+            accum.get(accum_start..accum_start.saturating_add(width)),
+        ) else {
+            return;
+        };
+        for (cell, &value) in out_row.iter_mut().zip(accum_row) {
+            let covered = value >> 3;
             let remaining = if area <= covered { 0 } else { area - covered };
-            let value = f64::from(remaining) * strength * 256.0 / area_f;
-            out[out_index] = coverage_byte(value);
+            *cell = lut
+                .get(usize::try_from(remaining).unwrap_or(usize::MAX))
+                .copied()
+                .unwrap_or_else(|| byte(remaining));
         }
     }
 }
 
-fn add_3x3(accum: &mut [i32], width: usize, x: i32, y: i32, weight: i32) {
+fn add_point(accum: &mut [i32], width: usize, x: i32, y: i32, weight: i32) {
     let stride = width.saturating_add(2);
     let Ok(x) = usize::try_from(x) else {
         return;
@@ -2195,19 +2874,46 @@ fn add_3x3(accum: &mut [i32], width: usize, x: i32, y: i32, weight: i32) {
     let Ok(y) = usize::try_from(y) else {
         return;
     };
-    let base = y.saturating_mul(stride).saturating_add(x);
-    for row in 0..3 {
-        let index = base.saturating_add(row * stride);
-        for col in 0..3 {
-            if let Some(cell) = accum.get_mut(index.saturating_add(col)) {
-                *cell = cell.saturating_add(weight);
-            }
-        }
+    if let Some(cell) = accum.get_mut(y.saturating_mul(stride).saturating_add(x)) {
+        *cell = cell.saturating_add(weight);
     }
 }
 
-fn div_toward_zero(value: i32, divisor: i32) -> i32 {
-    value / divisor
+struct TruncDiv {
+    divisor: i32,
+    magic: u64,
+    bound: u64,
+}
+
+impl TruncDiv {
+    fn new(divisor: i32) -> Self {
+        let (magic, bound) = if divisor > 0 {
+            let d = u64::from(divisor.unsigned_abs());
+            let magic = (1u64 << 40).div_ceil(d);
+            let bound = ((1u64 << 40) / d).min(u64::MAX / magic).min(1u64 << 31);
+            (magic, bound)
+        } else {
+            (0, 0)
+        };
+        Self {
+            divisor,
+            magic,
+            bound,
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn div(&self, value: i32) -> i32 {
+        let abs = u64::from(value.unsigned_abs());
+        if abs < self.bound {
+            let quotient = ((abs * self.magic) >> 40) as i32;
+            if value < 0 { -quotient } else { quotient }
+        } else if self.divisor == 0 {
+            0
+        } else {
+            value / self.divisor
+        }
+    }
 }
 
 fn cpu_map(value: i32) -> i32 {
@@ -2307,4 +3013,5 @@ fn coverage_byte(value: f64) -> u8 {
         (value & 0xFF) as u8
     }
 }
+use std::cell::RefCell;
 use std::ops::Range;
