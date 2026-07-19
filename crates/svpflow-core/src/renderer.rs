@@ -425,6 +425,7 @@ impl CpuRenderer {
             [max_mask.as_deref(), None, None],
             interp,
             zero_origin,
+            0..self.config.height / self.config.chroma_y_div,
             &mut pixel,
         );
     }
@@ -440,9 +441,9 @@ impl CpuRenderer {
         masks: [Option<&[u8]>; 3],
         interp: bool,
         zero_origin: bool,
+        rows: Range<i32>,
         mut pixel: impl FnMut(u8, u8, u8, u8, Option<u8>, Option<u8>, Option<u8>) -> u8,
     ) {
-        let height = self.config.height / self.config.chroma_y_div;
         #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
         {
             let params = self.plane_params(true, zero_origin);
@@ -468,7 +469,7 @@ impl CpuRenderer {
                     self.config.grid_w,
                     self.config.grid_h,
                     interp,
-                    0..height,
+                    rows.clone(),
                     |tile| {
                         let motion0_samples = Self::motion_samples(
                             motion0,
@@ -502,7 +503,7 @@ impl CpuRenderer {
                                     masks.map(|mask| mask.is_some()),
                                     &params,
                                     &tile,
-                                    0,
+                                    rows.start,
                                     &xw,
                                     &mut pixel,
                                 )
@@ -534,7 +535,7 @@ impl CpuRenderer {
             true,
             interp,
             zero_origin,
-            0..height,
+            rows.clone(),
             &mut pixel,
         );
         self.render_dual_warp_rows(
@@ -549,7 +550,7 @@ impl CpuRenderer {
             true,
             interp,
             zero_origin,
-            0..height,
+            rows,
             &mut pixel,
         );
     }
@@ -593,6 +594,7 @@ impl CpuRenderer {
             [Some(masks.a), Some(masks.b), final_mask],
             interp,
             !interp,
+            0..self.config.height / self.config.chroma_y_div,
             &mut pixel,
         );
     }
@@ -766,6 +768,35 @@ impl CpuRenderer {
             ),
             _ => return Err(RenderError::UnsupportedMode),
         }
+        Ok(())
+    }
+
+    pub fn render_mode21_or_22_uv_rows(
+        &self,
+        mode21: bool,
+        interp: bool,
+        dst: [PlaneMut<'_>; 2],
+        input: PlaneRenderInput<'_>,
+        second: [Plane<'_>; 2],
+        rows: Range<i32>,
+    ) -> Result<(), RenderError> {
+        let masks = input.masks.ok_or(RenderError::MissingMasks)?;
+        let [second_source0, second_source1] = second;
+        let mut pixel = |cur0, cur1, mv0, mv1, alpha0, alpha1, final_alpha| {
+            self.mode21_or_22_pixel(mode21, cur0, cur1, mv0, mv1, alpha0, alpha1, final_alpha)
+        };
+        self.render_dual_warp_uv(
+            dst,
+            [input.source0, second_source0],
+            [input.source1, second_source1],
+            input.motion0,
+            input.motion1,
+            [Some(masks.a), Some(masks.b), input.final_mask],
+            interp,
+            !interp,
+            rows,
+            &mut pixel,
+        );
         Ok(())
     }
 

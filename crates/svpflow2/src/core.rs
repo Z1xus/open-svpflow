@@ -1572,6 +1572,15 @@ impl FilterState {
                         [sources0.v, sources1.v],
                         0..middle,
                     );
+                } else if matches!(mode, 21 | 22) {
+                    let _ = cpu.render_mode21_or_22_uv_rows(
+                        mode == 21,
+                        interp,
+                        [dst.u, dst.v],
+                        input(sources0.u, sources1.u),
+                        [sources0.v, sources1.v],
+                        0..middle,
+                    );
                 } else {
                     let _ = cpu.render_plane_rows(
                         mode,
