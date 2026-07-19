@@ -80,7 +80,21 @@ pub(crate) struct FilterState {
 
     pub(crate) prep_cache: PrepCache,
     pub(crate) decode_cache: DecodeCache,
+    pub(crate) expand_cache: ExpandCache,
 }
+
+pub(crate) struct SuperExpand {
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+    y_stride: usize,
+    uv_stride: usize,
+}
+
+type ExpandCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<SuperExpand>>>>;
+pub(crate) type ExpandCache = std::sync::Mutex<Vec<(i64, ExpandCell)>>;
+
+const EXPAND_CACHE_CAP: usize = 8;
 
 type PrepCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<FramePrep>>>>;
 type PrepCache = std::sync::Mutex<Vec<(i64, PrepCell)>>;
@@ -967,6 +981,47 @@ impl FilterState {
         cell.get_or_init(decode).clone()
     }
 
+    fn cached_expand(
+        &self,
+        key: i64,
+        planes: &renderer::FramePlanes<'_>,
+    ) -> Option<std::sync::Arc<SuperExpand>> {
+        if std::env::var_os("SVP_NO_EXPAND").is_some() {
+            return None;
+        }
+        let width = usize::try_from(self.video_info.width.max(0)).ok()?;
+        let height = usize::try_from(self.video_info.height.max(0)).ok()?;
+        let cell: ExpandCell = {
+            let mut cache = self.expand_cache.lock().ok()?;
+            if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
+                let entry = cache.remove(pos);
+                let cell = std::sync::Arc::clone(&entry.1);
+                cache.push(entry);
+                cell
+            } else {
+                let cell: ExpandCell = std::sync::Arc::new(std::sync::OnceLock::new());
+                if cache.len() >= EXPAND_CACHE_CAP {
+                    cache.remove(0);
+                }
+                cache.push((key, std::sync::Arc::clone(&cell)));
+                cell
+            }
+        };
+        cell.get_or_init(|| {
+            let (y, y_stride) = expand_plane(planes.y, width, height)?;
+            let (u, uv_stride) = expand_plane(planes.u, width / 2, height / 2)?;
+            let (v, _) = expand_plane(planes.v, width / 2, height / 2)?;
+            Some(std::sync::Arc::new(SuperExpand {
+                y,
+                u,
+                v,
+                y_stride,
+                uv_stride,
+            }))
+        })
+        .clone()
+    }
+
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     unsafe fn build_frame_prep(
         &self,
@@ -1443,8 +1498,21 @@ impl FilterState {
                 v: plane(src1_v, src1_v_stride, src1_v_len),
             }
         };
-        let sources0 = super0.unwrap_or(raw_sources0);
-        let sources1 = super1.unwrap_or(raw_sources1);
+        let expand0 = super0
+            .as_ref()
+            .and_then(|planes| self.cached_expand(i64::from(source_frame), planes));
+        let expand1 = super1
+            .as_ref()
+            .and_then(|planes| self.cached_expand(i64::from(source_frame) + 1, planes));
+        let expanded = |expand: &Option<std::sync::Arc<SuperExpand>>| {
+            expand.as_ref().map(|expand| renderer::FramePlanes {
+                y: unsafe { plane(expand.y.as_ptr(), expand.y_stride, expand.y.len()) },
+                u: unsafe { plane(expand.u.as_ptr(), expand.uv_stride, expand.u.len()) },
+                v: unsafe { plane(expand.v.as_ptr(), expand.uv_stride, expand.v.len()) },
+            })
+        };
+        let sources0 = expanded(&expand0).or(super0).unwrap_or(raw_sources0);
+        let sources1 = expanded(&expand1).or(super1).unwrap_or(raw_sources1);
         let padding = self.options.padding(&self.video_info);
         let dst = unsafe {
             renderer::FramePlanesMut {
@@ -2980,6 +3048,44 @@ fn fill_plane(
             }
         }
     }
+}
+
+fn expand_plane(plane: renderer::Plane<'_>, width: usize, height: usize) -> Option<(Vec<u8>, usize)> {
+    let (stride, span, shift) = plane.layout();
+    if shift == 0 || shift > 2 || width == 0 || height == 0 {
+        return None;
+    }
+    let pel = 1usize << shift;
+    let out_stride = width.checked_mul(pel)?;
+    let mut out = vec![0u8; out_stride.checked_mul(height.checked_mul(pel)?)?];
+    for sy in 0..pel {
+        for row in 0..height {
+            let dst = out
+                .get_mut((row * pel + sy) * out_stride..(row * pel + sy) * out_stride + out_stride)?;
+            let sub = |sx: usize| {
+                let base = ((sy << shift) | sx).checked_mul(span)?.checked_add(row.checked_mul(stride)?)?;
+                plane.data.get(base..base.checked_add(width)?)
+            };
+            if pel == 2 {
+                let (a, b) = (sub(0)?, sub(1)?);
+                for ((chunk, &left), &right) in dst.chunks_exact_mut(2).zip(a).zip(b) {
+                    chunk[0] = left;
+                    chunk[1] = right;
+                }
+            } else {
+                let (a, b, c, d) = (sub(0)?, sub(1)?, sub(2)?, sub(3)?);
+                for ((((chunk, &s0), &s1), &s2), &s3) in
+                    dst.chunks_exact_mut(4).zip(a).zip(b).zip(c).zip(d)
+                {
+                    chunk[0] = s0;
+                    chunk[1] = s1;
+                    chunk[2] = s2;
+                    chunk[3] = s3;
+                }
+            }
+        }
+    }
+    Some((out, out_stride))
 }
 
 fn renderer_vectors(vectors: &[metadata::DecodedVector]) -> Vec<renderer::Vector> {

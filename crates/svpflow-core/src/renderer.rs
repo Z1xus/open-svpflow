@@ -105,6 +105,10 @@ impl<'a> Plane<'a> {
         }
     }
 
+    pub const fn layout(&self) -> (usize, usize, u32) {
+        (self.stride, self.super_span, self.super_shift)
+    }
+
     pub const fn super_plane(
         data: &'a [u8],
         stride: usize,
@@ -2090,37 +2094,56 @@ mod mode23_fast {
             let row01 = vertical(top01, bot01);
             let rowm = vertical(topm, botm);
             let source_y = (tile.y + y) * params.source_step;
+            let base_step = |plane: Plane<'_>| {
+                if plane.super_shift == 0 {
+                    params.source_step
+                } else {
+                    1
+                }
+            };
             #[allow(clippy::cast_sign_loss)]
             let row_base0 = if BASES {
                 plane_index(sources0[0], 0, source_y as usize)
             } else {
                 0
             };
+            let base_step0 = base_step(sources0[0]);
             #[allow(clippy::cast_sign_loss)]
             let row_base1 = if BASES && TWO_FIELDS {
                 plane_index(sources1[0], 0, source_y as usize)
             } else {
                 row_base0
             };
-            let mut pixel_at = |x: i32, out: &mut u8, second_out: Option<&mut u8>| {
-                let wv = xw[usize::try_from(x).unwrap_or(0).min(MAX_BLOCK_SIZE - 1)];
-                let m01 = _mm_sra_epi32(_mm_madd_epi16(wv, row01), x_shift);
-                let am = if any_mask {
+            let base_step1 = if TWO_FIELDS {
+                base_step(sources1[0])
+            } else {
+                base_step0
+            };
+            let second_row = second_row;
+            let weight = |x: i32| xw[usize::try_from(x).unwrap_or(0).min(MAX_BLOCK_SIZE - 1)];
+            let alphas = |wv: __m128i| {
+                if any_mask {
                     _mm_sra_epi32(_mm_madd_epi16(wv, rowm), x_shift)
                 } else {
                     rowm
-                };
+                }
+            };
+            let x_start = 0i32;
+            let mut pixel_at = |x: i32, out: &mut u8, second_out: Option<&mut u8>| {
+                let wv = weight(x);
+                let m01 = _mm_sra_epi32(_mm_madd_epi16(wv, row01), x_shift);
+                let am = alphas(wv);
                 let px = tile.x + x;
                 let source_x = px * params.source_step;
                 #[allow(clippy::cast_sign_loss)]
                 let cur0 = if BASES {
-                    load2::<DUAL>(sources0, row_base0 + px as usize)
+                    load2::<DUAL>(sources0, row_base0 + (px * base_step0) as usize)
                 } else {
                     [0; 2]
                 };
                 #[allow(clippy::cast_sign_loss)]
                 let cur1 = if BASES && TWO_FIELDS {
-                    load2::<DUAL>(sources1, row_base1 + px as usize)
+                    load2::<DUAL>(sources1, row_base1 + (px * base_step1) as usize)
                 } else {
                     cur0
                 };
@@ -2168,11 +2191,17 @@ mod mode23_fast {
                 }
             };
             if let Some(second_row) = second_row {
-                for (x, (out, second_out)) in (0..tile.width).zip(row.iter_mut().zip(second_row)) {
+                for (x, (out, second_out)) in (x_start..tile.width).zip(
+                    row[usize::try_from(x_start).unwrap_or(0)..]
+                        .iter_mut()
+                        .zip(&mut second_row[usize::try_from(x_start).unwrap_or(0)..]),
+                ) {
                     pixel_at(x, out, Some(second_out));
                 }
             } else {
-                for (x, out) in (0..tile.width).zip(row) {
+                for (x, out) in
+                    (x_start..tile.width).zip(&mut row[usize::try_from(x_start).unwrap_or(0)..])
+                {
                     pixel_at(x, out, None);
                 }
             }

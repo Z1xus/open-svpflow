@@ -340,6 +340,7 @@ unsafe fn collect_state(
         nvof: None,
         prep_cache: std::sync::Mutex::new(Vec::new()),
         decode_cache: std::sync::Mutex::new(Vec::new()),
+        expand_cache: std::sync::Mutex::new(Vec::new()),
     }
 }
 
