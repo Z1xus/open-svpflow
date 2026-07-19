@@ -1668,13 +1668,12 @@ pub fn vector_planes(
     height: usize,
 ) {
     let vectors = ctx.set(which);
-    let scale = ctx.scale_shift_base.max(1);
-    let step_x = (ctx.block_w - ctx.origin_x).saturating_mul(scale);
-    let step_y = (ctx.block_h - ctx.origin_y).saturating_mul(scale);
-    let block_x = ctx.block_w.saturating_mul(scale);
-    let block_y = ctx.block_h.saturating_mul(scale);
-    let frame_x = ctx.frame_w.saturating_mul(scale);
-    let frame_y = ctx.frame_h.saturating_mul(scale);
+    let step_x = ctx.block_w - ctx.origin_x;
+    let step_y = ctx.block_h - ctx.origin_y;
+    let block_x = ctx.block_w;
+    let block_y = ctx.block_h;
+    let frame_x = ctx.frame_w;
+    let frame_y = ctx.frame_h;
     for y in 0..height {
         let pos_y = i32::try_from(y).unwrap_or(0).saturating_mul(step_y);
         for x in 0..width {
