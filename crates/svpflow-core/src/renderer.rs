@@ -2132,7 +2132,7 @@ mod mode23_fast {
             #[allow(unused_mut)]
             let mut second_row = second_row;
             #[cfg(target_feature = "sse4.1")]
-            if BASES && DIRECT && shared && sources0[0].super_shift == 0 && !any_mask {
+            if BASES && DIRECT && shared && sources0[0].super_shift == 0 {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 let stride = sources0[0].stride as i32;
                 let row_off = source_y * stride;
@@ -2168,9 +2168,17 @@ mod mode23_fast {
                     } else {
                         cur0
                     };
-                    *out = pixel(cur0[0], cur1[0], mv0[0], mv1[0], None, None, None);
+                    let am = if any_mask {
+                        _mm_sra_epi32(_mm_madd_epi16(wv, rowm), x_shift)
+                    } else {
+                        rowm
+                    };
+                    let alpha =
+                        |index: usize| mask_present[index].then(|| byte_from_i32(lane(am, index)));
+                    *out = pixel(cur0[0], cur1[0], mv0[0], mv1[0], alpha(0), alpha(1), alpha(2));
                     if let Some(second_out) = second_out {
-                        *second_out = pixel(cur0[1], cur1[1], mv0[1], mv1[1], None, None, None);
+                        *second_out =
+                            pixel(cur0[1], cur1[1], mv0[1], mv1[1], alpha(0), alpha(1), alpha(2));
                     }
                     sx += params.source_step;
                     #[allow(clippy::cast_sign_loss)]
