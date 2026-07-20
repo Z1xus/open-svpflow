@@ -13,6 +13,7 @@ use core::arch::x86_64::{
     _mm_unpackhi_epi32, _mm_unpackhi_epi64, _mm_unpacklo_epi8, _mm_unpacklo_epi16,
     _mm_unpacklo_epi32, _mm_unpacklo_epi64,
 };
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Vec8 {
     pub(crate) dx: i16,
@@ -788,26 +789,12 @@ fn exact_refine_search(
             best.mv, radius, best,
         ),
         4 => {
-            let center = best.mv;
-            for y in center.1 - radius..=center.1 + radius {
-                for x in center.0 - radius..=center.0 + radius {
+            let (cx, cy) = best.mv;
+            for y in (cy - radius)..=(cy + radius) {
+                for x in (cx - radius)..=(cx + radius) {
                     exact_check(
-                        src,
-                        refp,
-                        level,
-                        px,
-                        py,
-                        bw,
-                        bh,
-                        pel,
-                        satd,
-                        chroma,
-                        predictor,
-                        bounds,
-                        lambda,
-                        pnew,
-                        (x, y),
-                        best,
+                        src, refp, level, px, py, bw, bh, pel, satd, chroma, predictor, bounds,
+                        lambda, pnew, (x, y), best,
                     );
                 }
             }
@@ -877,6 +864,59 @@ fn exact_expanding(
 }
 
 #[allow(clippy::too_many_arguments)]
+const HEX2: [(i32, i32); 8] = [
+    (-1, -2),
+    (-2, 0),
+    (-1, 2),
+    (1, 2),
+    (2, 0),
+    (1, -2),
+    (-1, -2),
+    (-2, 0),
+];
+const MOD6M1: [i32; 8] = [5, 0, 1, 2, 3, 4, 5, 0];
+
+#[allow(clippy::too_many_arguments)]
+fn exact_check_dir(
+    src: &SuperPlanes<'_>,
+    refp: &SuperPlanes<'_>,
+    level: i32,
+    px: i32,
+    py: i32,
+    bw: i32,
+    bh: i32,
+    pel: i32,
+    satd: bool,
+    chroma: bool,
+    predictor: (i32, i32),
+    bounds: (i32, i32, i32, i32),
+    lambda: i32,
+    pnew: i32,
+    mv: (i32, i32),
+    label: i32,
+    dir: &mut i32,
+    best: &mut SearchBest,
+) {
+    if !exact_ok(mv, bounds) {
+        return;
+    }
+    let motion = exact_motion_penalty(lambda, predictor, mv);
+    if motion >= best.cost {
+        return;
+    }
+    let Some((sad, cost)) = exact_sad_if_better(
+        src, refp, level, px, py, bw, bh, mv, satd, pel, chroma, motion, pnew, best.cost,
+    ) else {
+        return;
+    };
+    if cost < best.cost {
+        best.sad = sad;
+        best.cost = cost;
+        *dir = label;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn exact_hex2(
     src: &SuperPlanes<'_>,
     refp: &SuperPlanes<'_>,
@@ -895,13 +935,13 @@ fn exact_hex2(
     radius: i32,
     best: &mut SearchBest,
 ) {
-    let mut center = best.mv;
+    let mut bmx = best.mv.0;
+    let mut bmy = best.mv.1;
     if radius > 1 {
-        let hex = [(-2, 0), (-1, 2), (1, 2), (2, 0), (1, -2), (-1, -2)];
-        for _ in 0..(radius / 2).max(1) {
-            let before = best.mv;
-            for delta in hex {
-                exact_check(
+        let mut dir = -2i32;
+        macro_rules! check {
+            ($dx:expr, $dy:expr, $label:expr, $dir:expr) => {
+                exact_check_dir(
                     src,
                     refp,
                     level,
@@ -916,19 +956,57 @@ fn exact_hex2(
                     bounds,
                     lambda,
                     pnew,
-                    (center.0 + delta.0, center.1 + delta.1),
+                    (bmx + $dx, bmy + $dy),
+                    $label,
+                    $dir,
                     best,
-                );
-            }
-            if best.mv == before {
-                break;
-            }
-            center = best.mv;
+                )
+            };
         }
+        for (i, &(dx, dy)) in HEX2[1..7].iter().enumerate() {
+            check!(dx, dy, i as i32, &mut dir);
+        }
+
+        if dir != -2 {
+            bmx += HEX2[(dir + 1) as usize].0;
+            bmy += HEX2[(dir + 1) as usize].1;
+            let mut i = 1;
+            while i < radius / 2 && exact_ok((bmx, bmy), bounds) {
+                let odir = MOD6M1[(dir + 1) as usize];
+                dir = -2;
+                for k in 0..3i32 {
+                    let (dx, dy) = HEX2[(odir + k) as usize];
+                    check!(dx, dy, odir + k - 1, &mut dir);
+                }
+                if dir == -2 {
+                    break;
+                }
+                bmx += HEX2[(dir + 1) as usize].0;
+                bmy += HEX2[(dir + 1) as usize].1;
+                i += 1;
+            }
+        }
+        best.mv = (bmx, bmy);
     }
     exact_expanding(
-        src, refp, level, px, py, bw, bh, pel, satd, chroma, predictor, bounds, lambda, pnew,
-        center, 1, 1, best,
+        src,
+        refp,
+        level,
+        px,
+        py,
+        bw,
+        bh,
+        pel,
+        satd,
+        chroma,
+        predictor,
+        bounds,
+        lambda,
+        pnew,
+        (bmx, bmy),
+        1,
+        1,
+        best,
     );
 }
 
@@ -954,12 +1032,17 @@ fn exact_umh(
 ) {
     let mut d = 1;
     while d < radius {
-        for mv in [
-            (center.0 - d, center.1),
-            (center.0 + d, center.1),
-            (center.0, center.1 - d),
-            (center.0, center.1 + d),
-        ] {
+        for mv in [(center.0 - d, center.1), (center.0 + d, center.1)] {
+            exact_check(
+                src, refp, level, px, py, bw, bh, pel, satd, chroma, predictor, bounds, lambda,
+                pnew, mv, best,
+            );
+        }
+        d += 2;
+    }
+    let mut d = 1;
+    while d < radius {
+        for mv in [(center.0, center.1 - d), (center.0, center.1 + d)] {
             exact_check(
                 src, refp, level, px, py, bw, bh, pel, satd, chroma, predictor, bounds, lambda,
                 pnew, mv, best,
@@ -985,7 +1068,7 @@ fn exact_umh(
         (0, -4),
         (2, -3),
     ];
-    for scale in 1..=radius / 4 {
+    for scale in 1..=(radius / 4).max(1) {
         for delta in hex4 {
             exact_check(
                 src,
