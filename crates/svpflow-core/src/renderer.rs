@@ -316,14 +316,14 @@ impl CpuRenderer {
         motion1: MotionPlanes<'_>,
         masks: Option<MaskPlanes<'_>>,
     ) {
-        let (source, motion, mask) = if mode1 {
-            (source1, motion1, masks.map(|m| m.a))
+        let (source, motion, lut, mask) = if mode1 {
+            (source1, motion1, &self.inverse_lut, masks.map(|m| m.a))
         } else {
-            (source0, motion0, masks.map(|m| m.b))
+            (source0, motion0, &self.threshold_lut, masks.map(|m| m.b))
         };
-        self.render_selected_warp(dst.y, source.y, motion, mask, false, interp);
-        self.render_selected_warp(dst.u, source.u, motion, mask, true, interp);
-        self.render_selected_warp(dst.v, source.v, motion, mask, true, interp);
+        self.render_selected_warp(dst.y, source.y, motion, lut, mask, false, interp);
+        self.render_selected_warp(dst.u, source.u, motion, lut, mask, true, interp);
+        self.render_selected_warp(dst.v, source.v, motion, lut, mask, true, interp);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -690,15 +690,26 @@ impl CpuRenderer {
     ) -> Result<(), RenderError> {
         match mode {
             1 | 2 => {
-                let (source, motion, mask) = if mode == 1 {
-                    (input.source0, input.motion0, input.masks.map(|m| m.b))
+                let (source, motion, lut, mask) = if mode == 1 {
+                    (
+                        input.source0,
+                        input.motion0,
+                        &self.threshold_lut,
+                        input.masks.map(|m| m.b),
+                    )
                 } else {
-                    (input.source1, input.motion1, input.masks.map(|m| m.a))
+                    (
+                        input.source1,
+                        input.motion1,
+                        &self.inverse_lut,
+                        input.masks.map(|m| m.a),
+                    )
                 };
                 self.render_selected_warp_rows(
                     dst,
                     source,
                     motion,
+                    lut,
                     mask,
                     chroma,
                     interp,
@@ -846,6 +857,7 @@ impl CpuRenderer {
         dst: PlaneMut<'_>,
         source: Plane<'_>,
         motion: MotionPlanes<'_>,
+        lut: &[i16; LUT_LEN],
         mask: Option<&[u8]>,
         chroma: bool,
         interp: bool,
@@ -855,7 +867,7 @@ impl CpuRenderer {
         } else {
             self.config.height
         };
-        self.render_selected_warp_rows(dst, source, motion, mask, chroma, interp, 0..height);
+        self.render_selected_warp_rows(dst, source, motion, lut, mask, chroma, interp, 0..height);
     }
 
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
@@ -864,6 +876,7 @@ impl CpuRenderer {
         dst: PlaneMut<'_>,
         source: Plane<'_>,
         motion: MotionPlanes<'_>,
+        lut: &[i16; LUT_LEN],
         mask: Option<&[u8]>,
         chroma: bool,
         interp: bool,
@@ -883,8 +896,7 @@ impl CpuRenderer {
             interp,
             rows,
             |tile| {
-                let motion_samples =
-                    Self::motion_samples(motion, &self.threshold_lut, &params, &tile, interp);
+                let motion_samples = Self::motion_samples(motion, lut, &params, &tile, interp);
                 let covers = plane_covers(source, &params);
                 let direct = covers && tile_interior(&params, &tile, &[motion_samples]);
                 #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
