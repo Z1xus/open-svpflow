@@ -239,6 +239,7 @@ fn blend(@builtin(global_invocation_id) id: vec3<u32>) {
 const words = length => Math.max(1, Math.ceil(length / 4));
 const packed = view => {
   const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  if ((bytes.byteOffset | bytes.byteLength) % 4 === 0) return new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
   const copy = new Uint8Array(Math.ceil(bytes.length / 4) * 4);
   copy.set(bytes);
   return new Uint32Array(copy.buffer);
