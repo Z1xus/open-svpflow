@@ -508,10 +508,10 @@ fn exact_search_level(
     };
     let mut bad_count = 0i32;
     let mut processed = vec![false; ((gw + 1) * (gh + 1)).max(0) as usize];
+    let (level_w, level_h) = src.level_size(level);
 
     for &(bx, by) in order {
         let idx = (by * gw + bx) as usize;
-        let (level_w, level_h) = src.level_size(level);
         let px = if level > 0 && bx == gw - 1 {
             level_w as i32 - bw
         } else {
