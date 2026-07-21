@@ -13,6 +13,14 @@ use core::arch::x86_64::{
     _mm_unpackhi_epi32, _mm_unpackhi_epi64, _mm_unpacklo_epi8, _mm_unpacklo_epi16,
     _mm_unpacklo_epi32, _mm_unpacklo_epi64,
 };
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+use core::arch::x86_64::{
+    __m256i, _mm256_add_epi16, _mm256_add_epi32, _mm256_add_epi64, _mm256_castsi128_si256,
+    _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_inserti128_si256, _mm256_loadu_si256,
+    _mm256_madd_epi16, _mm256_max_epi16, _mm256_sad_epu8, _mm256_set1_epi16, _mm256_setzero_si256,
+    _mm256_srli_si256, _mm256_sub_epi16, _mm256_unpackhi_epi16, _mm256_unpackhi_epi32,
+    _mm256_unpackhi_epi64, _mm256_unpacklo_epi16, _mm256_unpacklo_epi32, _mm256_unpacklo_epi64,
+};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Vec8 {
@@ -1844,7 +1852,8 @@ fn block_cost_luma_interior(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(target_feature = "avx2", target_feature(enable = "avx2"))]
+#[cfg_attr(not(target_feature = "avx2"), target_feature(enable = "sse2"))]
 unsafe fn sad_u8_simd(
     src: *const u8,
     src_stride: usize,
@@ -1854,32 +1863,88 @@ unsafe fn sad_u8_simd(
     height: usize,
 ) -> u32 {
     let mut acc = _mm_setzero_si128();
-    for row in 0..height {
-        unsafe {
-            let a = src.add(row * src_stride);
-            let b = refp.add(row * ref_stride);
-            match width {
-                4 => {
+    #[cfg(target_feature = "avx2")]
+    let mut acc256 = _mm256_setzero_si256();
+    unsafe {
+        match width {
+            4 => {
+                for row in 0..height {
+                    let a = src.add(row * src_stride);
+                    let b = refp.add(row * ref_stride);
                     let av = _mm_cvtsi32_si128(std::ptr::read_unaligned(a.cast::<i32>()));
                     let bv = _mm_cvtsi32_si128(std::ptr::read_unaligned(b.cast::<i32>()));
                     acc = _mm_add_epi64(acc, _mm_sad_epu8(av, bv));
                 }
-                8 => {
+            }
+            8 => {
+                for row in 0..height {
+                    let a = src.add(row * src_stride);
+                    let b = refp.add(row * ref_stride);
                     let av = _mm_loadl_epi64(a.cast::<__m128i>());
                     let bv = _mm_loadl_epi64(b.cast::<__m128i>());
                     acc = _mm_add_epi64(acc, _mm_sad_epu8(av, bv));
                 }
-                16 | 32 => {
+            }
+            #[cfg(not(target_feature = "avx2"))]
+            16 | 32 => {
+                for row in 0..height {
+                    let a = src.add(row * src_stride);
+                    let b = refp.add(row * ref_stride);
                     for x in (0..width).step_by(16) {
                         let av = _mm_loadu_si128(a.add(x).cast::<__m128i>());
                         let bv = _mm_loadu_si128(b.add(x).cast::<__m128i>());
                         acc = _mm_add_epi64(acc, _mm_sad_epu8(av, bv));
                     }
                 }
-                _ => std::hint::unreachable_unchecked(),
             }
+            #[cfg(target_feature = "avx2")]
+            16 => {
+                let mut row = 0;
+                while row + 1 < height {
+                    let a = src.add(row * src_stride);
+                    let b = refp.add(row * ref_stride);
+                    let a1 = _mm_loadu_si128(src.add((row + 1) * src_stride).cast::<__m128i>());
+                    let b1 = _mm_loadu_si128(refp.add((row + 1) * ref_stride).cast::<__m128i>());
+                    let av = _mm256_inserti128_si256::<1>(
+                        _mm256_castsi128_si256(_mm_loadu_si128(a.cast::<__m128i>())),
+                        a1,
+                    );
+                    let bv = _mm256_inserti128_si256::<1>(
+                        _mm256_castsi128_si256(_mm_loadu_si128(b.cast::<__m128i>())),
+                        b1,
+                    );
+                    acc256 = _mm256_add_epi64(acc256, _mm256_sad_epu8(av, bv));
+                    row += 2;
+                }
+                if row < height {
+                    let a = src.add(row * src_stride);
+                    let b = refp.add(row * ref_stride);
+                    let av = _mm_loadu_si128(a.cast::<__m128i>());
+                    let bv = _mm_loadu_si128(b.cast::<__m128i>());
+                    acc = _mm_add_epi64(acc, _mm_sad_epu8(av, bv));
+                }
+            }
+            #[cfg(target_feature = "avx2")]
+            32 => {
+                for row in 0..height {
+                    let a = src.add(row * src_stride);
+                    let b = refp.add(row * ref_stride);
+                    let av = _mm256_loadu_si256(a.cast::<__m256i>());
+                    let bv = _mm256_loadu_si256(b.cast::<__m256i>());
+                    acc256 = _mm256_add_epi64(acc256, _mm256_sad_epu8(av, bv));
+                }
+            }
+            _ => std::hint::unreachable_unchecked(),
         }
     }
+    #[cfg(target_feature = "avx2")]
+    let acc = _mm_add_epi64(
+        acc,
+        _mm_add_epi64(
+            _mm256_castsi256_si128(acc256),
+            _mm256_extracti128_si256::<1>(acc256),
+        ),
+    );
     let lo = _mm_cvtsi128_si32(acc) as u32;
     let hi = _mm_cvtsi128_si32(_mm_srli_si128::<8>(acc)) as u32;
     lo + hi
@@ -2395,6 +2460,16 @@ unsafe fn satd_interior(
             } else {
                 for x in (0..n).step_by(16) {
                     total = total.saturating_add(unsafe {
+                        #[cfg(target_feature = "avx2")]
+                        {
+                            hadamard4_satd_avx2_16(
+                                src.add(y * src_stride + x),
+                                src_stride,
+                                refp.add(y * ref_stride + x),
+                                ref_stride,
+                            )
+                        }
+                        #[cfg(not(target_feature = "avx2"))]
                         hadamard4_satd_sse2::<16>(
                             src.add(y * src_stride + x),
                             src_stride,
@@ -2443,6 +2518,74 @@ unsafe fn satd_interior(
         }
     }
     total >> 1
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn hadamard4_satd_avx2_16(
+    src: *const u8,
+    src_stride: usize,
+    refp: *const u8,
+    ref_stride: usize,
+) -> u32 {
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn h4(x0: __m256i, x1: __m256i, x2: __m256i, x3: __m256i) -> [__m256i; 4] {
+        let s0 = _mm256_add_epi16(x0, x1);
+        let s1 = _mm256_sub_epi16(x0, x1);
+        let s2 = _mm256_add_epi16(x2, x3);
+        let s3 = _mm256_sub_epi16(x2, x3);
+        [
+            _mm256_add_epi16(s0, s2),
+            _mm256_add_epi16(s1, s3),
+            _mm256_sub_epi16(s0, s2),
+            _mm256_sub_epi16(s1, s3),
+        ]
+    }
+
+    let zero = _mm256_setzero_si256();
+    let mut rows = [zero; 4];
+    for (row, out) in rows.iter_mut().enumerate() {
+        unsafe {
+            let a = _mm_loadu_si128(src.add(row * src_stride).cast());
+            let b = _mm_loadu_si128(refp.add(row * ref_stride).cast());
+            let zero128 = _mm_setzero_si128();
+            let lower = _mm_sub_epi16(_mm_unpacklo_epi8(a, zero128), _mm_unpacklo_epi8(b, zero128));
+            let upper = _mm_sub_epi16(_mm_unpackhi_epi8(a, zero128), _mm_unpackhi_epi8(b, zero128));
+            *out = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(lower), upper);
+        }
+    }
+
+    let vertical = unsafe { h4(rows[0], rows[1], rows[2], rows[3]) };
+    let a0 = _mm256_unpacklo_epi16(vertical[0], vertical[1]);
+    let a1 = _mm256_unpacklo_epi16(vertical[2], vertical[3]);
+    let b0 = _mm256_unpackhi_epi16(vertical[0], vertical[1]);
+    let b1 = _mm256_unpackhi_epi16(vertical[2], vertical[3]);
+    let a01 = _mm256_unpacklo_epi32(a0, a1);
+    let a23 = _mm256_unpackhi_epi32(a0, a1);
+    let b01 = _mm256_unpacklo_epi32(b0, b1);
+    let b23 = _mm256_unpackhi_epi32(b0, b1);
+    let coeff = unsafe {
+        h4(
+            _mm256_unpacklo_epi64(a01, b01),
+            _mm256_unpackhi_epi64(a01, b01),
+            _mm256_unpacklo_epi64(a23, b23),
+            _mm256_unpackhi_epi64(a23, b23),
+        )
+    };
+    let mut sums = zero;
+    for values in coeff {
+        sums = _mm256_add_epi16(
+            sums,
+            _mm256_max_epi16(values, _mm256_sub_epi16(zero, values)),
+        );
+    }
+    let pairs = _mm256_madd_epi16(sums, _mm256_set1_epi16(1));
+    let pairs = _mm256_add_epi32(pairs, _mm256_srli_si256::<8>(pairs));
+    let pairs = _mm256_add_epi32(pairs, _mm256_srli_si256::<4>(pairs));
+    (_mm_cvtsi128_si32(_mm256_castsi256_si128(pairs))
+        + _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(pairs))) as u32
 }
 
 #[cfg(target_arch = "x86_64")]
