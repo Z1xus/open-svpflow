@@ -485,13 +485,15 @@ impl CpuRenderer {
                             &tile,
                             interp,
                         );
-                        let motion1_samples =
-                            Self::motion_samples(motion1, &self.inverse_lut, &params, &tile, interp);
-                        let direct = tile_interior(
+                        let motion1_samples = Self::motion_samples(
+                            motion1,
+                            &self.inverse_lut,
                             &params,
                             &tile,
-                            &[motion0_samples, motion1_samples],
+                            interp,
                         );
+                        let direct =
+                            tile_interior(&params, &tile, &[motion0_samples, motion1_samples]);
                         let corners = |m: &[u8]| {
                             [tile.i00, tile.i01, tile.i10, tile.i11]
                                 .map(|i| i32::from(m.get(i).copied().unwrap_or(0)))
@@ -908,7 +910,7 @@ impl CpuRenderer {
                     let mut pixel = |base, _, warped, _, alpha: Option<u8>, _, _| {
                         alpha.map_or(warped, |alpha| mode1_pixel(base, warped, alpha))
                     };
-    let mut unused = [0u8; 0];
+                    let mut unused = [0u8; 0];
                     macro_rules! fast_tile {
                         ($direct:literal, $bases:literal) => {
                             mode23_fast::warp_tile::<false, $direct, false, $bases>(
@@ -1069,7 +1071,7 @@ impl CpuRenderer {
                         [tile.i00, tile.i01, tile.i10, tile.i11]
                             .map(|i| i32::from(m.get(i).copied().unwrap_or(0)))
                     };
-    let mut unused = [0u8; 0];
+                    let mut unused = [0u8; 0];
                     macro_rules! fast_tile {
                         ($direct:literal, $bases:literal) => {
                             mode23_fast::warp_tile::<true, $direct, false, $bases>(
@@ -1375,7 +1377,11 @@ impl CpuRenderer {
                                     motion2_samples,
                                     motion3_samples,
                                 ],
-                                [corners(masks.a), corners(masks.b), mask.map_or([0; 4], corners)],
+                                [
+                                    corners(masks.a),
+                                    corners(masks.b),
+                                    mask.map_or([0; 4], corners),
+                                ],
                                 (self.threshold, self.threshold_limit),
                                 &params,
                                 &tile,
@@ -2181,9 +2187,7 @@ mod mode23_fast {
                 let stride = sources0[0].stride as i32;
                 let row_off = source_y * stride;
                 #[allow(clippy::cast_sign_loss)]
-                let take = usize::try_from(tile.width)
-                    .unwrap_or(0)
-                    .min(MAX_BLOCK_SIZE);
+                let take = usize::try_from(tile.width).unwrap_or(0).min(MAX_BLOCK_SIZE);
                 let mut sx = tile.x * params.source_step;
                 #[allow(clippy::cast_sign_loss)]
                 let mut base_off0 = row_base0 + (tile.x * base_step0) as usize;
@@ -2196,8 +2200,7 @@ mod mode23_fast {
                     let mv0 = load2::<DUAL>(sources0, index0);
                     let mv1 = if TWO_FIELDS {
                         #[allow(clippy::cast_sign_loss)]
-                        let index1 =
-                            (row_off + sx + lane(m01, 2) + lane(m01, 3) * stride) as usize;
+                        let index1 = (row_off + sx + lane(m01, 2) + lane(m01, 3) * stride) as usize;
                         load2::<DUAL>(sources1, index1)
                     } else {
                         mv0
@@ -2219,10 +2222,25 @@ mod mode23_fast {
                     };
                     let alpha =
                         |index: usize| mask_present[index].then(|| byte_from_i32(lane(am, index)));
-                    *out = pixel(cur0[0], cur1[0], mv0[0], mv1[0], alpha(0), alpha(1), alpha(2));
+                    *out = pixel(
+                        cur0[0],
+                        cur1[0],
+                        mv0[0],
+                        mv1[0],
+                        alpha(0),
+                        alpha(1),
+                        alpha(2),
+                    );
                     if let Some(second_out) = second_out {
-                        *second_out =
-                            pixel(cur0[1], cur1[1], mv0[1], mv1[1], alpha(0), alpha(1), alpha(2));
+                        *second_out = pixel(
+                            cur0[1],
+                            cur1[1],
+                            mv0[1],
+                            mv1[1],
+                            alpha(0),
+                            alpha(1),
+                            alpha(2),
+                        );
                     }
                     sx += params.source_step;
                     #[allow(clippy::cast_sign_loss)]
@@ -2308,9 +2326,25 @@ mod mode23_fast {
                 let (mv0, mv1) = scattered();
                 let alpha =
                     |index: usize| mask_present[index].then(|| byte_from_i32(lane(am, index)));
-                *out = pixel(cur0[0], cur1[0], mv0[0], mv1[0], alpha(0), alpha(1), alpha(2));
+                *out = pixel(
+                    cur0[0],
+                    cur1[0],
+                    mv0[0],
+                    mv1[0],
+                    alpha(0),
+                    alpha(1),
+                    alpha(2),
+                );
                 if let Some(second_out) = second_out {
-                    *second_out = pixel(cur0[1], cur1[1], mv0[1], mv1[1], alpha(0), alpha(1), alpha(2));
+                    *second_out = pixel(
+                        cur0[1],
+                        cur1[1],
+                        mv0[1],
+                        mv1[1],
+                        alpha(0),
+                        alpha(1),
+                        alpha(2),
+                    );
                 }
             };
             if let Some(second_row) = second_row {
@@ -2334,13 +2368,21 @@ mod mode23_fast {
     fn load2<const DUAL: bool>(planes: [Plane<'_>; 2], index: usize) -> [u8; 2] {
         [
             load_plane(planes[0], index),
-            if DUAL { load_plane(planes[1], index) } else { 0 },
+            if DUAL {
+                load_plane(planes[1], index)
+            } else {
+                0
+            },
         ]
     }
 
     #[cfg(target_feature = "sse4.1")]
     #[target_feature(enable = "sse4.1")]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )]
     fn gather_indices(plane: Plane<'_>, xs: __m128i, ys: __m128i) -> [usize; 4] {
         let stride = _mm_set1_epi32(plane.stride as i32);
         let index = if plane.super_shift == 0 {
@@ -2965,7 +3007,8 @@ fn splat_coverage(
                 && let base = (top as usize)
                     .saturating_mul(stride)
                     .saturating_add(left as usize)
-                && let Some(rows) = accum.get_mut(base..base.saturating_add(stride).saturating_add(2))
+                && let Some(rows) =
+                    accum.get_mut(base..base.saturating_add(stride).saturating_add(2))
             {
                 let (top_row, bottom_row) = rows.split_at_mut(stride);
                 top_row[0] += left_weight * top_weight;
@@ -2983,7 +3026,13 @@ fn splat_coverage(
                     );
                 }
                 if left >= -1 && top >= 0 && top < out_h && right < out_w {
-                    add_point(accum, width, right, top, top_weight.saturating_mul(right_weight));
+                    add_point(
+                        accum,
+                        width,
+                        right,
+                        top,
+                        top_weight.saturating_mul(right_weight),
+                    );
                 }
                 if top >= -1 && bottom < out_h && left >= -1 && right < out_w {
                     add_point(
@@ -3023,10 +3072,12 @@ fn window_3x3(points: &[i32], sums: &mut [i32], stride: usize) {
     {
         row[0] = source[0];
         row[1] = source[1] + source[0];
-        for (cell, ((a, b), c)) in row[2..]
-            .iter_mut()
-            .zip(source[2..].iter().zip(&source[1..]).zip(&source[..stride - 2]))
-        {
+        for (cell, ((a, b), c)) in row[2..].iter_mut().zip(
+            source[2..]
+                .iter()
+                .zip(&source[1..])
+                .zip(&source[..stride - 2]),
+        ) {
             *cell = a + b + c;
         }
     }

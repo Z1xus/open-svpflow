@@ -793,8 +793,22 @@ fn exact_refine_search(
             for y in (cy - radius)..=(cy + radius) {
                 for x in (cx - radius)..=(cx + radius) {
                     exact_check(
-                        src, refp, level, px, py, bw, bh, pel, satd, chroma, predictor, bounds,
-                        lambda, pnew, (x, y), best,
+                        src,
+                        refp,
+                        level,
+                        px,
+                        py,
+                        bw,
+                        bh,
+                        pel,
+                        satd,
+                        chroma,
+                        predictor,
+                        bounds,
+                        lambda,
+                        pnew,
+                        (x, y),
+                        best,
                     );
                 }
             }

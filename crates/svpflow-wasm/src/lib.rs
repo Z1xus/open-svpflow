@@ -740,7 +740,16 @@ impl WasmRenderer {
         };
         let results = {
             let (y, (u, v)) = rayon::join(
-                || self.render_plane_banded(mode, interpolate, output_y, self.layout.width, input_y, false),
+                || {
+                    self.render_plane_banded(
+                        mode,
+                        interpolate,
+                        output_y,
+                        self.layout.width,
+                        input_y,
+                        false,
+                    )
+                },
                 || {
                     rayon::join(
                         || {
@@ -792,7 +801,15 @@ impl WasmRenderer {
                 .try_for_each(|(band, output)| {
                     let start = band * BAND_ROWS;
                     let end = start + output.len() / stride;
-                    self.render_plane_rows(mode, interpolate, output, stride, input, chroma, start..end)
+                    self.render_plane_rows(
+                        mode,
+                        interpolate,
+                        output,
+                        stride,
+                        input,
+                        chroma,
+                        start..end,
+                    )
                 })
         } else {
             self.render_plane(mode, interpolate, output, stride, input, chroma)

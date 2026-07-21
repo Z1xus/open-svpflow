@@ -920,8 +920,7 @@ impl FilterState {
             }
             for (key, frame) in keys.into_iter().zip(neighbors) {
                 if !frame.is_null() {
-                    let _ =
-                        unsafe { self.cached_decode(api, key, frame, vector_data, vector_len) };
+                    let _ = unsafe { self.cached_decode(api, key, frame, vector_data, vector_len) };
                 }
             }
         }
@@ -1025,7 +1024,9 @@ impl FilterState {
         }
         let decode = || {
             let decoded = unsafe { decode_frame_vectors(api, frame, vector_data, vector_len) }?;
-            Some(std::sync::Arc::new(self.decoded_entry(decoded, vector_data)))
+            Some(std::sync::Arc::new(
+                self.decoded_entry(decoded, vector_data),
+            ))
         };
         if std::env::var_os("SVP_NO_PREP").is_some() {
             return decode();
@@ -1216,10 +1217,7 @@ impl FilterState {
                         .previous
                         .as_deref()
                         .or(next_decoded.decoded.current.as_deref());
-                    if next_scene < 3
-                        && prev_side.is_some()
-                        && next_side.is_some()
-                    {
+                    if next_scene < 3 && prev_side.is_some() && next_side.is_some() {
                         let prev_ctx = renderer::VectorContext {
                             a: &self_entry.vectors_prev,
                             b: &prev_decoded.vectors_cur,
@@ -1344,12 +1342,11 @@ impl FilterState {
                 source_frame,
             )
         }?;
-        let previous = prep
+        let previous = prep.decoded.decoded.previous.as_deref().or(prep
             .decoded
             .decoded
-            .previous
-            .as_deref()
-            .or(prep.decoded.decoded.current.as_deref())?;
+            .current
+            .as_deref())?;
         let current = prep.decoded.decoded.current.as_deref().or(Some(previous))?;
         let phase = self.phase_256(frame, source_frame).clamp(0, 256);
         let raw_scene_class = prep.raw_scene_class;
@@ -1656,68 +1653,64 @@ impl FilterState {
             });
         if !used_gpu {
             cpu.set_threshold(render_threshold);
-            let render_parallel = |mode,
-                                   dst: renderer::FramePlanesMut<'_>,
-                                   motion2,
-                                   motion3,
-                                   masks,
-                                   final_mask| {
-                let input = |source0, source1| renderer::PlaneRenderInput {
-                    source0,
-                    source1,
-                    motion0,
-                    motion1,
-                    motion2,
-                    motion3,
-                    masks: Some(masks),
-                    final_mask,
+            let render_parallel =
+                |mode, dst: renderer::FramePlanesMut<'_>, motion2, motion3, masks, final_mask| {
+                    let input = |source0, source1| renderer::PlaneRenderInput {
+                        source0,
+                        source1,
+                        motion0,
+                        motion1,
+                        motion2,
+                        motion3,
+                        masks: Some(masks),
+                        final_mask,
+                    };
+                    let height = self.video_info.height;
+                    let middle = height / 2;
+                    let _ = cpu.render_plane_rows(
+                        mode,
+                        interp,
+                        dst.y,
+                        input(sources0.y, sources1.y),
+                        false,
+                        0..height,
+                    );
+                    if mode == 23 {
+                        let _ = cpu.render_mode23_uv_rows(
+                            interp,
+                            [dst.u, dst.v],
+                            input(sources0.u, sources1.u),
+                            [sources0.v, sources1.v],
+                            0..middle,
+                        );
+                    } else if matches!(mode, 21 | 22) {
+                        let _ = cpu.render_mode21_or_22_uv_rows(
+                            mode == 21,
+                            interp,
+                            [dst.u, dst.v],
+                            input(sources0.u, sources1.u),
+                            [sources0.v, sources1.v],
+                            0..middle,
+                        );
+                    } else {
+                        let _ = cpu.render_plane_rows(
+                            mode,
+                            interp,
+                            dst.u,
+                            input(sources0.u, sources1.u),
+                            true,
+                            0..middle,
+                        );
+                        let _ = cpu.render_plane_rows(
+                            mode,
+                            interp,
+                            dst.v,
+                            input(sources0.v, sources1.v),
+                            true,
+                            0..middle,
+                        );
+                    }
                 };
-                let height = self.video_info.height;
-                let middle = height / 2;
-                let _ = cpu.render_plane_rows(
-                    mode,
-                    interp,
-                    dst.y,
-                    input(sources0.y, sources1.y),
-                    false,
-                    0..height,
-                );
-                if mode == 23 {
-                    let _ = cpu.render_mode23_uv_rows(
-                        interp,
-                        [dst.u, dst.v],
-                        input(sources0.u, sources1.u),
-                        [sources0.v, sources1.v],
-                        0..middle,
-                    );
-                } else if matches!(mode, 21 | 22) {
-                    let _ = cpu.render_mode21_or_22_uv_rows(
-                        mode == 21,
-                        interp,
-                        [dst.u, dst.v],
-                        input(sources0.u, sources1.u),
-                        [sources0.v, sources1.v],
-                        0..middle,
-                    );
-                } else {
-                    let _ = cpu.render_plane_rows(
-                        mode,
-                        interp,
-                        dst.u,
-                        input(sources0.u, sources1.u),
-                        true,
-                        0..middle,
-                    );
-                    let _ = cpu.render_plane_rows(
-                        mode,
-                        interp,
-                        dst.v,
-                        input(sources0.v, sources1.v),
-                        true,
-                        0..middle,
-                    );
-                }
-            };
             match algo {
                 1 | 2 => cpu.render_mode1_or_2(
                     algo == 1,
@@ -3100,7 +3093,11 @@ fn fill_plane(
     }
 }
 
-fn expand_plane(plane: renderer::Plane<'_>, width: usize, height: usize) -> Option<(Vec<u8>, usize)> {
+fn expand_plane(
+    plane: renderer::Plane<'_>,
+    width: usize,
+    height: usize,
+) -> Option<(Vec<u8>, usize)> {
     let (stride, span, shift) = plane.layout();
     if shift == 0 || shift > 2 || width == 0 || height == 0 {
         return None;
@@ -3110,10 +3107,13 @@ fn expand_plane(plane: renderer::Plane<'_>, width: usize, height: usize) -> Opti
     let mut out = vec![0u8; out_stride.checked_mul(height.checked_mul(pel)?)?];
     for sy in 0..pel {
         for row in 0..height {
-            let dst = out
-                .get_mut((row * pel + sy) * out_stride..(row * pel + sy) * out_stride + out_stride)?;
+            let dst = out.get_mut(
+                (row * pel + sy) * out_stride..(row * pel + sy) * out_stride + out_stride,
+            )?;
             let sub = |sx: usize| {
-                let base = ((sy << shift) | sx).checked_mul(span)?.checked_add(row.checked_mul(stride)?)?;
+                let base = ((sy << shift) | sx)
+                    .checked_mul(span)?
+                    .checked_add(row.checked_mul(stride)?)?;
                 plane.data.get(base..base.checked_add(width)?)
             };
             if pel == 2 {
