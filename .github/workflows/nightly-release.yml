@@ -1,0 +1,24 @@
+name: Draft nightly release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="nightly-$(date -u +%Y%m%d)-${GITHUB_SHA:0:7}"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
+            --notes "Built from $GITHUB_SHA." \
+            --prerelease \
+            --draft
