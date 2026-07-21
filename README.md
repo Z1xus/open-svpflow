@@ -22,6 +22,18 @@ Benchmarked on a 7,992 frame video with [smoothie's](https://github.com/couleur-
 | CPU | 60.44 fps | 58.94 fps | 0.975x (2.5% slower) | 98.75% | 45.24 dB |
 | GPU | 78.73 fps | 74.82 fps | 0.950x (5.0% slower) | 98.77% | 43.57 dB |
 
+## Releases
+
+Download `svpflow1_vs.dll` and `svpflow2_vs.dll` from [Releases](https://github.com/Z1xus/open-svpflow/releases). Release DLLs use profile-guided optimization (PGO) trained on a [smoothie](https://github.com/couleur-tweak-tips/smoothie-rs) workload.
+
+| Path | PGO speedup over a regular release build |
+| --- | ---: |
+| Motion analysis | 1.058x (5.8% faster) |
+| CPU | 1.062x (6.2% faster) |
+| GPU | 1.062x (6.2% faster) |
+
+Linux builds aren't included, so build from source.
+
 ## Build
 
 Rust 1.88 or newer:
