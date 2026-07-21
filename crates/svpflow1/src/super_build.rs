@@ -1,8 +1,9 @@
 use crate::super_opts::{SuperOpts, reduce_dim};
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
-    __m128i, _mm_add_epi16, _mm_loadl_epi64, _mm_mullo_epi16, _mm_packus_epi16, _mm_set1_epi16,
-    _mm_setzero_si128, _mm_srai_epi16, _mm_storel_epi64, _mm_sub_epi16, _mm_unpacklo_epi8,
+    __m128i, _mm_add_epi16, _mm_cvtsi128_si32, _mm_loadl_epi64, _mm_loadu_si128, _mm_mullo_epi16,
+    _mm_packus_epi16, _mm_set1_epi16, _mm_setr_epi8, _mm_setzero_si128, _mm_shuffle_epi8,
+    _mm_srai_epi16, _mm_storel_epi64, _mm_sub_epi16, _mm_unpacklo_epi8,
 };
 
 pub(crate) fn build_plane(
@@ -328,23 +329,36 @@ fn horizontal_6tap_inplace(row: &mut [u8], dst_w: usize, scratch: &mut [u8]) {
 
     row[0] = avg_epu8(src[0], src.get(1).copied().unwrap_or(src[0]));
 
-    let mut left = row[0];
-    let interior = dst_w.saturating_sub(2);
-    for i in 0..interior {
-        let k = 5 + 2 * i;
-        let p_k = src.get(k).copied().unwrap_or_else(|| src[src_w - 1]);
-        let p_km3 = src.get(k - 3).copied().unwrap_or(0);
-        let p_km2 = src.get(k - 2).copied().unwrap_or(0);
-        let p_km4 = src.get(k - 4).copied().unwrap_or(0);
-        let p_even = src.get((k - 1) & !1).copied().unwrap_or(0);
-        let v = (u32::from(left)
-            + u32::from(p_k)
-            + 10 * (u32::from(p_km3) + u32::from(p_km2))
-            + 5 * (u32::from(p_km4) + u32::from(p_even))
+    let p5 = src.get(5).copied().unwrap_or_else(|| src[src_w - 1]);
+    let v = (u32::from(row[0])
+        + u32::from(p5)
+        + 10 * (u32::from(src.get(2).copied().unwrap_or(0))
+            + u32::from(src.get(3).copied().unwrap_or(0)))
+        + 5 * (u32::from(src.get(1).copied().unwrap_or(0))
+            + u32::from(src.get(4).copied().unwrap_or(0)))
+        + 16)
+        >> 5;
+    row[1] = v.min(255) as u8;
+
+    let end = dst_w - 1;
+    let mut out = 2;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        while out + 3 < end && 2 * out + 14 <= src_w {
+            horizontal_6tap4(src.as_ptr().add(2 * out - 2), row.as_mut_ptr().add(out));
+            out += 4;
+        }
+    }
+    while out < end {
+        let base = 2 * out - 2;
+        let v = (u32::from(src[base])
+            + u32::from(src[base + 5])
+            + 5 * (u32::from(src[base + 1]) + u32::from(src[base + 4]))
+            + 10 * (u32::from(src[base + 2]) + u32::from(src[base + 3]))
             + 16)
             >> 5;
-        row[i + 1] = v.min(255) as u8;
-        left = p_km3;
+        row[out] = v.min(255) as u8;
+        out += 1;
     }
 
     let mut i = dst_w.saturating_sub(1).max(1);
@@ -354,6 +368,45 @@ fn horizontal_6tap_inplace(row: &mut [u8], dst_w: usize, scratch: &mut [u8]) {
         row[i] = avg_epu8(a, b);
         i += 1;
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn horizontal_6tap4(src: *const u8, dst: *mut u8) {
+    let mask = |offset| {
+        _mm_setr_epi8(
+            offset,
+            offset + 2,
+            offset + 4,
+            offset + 6,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+        )
+    };
+    // SAFETY: the caller checks 16 readable source bytes and four writable outputs.
+    let input = unsafe { _mm_loadu_si128(src.cast()) };
+    let zero = _mm_setzero_si128();
+    let tap = |offset| _mm_unpacklo_epi8(_mm_shuffle_epi8(input, mask(offset)), zero);
+    let sum = _mm_add_epi16(
+        _mm_add_epi16(tap(0), tap(5)),
+        _mm_add_epi16(
+            _mm_mullo_epi16(_mm_add_epi16(tap(1), tap(4)), _mm_set1_epi16(5)),
+            _mm_mullo_epi16(_mm_add_epi16(tap(2), tap(3)), _mm_set1_epi16(10)),
+        ),
+    );
+    let rounded = _mm_srai_epi16(_mm_add_epi16(sum, _mm_set1_epi16(16)), 5);
+    let packed = _mm_packus_epi16(rounded, zero);
+    unsafe { std::ptr::write_unaligned(dst.cast::<i32>(), _mm_cvtsi128_si32(packed)) };
 }
 
 #[inline]
