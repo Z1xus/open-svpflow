@@ -1225,8 +1225,31 @@ fn exact_sad(
     pel: i32,
     include_chroma: bool,
 ) -> u32 {
+    if !include_chroma {
+        let pel = pel.max(1);
+        if let Some((luma, _, _)) =
+            block_cost_edge_lc(src, refp, level, px, py, bw, bh, mv.0, mv.1, satd, pel)
+        {
+            return luma;
+        }
+        return block_cost_luma_interior(
+            src,
+            refp,
+            level,
+            px,
+            py,
+            bw as usize,
+            bh as usize,
+            mv.0,
+            mv.1,
+            satd,
+            pel,
+            false,
+        )
+        .0;
+    }
     let (luma, chroma) = block_cost_lc(src, refp, level, px, py, bw, bh, mv.0, mv.1, satd, pel);
-    luma.saturating_add(chroma * u32::from(include_chroma))
+    luma.saturating_add(chroma)
 }
 
 fn exact_motion_penalty(lambda: i32, predictor: (i32, i32), mv: (i32, i32)) -> i64 {
