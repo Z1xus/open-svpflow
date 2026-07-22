@@ -1,9 +1,10 @@
 use crate::super_opts::{SuperOpts, reduce_dim};
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
-    __m128i, _mm_add_epi16, _mm_cvtsi128_si32, _mm_loadl_epi64, _mm_loadu_si128, _mm_mullo_epi16,
-    _mm_packus_epi16, _mm_set1_epi16, _mm_setr_epi8, _mm_setzero_si128, _mm_shuffle_epi8,
-    _mm_srai_epi16, _mm_storel_epi64, _mm_sub_epi16, _mm_unpacklo_epi8,
+    __m128i, _mm_add_epi16, _mm_avg_epu8, _mm_cvtsi128_si32, _mm_loadl_epi64, _mm_loadu_si128,
+    _mm_mullo_epi16, _mm_packus_epi16, _mm_set1_epi16, _mm_setr_epi8, _mm_setzero_si128,
+    _mm_shuffle_epi8, _mm_srai_epi16, _mm_storel_epi64, _mm_storeu_si128, _mm_sub_epi16,
+    _mm_unpacklo_epi8,
 };
 
 pub(crate) fn build_plane(
@@ -186,26 +187,14 @@ fn fill_bilinear_pel2(dst: &mut [u8], stride: usize, row0: usize, w: usize, h: u
     for y in 0..h {
         let src_base = (full + y) * stride;
         let dst_base = (h_plane + y) * stride;
-        for x in 0..w {
-            let a = dst.get(src_base + x).copied().unwrap_or(0);
-            let b = dst.get(src_base + x + 1).copied().unwrap_or(a);
-            if dst_base + x < dst.len() {
-                dst[dst_base + x] = avg_epu8(a, b);
-            }
-        }
+        average_row(dst, dst_base, src_base, src_base + 1, w);
     }
 
     for y in 0..h {
         let src_base = (full + y) * stride;
         let next_base = (full + y + 1) * stride;
         let dst_base = (v_plane + y) * stride;
-        for x in 0..w {
-            let a = dst.get(src_base + x).copied().unwrap_or(0);
-            let b = dst.get(next_base + x).copied().unwrap_or(a);
-            if dst_base + x < dst.len() {
-                dst[dst_base + x] = avg_epu8(a, b);
-            }
-        }
+        average_row(dst, dst_base, src_base, next_base, w);
     }
     copy_row(dst, v_plane * stride, full * stride, w);
 
@@ -213,15 +202,32 @@ fn fill_bilinear_pel2(dst: &mut [u8], stride: usize, row0: usize, w: usize, h: u
         let src_base = (full + y) * stride;
         let diag_base = (full + y + 1) * stride + 1;
         let dst_base = (hv_plane + y) * stride;
-        for x in 0..w {
-            let a = dst.get(src_base + x).copied().unwrap_or(0);
-            let b = dst.get(diag_base + x).copied().unwrap_or(a);
-            if dst_base + x < dst.len() {
-                dst[dst_base + x] = avg_epu8(a, b);
-            }
-        }
+        average_row(dst, dst_base, src_base, diag_base, w);
     }
     copy_row(dst, hv_plane * stride, full * stride + 1, w);
+}
+
+fn average_row(buf: &mut [u8], dst: usize, a: usize, b: usize, width: usize) {
+    let end = width
+        .min(buf.len().saturating_sub(dst))
+        .min(buf.len().saturating_sub(a))
+        .min(buf.len().saturating_sub(b));
+    let mut x = 0;
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: end bounds both sources and the disjoint destination plane.
+    unsafe {
+        while x + 16 <= end {
+            let av = _mm_loadu_si128(buf.as_ptr().add(a + x).cast());
+            let bv = _mm_loadu_si128(buf.as_ptr().add(b + x).cast());
+            _mm_storeu_si128(buf.as_mut_ptr().add(dst + x).cast(), _mm_avg_epu8(av, bv));
+            x += 16;
+        }
+    }
+    for x in x..width.min(buf.len().saturating_sub(dst)) {
+        let av = buf.get(a + x).copied().unwrap_or(0);
+        let bv = buf.get(b + x).copied().unwrap_or(av);
+        buf[dst + x] = avg_epu8(av, bv);
+    }
 }
 
 fn copy_row(buf: &mut [u8], dst_off: usize, src_off: usize, n: usize) {
