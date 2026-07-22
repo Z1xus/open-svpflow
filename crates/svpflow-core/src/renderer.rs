@@ -8,6 +8,13 @@ const LUT_CENTER: i32 = 1024;
 const LUT_LEN: usize = 2048;
 const MAX_BLOCK_SIZE: usize = 32;
 
+struct MotionLuts {
+    inverse: [i16; LUT_LEN],
+    threshold: [i16; LUT_LEN],
+}
+
+type MotionLutCache = std::sync::Mutex<Vec<(i32, std::sync::Arc<MotionLuts>)>>;
+
 #[derive(Clone, Copy, Default)]
 pub struct Vector {
     pub dx: i16,
@@ -69,9 +76,7 @@ pub struct CpuRenderer {
     half_height_map: i32,
     threshold: i32,
     threshold_limit: i32,
-    luts_ready: bool,
-    inverse_lut: [i16; LUT_LEN],
-    threshold_lut: [i16; LUT_LEN],
+    luts: Option<std::sync::Arc<MotionLuts>>,
 }
 
 #[derive(Clone, Copy)]
@@ -229,24 +234,16 @@ impl CpuRenderer {
             half_height_map,
             threshold: 0,
             threshold_limit: 0,
-            luts_ready: false,
-            inverse_lut: [0; LUT_LEN],
-            threshold_lut: [0; LUT_LEN],
+            luts: None,
         }
     }
 
     pub fn set_threshold(&mut self, threshold: i32) {
-        if self.luts_ready && self.threshold == threshold {
+        if self.luts.is_some() && self.threshold == threshold {
             return;
         }
         self.set_threshold_value(threshold);
-
-        let inverse = 256i32.saturating_sub(threshold);
-        for (index, sample) in (-LUT_CENTER..LUT_CENTER).enumerate() {
-            self.inverse_lut[index] = trunc_div_256(sample.saturating_mul(inverse));
-            self.threshold_lut[index] = trunc_div_256(sample.saturating_mul(threshold));
-        }
-        self.luts_ready = true;
+        self.luts = Some(motion_luts(threshold));
     }
 
     pub fn set_gpu_threshold(&mut self, threshold: i32) {
@@ -283,7 +280,23 @@ impl CpuRenderer {
     }
 
     pub fn gpu_luts(&self) -> (&[i16; LUT_LEN], &[i16; LUT_LEN]) {
-        (&self.inverse_lut, &self.threshold_lut)
+        (self.inverse_lut(), self.threshold_lut())
+    }
+
+    fn inverse_lut(&self) -> &[i16; LUT_LEN] {
+        &self
+            .luts
+            .as_deref()
+            .expect("threshold LUTs not initialized")
+            .inverse
+    }
+
+    fn threshold_lut(&self) -> &[i16; LUT_LEN] {
+        &self
+            .luts
+            .as_deref()
+            .expect("threshold LUTs not initialized")
+            .threshold
     }
 
     pub fn gpu_thresholds(&self) -> (i32, i32) {
@@ -317,9 +330,9 @@ impl CpuRenderer {
         masks: Option<MaskPlanes<'_>>,
     ) {
         let (source, motion, lut, mask) = if mode1 {
-            (source1, motion1, &self.inverse_lut, masks.map(|m| m.a))
+            (source1, motion1, self.inverse_lut(), masks.map(|m| m.a))
         } else {
-            (source0, motion0, &self.threshold_lut, masks.map(|m| m.b))
+            (source0, motion0, self.threshold_lut(), masks.map(|m| m.b))
         };
         self.render_selected_warp(dst.y, source.y, motion, lut, mask, false, interp);
         self.render_selected_warp(dst.u, source.u, motion, lut, mask, true, interp);
@@ -480,14 +493,14 @@ impl CpuRenderer {
                     |tile| {
                         let motion0_samples = Self::motion_samples(
                             motion0,
-                            &self.threshold_lut,
+                            self.threshold_lut(),
                             &params,
                             &tile,
                             interp,
                         );
                         let motion1_samples = Self::motion_samples(
                             motion1,
-                            &self.inverse_lut,
+                            self.inverse_lut(),
                             &params,
                             &tile,
                             interp,
@@ -696,14 +709,14 @@ impl CpuRenderer {
                     (
                         input.source0,
                         input.motion0,
-                        &self.threshold_lut,
+                        self.threshold_lut(),
                         input.masks.map(|m| m.b),
                     )
                 } else {
                     (
                         input.source1,
                         input.motion1,
-                        &self.inverse_lut,
+                        self.inverse_lut(),
                         input.masks.map(|m| m.a),
                     )
                 };
@@ -1059,9 +1072,9 @@ impl CpuRenderer {
             rows,
             |tile| {
                 let motion0_samples =
-                    Self::motion_samples(motion0, &self.threshold_lut, &params, &tile, interp);
+                    Self::motion_samples(motion0, self.threshold_lut(), &params, &tile, interp);
                 let motion1_samples =
-                    Self::motion_samples(motion1, &self.inverse_lut, &params, &tile, interp);
+                    Self::motion_samples(motion1, self.inverse_lut(), &params, &tile, interp);
                 let covers = plane_covers(source0, &params) && plane_covers(source1, &params);
                 let direct =
                     covers && tile_interior(&params, &tile, &[motion0_samples, motion1_samples]);
@@ -1333,13 +1346,13 @@ impl CpuRenderer {
             rows.clone(),
             |tile| {
                 let motion0_samples =
-                    Self::motion_samples(base0, &self.threshold_lut, &params, &tile, interp);
+                    Self::motion_samples(base0, self.threshold_lut(), &params, &tile, interp);
                 let motion1_samples =
-                    Self::motion_samples(base1, &self.inverse_lut, &params, &tile, interp);
+                    Self::motion_samples(base1, self.inverse_lut(), &params, &tile, interp);
                 let motion2_samples =
-                    Self::motion_samples(next0, &self.threshold_lut, &params, &tile, interp);
+                    Self::motion_samples(next0, self.threshold_lut(), &params, &tile, interp);
                 let motion3_samples =
-                    Self::motion_samples(prev1, &self.inverse_lut, &params, &tile, interp);
+                    Self::motion_samples(prev1, self.inverse_lut(), &params, &tile, interp);
                 let covers = plane_covers(source0, &params)
                     && plane_covers(source1, &params)
                     && (!DUAL
@@ -3190,6 +3203,36 @@ fn cpu_map(value: i32) -> i32 {
     } else {
         -1
     }
+}
+
+fn motion_luts(threshold: i32) -> std::sync::Arc<MotionLuts> {
+    static CACHE: std::sync::OnceLock<MotionLutCache> = std::sync::OnceLock::new();
+    // ponytail: one short global lock; shard only if LUT setup becomes contended.
+    let mut cache = CACHE
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(index) = cache.iter().position(|(key, _)| *key == threshold) {
+        let entry = cache.remove(index);
+        let result = std::sync::Arc::clone(&entry.1);
+        cache.push(entry);
+        return result;
+    }
+    let inverse = 256i32.saturating_sub(threshold);
+    let mut luts = MotionLuts {
+        inverse: [0; LUT_LEN],
+        threshold: [0; LUT_LEN],
+    };
+    for (index, sample) in (-LUT_CENTER..LUT_CENTER).enumerate() {
+        luts.inverse[index] = trunc_div_256(sample.saturating_mul(inverse));
+        luts.threshold[index] = trunc_div_256(sample.saturating_mul(threshold));
+    }
+    let result = std::sync::Arc::new(luts);
+    if cache.len() == 32 {
+        cache.remove(0);
+    }
+    cache.push((threshold, std::sync::Arc::clone(&result)));
+    result
 }
 
 fn trunc_div_256(value: i32) -> i16 {
