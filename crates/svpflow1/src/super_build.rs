@@ -283,7 +283,19 @@ fn reduce_6tap(
             }
         } else {
             let start = win0 as usize;
-            for x in 0..inter_w {
+            let mut x = 0;
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                while x + 8 <= inter_w {
+                    vertical_6tap8(
+                        buf.as_ptr().add((src_row0 + start) * stride + x),
+                        stride,
+                        inter.as_mut_ptr().add(dy * inter_w + x),
+                    );
+                    x += 8;
+                }
+            }
+            for x in x..inter_w {
                 let p0 = u32::from(sample(buf, stride, src_row0, start, x));
                 let p1 = u32::from(sample(buf, stride, src_row0, start + 1, x));
                 let p2 = u32::from(sample(buf, stride, src_row0, start + 2, x));
@@ -306,6 +318,28 @@ fn reduce_6tap(
             buf[dst_base..dst_base + n].copy_from_slice(&row[..n]);
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn vertical_6tap8(src: *const u8, stride: usize, dst: *mut u8) {
+    let zero = _mm_setzero_si128();
+    let tap = |row| {
+        // SAFETY: reduce_6tap verifies six complete source rows and eight output columns.
+        _mm_unpacklo_epi8(
+            unsafe { _mm_loadl_epi64(src.add(row * stride).cast()) },
+            zero,
+        )
+    };
+    let sum = _mm_add_epi16(
+        _mm_add_epi16(tap(0), tap(5)),
+        _mm_add_epi16(
+            _mm_mullo_epi16(_mm_add_epi16(tap(1), tap(4)), _mm_set1_epi16(5)),
+            _mm_mullo_epi16(_mm_add_epi16(tap(2), tap(3)), _mm_set1_epi16(10)),
+        ),
+    );
+    let rounded = _mm_srai_epi16(_mm_add_epi16(sum, _mm_set1_epi16(16)), 5);
+    unsafe { _mm_storel_epi64(dst.cast(), _mm_packus_epi16(rounded, zero)) };
 }
 
 fn horizontal_6tap_inplace(row: &mut [u8], dst_w: usize, scratch: &mut [u8]) {
