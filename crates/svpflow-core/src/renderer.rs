@@ -694,6 +694,7 @@ impl CpuRenderer {
         self.render_plane_rows(mode, interp, dst, input, chroma, 0..height)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn render_plane_rows(
         &self,
         mode: u32,
