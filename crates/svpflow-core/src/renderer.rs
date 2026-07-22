@@ -330,7 +330,7 @@ impl CpuRenderer {
         masks: Option<MaskPlanes<'_>>,
     ) {
         let (source, motion, lut, mask) = if mode1 {
-            (source1, motion1, self.inverse_lut(), masks.map(|m| m.a))
+            (source1, motion1, self.threshold_lut(), masks.map(|m| m.a))
         } else {
             (source0, motion0, self.threshold_lut(), masks.map(|m| m.b))
         };
