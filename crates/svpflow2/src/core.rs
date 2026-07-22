@@ -967,8 +967,12 @@ impl FilterState {
         let scene_class = self.scene_class(&decoded, vector_data);
         let previous = decoded.previous.as_deref().or(decoded.current.as_deref());
         let current = decoded.current.as_deref().or(previous);
-        let vectors_prev = previous.map(renderer_vectors).unwrap_or_default();
-        let vectors_cur = current.map(renderer_vectors).unwrap_or_default();
+        let vectors_prev = previous
+            .map(|vectors| renderer_vectors(vectors, vector_data.marker))
+            .unwrap_or_default();
+        let vectors_cur = current
+            .map(|vectors| renderer_vectors(vectors, vector_data.marker))
+            .unwrap_or_default();
         let origin = vector_data.origin();
         let motion_grid = vector_data.motion_grid();
         let motion_w = usize::try_from(motion_grid.width.max(0)).unwrap_or(0);
@@ -1985,7 +1989,7 @@ impl FilterState {
         let previous = decoded.previous.as_deref().or(decoded.current.as_deref())?;
         let current = decoded.current.as_deref().or(Some(previous))?;
         let selected = if phase > 128 { current } else { previous };
-        let selected = renderer_vectors(selected);
+        let selected = renderer_vectors(selected, vector_data.marker);
         let origin = vector_data.origin();
         let motion_grid = vector_data.motion_grid();
         let motion_w = usize::try_from(motion_grid.width.max(0)).ok()?;
@@ -3138,12 +3142,13 @@ fn expand_plane(
     Some((out, out_stride))
 }
 
-fn renderer_vectors(vectors: &[metadata::DecodedVector]) -> Vec<renderer::Vector> {
+fn renderer_vectors(vectors: &[metadata::DecodedVector], marker: i32) -> Vec<renderer::Vector> {
+    let scale = i16::try_from(marker.max(1)).unwrap_or(i16::MAX);
     vectors
         .iter()
         .map(|vector| renderer::Vector {
-            dx: vector.dx,
-            dy: vector.dy,
+            dx: vector.dx / scale,
+            dy: vector.dy / scale,
             magnitude: vector.score,
         })
         .collect()
