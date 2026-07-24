@@ -311,6 +311,10 @@ unsafe fn collect_state(
     } else {
         unsafe { render_mode(&options, vdata, generated_vdata) }
     };
+    let scene_luma_luts = [
+        metadata::scene_luma_lut(0, options.scene_luma()),
+        metadata::scene_luma_lut(3, options.scene_luma()),
+    ];
 
     let gpu = if mode == 0 && render_mode == 2 && !options.cpu_render() {
         crate::gpu::GpuContext::new(
@@ -333,6 +337,7 @@ unsafe fn collect_state(
         render_mode,
         request_super: false,
         options,
+        scene_luma_luts,
         light: light::LightState::new(),
         video_info,
         super_info,

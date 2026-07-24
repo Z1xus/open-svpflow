@@ -70,6 +70,7 @@ pub(crate) struct FilterState {
     pub(crate) render_mode: i32,
     pub(crate) request_super: bool,
     pub(crate) options: options::Options,
+    pub(crate) scene_luma_luts: [metadata::SceneLumaLut; 2],
     pub(crate) light: light::LightState,
     pub(crate) video_info: vs::VideoInfo,
     pub(crate) super_info: Option<vs::VideoInfo>,
@@ -2092,15 +2093,13 @@ impl FilterState {
         let Some(current) = decoded.current.as_deref().or(Some(previous)) else {
             return 3;
         };
-        metadata::analyze_scene(
+        metadata::classify_scene_pair(
             previous,
             current,
-            vector_data.marker,
+            &self.scene_luma_luts[usize::from(vector_data.marker == 3)],
             vector_data.grid,
-            self.options.scene_luma(),
             self.options.scene_thresholds(),
         )
-        .class
         .max(0)
     }
 

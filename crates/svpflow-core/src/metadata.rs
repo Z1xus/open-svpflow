@@ -55,6 +55,8 @@ pub struct SceneAnalysis {
     pub luma: LumaStats,
 }
 
+pub type SceneLumaLut = [u8; 511];
+
 pub struct AvglumaPayload {
     pub class: i32,
     pub geomean: f64,
@@ -296,11 +298,46 @@ pub fn luma_map(
     }
 }
 
+pub fn scene_luma_lut(marker: i32, gamma: f64) -> SceneLumaLut {
+    let denom = if marker == 3 { 510.0 } else { 255.0 };
+    std::array::from_fn(|sum| {
+        luma_byte(f64::from(u16::try_from(sum).unwrap_or(510)) / denom, gamma)
+    })
+}
+
 pub fn classify_scene(
     vectors: &[DecodedVector],
     luma: &[u8],
     shape: VectorShape,
     thresholds: SceneThresholds,
+) -> i32 {
+    classify_scene_with_luma(vectors, shape, thresholds, |index| {
+        luma.get(index).copied().unwrap_or(1)
+    })
+}
+
+pub fn classify_scene_pair(
+    previous: &[DecodedVector],
+    current: &[DecodedVector],
+    luma: &SceneLumaLut,
+    shape: VectorShape,
+    thresholds: SceneThresholds,
+) -> i32 {
+    let count = previous.len().min(current.len());
+    classify_scene_with_luma(current, shape, thresholds, |index| {
+        if index >= count {
+            return 1;
+        }
+        let sum = usize::from(previous[index].luma) + usize::from(current[index].luma);
+        luma[sum]
+    })
+}
+
+fn classify_scene_with_luma(
+    vectors: &[DecodedVector],
+    shape: VectorShape,
+    thresholds: SceneThresholds,
+    mut luma_at: impl FnMut(usize) -> u8,
 ) -> i32 {
     let width = shape.width.max(0);
     let height = shape.height.max(0);
@@ -315,7 +352,7 @@ pub fn classify_scene(
             let Some(vector) = vectors.get(index) else {
                 continue;
             };
-            let luma = i32::from(luma.get(index).copied().unwrap_or(1).max(1));
+            let luma = i32::from(luma_at(index).max(1));
             let score = i32::try_from(vector.score)
                 .unwrap_or(i32::MAX)
                 .saturating_mul(255)
