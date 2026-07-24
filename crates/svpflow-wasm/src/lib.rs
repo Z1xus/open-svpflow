@@ -738,20 +738,29 @@ impl WasmRenderer {
             source1: source1.v,
             ..input_y
         };
-        let results = {
-            let (y, (u, v)) = rayon::join(
-                || {
-                    self.render_plane_banded(
-                        mode,
+        let (y, chroma) = rayon::join(
+            || {
+                self.render_plane_banded(
+                    mode,
+                    interpolate,
+                    output_y,
+                    self.layout.width,
+                    input_y,
+                    false,
+                )
+            },
+            || {
+                if mode == 23 {
+                    self.render_mode23_chroma_banded(
                         interpolate,
-                        output_y,
-                        self.layout.width,
-                        input_y,
-                        false,
+                        output_u,
+                        output_v,
+                        self.layout.chroma_width,
+                        input_u,
+                        [input_v.source0, input_v.source1],
                     )
-                },
-                || {
-                    rayon::join(
+                } else {
+                    let (u, v) = rayon::join(
                         || {
                             self.render_plane_banded(
                                 mode,
@@ -772,15 +781,89 @@ impl WasmRenderer {
                                 true,
                             )
                         },
-                    )
-                },
-            );
-            [y, u, v]
-        };
-        for result in results {
-            result?;
-        }
+                    );
+                    u?;
+                    v
+                }
+            },
+        );
+        y?;
+        chroma?;
         Ok(())
+    }
+
+    fn render_mode23_chroma_banded(
+        &self,
+        interpolate: bool,
+        output_u: &mut [u8],
+        output_v: &mut [u8],
+        stride: usize,
+        input_u: PlaneRenderInput<'_>,
+        second: [Plane<'_>; 2],
+    ) -> Result<(), String> {
+        const BAND_ROWS: usize = 64;
+        let band_bytes = stride * BAND_ROWS;
+        if output_u.len() > band_bytes && rayon::current_num_threads() > 1 {
+            output_u
+                .par_chunks_mut(band_bytes)
+                .zip(output_v.par_chunks_mut(band_bytes))
+                .enumerate()
+                .try_for_each(|(band, (output_u, output_v))| {
+                    let start = band * BAND_ROWS;
+                    let end = start + output_u.len() / stride;
+                    self.render_mode23_chroma_rows(
+                        interpolate,
+                        output_u,
+                        output_v,
+                        stride,
+                        input_u,
+                        second,
+                        start..end,
+                    )
+                })
+        } else {
+            self.render_mode23_chroma_rows(
+                interpolate,
+                output_u,
+                output_v,
+                stride,
+                input_u,
+                second,
+                0..output_u.len() / stride,
+            )
+        }
+    }
+
+    fn render_mode23_chroma_rows(
+        &self,
+        interpolate: bool,
+        output_u: &mut [u8],
+        output_v: &mut [u8],
+        stride: usize,
+        input_u: PlaneRenderInput<'_>,
+        second: [Plane<'_>; 2],
+        rows: std::ops::Range<usize>,
+    ) -> Result<(), String> {
+        let rows = i32::try_from(rows.start).map_err(|_| "invalid row range")?
+            ..i32::try_from(rows.end).map_err(|_| "invalid row range")?;
+        self.renderer
+            .render_mode23_uv_rows(
+                interpolate,
+                [
+                    PlaneMut {
+                        data: output_u,
+                        stride,
+                    },
+                    PlaneMut {
+                        data: output_v,
+                        stride,
+                    },
+                ],
+                input_u,
+                second,
+                rows,
+            )
+            .map_err(|_| "invalid render inputs".into())
     }
 
     fn render_plane_banded(
