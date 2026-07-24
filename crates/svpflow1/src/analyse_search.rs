@@ -1192,9 +1192,8 @@ fn exact_sad_if_better(
 
     let bw_u = bw as usize;
     let bh_u = bh as usize;
-    let (luma, _) = block_cost_luma_interior(
-        src, refp, level, px, py, bw_u, bh_u, mv.0, mv.1, satd, pel, false,
-    );
+    let luma =
+        block_cost_luma_interior(src, refp, level, px, py, bw_u, bh_u, mv.0, mv.1, satd, pel);
     let lower_bound = motion + i64::from(luma) + ((i64::from(pnew) * i64::from(luma)) >> 8);
     if lower_bound >= best_cost {
         return None;
@@ -1239,7 +1238,7 @@ fn exact_sad(
 ) -> u32 {
     if !include_chroma {
         let pel = pel.max(1);
-        if let Some((luma, _, _)) =
+        if let Some((luma, _)) =
             block_cost_edge_lc(src, refp, level, px, py, bw, bh, mv.0, mv.1, satd, pel)
         {
             return luma;
@@ -1256,9 +1255,7 @@ fn exact_sad(
             mv.1,
             satd,
             pel,
-            false,
-        )
-        .0;
+        );
     }
     let (luma, chroma) = block_cost_lc(src, refp, level, px, py, bw, bh, mv.0, mv.1, satd, pel);
     luma.saturating_add(chroma)
@@ -1700,7 +1697,7 @@ fn block_cost_lc(
     let pel = pel.max(1);
 
     let (lw, lh) = src.level_size(level);
-    if let Some((l, c, _)) =
+    if let Some((l, c)) =
         block_cost_edge_lc(src, refp, level, px, py, bw, bh, mvx, mvy, use_satd, pel)
     {
         return (l, c);
@@ -1710,8 +1707,8 @@ fn block_cost_lc(
     let bh_u = bh as usize;
     let px_u = px as usize;
     let py_u = py as usize;
-    let (sad_l, _) = block_cost_luma_interior(
-        src, refp, level, px, py, bw_u, bh_u, mvx, mvy, use_satd, pel, false,
+    let sad_l = block_cost_luma_interior(
+        src, refp, level, px, py, bw_u, bh_u, mvx, mvy, use_satd, pel,
     );
 
     let sad_c = chroma_sad_x4(
@@ -1732,8 +1729,7 @@ fn block_cost_luma_interior(
     mvy: i32,
     use_satd: bool,
     pel: i32,
-    compute_luma: bool,
-) -> (u32, u8) {
+) -> u32 {
     let (lw, lh) = src.level_size(level);
     let px = px - i32::from(level > 0 && px + bw as i32 >= lw as i32);
     let py = py - i32::from(level > 0 && py + bh as i32 >= lh as i32);
@@ -1750,29 +1746,8 @@ fn block_cost_luma_interior(
     let cur_row0 = y_off;
     let ref_row0 = y_off + sub_idx * lh;
 
-    let mut sum = 0u32;
     let sad_l =
         if use_satd && matches!(bw, 4 | 8 | 16 | 32) && matches!(bh, 4 | 8 | 16 | 32) && bw == bh {
-            if compute_luma {
-                for row in 0..bh {
-                    let sy = py_u + row;
-                    if sy >= lh {
-                        break;
-                    }
-                    for col in 0..bw {
-                        let sx = px_u + col;
-                        if sx >= lw {
-                            break;
-                        }
-                        sum += u32::from(
-                            src.y
-                                .get((cur_row0 + sy) * src.y_stride + sx)
-                                .copied()
-                                .unwrap_or(0),
-                        );
-                    }
-                }
-            }
             satd_luma_clamp(
                 src, refp, cur_row0, ref_row0, px_u, py_u, mv_x_px, mv_y_px, lw, lh, bw,
             )
@@ -1806,17 +1781,7 @@ fn block_cost_luma_interior(
                             bh,
                         )
                     };
-                    if compute_luma {
-                        for row in 0..bh {
-                            let start = src_idx + row * src.y_stride;
-                            sum += src.y[start..start + bw]
-                                .iter()
-                                .map(|&v| u32::from(v))
-                                .sum::<u32>();
-                        }
-                    }
-                    let luma = (sum / (bw * bh).max(1) as u32).min(255) as u8;
-                    return (sad, luma);
+                    return sad;
                 }
             }
 
@@ -1844,15 +1809,11 @@ fn block_cost_luma_interior(
                         .copied()
                         .unwrap_or(0);
                     sad = sad.saturating_add(u32::from(a.abs_diff(b)));
-                    if compute_luma {
-                        sum = sum.saturating_add(u32::from(a));
-                    }
                 }
             }
             sad
         };
-    let luma = (sum / (bw * bh).max(1) as u32).min(255) as u8;
-    (sad_l, luma)
+    sad_l
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2009,7 +1970,7 @@ fn block_cost_edge_lc(
     mvy: i32,
     use_satd: bool,
     pel: i32,
-) -> Option<(u32, u32, u8)> {
+) -> Option<(u32, u32)> {
     let (lw, lh) = src.level_size(level);
     let (cx, cy, rx0, ry0) =
         edge_shift_origins(px, py, mvx, mvy, bw, bh, lw as i32, lh as i32, pel)?;
@@ -2028,24 +1989,11 @@ fn block_cost_edge_lc(
     let lw_i = lw as i32;
     let lh_i = lh as i32;
 
-    let mut sum = 0u32;
     let sad_l = if use_satd
         && matches!(bw_u, 4 | 8 | 16 | 32)
         && matches!(bh_u, 4 | 8 | 16 | 32)
         && bw_u == bh_u
     {
-        for row in 0..bh_u {
-            let sy = (cy + row as i32).clamp(0, (lh_i - 1).max(0)) as usize;
-            for col in 0..bw_u {
-                let sx = (cx + col as i32).clamp(0, (lw_i - 1).max(0)) as usize;
-                sum += u32::from(
-                    src.y
-                        .get((cur_row0 + sy) * src.y_stride + sx)
-                        .copied()
-                        .unwrap_or(0),
-                );
-            }
-        }
         satd_edge(
             src.y,
             src.y_stride,
@@ -2080,7 +2028,6 @@ fn block_cost_edge_lc(
                     .copied()
                     .unwrap_or(0);
                 sad = sad.saturating_add(u32::from(a.abs_diff(b)));
-                sum = sum.saturating_add(u32::from(a));
             }
         }
         sad
@@ -2166,8 +2113,7 @@ fn block_cost_edge_lc(
         sad
     };
     let sad_c = sad_uv.saturating_mul(4);
-    let luma = (sum / (bw_u * bh_u).max(1) as u32).min(255) as u8;
-    Some((sad_l, sad_c, luma))
+    Some((sad_l, sad_c))
 }
 
 fn chroma_sad_x4(
