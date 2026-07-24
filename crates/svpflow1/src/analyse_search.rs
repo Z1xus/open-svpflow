@@ -674,7 +674,11 @@ fn exact_search_level(
             dx: best.mv.0 as i16,
             dy: best.mv.1 as i16,
             score: best.sad.saturating_mul(if smallest { 3 } else { 1 }),
-            luma: block_luma_dc(src, level, px, py, bw, bh),
+            luma: if level == 0 && opts.refine_thsad.is_none() {
+                block_luma_dc(src, level, px, py, bw, bh)
+            } else {
+                0
+            },
         };
         processed[(by * (gw + 1) + bx) as usize] = true;
     }
