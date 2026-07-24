@@ -52,7 +52,8 @@ fn interp_pair(a: i32, b: i32, total: i32, pos: i32, shift: i32) -> i32 {
 fn interp4(a: i32, b: i32, c: i32, d: i32, bw: i32, bh: i32, x: i32, y: i32) -> i32 {
   let xshift = cpu_shift(bw);
   let yshift = cpu_shift(select(bh, cfg.block_h / 2, bw != cfg.block_w));
-  return interp_pair(interp_pair(a, c, bh, y, yshift), interp_pair(b, d, bh, y, yshift), bw, x, xshift);
+  let value = interp_pair(interp_pair(a, c, bh, y, yshift), interp_pair(b, d, bh, y, yshift), bw, x, xshift);
+  return select(0, value, x >= 0 && x < bw && y >= 0 && y < bh);
 }
 fn tile_axis(p: i32, origin: i32, block: i32, count: i32) -> vec3<i32> {
   if (p < origin) { return vec3<i32>(0, 0, p); }
@@ -129,6 +130,7 @@ fn render(@builtin(global_invocation_id) id: vec3<u32>) {
   let xdiv = select(1, 2, chroma);
   let ydiv = select(1, cfg.chroma_y_div, chroma);
   let bw = cfg.block_w / xdiv; let bh = cfg.block_h / ydiv;
+  if (bw <= 0 || bh <= 0) { return; }
   let real_ox = cfg.origin_x / xdiv; let real_oy = cfg.origin_y / ydiv;
   let ox = select(0, real_ox, cfg.interpolate != 0u);
   let oy = select(0, real_oy, cfg.interpolate != 0u);
