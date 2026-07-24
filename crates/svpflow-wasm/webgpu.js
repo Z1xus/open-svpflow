@@ -147,7 +147,7 @@ fn render(@builtin(global_invocation_id) id: vec3<u32>) {
   var result = 0;
   if (cfg.mode == 1u || cfg.mode == 2u) {
     let use_second = cfg.mode == 2u;
-    let factor = cfg.threshold;
+    let factor = select(cfg.threshold, inverse, use_second);
     let plane_x = select(0u, 2u, use_second); let plane_y = plane_x + 1u;
     let dx = motion_at(plane_x, factor, xdiv, tx, ty, bw, bh);
     let dy = motion_at(plane_y, factor, ydiv, tx, ty, bw, bh);
