@@ -103,7 +103,7 @@ fn sample(data: ptr<storage, array<u32>, read>, offset: u32, stride: i32,
   return byte_at(data, offset + u32(y * stride + x));
 }
 fn blend255(a: i32, b: i32, weight: i32) -> i32 { return clamp((a * (255-weight) + b*weight + 255) >> 8u, 0, 255); }
-fn blend256(a: i32, b: i32, weight: i32) -> i32 { return clamp((a * (256-weight) + b*weight + 128) >> 8u, 0, 255); }
+fn blend256(a: i32, b: i32, weight: i32) -> i32 { return clamp((a * (256-weight) + b*weight) >> 8u, 0, 255); }
 fn between(value: i32, a: i32, b: i32) -> i32 { return clamp(value, min(a,b), max(a,b)); }
 
 @compute @workgroup_size(256)
