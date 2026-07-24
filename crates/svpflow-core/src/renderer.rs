@@ -335,8 +335,14 @@ impl CpuRenderer {
             (source0, motion0, self.threshold_lut(), masks.map(|m| m.b))
         };
         self.render_selected_warp(dst.y, source.y, motion, lut, mask, false, interp);
-        self.render_selected_warp(dst.u, source.u, motion, lut, mask, true, interp);
-        self.render_selected_warp(dst.v, source.v, motion, lut, mask, true, interp);
+        self.render_selected_warp_uv(
+            [dst.u, dst.v],
+            [source.u, source.v],
+            motion,
+            lut,
+            mask,
+            interp,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -865,6 +871,88 @@ impl CpuRenderer {
         };
         self.render_mode23_plane_rows_dispatch::<true>([dst, second_dst], &input, interp, rows);
         Ok(())
+    }
+
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+    fn render_selected_warp_uv(
+        &self,
+        dst: [PlaneMut<'_>; 2],
+        sources: [Plane<'_>; 2],
+        motion: MotionPlanes<'_>,
+        lut: &[i16; LUT_LEN],
+        mask: Option<&[u8]>,
+        interp: bool,
+    ) {
+        let height = self.config.height / self.config.chroma_y_div;
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+        {
+            let params = self.plane_params(true, !interp);
+            let [dst_u, dst_v] = &dst;
+            let fused = interp
+                && params.x_shift >= 0
+                && params.y_shift >= 0
+                && dst_u.stride == dst_v.stride
+                && dst_u.data.len() == dst_v.data.len()
+                && sources.iter().all(|plane| plane_covers(*plane, &params))
+                && mode23_fast::layout_matches(sources[0], sources[1]);
+            if fused {
+                let [dst_u, dst_v] = dst;
+                #[allow(unsafe_code)]
+                let xw = unsafe { mode23_fast::x_weight_table(&params) };
+                render_tiles(
+                    &params,
+                    self.config.grid_w,
+                    self.config.grid_h,
+                    interp,
+                    0..height,
+                    |tile| {
+                        let motion_samples =
+                            Self::motion_samples(motion, lut, &params, &tile, interp);
+                        let direct = tile_interior(&params, &tile, &[motion_samples]);
+                        let corners = |values: &[u8]| {
+                            [tile.i00, tile.i01, tile.i10, tile.i11]
+                                .map(|i| i32::from(values.get(i).copied().unwrap_or(0)))
+                        };
+                        let mut pixel = |base, _, warped, _, alpha: Option<u8>, _, _| {
+                            alpha.map_or(warped, |alpha| mode1_pixel(base, warped, alpha))
+                        };
+                        macro_rules! fast_tile {
+                            ($direct:literal, $bases:literal) => {
+                                mode23_fast::warp_tile::<false, $direct, true, $bases>(
+                                    dst_u.data,
+                                    dst_u.stride,
+                                    dst_v.data,
+                                    dst_v.stride,
+                                    sources,
+                                    sources,
+                                    [motion_samples; 2],
+                                    [mask.map_or([0; 4], corners), [0; 4], [0; 4]],
+                                    [mask.is_some(), false, false],
+                                    &params,
+                                    &tile,
+                                    0,
+                                    &xw,
+                                    &mut pixel,
+                                )
+                            };
+                        }
+                        #[allow(unsafe_code)]
+                        unsafe {
+                            match (direct, mask.is_some()) {
+                                (true, true) => fast_tile!(true, true),
+                                (true, false) => fast_tile!(true, false),
+                                (false, true) => fast_tile!(false, true),
+                                (false, false) => fast_tile!(false, false),
+                            }
+                        }
+                    },
+                );
+                return;
+            }
+        }
+        let [dst_u, dst_v] = dst;
+        self.render_selected_warp(dst_u, sources[0], motion, lut, mask, true, interp);
+        self.render_selected_warp(dst_v, sources[1], motion, lut, mask, true, interp);
     }
 
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
