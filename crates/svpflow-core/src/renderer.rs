@@ -176,6 +176,7 @@ pub struct PlaneRenderInput<'a> {
     pub motion2: Option<MotionPlanes<'a>>,
     pub motion3: Option<MotionPlanes<'a>>,
     pub masks: Option<MaskPlanes<'a>>,
+    pub max_mask: Option<&'a [u8]>,
     pub final_mask: Option<&'a [u8]>,
 }
 
@@ -739,14 +740,18 @@ impl CpuRenderer {
                 );
             }
             11 | 13 => {
-                let max_mask = input.masks.map(max_mask);
+                let owned_max_mask = input
+                    .masks
+                    .filter(|_| input.max_mask.is_none())
+                    .map(max_mask);
+                let max_mask = input.max_mask.or(owned_max_mask.as_deref());
                 self.render_dual_warp_rows(
                     dst,
                     input.source0,
                     input.source1,
                     input.motion0,
                     input.motion1,
-                    max_mask.as_deref(),
+                    max_mask,
                     None,
                     None,
                     chroma,

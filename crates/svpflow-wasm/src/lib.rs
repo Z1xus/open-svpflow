@@ -716,6 +716,11 @@ impl WasmRenderer {
             _ => None,
         };
         let final_mask = mask_chunks.next();
+        let max_mask = if matches!(mode, 11 | 13) && rayon::current_num_threads() > 1 {
+            coverage.map(renderer::max_mask)
+        } else {
+            None
+        };
         let (output_y, chroma) = output.split_at_mut(self.layout.output_y_len);
         let (output_u, output_v) = chroma.split_at_mut(self.layout.output_chroma_len);
         let input_y = PlaneRenderInput {
@@ -726,6 +731,7 @@ impl WasmRenderer {
             motion2,
             motion3,
             masks: coverage,
+            max_mask: max_mask.as_deref(),
             final_mask,
         };
         let input_u = PlaneRenderInput {

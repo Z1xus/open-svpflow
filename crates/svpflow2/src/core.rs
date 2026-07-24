@@ -1669,6 +1669,7 @@ impl FilterState {
                         motion2,
                         motion3,
                         masks: Some(masks),
+                        max_mask: None,
                         final_mask,
                     };
                     let height = self.video_info.height;
