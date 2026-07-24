@@ -1063,10 +1063,11 @@ impl CpuRenderer {
                             [usize::try_from(x).unwrap_or(0).min(MAX_BLOCK_SIZE - 1)];
                         let (dx, dy) =
                             interpolate_motion::<false>(motion_row, &params, weights, interp);
-                        let base = sample_plane(source, &params, source_x, source_y, 0, 0, direct);
                         let warped =
                             sample_plane(source, &params, source_x, source_y, dx, dy, direct);
                         let value = if let Some(mask) = mask {
+                            let base =
+                                sample_plane(source, &params, source_x, source_y, 0, 0, direct);
                             let alpha = if let Some(mask_params) = &mask_params {
                                 alpha_at_absolute(mask, mask_params, self.config.grid_w, px, py)
                             } else {
