@@ -283,11 +283,23 @@ export class WebGpuRenderer {
     this.outputBytes = words(this.outputLength) * 4;
     this.output = device.createBuffer({size: this.outputBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST});
     this.readback = device.createBuffer({size: this.outputBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
-    const module = device.createShaderModule({code: shader});
-    this.pipeline = device.createComputePipeline({layout: "auto", compute: {module, entryPoint: "render"}});
-    this.bindGroup = device.createBindGroup({layout: this.pipeline.getBindGroupLayout(0), entries: [
+    const renderEntries = [
       [0, this.uniform], [1, this.source0], [2, this.source1], [3, this.motion], [4, this.masks], [5, this.output]
-    ].map(([binding, buffer]) => ({binding, resource: {buffer}}))});
+    ].map(([binding, buffer]) => ({binding, resource: {buffer}}));
+    this.pipelines = new Map();
+    this.bindGroups = new Map();
+    for (const mode of [0, 1]) {
+      const module = device.createShaderModule({code: mode === 1 ? shader.replaceAll("cfg.mode", "1u") : shader});
+      const pipeline = device.createComputePipeline({
+        layout: "auto",
+        compute: {module, entryPoint: "render"},
+      });
+      this.pipelines.set(mode, pipeline);
+      this.bindGroups.set(mode, device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: renderEntries,
+      }));
+    }
     const blendModule = device.createShaderModule({code: blendShader});
     this.blendPipeline = device.createComputePipeline({layout: "auto", compute: {module: blendModule, entryPoint: "blend"}});
     this.blendUniform = device.createBuffer({size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST});
@@ -402,12 +414,15 @@ export class WebGpuRenderer {
       c.chromaYDivisor,c.sourceStep,mode,interpolate ? 1 : 0,this.threshold,thresholdLimit,this.maskPlanes,this.outputLength,
       this.sourceYLength,this.sourceChromaLength,this.outputYLength,this.outputChromaLength]);
     this.device.queue.writeBuffer(this.uniform, 0, values);
+    this.renderMode = mode;
   }
 
   #encodeRender(encoder) {
     encoder.clearBuffer(this.output);
     const pass = encoder.beginComputePass();
-    pass.setPipeline(this.pipeline); pass.setBindGroup(0, this.bindGroup); pass.dispatchWorkgroups(Math.ceil(this.outputLength / 256)); pass.end();
+    const mode = this.renderMode === 1 ? 1 : 0;
+    pass.setPipeline(this.pipelines.get(mode)); pass.setBindGroup(0, this.bindGroups.get(mode));
+    pass.dispatchWorkgroups(Math.ceil(this.outputLength / 256)); pass.end();
   }
 
   async render(mode, interpolate, readback = true) {
