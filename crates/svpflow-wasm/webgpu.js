@@ -52,7 +52,7 @@ fn interp_pair(a: i32, b: i32, total: i32, pos: i32, shift: i32) -> i32 {
 fn interp4(a: i32, b: i32, c: i32, d: i32, bw: i32, bh: i32, x: i32, y: i32) -> i32 {
   let xshift = cpu_shift(bw);
   let yshift = cpu_shift(select(bh, cfg.block_h / 2, bw != cfg.block_w));
-  return interp_pair(interp_pair(a, b, bw, x, xshift), interp_pair(c, d, bw, x, xshift), bh, y, yshift);
+  return interp_pair(interp_pair(a, c, bh, y, yshift), interp_pair(b, d, bh, y, yshift), bw, x, xshift);
 }
 fn tile_axis(p: i32, origin: i32, block: i32, count: i32) -> vec3<i32> {
   if (p < origin) { return vec3<i32>(0, 0, p); }
