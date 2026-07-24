@@ -2671,11 +2671,13 @@ fn rescale_scores(field: &mut [Vec8], width: i32, height: i32, blk: i32) {
     let denom = (diag.saturating_mul(blk.max(1))).max(1);
     for v in field.iter_mut() {
         let mag = i32::from(v.dx).abs() + i32::from(v.dy).abs();
-        let ratio = (100 * mag) / denom;
+        let scaled = i64::from(100 * mag);
+        let denom = i64::from(denom);
         let mut score = v.score as i32;
-        if ratio >= 51 {
+        if scaled >= 51 * denom {
             score = score.saturating_mul(20);
-        } else if ratio >= 16 {
+        } else if scaled >= 16 * denom {
+            let ratio = (scaled / denom) as i32;
             let v71 = ((3_926_827_243u64)
                 .wrapping_mul(score as u32 as u64)
                 .wrapping_mul((ratio - 15) as u32 as u64))
