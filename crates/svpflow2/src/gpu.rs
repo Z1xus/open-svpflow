@@ -509,6 +509,7 @@ pub struct KernelParams {
     pub phase: i32,
     pub has_sad: i32,
     pub linear_luma: i32,
+    pub cubic: i32,
 }
 
 struct Buf<'a> {
@@ -1045,7 +1046,7 @@ const sampler_t nearest_sampler = CLK_NORMALIZED_COORDS_FALSE |
 
 typedef struct {
     int algorithm, width, height, x_ratio, y_ratio, pel;
-    int block_w, block_h, origin_x, origin_y, phase, has_sad, linear_luma;
+    int block_w, block_h, origin_x, origin_y, phase, has_sad, linear_luma, cubic;
 } Params;
 
 inline float median3(float a, float b, float c) {
@@ -1071,6 +1072,12 @@ inline float4 cubic_sample(read_only image2d_t image, float2 position) {
     float4 c = read_imagef(image, linear_sampler, (float2)(h0.x, h1.y));
     float4 d = read_imagef(image, linear_sampler, h1);
     return mix(mix(d, b, g0.y), mix(c, a, g0.y), g0.x);
+}
+
+inline float4 field_sample(read_only image2d_t image, float2 position, int cubic) {
+    if (cubic)
+        return cubic_sample(image, position);
+    return read_imagef(image, linear_sampler, position);
 }
 
 inline float source_sample(
@@ -1113,7 +1120,7 @@ kernel void render_frame(
     float2 vector_position = (float2)(
         (float)(x*p.x_ratio-p.origin_x)/(float)p.block_w,
         (float)(y*p.y_ratio-p.origin_y)/(float)p.block_h);
-    float4 vector = cubic_sample(vectors, vector_position);
+    float4 vector = field_sample(vectors, vector_position, p.cubic);
     float ref_f = source_sample(source_f, &p, vector.x, vector.w, p.phase);
     float ref_b = source_sample(source_b, &p, vector.z, vector.y, 256-p.phase);
     float ref_f0 = base_sample(source_f);
@@ -1123,7 +1130,7 @@ kernel void render_frame(
     float4 mask = (float4)(0.0f);
 
     if (p.algorithm >= 21 || p.has_sad)
-        mask = cubic_sample(masks, vector_position);
+        mask = field_sample(masks, vector_position, p.cubic);
 
     if (p.algorithm == 1) {
         result = ref_b;
@@ -1141,7 +1148,7 @@ kernel void render_frame(
             mix(ref_b, ref_f, mask.z),
             mix(ref_f0, ref_b0, time));
     } else {
-        float4 ext = cubic_sample(vectors_ext, vector_position);
+        float4 ext = field_sample(vectors_ext, vector_position, p.cubic);
         float ref_ff = source_sample(source_f, &p, ext.x, ext.w, p.phase);
         float ref_bb = source_sample(source_b, &p, ext.z, ext.y, 256-p.phase);
         result = mix(

@@ -1653,6 +1653,7 @@ impl FilterState {
                     area_mask,
                     gpu_algorithm,
                     source_frame,
+                    self.options.cubic_positive(),
                 )
             });
         if !used_gpu {
@@ -3251,6 +3252,7 @@ fn gpu_render_frame(
     area: Option<renderer::MaskPlanes<'_>>,
     algorithm: i32,
     source_frame: i32,
+    cubic: bool,
 ) -> bool {
     fn uploads(
         sources: renderer::FramePlanes<'_>,
@@ -3319,6 +3321,7 @@ fn gpu_render_frame(
             phase,
             has_sad: i32::from(area.is_some()),
             linear_luma: i32::from(!chroma),
+            cubic: i32::from(cubic),
         }
     };
     gpu.render_frame(
