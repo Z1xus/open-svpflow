@@ -892,12 +892,12 @@ impl GpuContext {
             }
 
             let run = |dslot: &mut (ClMem, usize),
-                       dst: &mut [u8],
+                       dst: &[u8],
                        stride: i32,
                        p: KernelParams,
                        s0: GpuBuf,
                        s1: GpuBuf|
-             -> Option<()> {
+             -> Option<ClMem> {
                 let dmem = self.ensure_buffer(dslot, dst.len())?;
                 (self.cl.SetKernelArg)(k, 0, size_of::<ClMem>(), (&raw const dmem).cast());
                 self.set_i32(k, 1, stride).then_some(())?;
@@ -926,14 +926,19 @@ impl GpuContext {
                 {
                     return None;
                 }
-
+                Some(dmem)
+            };
+            let y_mem = run(&mut dst[0], dst_y, sy, py, src0[0], src1[0])?;
+            let u_mem = run(&mut dst[1], dst_u, su, pu, src0[1], src1[1])?;
+            let v_mem = run(&mut dst[2], dst_v, sv, pv, src0[2], src1[2])?;
+            for (dmem, output) in [(y_mem, dst_y), (u_mem, dst_u), (v_mem, dst_v)] {
                 if (self.cl.EnqueueReadBuffer)(
                     q,
                     dmem,
                     CL_FALSE,
                     0,
-                    dst.len(),
-                    dst.as_mut_ptr().cast(),
+                    output.len(),
+                    output.as_mut_ptr().cast(),
                     0,
                     std::ptr::null(),
                     std::ptr::null_mut(),
@@ -941,11 +946,7 @@ impl GpuContext {
                 {
                     return None;
                 }
-                Some(())
-            };
-            run(&mut dst[0], dst_y, sy, py, src0[0], src1[0])?;
-            run(&mut dst[1], dst_u, su, pu, src0[1], src1[1])?;
-            run(&mut dst[2], dst_v, sv, pv, src0[2], src1[2])?;
+            }
             if (self.cl.Finish)(q) != CL_SUCCESS {
                 return None;
             }
