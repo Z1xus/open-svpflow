@@ -35,6 +35,14 @@ fn mask_value(plane: u32, x: i32, y: i32) -> i32 {
   if (plane == 3u) { return max(mask_at(0u, x, y), mask_at(1u, x, y)); }
   return mask_at(plane, x, y);
 }
+fn mask_grid_at(plane: u32, x: i32, y: i32) -> i32 {
+  let index = u32(y) * cfg.grid_w + u32(x);
+  return byte_at(&masks, plane * cfg.grid_w * cfg.grid_h + index);
+}
+fn mask_grid_value(plane: u32, x: i32, y: i32) -> i32 {
+  if (plane == 3u) { return max(mask_grid_at(0u, x, y), mask_grid_at(1u, x, y)); }
+  return mask_grid_at(plane, x, y);
+}
 fn cpu_shift(value: i32) -> i32 {
   switch value {
     case 1: { return 0; } case 2: { return 1; } case 3, 4: { return 2; }
@@ -76,8 +84,8 @@ fn motion_at(plane: u32, factor: i32, divisor: i32, tx: vec3<i32>, ty: vec3<i32>
     bw, bh, tx.z, ty.z);
 }
 fn alpha_interpolated(plane: u32, tx: vec3<i32>, ty: vec3<i32>, bw: i32, bh: i32) -> i32 {
-  return clamp(interp4(mask_value(plane, tx.x, ty.x), mask_value(plane, tx.y, ty.x),
-    mask_value(plane, tx.x, ty.y), mask_value(plane, tx.y, ty.y), bw, bh, tx.z, ty.z), 0, 255);
+  return clamp(interp4(mask_grid_value(plane, tx.x, ty.x), mask_grid_value(plane, tx.y, ty.x),
+    mask_grid_value(plane, tx.x, ty.y), mask_grid_value(plane, tx.y, ty.y), bw, bh, tx.z, ty.z), 0, 255);
 }
 fn alpha_absolute(plane: u32, px: i32, py: i32, origin_x: i32, origin_y: i32, bw: i32, bh: i32) -> i32 {
   var x0 = 0; var x1 = 0; var y0 = 0; var y1 = 0;
