@@ -175,8 +175,8 @@ fn render(@builtin(global_invocation_id) id: vec3<u32>) {
     let dy3 = motion_at(7u, inverse, ydiv, tx, ty, bw, bh);
     let c = sample(&source0, source_offset, stride, width, height, px, py, dx2, dy2);
     let d = sample(&source1, source_offset, stride, width, height, px, py, dx3, dy3);
-    let i0 = blend255(mv0, between(c, mv0, mv1), alpha(0u, tx, ty, px, py, real_ox, real_oy, bw, bh));
-    let i1 = blend255(mv1, between(d, mv0, mv1), alpha(1u, tx, ty, px, py, real_ox, real_oy, bw, bh));
+    let i0 = blend255(mv0, between(d, mv0, mv1), alpha(0u, tx, ty, px, py, real_ox, real_oy, bw, bh));
+    let i1 = blend255(mv1, between(c, mv0, mv1), alpha(1u, tx, ty, px, py, real_ox, real_oy, bw, bh));
     result = blend256(i0, i1, cfg.threshold);
     if (cfg.mask_planes == 3u) { result = blend255(result, blend256(cur0, cur1, cfg.threshold), alpha(2u, tx, ty, px, py, real_ox, real_oy, bw, bh)); }
   }
