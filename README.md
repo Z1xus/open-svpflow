@@ -19,8 +19,8 @@ Benchmarked on a 7,992 frame video with [smoothie's](https://github.com/couleur-
 
 | Path | Original | open-svpflow | Speed vs original | SSIM parity | PSNR |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| CPU | 60.77 fps | 56.85 fps | 0.935x (6.5% slower) | 98.75% | 45.24 dB |
-| GPU | 79.38 fps | 77.74 fps | 0.979x (2.1% slower) | 98.77% | 43.57 dB |
+| CPU | 61.50 fps | 61.45 fps | 0.999x (0.1% slower) | 98.75% | 45.24 dB |
+| GPU | 83.58 fps | 82.19 fps | 0.983x (1.7% slower) | 98.77% | 43.57 dB |
 
 ## Releases
 
