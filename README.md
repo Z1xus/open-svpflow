@@ -12,6 +12,7 @@ This proof of concept runs open-svpflow's analysis pipeline as WASM and renders 
 
 - `svpflow1`: `Super` and `Analyse`, including super-frame pyramids, multi-level predictors, SAD/SATD and chroma costs, and hex2, UMH, and exhaustive motion search.
 - `svpflow2`: `SmoothFps` rendering for algorithms 1, 2, 11, 13, 21, 22, and 23, with scene handling, masks, CPU rendering, and the GPU path.
+- Native I444 input and output, which the original SVPFlow doesn't support.
 
 Output is close, but not byte-exact (yet)
 
