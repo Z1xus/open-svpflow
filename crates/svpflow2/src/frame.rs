@@ -1,6 +1,6 @@
 use std::ptr;
 
-use crate::{strings, vs};
+use crate::{strings, video_format, vs};
 
 pub(crate) struct PlaneApi {
     new_video_frame: vs::NewVideoFrame,
@@ -200,6 +200,12 @@ impl PlaneApi {
         let Some(height) = usize_positive(info.height) else {
             return false;
         };
+        let (chroma_x_div, chroma_y_div) = video_format::chroma_divisors(info);
+        let (Ok(chroma_x_div), Ok(chroma_y_div)) =
+            (usize::try_from(chroma_x_div), usize::try_from(chroma_y_div))
+        else {
+            return false;
+        };
         let y = unsafe {
             self.copy_plane(PlaneCopy {
                 source,
@@ -217,10 +223,10 @@ impl PlaneApi {
                 source,
                 output,
                 plane: 1,
-                width: width / 2,
-                height: height / 2,
-                pad_x: pad_x / 2,
-                pad_y: pad_y / 2,
+                width: width / chroma_x_div,
+                height: height / chroma_y_div,
+                pad_x: pad_x / i32::try_from(chroma_x_div).unwrap_or(1),
+                pad_y: pad_y / i32::try_from(chroma_y_div).unwrap_or(1),
                 bytes_per_sample,
             })
         };
@@ -229,10 +235,10 @@ impl PlaneApi {
                 source,
                 output,
                 plane: 2,
-                width: width / 2,
-                height: height / 2,
-                pad_x: pad_x / 2,
-                pad_y: pad_y / 2,
+                width: width / chroma_x_div,
+                height: height / chroma_y_div,
+                pad_x: pad_x / i32::try_from(chroma_x_div).unwrap_or(1),
+                pad_y: pad_y / i32::try_from(chroma_y_div).unwrap_or(1),
                 bytes_per_sample,
             })
         };

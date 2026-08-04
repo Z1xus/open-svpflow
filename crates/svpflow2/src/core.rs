@@ -1065,6 +1065,9 @@ impl FilterState {
         }
         let width = usize::try_from(self.video_info.width.max(0)).ok()?;
         let height = usize::try_from(self.video_info.height.max(0)).ok()?;
+        let (chroma_x_div, chroma_y_div) = video_format::chroma_divisors(&self.video_info);
+        let chroma_x_div = usize::try_from(chroma_x_div).ok()?;
+        let chroma_y_div = usize::try_from(chroma_y_div).ok()?;
         let cell: ExpandCell = {
             let mut cache = self.expand_cache.lock().ok()?;
             if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
@@ -1083,8 +1086,9 @@ impl FilterState {
         };
         cell.get_or_init(|| {
             let (y, y_stride) = expand_plane(planes.y, width, height)?;
-            let (u, uv_stride) = expand_plane(planes.u, width / 2, height / 2)?;
-            let (v, _) = expand_plane(planes.v, width / 2, height / 2)?;
+            let (u, uv_stride) =
+                expand_plane(planes.u, width / chroma_x_div, height / chroma_y_div)?;
+            let (v, _) = expand_plane(planes.v, width / chroma_x_div, height / chroma_y_div)?;
             Some(std::sync::Arc::new(SuperExpand {
                 y,
                 u,
@@ -1289,7 +1293,8 @@ impl FilterState {
         else {
             return None;
         };
-        let chroma_h = usize_height(self.video_info.height / 2);
+        let (chroma_x_div, chroma_y_div) = video_format::chroma_divisors(&self.video_info);
+        let chroma_h = usize_height(self.video_info.height / chroma_y_div);
         let Some((src0_u, src0_u_stride, src0_u_len)) =
             (unsafe { api.read_plane(source, 1, chroma_h) })
         else {
@@ -1310,7 +1315,7 @@ impl FilterState {
         else {
             return None;
         };
-        let output_chroma_h = usize_height(self.output_info().height / 2);
+        let output_chroma_h = usize_height(self.output_info().height / chroma_y_div);
         let Some((dst_y, dst_y_stride, dst_y_len)) =
             (unsafe { api.write_plane(output, 0, usize_height(self.output_info().height)) })
         else {
@@ -1517,7 +1522,8 @@ impl FilterState {
             origin_y: vector_data.block.height / 2,
             grid_w: motion_w,
             grid_h: motion_h,
-            chroma_y_div: 2,
+            chroma_x_div,
+            chroma_y_div,
             source_step,
             scale: self.options.mask_area_scale(),
         };
@@ -1573,16 +1579,16 @@ impl FilterState {
                     dst_u,
                     dst_u_stride,
                     dst_u_len,
-                    padding.0 / 2,
-                    padding.1 / 2,
+                    padding.0 / chroma_x_div,
+                    padding.1 / chroma_y_div,
                     1,
                 ),
                 v: offset_plane_mut(
                     dst_v,
                     dst_v_stride,
                     dst_v_len,
-                    padding.0 / 2,
-                    padding.1 / 2,
+                    padding.0 / chroma_x_div,
+                    padding.1 / chroma_y_div,
                     1,
                 ),
             }
@@ -1673,7 +1679,7 @@ impl FilterState {
                         final_mask,
                     };
                     let height = self.video_info.height;
-                    let middle = height / 2;
+                    let middle = height / chroma_y_div;
                     let _ = cpu.render_plane_rows(
                         mode,
                         interp,
@@ -1831,7 +1837,7 @@ impl FilterState {
                     v: plane_mut(dst_v, dst_v_stride, dst_v_len),
                 }
             };
-            qmode_overlay(scene_class, output_info.width, output_info.height, dst);
+            qmode_overlay(scene_class, &output_info, dst);
         }
         if self.options.debug_tt() {
             let _ = unsafe { self.apply_timing_bar(api, output, frame) };
@@ -1847,7 +1853,8 @@ impl FilterState {
         frame: i32,
     ) -> Option<()> {
         let output_info = self.output_info();
-        let chroma_h = usize_height(output_info.height / 2);
+        let chroma_h =
+            usize_height(output_info.height / video_format::chroma_divisors(&output_info).1);
         let (dst_y, dst_y_stride, dst_y_len) =
             unsafe { api.write_plane(output, 0, usize_height(output_info.height)) }?;
         let (dst_u, dst_u_stride, dst_u_len) = unsafe { api.write_plane(output, 1, chroma_h) }?;
@@ -1861,8 +1868,7 @@ impl FilterState {
         };
         timing_bar(
             frame,
-            output_info.width,
-            output_info.height,
+            &output_info,
             video_format::source_depth(&self.video_info),
             dst,
         );
@@ -1881,7 +1887,8 @@ impl FilterState {
             return Some(());
         }
         let output_info = self.output_info();
-        let chroma_h = usize_height(output_info.height / 2);
+        let chroma_h =
+            usize_height(output_info.height / video_format::chroma_divisors(&output_info).1);
         let (dst_y, dst_y_stride, dst_y_len) =
             unsafe { api.write_plane(output, 0, usize_height(output_info.height)) }?;
         let (dst_u, dst_u_stride, dst_u_len) = unsafe { api.write_plane(output, 1, chroma_h) }?;
@@ -1942,7 +1949,8 @@ impl FilterState {
             self.options.qmap_thresholds(),
         );
         let output_info = self.output_info();
-        let chroma_h = usize_height(output_info.height / 2);
+        let chroma_h =
+            usize_height(output_info.height / video_format::chroma_divisors(&output_info).1);
         let (dst_y, dst_y_stride, dst_y_len) =
             unsafe { api.write_plane(output, 0, usize_height(output_info.height)) }?;
         let (dst_u, dst_u_stride, dst_u_len) = unsafe { api.write_plane(output, 1, chroma_h) }?;
@@ -2028,7 +2036,8 @@ impl FilterState {
             self.options.mask_area_sharp(),
         );
         let output_info = self.output_info();
-        let chroma_h = usize_height(output_info.height / 2);
+        let chroma_h =
+            usize_height(output_info.height / video_format::chroma_divisors(&output_info).1);
         let (dst_y, dst_y_stride, dst_y_len) =
             unsafe { api.write_plane(output, 0, usize_height(output_info.height)) }?;
         let (dst_u, dst_u_stride, dst_u_len) = unsafe { api.write_plane(output, 1, chroma_h) }?;
@@ -2615,7 +2624,8 @@ fn bytes_per_sample(info: &vs::VideoInfo) -> usize {
     }
 }
 
-fn timing_bar(frame: i32, width: i32, height: i32, depth: i32, dst: renderer::FramePlanesMut<'_>) {
+fn timing_bar(frame: i32, info: &vs::VideoInfo, depth: i32, dst: renderer::FramePlanesMut<'_>) {
+    let (width, height) = (info.width, info.height);
     let period = width.saturating_mul(2).saturating_sub(20);
     if period <= 0 {
         return;
@@ -2625,26 +2635,37 @@ fn timing_bar(frame: i32, width: i32, height: i32, depth: i32, dst: renderer::Fr
         .saturating_sub(10)
         .abs()
         .saturating_add(2);
-    fill_yuv420_rect(dst, x, 0, 6, height, depth, [80, 39, 198]);
+    fill_yuv_rect(
+        dst,
+        x,
+        0,
+        6,
+        height,
+        video_format::chroma_divisors(info),
+        depth,
+        [80, 39, 198],
+    );
 }
 
-fn qmode_overlay(scene_class: i32, width: i32, height: i32, mut dst: renderer::FramePlanesMut<'_>) {
+fn qmode_overlay(scene_class: i32, info: &vs::VideoInfo, mut dst: renderer::FramePlanesMut<'_>) {
+    let (width, height) = (info.width, info.height);
+    let (x_div, y_div) = video_format::chroma_divisors(info);
     let [y, u, v] = qmode_color(scene_class);
     fill_byte_plane(&mut dst.y, 0, 0, width.min(50), height.min(50), y);
     fill_byte_plane(
         &mut dst.u,
         0,
         0,
-        (width / 2).min(25),
-        (height / 2).min(25),
+        (width / x_div).min(50 / x_div),
+        (height / y_div).min(50 / y_div),
         u,
     );
     fill_byte_plane(
         &mut dst.v,
         0,
         0,
-        (width / 2).min(25),
-        (height / 2).min(25),
+        (width / x_div).min(50 / x_div),
+        (height / y_div).min(50 / y_div),
         v,
     );
 }
@@ -2828,8 +2849,9 @@ fn write_vector_pixel_inner(
     if y < 0 || y >= output.height || x < 0 || x >= output.width.saturating_sub(1) {
         return;
     }
-    let y_offset = vector_offset(x, y, dst.y.stride, depth, false);
-    let u_offset = vector_offset(x, y, dst.u.stride, depth, true);
+    let (x_div, y_div) = video_format::chroma_divisors(output);
+    let y_offset = vector_offset(x, y, dst.y.stride, depth, (1, 1));
+    let u_offset = vector_offset(x, y, dst.u.stride, depth, (x_div, y_div));
     if let Some(byte) = dst.y.data.get_mut(y_offset) {
         *byte = if blend {
             blend_vector_byte(*byte, color[0])
@@ -2853,15 +2875,9 @@ fn write_vector_pixel_inner(
     }
 }
 
-fn vector_offset(x: i32, y: i32, stride: usize, depth: i32, chroma: bool) -> usize {
-    let row = if chroma { y >> 1 } else { y };
-    let col = if chroma {
-        if depth == 0 { x >> 1 } else { x }
-    } else if depth == 0 {
-        x
-    } else {
-        x << 1
-    };
+fn vector_offset(x: i32, y: i32, stride: usize, depth: i32, divisors: (i32, i32)) -> usize {
+    let row = y / divisors.1;
+    let col = x / divisors.0 * if depth == 0 { 1 } else { 2 };
     usize::try_from(row)
         .unwrap_or(0)
         .saturating_mul(stride)
@@ -2913,6 +2929,7 @@ fn qmap_overlay(
     depth: i32,
     mut dst: renderer::FramePlanesMut<'_>,
 ) {
+    let divisors = video_format::chroma_divisors(output);
     let grid_w = usize::try_from(grid.width.max(0)).unwrap_or(0);
     let grid_h = usize::try_from(grid.height.max(0)).unwrap_or(0);
     for y in 0..grid_h {
@@ -2938,7 +2955,7 @@ fn qmap_overlay(
                 output.width,
                 output.height,
                 depth,
-                false,
+                (1, 1),
                 cy,
             );
             blend_qmap_plane(
@@ -2950,7 +2967,7 @@ fn qmap_overlay(
                 output.width,
                 output.height,
                 depth,
-                true,
+                divisors,
                 cu,
             );
             blend_qmap_plane(
@@ -2962,7 +2979,7 @@ fn qmap_overlay(
                 output.width,
                 output.height,
                 depth,
-                true,
+                divisors,
                 cv,
             );
         }
@@ -2979,7 +2996,7 @@ fn blend_qmap_plane(
     frame_w: i32,
     frame_h: i32,
     depth: i32,
-    chroma: bool,
+    divisors: (i32, i32),
     value: u8,
 ) {
     let y0 = y.max(0);
@@ -2989,18 +3006,12 @@ fn blend_qmap_plane(
         .saturating_add(width)
         .min(frame_w.saturating_sub(1).max(0));
     for py in y0..y1 {
-        let row = if chroma { py >> 1 } else { py };
+        let row = py / divisors.1;
         let Ok(row) = usize::try_from(row) else {
             continue;
         };
         for px in x0..x1 {
-            let col = if chroma {
-                if depth == 0 { px >> 1 } else { px }
-            } else if depth == 0 {
-                px
-            } else {
-                px << 1
-            };
+            let col = px / divisors.0 * if depth == 0 { 1 } else { 2 };
             let Ok(col) = usize::try_from(col.saturating_add(1)) else {
                 continue;
             };
@@ -3016,31 +3027,32 @@ fn blend_qmap_byte(dst: u8, value: u8) -> u8 {
     ((u16::from(value) * 20 + u16::from(dst) * 235) >> 8) as u8
 }
 
-fn fill_yuv420_rect(
+fn fill_yuv_rect(
     mut dst: renderer::FramePlanesMut<'_>,
     x: i32,
     y: i32,
     width: i32,
     height: i32,
+    divisors: (i32, i32),
     depth: i32,
     color: [u16; 3],
 ) {
     fill_plane(&mut dst.y, x, y, width, height, depth, color[0]);
     fill_plane(
         &mut dst.u,
-        x / 2,
-        y / 2,
-        width / 2,
-        height / 2,
+        x / divisors.0,
+        y / divisors.1,
+        width / divisors.0,
+        height / divisors.1,
         depth,
         color[1],
     );
     fill_plane(
         &mut dst.v,
-        x / 2,
-        y / 2,
-        width / 2,
-        height / 2,
+        x / divisors.0,
+        y / divisors.1,
+        width / divisors.0,
+        height / divisors.1,
         depth,
         color[2],
     );
@@ -3365,11 +3377,13 @@ unsafe fn super_frame_planes(
     }
     let shift = lane.trailing_zeros();
     let y_height = usize_height(info.height);
-    let uv_height = y_height / 2;
+    let (_, chroma_y_div) = video_format::chroma_divisors(info);
+    let chroma_y_div = usize::try_from(chroma_y_div).ok()?;
+    let uv_height = y_height / chroma_y_div;
     let read_height = usize_height(super_info.map_or(info.height, |info| info.height));
     let y = unsafe { api.read_plane(frame, 0, read_height) }?;
-    let u = unsafe { api.read_plane(frame, 1, read_height / 2) }?;
-    let v = unsafe { api.read_plane(frame, 2, read_height / 2) }?;
+    let u = unsafe { api.read_plane(frame, 1, read_height / chroma_y_div) }?;
+    let v = unsafe { api.read_plane(frame, 2, read_height / chroma_y_div) }?;
     Some(renderer::FramePlanes {
         y: unsafe { super_plane(y.0, y.1, y.2, y_height, shift) }?,
         u: unsafe { super_plane(u.0, u.1, u.2, uv_height, shift) }?,

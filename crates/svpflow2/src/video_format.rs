@@ -1,19 +1,22 @@
 use crate::vs;
 
 const FORMAT_ID: usize = 32;
+const SUBSAMPLING_W: usize = 52;
+const SUBSAMPLING_H: usize = 56;
 const YUV420P8_ALT: i32 = 1_000_010;
 const YUV420P8: i32 = 3_000_010;
+const YUV444P8: i32 = 3_000_012;
 const YUV420P10: i32 = 3_000_019;
 const YUV420P16: i32 = 3_000_022;
 
 pub(crate) fn is_cpu_source(info: &vs::VideoInfo) -> bool {
-    is_yuv420p8(info)
+    matches!(unsafe { format_id(info) }, YUV420P8 | YUV444P8)
 }
 
-pub(crate) fn is_yuv420_source(info: &vs::VideoInfo) -> bool {
+pub(crate) fn is_yuv_source(info: &vs::VideoInfo) -> bool {
     matches!(
         unsafe { format_id(info) },
-        YUV420P8_ALT | YUV420P8 | YUV420P10 | YUV420P16
+        YUV420P8_ALT | YUV420P8 | YUV444P8 | YUV420P10 | YUV420P16
     )
 }
 
@@ -37,14 +40,23 @@ pub(crate) fn source_depth(info: &vs::VideoInfo) -> i32 {
     source_unmodified_depth(info)
 }
 
+pub(crate) fn chroma_divisors(info: &vs::VideoInfo) -> (i32, i32) {
+    let shift = |offset| unsafe { format_field(info, offset) }.clamp(0, 1);
+    (1 << shift(SUBSAMPLING_W), 1 << shift(SUBSAMPLING_H))
+}
+
 unsafe fn format_id(info: &vs::VideoInfo) -> i32 {
+    unsafe { format_field(info, FORMAT_ID) }
+}
+
+unsafe fn format_field(info: &vs::VideoInfo, offset: usize) -> i32 {
     if info.format.is_null() {
         return 0;
     }
     unsafe {
         info.format
             .cast::<u8>()
-            .add(FORMAT_ID)
+            .add(offset)
             .cast::<i32>()
             .read_unaligned()
     }

@@ -108,7 +108,7 @@ impl SuperBuilder {
         rayon::join(
             || {
                 super_build::build_plane(
-                    &mut y, width, source_y, width, width, height, width, height, false, &opts,
+                    &mut y, width, source_y, width, width, height, width, height, 1, 1, &opts,
                 );
             },
             || {
@@ -123,7 +123,8 @@ impl SuperBuilder {
                             chroma_height,
                             width,
                             height,
-                            true,
+                            2,
+                            2,
                             &opts,
                         );
                     },
@@ -137,7 +138,8 @@ impl SuperBuilder {
                             chroma_height,
                             width,
                             height,
-                            true,
+                            2,
+                            2,
                             &opts,
                         );
                     },
@@ -176,6 +178,8 @@ impl SuperFrame {
             u_stride: usize::try_from(self.opts.width / 2).unwrap_or(0),
             v: &self.v,
             v_stride: usize::try_from(self.opts.width / 2).unwrap_or(0),
+            chroma_x_div: 2,
+            chroma_y_div: 2,
             luma_w: usize::try_from(self.opts.width).unwrap_or(0),
             luma_h: usize::try_from(self.opts.height).unwrap_or(0),
             pel: self.opts.pel,

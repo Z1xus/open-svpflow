@@ -34,6 +34,8 @@ mod super_build;
 mod super_filter;
 mod super_opts;
 #[cfg(not(target_arch = "wasm32"))]
+mod video_format;
+#[cfg(not(target_arch = "wasm32"))]
 mod vs;
 
 pub(crate) use svpflow_core::params;

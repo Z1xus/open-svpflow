@@ -18,7 +18,8 @@ pub(crate) fn build_plane(
 
     luma_w: usize,
     luma_h: usize,
-    chroma: bool,
+    x_div: usize,
+    y_div: usize,
     opts: &SuperOpts,
 ) {
     let levels = opts.levels as usize;
@@ -30,7 +31,7 @@ pub(crate) fn build_plane(
     let level_size = |lv: usize| -> (usize, usize) {
         let yw = reduce_dim(luma_w as i32, lv as i32) as usize;
         let yh = reduce_dim(luma_h as i32, lv as i32) as usize;
-        if chroma { (yw / 2, yh / 2) } else { (yw, yh) }
+        (yw / x_div, yh / y_div)
     };
 
     let mut level_y = Vec::with_capacity(levels);

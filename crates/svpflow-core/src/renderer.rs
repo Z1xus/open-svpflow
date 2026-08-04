@@ -47,6 +47,7 @@ pub struct CpuConfig {
     pub origin_y: i32,
     pub grid_w: usize,
     pub grid_h: usize,
+    pub chroma_x_div: i32,
     pub chroma_y_div: i32,
     pub source_step: i32,
     pub scale: f64,
@@ -69,7 +70,6 @@ pub struct GpuPlaneParams {
 
 pub struct CpuRenderer {
     config: CpuConfig,
-    chroma_factor: i32,
     width_map: i32,
     height_map: i32,
     half_width_map: i32,
@@ -224,11 +224,10 @@ impl CpuRenderer {
     pub fn new_deferred(config: CpuConfig) -> Self {
         let width_map = cpu_map(config.block_w);
         let height_map = cpu_map(config.block_h);
-        let half_width_map = cpu_map(config.block_w / 2);
-        let half_height_map = cpu_map(config.block_h / 2);
+        let half_width_map = cpu_map(config.block_w / config.chroma_x_div);
+        let half_height_map = cpu_map(config.block_h / config.chroma_y_div);
         Self {
             config,
-            chroma_factor: 2,
             width_map,
             height_map,
             half_width_map,
@@ -263,7 +262,7 @@ impl CpuRenderer {
 
     pub fn gpu_plane_params(&self, chroma: bool) -> GpuPlaneParams {
         let p = self.plane_params(false, false);
-        let x_ratio = if chroma { 2 } else { 1 };
+        let x_ratio = if chroma { self.config.chroma_x_div } else { 1 };
         let y_ratio = if chroma { self.config.chroma_y_div } else { 1 };
         GpuPlaneParams {
             width: self.config.width / x_ratio,
@@ -311,8 +310,14 @@ impl CpuRenderer {
     pub fn fill_default(&self, y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
         let area = usize::try_from(self.config.width.saturating_mul(self.config.height).max(0))
             .unwrap_or(0);
-        let chroma =
-            area / usize::try_from(self.chroma_factor.saturating_mul(2).max(1)).unwrap_or(1);
+        let chroma = area
+            / usize::try_from(
+                self.config
+                    .chroma_x_div
+                    .saturating_mul(self.config.chroma_y_div)
+                    .max(1),
+            )
+            .unwrap_or(1);
         fill_prefix(y, area, 0x7F);
         fill_prefix(u, chroma, 0x7F);
         fill_prefix(v, chroma, 0x7F);
@@ -1649,7 +1654,7 @@ impl CpuRenderer {
             (0, 0)
         } else if chroma {
             (
-                self.config.origin_x / 2,
+                self.config.origin_x / self.config.chroma_x_div,
                 self.config.origin_y / self.config.chroma_y_div,
             )
         } else {
@@ -1657,18 +1662,18 @@ impl CpuRenderer {
         };
         if chroma {
             PlaneParams {
-                width: self.config.width / 2,
+                width: self.config.width / self.config.chroma_x_div,
                 height: self.config.height / self.config.chroma_y_div,
-                block_w: self.config.block_w / 2,
+                block_w: self.config.block_w / self.config.chroma_x_div,
                 block_h: self.config.block_h / self.config.chroma_y_div,
                 origin_x,
                 origin_y,
                 x_shift: self.half_width_map,
                 y_shift: self.half_height_map,
-                x_div: 2,
+                x_div: self.config.chroma_x_div,
                 y_div: self.config.chroma_y_div,
                 source_step: self.config.source_step,
-                max_x: (self.config.width / 2)
+                max_x: (self.config.width / self.config.chroma_x_div)
                     .saturating_mul(self.config.source_step)
                     .saturating_sub(1)
                     .max(0),
@@ -1676,7 +1681,10 @@ impl CpuRenderer {
                     .saturating_mul(self.config.source_step)
                     .saturating_sub(1)
                     .max(0),
-                x_weights: interpolation_weights(self.config.block_w / 2, self.half_width_map),
+                x_weights: interpolation_weights(
+                    self.config.block_w / self.config.chroma_x_div,
+                    self.half_width_map,
+                ),
                 y_weights: interpolation_weights(
                     self.config.block_h / self.config.chroma_y_div,
                     self.half_height_map,
@@ -1875,10 +1883,11 @@ pub fn sample_mask(
     mask: &[u8],
     x: i32,
     y: i32,
+    chroma_x_div: i32,
     chroma_y_div: i32,
     chroma: bool,
 ) -> u8 {
-    let x_div = if chroma { 2 } else { 1 };
+    let x_div = if chroma { chroma_x_div } else { 1 };
     let y_div = if chroma { chroma_y_div } else { 1 };
     if x_div == 0 || y_div == 0 {
         return 0;

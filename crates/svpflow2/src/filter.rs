@@ -719,7 +719,7 @@ unsafe fn validate_source_format(data: &FilterData, output: vs::Raw, vsapi: vs::
         unsafe { set_error(output, vsapi, strings::ERR_SOURCE_CPU.as_ptr().cast()) };
         return false;
     }
-    if !requires_cpu && !video_format::is_yuv420_source(&data.video_info) {
+    if !requires_cpu && !video_format::is_yuv_source(&data.video_info) {
         unsafe { set_error(output, vsapi, strings::ERR_SOURCE_YUV.as_ptr().cast()) };
         return false;
     }

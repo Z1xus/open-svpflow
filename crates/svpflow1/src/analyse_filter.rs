@@ -1,6 +1,6 @@
 use crate::analyse_opts::AnalyseOpts;
 use crate::analyse_search::{self, SuperPlanes};
-use crate::{params, vs};
+use crate::{params, video_format, vs};
 
 struct AnalyseState {
     super_node: vs::Raw,
@@ -14,6 +14,7 @@ struct AnalyseState {
     vdata_handle: i64,
     gray_format: vs::ConstRaw,
     payload_len: i32,
+    chroma_divisors: (usize, usize),
 }
 
 pub(crate) unsafe extern "system" fn create_analyse(
@@ -80,6 +81,19 @@ unsafe fn create_analyse_inner(
 
     let src_vi = unsafe { *get_vi(src_node) };
     let super_vi = unsafe { *get_vi(super_node) };
+    if !video_format::is_supported(&src_vi) {
+        unsafe { vs::free_node(super_node, vsapi) };
+        unsafe { vs::free_node(src_node, vsapi) };
+        unsafe {
+            vs::set_error(
+                output,
+                vsapi,
+                c"SVAnalyse: src must be YUV420P8 or YUV444P8".as_ptr(),
+            );
+        };
+        return 0;
+    }
+    let chroma_divisors = video_format::chroma_divisors(&src_vi);
 
     let opt_raw = unsafe { read_opt_bytes(input, vsapi) };
     let opt_val = opt_raw.as_ref().and_then(|b| params::parse(b).ok());
@@ -151,6 +165,7 @@ unsafe fn create_analyse_inner(
         vdata_handle,
         gray_format: gray,
         payload_len,
+        chroma_divisors,
     }));
 
     unsafe {
@@ -293,8 +308,26 @@ unsafe extern "system" fn get_frame_analyse(
     }
 
     let sh = unsafe { super_height(get_stride, f0) };
-    let planes0 = unsafe { load_super_planes(get_stride, get_read, f0, &state.opts, sh) };
-    let planes1 = unsafe { load_super_planes(get_stride, get_read, f1, &state.opts, sh) };
+    let planes0 = unsafe {
+        load_super_planes(
+            get_stride,
+            get_read,
+            f0,
+            &state.opts,
+            state.chroma_divisors,
+            sh,
+        )
+    };
+    let planes1 = unsafe {
+        load_super_planes(
+            get_stride,
+            get_read,
+            f1,
+            &state.opts,
+            state.chroma_divisors,
+            sh,
+        )
+    };
 
     let (bwd, fwd) = match (planes0.as_ref(), planes1.as_ref()) {
         (Some(p0), Some(p1)) => analyse_search::analyse_pair(p0, p1, &state.opts),
@@ -343,6 +376,7 @@ unsafe fn load_super_planes<'a>(
     get_read: vs::GetReadPtr,
     frame: vs::ConstRaw,
     opts: &AnalyseOpts,
+    chroma_divisors: (usize, usize),
     _sh_unused: usize,
 ) -> Option<SuperPlanes<'a>> {
     let y_stride = unsafe { get_stride(frame, 0) } as usize;
@@ -356,7 +390,7 @@ unsafe fn load_super_planes<'a>(
     }
     let y_h = crate::super_opts::super_plane_height(opts.height, opts.pel, opts.super_levels, true)
         as usize;
-    let uv_h = y_h / 2;
+    let uv_h = y_h / chroma_divisors.1;
     let y = unsafe { std::slice::from_raw_parts(y_ptr, y_stride * y_h) };
     let u = unsafe { std::slice::from_raw_parts(u_ptr, u_stride * uv_h) };
     let v = unsafe { std::slice::from_raw_parts(v_ptr, v_stride * uv_h) };
@@ -367,6 +401,8 @@ unsafe fn load_super_planes<'a>(
         u_stride,
         v,
         v_stride,
+        chroma_x_div: chroma_divisors.0,
+        chroma_y_div: chroma_divisors.1,
         luma_w: opts.width as usize,
         luma_h: opts.height as usize,
         pel: opts.pel,

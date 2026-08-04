@@ -26,8 +26,9 @@ pub(crate) const ERR_SCENE_MODE: &[u8] = b"SVSmoothFps: 'scene.mode' must be in 
 pub(crate) const ERR_SCENE_MODE_RATE: &[u8] =
     b"SVSmoothFps: 'scene.mode' value isn't supported for selected frame rate\0";
 pub(crate) const ERR_SOURCE_CPU: &[u8] =
-    b"SVSmoothFps: source must be YV12 (8-bit 4:2:0) for CPU rendering\0";
-pub(crate) const ERR_SOURCE_YUV: &[u8] = b"SVSmoothFps: source must be YUV 4:2:0 8/10/16-bits\0";
+    b"SVSmoothFps: source must be 8-bit YUV 4:2:0 or 4:4:4 for CPU rendering\0";
+pub(crate) const ERR_SOURCE_YUV: &[u8] =
+    b"SVSmoothFps: source must be YUV 4:2:0 8/10/16-bit or 4:4:4 8-bit\0";
 pub(crate) const ERR_VECTORS_SIZE: &[u8] =
     b"SVSmoothFps: source and vectors frame sizes are different\0";
 pub(crate) const ERR_VECTORS_INVALID_1: &[u8] = b"SVSmoothFps: invalid vectors stream [1]\0";

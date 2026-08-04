@@ -578,6 +578,7 @@ impl WasmRenderer {
                 origin_y,
                 grid_w: usize::try_from(grid_width).map_err(|_| "invalid grid width")?,
                 grid_h: usize::try_from(grid_height).map_err(|_| "invalid grid height")?,
+                chroma_x_div: 2,
                 chroma_y_div: chroma_y_divisor,
                 source_step,
                 scale,

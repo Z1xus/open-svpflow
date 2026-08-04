@@ -38,6 +38,8 @@ pub(crate) struct SuperPlanes<'a> {
     pub(crate) u_stride: usize,
     pub(crate) v: &'a [u8],
     pub(crate) v_stride: usize,
+    pub(crate) chroma_x_div: usize,
+    pub(crate) chroma_y_div: usize,
     pub(crate) luma_w: usize,
     pub(crate) luma_h: usize,
     pub(crate) pel: i32,
@@ -62,6 +64,14 @@ impl SuperPlanes<'_> {
             reduce_dim(self.luma_w as i32, level) as usize,
             reduce_dim(self.luma_h as i32, level) as usize,
         )
+    }
+
+    fn chroma_size(&self, width: usize, height: usize) -> (usize, usize) {
+        (width / self.chroma_x_div, height / self.chroma_y_div)
+    }
+
+    fn chroma_weight(&self) -> u32 {
+        u32::try_from(self.chroma_x_div.saturating_mul(self.chroma_y_div)).unwrap_or(1)
     }
 }
 
@@ -1508,11 +1518,26 @@ fn block_activity(
         bw as usize,
         bh as usize,
     );
-    let cw = (bw / 2) as usize;
-    let ch = (bh / 2) as usize;
+    let cw = bw as usize / src.chroma_x_div;
+    let ch = bh as usize / src.chroma_y_div;
     let offset = chroma_level_offset(src, level);
-    luma + plane(src.u, src.u_stride, offset, px / 2, py / 2, cw, ch)
-        + plane(src.v, src.v_stride, offset, px / 2, py / 2, cw, ch)
+    luma + plane(
+        src.u,
+        src.u_stride,
+        offset,
+        px / src.chroma_x_div as i32,
+        py / src.chroma_y_div as i32,
+        cw,
+        ch,
+    ) + plane(
+        src.v,
+        src.v_stride,
+        offset,
+        px / src.chroma_x_div as i32,
+        py / src.chroma_y_div as i32,
+        cw,
+        ch,
+    )
 }
 
 fn plane_activity(
@@ -1677,8 +1702,19 @@ fn edge_shift_origins(
 }
 
 #[inline]
-fn chroma_origins_after_luma_shift(px: i32, py: i32, cx: i32, cy: i32) -> (i32, i32) {
-    ((px >> 1) - ((px - cx) >> 1), (py >> 1) - ((py - cy) >> 1))
+fn chroma_origins_after_luma_shift(
+    px: i32,
+    py: i32,
+    cx: i32,
+    cy: i32,
+    x_div: usize,
+    y_div: usize,
+) -> (i32, i32) {
+    let shift = |value: i32, divisor: usize| value >> divisor.trailing_zeros();
+    (
+        shift(px, x_div) - shift(px - cx, x_div),
+        shift(py, y_div) - shift(py - cy, y_div),
+    )
 }
 
 fn block_cost_lc(
@@ -2033,12 +2069,12 @@ fn block_cost_edge_lc(
         sad
     };
 
-    let cw = bw_u / 2;
-    let ch = bh_u / 2;
-    let (clw, clh) = (lw / 2, lh / 2);
-    let (ccx, ccy) = chroma_origins_after_luma_shift(px, py, cx, cy);
-    let crx0 = ((mvx >> 1) + 2 * ccx) >> 1;
-    let cry0 = ((mvy >> 1) + 2 * ccy) >> 1;
+    let (cw, ch) = src.chroma_size(bw_u, bh_u);
+    let (clw, clh) = src.chroma_size(lw, lh);
+    let (ccx, ccy) =
+        chroma_origins_after_luma_shift(px, py, cx, cy, src.chroma_x_div, src.chroma_y_div);
+    let crx0 = ((mvx >> 1) + src.chroma_x_div as i32 * ccx) >> src.chroma_x_div.trailing_zeros();
+    let cry0 = ((mvy >> 1) + src.chroma_y_div as i32 * ccy) >> src.chroma_y_div.trailing_zeros();
     let c_off = chroma_level_offset(src, level);
 
     let c_sub = if level == 0 && pel >= 2 {
@@ -2112,7 +2148,7 @@ fn block_cost_edge_lc(
         }
         sad
     };
-    let sad_c = sad_uv.saturating_mul(4);
+    let sad_c = sad_uv.saturating_mul(src.chroma_weight());
     Some((sad_l, sad_c))
 }
 
@@ -2131,23 +2167,30 @@ fn chroma_sad_x4(
     lh: usize,
     use_satd: bool,
 ) -> u32 {
-    let cw = bw / 2;
-    let ch = bh / 2;
+    let (cw, ch) = src.chroma_size(bw, bh);
     if cw < 4 || ch < 4 {
         return 0;
     }
-    let cpx = px / 2;
-    let cpy = py / 2;
-    let (clw, clh) = (lw / 2, lh / 2);
+    let cpx = px / src.chroma_x_div;
+    let cpy = py / src.chroma_y_div;
+    let (clw, clh) = src.chroma_size(lw, lh);
     let c_off = chroma_level_offset(src, level);
 
     let (c_sub_idx, mv_cx, mv_cy) = if level == 0 && pel >= 2 {
         let sx = mvx & 1;
         let sy = mvy & 1;
         let idx = ((sy * pel) + sx) as usize;
-        (idx, mvx >> 2, mvy >> 2)
+        (
+            idx,
+            mvx >> (1 + src.chroma_x_div.trailing_zeros()),
+            mvy >> (1 + src.chroma_y_div.trailing_zeros()),
+        )
     } else {
-        (0usize, mvx >> 1, mvy >> 1)
+        (
+            0usize,
+            mvx >> src.chroma_x_div.trailing_zeros(),
+            mvy >> src.chroma_y_div.trailing_zeros(),
+        )
     };
 
     let c_cur = c_off;
@@ -2249,7 +2292,7 @@ fn chroma_sad_x4(
                 .saturating_add(u32::from(av.abs_diff(bv)));
         }
     }
-    sad_uv.saturating_mul(4)
+    sad_uv.saturating_mul(src.chroma_weight())
 }
 
 fn satd_edge(
@@ -2655,7 +2698,7 @@ fn chroma_level_offset(src: &SuperPlanes<'_>, level: i32) -> usize {
     let mut y = 0usize;
     let pel = src.pel as usize;
     for lv in 0..level {
-        let h = reduce_dim(src.luma_h as i32, lv) as usize / 2;
+        let h = reduce_dim(src.luma_h as i32, lv) as usize / src.chroma_y_div;
         let sub = if lv == 0 && src.full { pel * pel } else { 1 };
         y += h.max(1) * sub;
     }

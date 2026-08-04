@@ -59,10 +59,11 @@ impl LightState {
         frame: i32,
         dst: &mut renderer::FramePlanesMut<'_>,
     ) {
-        if padding == (0, 0) || !video_format::is_yuv420p8(info) {
+        if padding == (0, 0) || !video_format::is_cpu_source(info) {
             return;
         }
         let (pad_x, pad_y) = padding;
+        let (x_div, y_div) = video_format::chroma_divisors(info);
 
         let frame = frame.max(0);
         let seed = u32::try_from((frame + 1) / 2).unwrap_or(0);
@@ -87,7 +88,7 @@ impl LightState {
         };
         let chroma = PlaneCfg {
             base: 127,
-            border: params.border / 2,
+            border: params.border / x_div,
             table_h: 1,
             table_v: 3,
             table_corner: 5,
@@ -105,10 +106,10 @@ impl LightState {
         );
         self.plane(
             &mut dst.u,
-            info.width / 2,
-            info.height / 2,
-            pad_x / 2,
-            pad_y / 2,
+            info.width / x_div,
+            info.height / y_div,
+            pad_x / x_div,
+            pad_y / y_div,
             &chroma,
             params,
             &noise,
@@ -116,10 +117,10 @@ impl LightState {
         );
         self.plane(
             &mut dst.v,
-            info.width / 2,
-            info.height / 2,
-            pad_x / 2,
-            pad_y / 2,
+            info.width / x_div,
+            info.height / y_div,
+            pad_x / x_div,
+            pad_y / y_div,
             &chroma,
             params,
             &noise,

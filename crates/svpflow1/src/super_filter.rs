@@ -1,9 +1,10 @@
-use crate::{params, super_build, super_opts::SuperOpts, vs};
+use crate::{params, super_build, super_opts::SuperOpts, video_format, vs};
 
 struct SuperState {
     node: vs::Raw,
     vi: vs::VideoInfo,
     opts: SuperOpts,
+    chroma_divisors: (usize, usize),
 }
 
 pub(crate) unsafe extern "system" fn create_super(
@@ -58,11 +59,18 @@ unsafe fn create_super_inner(
     }
     let vi = unsafe { *vi_ptr };
 
-    if vi.width <= 0 || vi.height <= 0 || vi.format.is_null() {
+    if vi.width <= 0 || vi.height <= 0 || !video_format::is_supported(&vi) {
         unsafe { vs::free_node(node, vsapi) };
-        unsafe { vs::set_error(output, vsapi, c"SVSuper: Clip must be YV12".as_ptr()) };
+        unsafe {
+            vs::set_error(
+                output,
+                vsapi,
+                c"SVSuper: Clip must be YUV420P8 or YUV444P8".as_ptr(),
+            );
+        };
         return 0;
     }
+    let chroma_divisors = video_format::chroma_divisors(&vi);
 
     let opt_val = unsafe { read_opt(input, vsapi) };
     let opts = match SuperOpts::from_opt(opt_val.as_ref(), vi.width, vi.height) {
@@ -85,6 +93,7 @@ unsafe fn create_super_inner(
         node,
         vi: out_vi,
         opts,
+        chroma_divisors,
     }));
 
     unsafe {
@@ -210,11 +219,12 @@ unsafe extern "system" fn get_frame_super(
     for plane in 0..3 {
         let stride = unsafe { get_stride(out.cast_const(), plane) } as usize;
         let ptr = unsafe { get_write(out, plane) };
-        let h = if plane == 0 {
-            state.vi.height as usize
-        } else {
-            (state.vi.height as usize) / 2
-        };
+        let h = state.vi.height as usize
+            / if plane == 0 {
+                1
+            } else {
+                state.chroma_divisors.1
+            };
         if !ptr.is_null() && stride > 0 {
             unsafe {
                 std::ptr::write_bytes(ptr, 0, stride * h);
@@ -226,11 +236,12 @@ unsafe extern "system" fn get_frame_super(
     let src_h = state.opts.height as usize;
 
     for plane in 0..3i32 {
-        let (bw, bh) = if plane == 0 {
-            (src_w, src_h)
+        let (x_div, y_div) = if plane == 0 {
+            (1, 1)
         } else {
-            (src_w / 2, src_h / 2)
+            state.chroma_divisors
         };
+        let (bw, bh) = (src_w / x_div, src_h / y_div);
         let src_stride = unsafe { get_stride(src_frame, plane) } as usize;
         let src_ptr = unsafe { get_read(src_frame, plane) };
         let dst_stride = unsafe { get_stride(out.cast_const(), plane) } as usize;
@@ -239,11 +250,7 @@ unsafe extern "system" fn get_frame_super(
             continue;
         }
         let src_h_bytes = bh;
-        let dst_h = if plane == 0 {
-            state.vi.height as usize
-        } else {
-            state.vi.height as usize / 2
-        };
+        let dst_h = state.vi.height as usize / y_div;
         let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, src_stride * src_h_bytes) };
         let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_ptr, dst_stride * dst_h) };
 
@@ -256,7 +263,8 @@ unsafe extern "system" fn get_frame_super(
             bh,
             src_w,
             src_h,
-            plane != 0,
+            x_div,
+            y_div,
             &state.opts,
         );
     }
