@@ -136,11 +136,7 @@ unsafe fn create_analyse_inner(
     let (bw, bh, ox, oy) = opts.output_block();
     let (gw, gh) = opts.grid(bw, bh, ox, oy);
     let count = (gw * gh) as usize;
-    let n_reg = match opts.vectors {
-        1 | 2 => 1,
-        _ => 2,
-    };
-    let payload_len = (0x40 + n_reg * (4 + count * 8)) as i32;
+    let payload_len = (0x40 + 2 * (4 + count * 8)) as i32;
 
     let mut out_vi = vs::VideoInfo {
         format: gray,

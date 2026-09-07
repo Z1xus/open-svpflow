@@ -2743,14 +2743,7 @@ pub(crate) fn pack_vector_frame(
     let flags = (if previous.is_some() { 1 } else { 0 }) | (if current.is_some() { 2 } else { 0 });
 
     let region_size = 4 + count * 8;
-    let mut n_regions = 0;
-    if previous.is_some() {
-        n_regions += 1;
-    }
-    if current.is_some() {
-        n_regions += 1;
-    }
-    let total = 0x40 + n_regions * region_size;
+    let total = 0x40 + 2 * region_size;
     let mut out = vec![0u8; total];
 
     write_i32(&mut out, 0, 16);
@@ -2778,19 +2771,16 @@ pub(crate) fn pack_vector_frame(
     write_i32(&mut out, 0x38, opts.selector);
     write_i32(&mut out, 0x3C, opts.delta);
 
-    let mut cursor = 0x40;
     let marker = (2 * count + 1) as i32;
     if let Some(vecs) = previous {
-        write_i32(&mut out, cursor, marker);
-        cursor += 4;
-        cursor = write_vecs(&mut out, cursor, vecs, count);
+        write_i32(&mut out, 0x40, marker);
+        write_vecs(&mut out, 0x44, vecs, count);
     }
     if let Some(vecs) = current {
+        let cursor = 0x40 + region_size;
         write_i32(&mut out, cursor, marker);
-        cursor += 4;
-        let _ = write_vecs(&mut out, cursor, vecs, count);
+        write_vecs(&mut out, cursor + 4, vecs, count);
     }
-    let _ = cursor;
     out
 }
 fn write_vecs(out: &mut [u8], mut cursor: usize, vecs: &[Vec8], count: usize) -> usize {
