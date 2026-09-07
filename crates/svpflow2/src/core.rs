@@ -394,6 +394,21 @@ impl FilterState {
                 drop_frame(next_source_8bit, free_frame);
             }
             Mode::Rife => {
+                let mut rife = rife;
+                if let Some(scene_frame) = unsafe {
+                    self.rife_scene_frame(
+                        source,
+                        next_source,
+                        frame,
+                        source_frame,
+                        frame_ctx,
+                        core,
+                        vsapi,
+                    )
+                } {
+                    drop_frame(rife, free_frame);
+                    rife = scene_frame;
+                }
                 if self.options.hdr_enabled()
                     && !self.options.cpu_render()
                     && !rife.is_null()
@@ -507,6 +522,61 @@ impl FilterState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    unsafe fn rife_scene_frame(
+        &self,
+        source: vs::ConstRaw,
+        next_source: vs::ConstRaw,
+        frame: i32,
+        source_frame: i32,
+        frame_ctx: vs::Raw,
+        core: vs::Raw,
+        vsapi: vs::ConstRaw,
+    ) -> Option<vs::ConstRaw> {
+        if source.is_null() || next_source.is_null() {
+            return None;
+        }
+        let api = unsafe { frame::PlaneApi::load(vsapi) }?;
+        let scene_change = if unsafe { api.scene_change_next(source) } {
+            true
+        } else if !self.clips.vectors.is_null() {
+            let metadata::VectorRecord::Ready(vector_data) = self.vector_data() else {
+                return None;
+            };
+            let count = usize::try_from(vector_data.grid.width)
+                .ok()?
+                .checked_mul(usize::try_from(vector_data.grid.height).ok()?)?;
+            let vector_len = 0x48usize.checked_add(count.checked_mul(16)?)?;
+            let get_frame =
+                unsafe { vs::table_fn::<vs::GetFrameFilter>(vsapi, vs::GET_FRAME_FILTER) }?;
+            let vectors = get_node(get_frame, self.clips.vectors, source_frame, frame_ctx);
+            let decoded = unsafe {
+                self.cached_decode(
+                    &api,
+                    i64::from(source_frame),
+                    vectors,
+                    vector_data,
+                    vector_len,
+                )
+            };
+            drop_frame(vectors, unsafe { vs::table_fn(vsapi, vs::FREE_FRAME) });
+            decoded?.scene_class >= 3
+        } else {
+            false
+        };
+        if !scene_change {
+            return None;
+        }
+        let phase = self.phase_256(frame, source_frame).clamp(0, 256);
+        let weight = if self.options.scene_blend() {
+            phase
+        } else if phase <= 128 {
+            0
+        } else {
+            256
+        };
+        unsafe { api.blend_frames(source, next_source, &self.video_info, weight, core) }
+    }
+
     unsafe fn try_rife_hdr_render(
         &self,
         rife: vs::ConstRaw,

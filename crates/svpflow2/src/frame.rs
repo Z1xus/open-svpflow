@@ -108,6 +108,83 @@ impl PlaneApi {
         }
     }
 
+    pub(crate) unsafe fn blend_frames(
+        &self,
+        source: vs::ConstRaw,
+        next_source: vs::ConstRaw,
+        info: &vs::VideoInfo,
+        weight: i32,
+        core: vs::Raw,
+    ) -> Option<vs::ConstRaw> {
+        let width = usize_positive(info.width)?;
+        let height = usize_positive(info.height)?;
+        let sample_bytes = if video_format::needs_8bit_vec_src(info) {
+            2
+        } else {
+            1
+        };
+        let (chroma_x, chroma_y) = video_format::chroma_divisors(info);
+        let selected = if weight <= 128 { source } else { next_source };
+        let output =
+            unsafe { self.new_frame(info.format, info.width, info.height, selected, core) }?;
+        let blend = || -> Option<()> {
+            for plane in 0..3 {
+                let (width, height) = if plane == 0 {
+                    (width, height)
+                } else {
+                    (
+                        width / usize::try_from(chroma_x).ok()?,
+                        height / usize::try_from(chroma_y).ok()?,
+                    )
+                };
+                let (left, left_stride, left_len) =
+                    unsafe { self.read_plane(source, plane, height) }?;
+                let (right, right_stride, right_len) =
+                    unsafe { self.read_plane(next_source, plane, height) }?;
+                let (dest, dest_stride, dest_len) =
+                    unsafe { self.write_plane(output, plane, height) }?;
+                let row_len = width.checked_mul(sample_bytes)?;
+                if row_len > left_stride || row_len > right_stride || row_len > dest_stride {
+                    return None;
+                }
+                let left = unsafe { std::slice::from_raw_parts(left, left_len) };
+                let right = unsafe { std::slice::from_raw_parts(right, right_len) };
+                let dest = unsafe { std::slice::from_raw_parts_mut(dest, dest_len) };
+                let weight = u32::try_from(weight.clamp(0, 256)).ok()?;
+                for row in 0..height {
+                    let left = &left[row * left_stride..row * left_stride + row_len];
+                    let right = &right[row * right_stride..row * right_stride + row_len];
+                    let dest = &mut dest[row * dest_stride..row * dest_stride + row_len];
+                    if sample_bytes == 1 {
+                        for ((dest, &left), &right) in dest.iter_mut().zip(left).zip(right) {
+                            *dest = ((u32::from(left) * (256 - weight) + u32::from(right) * weight)
+                                >> 8) as u8;
+                        }
+                    } else {
+                        for ((dest, left), right) in dest
+                            .as_chunks_mut::<2>()
+                            .0
+                            .iter_mut()
+                            .zip(left.as_chunks::<2>().0)
+                            .zip(right.as_chunks::<2>().0)
+                        {
+                            let left = u32::from(u16::from_ne_bytes([left[0], left[1]]));
+                            let right = u32::from(u16::from_ne_bytes([right[0], right[1]]));
+                            let value = ((left * (256 - weight) + right * weight) >> 8) as u16;
+                            dest.copy_from_slice(&value.to_ne_bytes());
+                        }
+                    }
+                }
+            }
+            Some(())
+        };
+        if blend().is_none() {
+            unsafe { self.free(output.cast_const()) };
+            return None;
+        }
+        Some(output.cast_const())
+    }
+
     pub(crate) unsafe fn copy_interpolated_timing(
         &self,
         source: vs::ConstRaw,
