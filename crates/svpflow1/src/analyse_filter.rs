@@ -114,6 +114,34 @@ unsafe fn create_analyse_inner(
         opts.height = src_vi.height;
     }
 
+    let expected_width = if opts.super_full {
+        opts.width
+    } else {
+        crate::super_opts::reduce_dim(opts.width, 1)
+    };
+    let expected_height = crate::super_opts::super_plane_height(
+        opts.width,
+        opts.height,
+        opts.pel,
+        opts.super_levels,
+        opts.super_full,
+    );
+    if super_vi.width != expected_width
+        || super_vi.height != expected_height
+        || super_vi.format != src_vi.format
+    {
+        unsafe { vs::free_node(super_node, vsapi) };
+        unsafe { vs::free_node(src_node, vsapi) };
+        unsafe {
+            vs::set_error(
+                output,
+                vsapi,
+                c"SVAnalyse: invalid super clip layout".as_ptr(),
+            );
+        };
+        return 0;
+    }
+
     let gray = unsafe { get_gray8_format(core, vsapi, super_vi.format) };
     if gray.is_null() {
         unsafe { vs::free_node(super_node, vsapi) };
@@ -253,8 +281,13 @@ unsafe extern "system" fn get_frame_analyse(
             unsafe { vs::table_fn::<vs::RequestFrameFilter>(vsapi, vs::REQUEST_FRAME_FILTER) }
         {
             let delta = state.opts.delta.max(1);
+            let n2 = (n + delta).min(state.vi.num_frames.saturating_sub(1));
             unsafe { request(n, state.super_node, frame_ctx) };
-            unsafe { request(n + delta, state.super_node, frame_ctx) };
+            unsafe { request(n2, state.super_node, frame_ctx) };
+            if !state.opts.super_full {
+                unsafe { request(n, state.src_node, frame_ctx) };
+                unsafe { request(n2, state.src_node, frame_ctx) };
+            }
         }
         return std::ptr::null();
     }
@@ -291,19 +324,51 @@ unsafe extern "system" fn get_frame_analyse(
 
     let f0 = unsafe { get_frame(n, state.super_node, frame_ctx) };
     let f1 = unsafe { get_frame(n2, state.super_node, frame_ctx) };
-    if f0.is_null() || f1.is_null() {
+    let (s0, s1) = if state.opts.super_full {
+        (std::ptr::null(), std::ptr::null())
+    } else {
+        unsafe {
+            (
+                get_frame(n, state.src_node, frame_ctx),
+                get_frame(n2, state.src_node, frame_ctx),
+            )
+        }
+    };
+    if f0.is_null() || f1.is_null() || (!state.opts.super_full && (s0.is_null() || s1.is_null())) {
         if let Some(ff) = free_frame {
-            if !f0.is_null() {
-                unsafe { ff(f0) };
-            }
-            if !f1.is_null() {
-                unsafe { ff(f1) };
+            for frame in [f0, f1, s0, s1] {
+                if !frame.is_null() {
+                    unsafe { ff(frame) };
+                }
             }
         }
         return std::ptr::null();
     }
 
-    let sh = unsafe { super_height(get_stride, f0) };
+    let mut source_opts = state.opts.clone();
+    source_opts.super_full = true;
+    source_opts.super_levels = 1;
+    source_opts.pel = 1;
+    let source0 = unsafe {
+        load_super_planes(
+            get_stride,
+            get_read,
+            s0,
+            &source_opts,
+            state.chroma_divisors,
+            None,
+        )
+    };
+    let source1 = unsafe {
+        load_super_planes(
+            get_stride,
+            get_read,
+            s1,
+            &source_opts,
+            state.chroma_divisors,
+            None,
+        )
+    };
     let planes0 = unsafe {
         load_super_planes(
             get_stride,
@@ -311,7 +376,7 @@ unsafe extern "system" fn get_frame_analyse(
             f0,
             &state.opts,
             state.chroma_divisors,
-            sh,
+            source0.as_ref(),
         )
     };
     let planes1 = unsafe {
@@ -321,7 +386,7 @@ unsafe extern "system" fn get_frame_analyse(
             f1,
             &state.opts,
             state.chroma_divisors,
-            sh,
+            source1.as_ref(),
         )
     };
 
@@ -329,6 +394,14 @@ unsafe extern "system" fn get_frame_analyse(
         (Some(p0), Some(p1)) => analyse_search::analyse_pair(p0, p1, &state.opts),
         _ => (None, None),
     };
+
+    if let Some(ff) = free_frame {
+        for frame in [s0, s1] {
+            if !frame.is_null() {
+                unsafe { ff(frame) };
+            }
+        }
+    }
 
     let payload = analyse_search::pack_vector_frame(&state.opts, bwd.as_deref(), fwd.as_deref());
 
@@ -362,19 +435,17 @@ unsafe extern "system" fn get_frame_analyse(
     out.cast_const()
 }
 
-unsafe fn super_height(get_stride: vs::GetStride, frame: vs::ConstRaw) -> usize {
-    let _ = (get_stride, frame);
-    0
-}
-
 unsafe fn load_super_planes<'a>(
     get_stride: vs::GetStride,
     get_read: vs::GetReadPtr,
     frame: vs::ConstRaw,
     opts: &AnalyseOpts,
     chroma_divisors: (usize, usize),
-    _sh_unused: usize,
+    finest: Option<&'a SuperPlanes<'a>>,
 ) -> Option<SuperPlanes<'a>> {
+    if frame.is_null() {
+        return None;
+    }
     let y_stride = unsafe { get_stride(frame, 0) } as usize;
     let u_stride = unsafe { get_stride(frame, 1) } as usize;
     let v_stride = unsafe { get_stride(frame, 2) } as usize;
@@ -384,8 +455,13 @@ unsafe fn load_super_planes<'a>(
     if y_ptr.is_null() || u_ptr.is_null() || v_ptr.is_null() {
         return None;
     }
-    let y_h = crate::super_opts::super_plane_height(opts.height, opts.pel, opts.super_levels, true)
-        as usize;
+    let y_h = crate::super_opts::super_plane_height(
+        opts.width,
+        opts.height,
+        opts.pel,
+        opts.super_levels,
+        opts.super_full,
+    ) as usize;
     let uv_h = y_h / chroma_divisors.1;
     let y = unsafe { std::slice::from_raw_parts(y_ptr, y_stride * y_h) };
     let u = unsafe { std::slice::from_raw_parts(u_ptr, u_stride * uv_h) };
@@ -403,6 +479,7 @@ unsafe fn load_super_planes<'a>(
         luma_h: opts.height as usize,
         pel: opts.pel,
         levels: opts.super_levels,
-        full: true,
+        full: opts.super_full,
+        finest,
     })
 }

@@ -87,6 +87,7 @@ unsafe fn create_super_inner(
     unsafe { prop_set_int(output, c"data".as_ptr(), sdata, 0) };
 
     let mut out_vi = vi;
+    out_vi.width = opts.super_width();
     out_vi.height = opts.super_height();
 
     let state = Box::into_raw(Box::new(SuperState {

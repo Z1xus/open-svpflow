@@ -45,13 +45,22 @@ pub(crate) struct SuperPlanes<'a> {
     pub(crate) pel: i32,
     pub(crate) levels: i32,
     pub(crate) full: bool,
+    pub(crate) finest: Option<&'a SuperPlanes<'a>>,
 }
 
 impl SuperPlanes<'_> {
+    fn for_level(&self, level: i32) -> &Self {
+        if level == 0 {
+            self.finest.unwrap_or(self)
+        } else {
+            self
+        }
+    }
+
     fn level_y_offset(&self, level: i32) -> usize {
         let mut y = 0usize;
         let pel = self.pel as usize;
-        for lv in 0..level {
+        for lv in i32::from(!self.full)..level {
             let h = reduce_dim(self.luma_h as i32, lv) as usize;
             let sub = if lv == 0 && self.full { pel * pel } else { 1 };
             y += h * sub;
@@ -1503,6 +1512,7 @@ fn block_activity(
     bh: i32,
     satd: bool,
 ) -> u32 {
+    let src = src.for_level(level);
     let (lw, lh) = src.level_size(level);
     let x = px - i32::from(level > 0 && px + bw >= lw as i32);
     let y = py - i32::from(level > 0 && py + bh >= lh as i32);
@@ -1590,6 +1600,7 @@ fn adapt_lambda(nlambda: i32, lsad: i32, pred_score: u32) -> i32 {
 }
 
 fn block_luma_dc(src: &SuperPlanes<'_>, level: i32, px: i32, py: i32, bw: i32, bh: i32) -> u8 {
+    let src = src.for_level(level);
     let (lw, lh) = src.level_size(level);
     let y_off = src.level_y_offset(level);
 
@@ -1766,6 +1777,8 @@ fn block_cost_luma_interior(
     use_satd: bool,
     pel: i32,
 ) -> u32 {
+    let src = src.for_level(level);
+    let refp = refp.for_level(level);
     let (lw, lh) = src.level_size(level);
     let px = px - i32::from(level > 0 && px + bw as i32 >= lw as i32);
     let py = py - i32::from(level > 0 && py + bh as i32 >= lh as i32);
@@ -2007,6 +2020,8 @@ fn block_cost_edge_lc(
     use_satd: bool,
     pel: i32,
 ) -> Option<(u32, u32)> {
+    let src = src.for_level(level);
+    let refp = refp.for_level(level);
     let (lw, lh) = src.level_size(level);
     let (cx, cy, rx0, ry0) =
         edge_shift_origins(px, py, mvx, mvy, bw, bh, lw as i32, lh as i32, pel)?;
@@ -2167,6 +2182,8 @@ fn chroma_sad_x4(
     lh: usize,
     use_satd: bool,
 ) -> u32 {
+    let src = src.for_level(level);
+    let refp = refp.for_level(level);
     let (cw, ch) = src.chroma_size(bw, bh);
     if cw < 4 || ch < 4 {
         return 0;
@@ -2697,7 +2714,7 @@ fn hadamard4_satd(diff: [[i32; 4]; 4]) -> u32 {
 fn chroma_level_offset(src: &SuperPlanes<'_>, level: i32) -> usize {
     let mut y = 0usize;
     let pel = src.pel as usize;
-    for lv in 0..level {
+    for lv in i32::from(!src.full)..level {
         let h = reduce_dim(src.luma_h as i32, lv) as usize / src.chroma_y_div;
         let sub = if lv == 0 && src.full { pel * pel } else { 1 };
         y += h.max(1) * sub;

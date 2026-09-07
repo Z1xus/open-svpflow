@@ -63,7 +63,15 @@ impl SuperOpts {
     }
 
     pub(crate) fn super_height(&self) -> i32 {
-        super_plane_height(self.height, self.pel, self.levels, self.full)
+        super_plane_height(self.width, self.height, self.pel, self.levels, self.full)
+    }
+
+    pub(crate) fn super_width(&self) -> i32 {
+        if self.full {
+            self.width
+        } else {
+            reduce_dim(self.width, 1)
+        }
     }
 }
 
@@ -86,8 +94,20 @@ pub(crate) fn auto_levels(width: i32, height: i32) -> i32 {
     }
 }
 
-pub(crate) fn super_plane_height(base_h: i32, pel: i32, levels: i32, full: bool) -> i32 {
-    let mut total = if full { pel * pel * base_h } else { 0 };
+pub(crate) fn super_plane_height(
+    base_w: i32,
+    base_h: i32,
+    pel: i32,
+    levels: i32,
+    full: bool,
+) -> i32 {
+    if !full {
+        let width = i64::from(reduce_dim(base_w, 1)).max(1);
+        let area = i64::from(base_w) * i64::from(base_h) / 2;
+        let height = (area + width - 1) / width;
+        return (height + (height & 1)) as i32;
+    }
+    let mut total = pel * pel * base_h;
     for lv in 1..levels {
         total += reduce_dim(base_h, lv);
     }

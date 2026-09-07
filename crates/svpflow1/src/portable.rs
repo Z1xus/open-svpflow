@@ -185,6 +185,7 @@ impl SuperFrame {
             pel: self.opts.pel,
             levels: self.opts.levels,
             full: self.opts.full,
+            finest: None,
         }
     }
 }

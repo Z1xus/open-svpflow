@@ -3441,6 +3441,9 @@ unsafe fn super_frame_planes(
     super_info: Option<&vs::VideoInfo>,
     sdata: i64,
 ) -> Option<renderer::FramePlanes<'static>> {
+    if !metadata::super_data(sdata).full() {
+        return None;
+    }
     let lane = usize::try_from(metadata::super_data(sdata).scale()).ok()?;
     if frame.is_null() || !matches!(lane, 1 | 2 | 4) {
         return None;

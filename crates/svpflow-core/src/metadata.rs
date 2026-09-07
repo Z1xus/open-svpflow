@@ -127,6 +127,10 @@ pub fn super_data(handle: i64) -> SuperData {
 }
 
 impl SuperData {
+    pub const fn full(&self) -> bool {
+        self.limit & 2 == 0
+    }
+
     pub const fn scale(&self) -> i32 {
         self.marker
     }

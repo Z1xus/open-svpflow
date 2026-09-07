@@ -39,13 +39,17 @@ pub(crate) fn build_plane(
     for lv in 0..levels {
         level_y.push(y);
         let (_, h) = level_size(lv);
-        let sub = if lv == 0 && opts.full { pel * pel } else { 1 };
+        let sub = if lv == 0 {
+            if opts.full { pel * pel } else { 0 }
+        } else {
+            1
+        };
         y += h * sub;
     }
 
     let (base_w, base_h) = level_size(0);
 
-    {
+    if opts.full {
         let row0 = level_y[0];
         for row in 0..base_h.min(src_h) {
             let dst_off = (row0 + row) * dst_stride;
@@ -73,15 +77,22 @@ pub(crate) fn build_plane(
         for lv in 0..levels.saturating_sub(1) {
             let (src_w_lv, src_h_lv) = level_size(lv);
             let (dst_w_lv, dst_h_lv) = level_size(lv + 1);
+            let (previous, output) = dst.split_at_mut(level_y[lv + 1] * dst_stride);
+            let (input, input_stride, input_row) = if lv == 0 && !opts.full {
+                (src, src_stride, 0)
+            } else {
+                (&*previous, dst_stride, level_y[lv])
+            };
             reduce_6tap(
-                dst,
-                dst_stride,
-                level_y[lv + 1],
-                dst_w_lv,
-                dst_h_lv,
-                level_y[lv],
+                input,
+                input_stride,
+                input_row,
                 src_w_lv,
                 src_h_lv,
+                output,
+                dst_stride,
+                dst_w_lv,
+                dst_h_lv,
             );
         }
     }
@@ -260,14 +271,15 @@ fn avg_epu8(a: u8, b: u8) -> u8 {
 }
 
 fn reduce_6tap(
-    buf: &mut [u8],
+    buf: &[u8],
     stride: usize,
-    dst_row0: usize,
-    dst_w: usize,
-    dst_h: usize,
     src_row0: usize,
     src_w: usize,
     src_h: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    dst_w: usize,
+    dst_h: usize,
 ) {
     if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
         return;
@@ -319,10 +331,12 @@ fn reduce_6tap(
     for dy in 0..dst_h {
         let row = &mut inter[dy * inter_w..dy * inter_w + inter_w];
         horizontal_6tap_inplace(row, dst_w, &mut row_scratch);
-        let dst_base = (dst_row0 + dy) * stride;
-        let n = inter_w.min(buf.len().saturating_sub(dst_base));
+        let dst_base = dy * dst_stride;
+        let n = inter_w
+            .min(dst_stride)
+            .min(dst.len().saturating_sub(dst_base));
         if n > 0 {
-            buf[dst_base..dst_base + n].copy_from_slice(&row[..n]);
+            dst[dst_base..dst_base + n].copy_from_slice(&row[..n]);
         }
     }
 }
