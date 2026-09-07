@@ -142,9 +142,15 @@ struct OpenCl {
 
 impl OpenCl {
     unsafe fn load() -> Result<Self, String> {
-        let lib = unsafe { libloading::Library::new("OpenCL.dll") }
-            .or_else(|_| unsafe { libloading::Library::new("OpenCL") })
-            .map_err(|e| format!("OpenCL.dll not loadable: {e}"))?;
+        let name = if cfg!(target_os = "windows") {
+            "OpenCL.dll"
+        } else if cfg!(target_os = "macos") {
+            "/System/Library/Frameworks/OpenCL.framework/OpenCL"
+        } else {
+            "libOpenCL.so.1"
+        };
+        let lib = unsafe { libloading::Library::new(name) }
+            .map_err(|e| format!("{name} not loadable: {e}"))?;
         macro_rules! sym {
             ($name:literal) => {
                 *unsafe {

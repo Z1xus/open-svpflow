@@ -25,9 +25,11 @@ Benchmarked on a 7,992 frame video with [smoothie's](https://github.com/couleur-
 
 ## Releases
 
-Download `svpflow1_vs.dll` and `svpflow2_vs.dll` from [Releases](https://github.com/Z1xus/open-svpflow/releases).
+Download builds for Windows, Linux, and macOS from [Releases](https://github.com/Z1xus/open-svpflow/releases).
 
-Linux builds aren't included, so build from source.
+New releases are reproducible and immutable once published.
+
+To reproduce the binaries, check out the release commit in a clean directory and use the matching build environment from the [release workflow](.github/workflows/nightly-release.yml). Run `bash .github/build.sh <target>` with the target from the release's `BUILD.txt`, then compare the files in `dist/` with the extracted release.
 
 ## Build
 

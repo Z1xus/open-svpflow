@@ -85,8 +85,16 @@ struct CudaApi {
 
 impl CudaApi {
     unsafe fn load() -> Result<Self, InitError> {
-        let lib = unsafe { libloading::Library::new("nvcuda.dll") }
-            .map_err(|_| InitError::CudaUnavailable)?;
+        if cfg!(target_os = "macos") {
+            return Err(InitError::CudaUnavailable);
+        }
+        let name = if cfg!(target_os = "windows") {
+            "nvcuda.dll"
+        } else {
+            "libcuda.so.1"
+        };
+        let lib =
+            unsafe { libloading::Library::new(name) }.map_err(|_| InitError::CudaUnavailable)?;
         macro_rules! sym {
             ($name:literal) => {
                 *unsafe {
@@ -206,8 +214,13 @@ struct NvApi {
 
 impl NvApi {
     unsafe fn load() -> Result<Self, InitError> {
-        let lib = unsafe { libloading::Library::new("nvofapi64.dll") }
-            .map_err(|_| InitError::Failed(0xB_0000))?;
+        let name = if cfg!(target_os = "windows") {
+            "nvofapi64.dll"
+        } else {
+            "libnvidia-opticalflow.so.1"
+        };
+        let lib =
+            unsafe { libloading::Library::new(name) }.map_err(|_| InitError::Failed(0xB_0000))?;
         let create: NvCreateInstance = *unsafe {
             lib.get(b"NvOFAPICreateInstanceCuda\0")
                 .map_err(|_| InitError::Failed(0xB_0001))?
