@@ -220,16 +220,27 @@ unsafe extern "system" fn get_frame_super(
     for plane in 0..3 {
         let stride = unsafe { get_stride(out.cast_const(), plane) } as usize;
         let ptr = unsafe { get_write(out, plane) };
-        let h = state.vi.height as usize
-            / if plane == 0 {
-                1
-            } else {
-                state.chroma_divisors.1
-            };
-        if !ptr.is_null() && stride > 0 {
-            unsafe {
-                std::ptr::write_bytes(ptr, 0, stride * h);
-            }
+        let (x_div, y_div) = if plane == 0 {
+            (1, 1)
+        } else {
+            state.chroma_divisors
+        };
+        let h = state.vi.height as usize / y_div;
+        let width = state.vi.width as usize / x_div;
+        let regions = super_build::level_regions(
+            stride,
+            state.opts.width as usize,
+            state.opts.height as usize,
+            (x_div.trailing_zeros(), y_div.trailing_zeros()),
+            &state.opts,
+        );
+        let untouched = if stride > width {
+            0
+        } else {
+            regions.get(1).map_or(0, |r| r.offset)
+        };
+        if !ptr.is_null() && stride * h > untouched {
+            unsafe { std::ptr::write_bytes(ptr.add(untouched), 0, stride * h - untouched) };
         }
     }
 
@@ -242,7 +253,7 @@ unsafe extern "system" fn get_frame_super(
         } else {
             state.chroma_divisors
         };
-        let (bw, bh) = (src_w / x_div, src_h / y_div);
+        let bh = src_h / y_div;
         let src_stride = unsafe { get_stride(src_frame, plane) } as usize;
         let src_ptr = unsafe { get_read(src_frame, plane) };
         let dst_stride = unsafe { get_stride(out.cast_const(), plane) } as usize;
@@ -260,12 +271,9 @@ unsafe extern "system" fn get_frame_super(
             dst_stride,
             src_slice,
             src_stride,
-            bw,
-            bh,
             src_w,
             src_h,
-            x_div,
-            y_div,
+            (x_div.trailing_zeros(), y_div.trailing_zeros()),
             &state.opts,
         );
     }

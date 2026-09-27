@@ -1,472 +1,481 @@
 use crate::super_opts::{SuperOpts, reduce_dim};
-#[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{
-    __m128i, _mm_add_epi16, _mm_avg_epu8, _mm_cvtsi128_si32, _mm_loadl_epi64, _mm_loadu_si128,
-    _mm_mullo_epi16, _mm_packus_epi16, _mm_set1_epi16, _mm_setr_epi8, _mm_setzero_si128,
-    _mm_shuffle_epi8, _mm_srai_epi16, _mm_storel_epi64, _mm_storeu_si128, _mm_sub_epi16,
-    _mm_unpacklo_epi8,
-};
+
+const SSE_CHUNK: usize = 16;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReduceFilter {
+    Average,
+    Bilinear,
+    Quadratic,
+    Cubic,
+}
+
+impl ReduceFilter {
+    fn from_option(value: i32) -> Option<Self> {
+        match value {
+            0 | 1 => Some(Self::Average),
+            2 => Some(Self::Bilinear),
+            3 => Some(Self::Quadratic),
+            4 => Some(Self::Cubic),
+            _ => None,
+        }
+    }
+
+    const fn rows(self) -> std::ops::RangeInclusive<isize> {
+        match self {
+            Self::Average => -1..=1,
+            Self::Bilinear => -1..=2,
+            Self::Quadratic | Self::Cubic => -2..=3,
+        }
+    }
+
+    fn vertical_edge(self, y: usize, height: usize) -> bool {
+        y == 0 || (self != Self::Average && y + 1 >= height.max(2))
+    }
+
+    fn apply(self, t: [u32; 6]) -> u32 {
+        let [m2, m1, c0, p1, p2, p3] = t;
+        match self {
+            Self::Average => (m1 + 2 * c0 + p1 + 2) >> 2,
+            Self::Bilinear => (m1 + 3 * (c0 + p1) + p2 + 4) >> 3,
+            Self::Quadratic => (m2 + 9 * (m1 + p2) + 22 * (c0 + p1) + p3 + 32) >> 6,
+            Self::Cubic => (m2 + 5 * (m1 + p2) + 10 * (c0 + p1) + p3 + 16) >> 5,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Upscale {
+    Bilinear,
+    Bicubic,
+    Wiener,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Region {
+    pub(crate) offset: usize,
+    width: usize,
+    height: usize,
+}
+
+pub(crate) fn level_regions(
+    pitch: usize,
+    luma_w: usize,
+    luma_h: usize,
+    (x_shift, y_shift): (u32, u32),
+    opts: &SuperOpts,
+) -> Vec<Region> {
+    let pel = opts.pel as usize;
+    let mut offset = 0;
+    (0..opts.levels.max(0))
+        .map(|level| {
+            let width = reduce_dim(luma_w as i32, level) as usize >> x_shift;
+            let height = reduce_dim(luma_h as i32, level) as usize >> y_shift;
+            let region = Region {
+                offset,
+                width,
+                height,
+            };
+            let stored = match (level, opts.full) {
+                (0, true) => pel * pel,
+                (0, false) => 0,
+                _ => 1,
+            };
+            offset += stored * height * pitch;
+            region
+        })
+        .collect()
+}
 
 pub(crate) fn build_plane(
     dst: &mut [u8],
-    dst_stride: usize,
+    pitch: usize,
     src: &[u8],
-    src_stride: usize,
-
-    src_w: usize,
-    src_h: usize,
-
+    src_pitch: usize,
     luma_w: usize,
     luma_h: usize,
-    x_div: usize,
-    y_div: usize,
+    shift: (u32, u32),
     opts: &SuperOpts,
 ) {
-    let levels = opts.levels as usize;
-    let pel = opts.pel as usize;
-    if levels == 0 || src_w == 0 || src_h == 0 {
+    let regions = level_regions(pitch, luma_w, luma_h, shift, opts);
+    let Some(&level0) = regions.first() else {
         return;
-    }
-
-    let level_size = |lv: usize| -> (usize, usize) {
-        let yw = reduce_dim(luma_w as i32, lv as i32) as usize;
-        let yh = reduce_dim(luma_h as i32, lv as i32) as usize;
-        (yw / x_div, yh / y_div)
     };
-
-    let mut level_y = Vec::with_capacity(levels);
-    let mut y = 0usize;
-    for lv in 0..levels {
-        level_y.push(y);
-        let (_, h) = level_size(lv);
-        let sub = if lv == 0 {
-            if opts.full { pel * pel } else { 0 }
-        } else {
-            1
-        };
-        y += h * sub;
-    }
-
-    let (base_w, base_h) = level_size(0);
-
+    let mut canvas = Canvas {
+        frame: dst,
+        spill: Vec::new(),
+    };
     if opts.full {
-        let row0 = level_y[0];
-        for row in 0..base_h.min(src_h) {
-            let dst_off = (row0 + row) * dst_stride;
-            let src_off = row * src_stride;
-            let n = base_w
-                .min(src_w)
-                .min(dst.len().saturating_sub(dst_off))
-                .min(src.len().saturating_sub(src_off));
-            if n > 0 {
-                dst[dst_off..dst_off + n].copy_from_slice(&src[src_off..src_off + n]);
-            }
-
-            if base_w > 0 && dst_stride > base_w {
-                let edge = dst[dst_off + base_w - 1];
-                for p in base_w..dst_stride {
-                    if dst_off + p < dst.len() {
-                        dst[dst_off + p] = edge;
-                    }
-                }
-            }
-        }
-    }
-
-    if opts.scale_down == 4 {
-        for lv in 0..levels.saturating_sub(1) {
-            let (src_w_lv, src_h_lv) = level_size(lv);
-            let (dst_w_lv, dst_h_lv) = level_size(lv + 1);
-            let (previous, output) = dst.split_at_mut(level_y[lv + 1] * dst_stride);
-            let (input, input_stride, input_row) = if lv == 0 && !opts.full {
-                (src, src_stride, 0)
-            } else {
-                (&*previous, dst_stride, level_y[lv])
-            };
-            reduce_6tap(
-                input,
-                input_stride,
-                input_row,
-                src_w_lv,
-                src_h_lv,
-                output,
-                dst_stride,
-                dst_w_lv,
-                dst_h_lv,
+        for row in 0..level0.height {
+            canvas.store(
+                level0.offset + row * pitch,
+                &src[row * src_pitch..][..level0.width],
             );
         }
     }
-
-    if pel >= 2 && opts.gpu <= 1 && opts.full {
-        if opts.scale_up == 0 {
-            fill_bilinear_pel2(dst, dst_stride, level_y[0], base_w, base_h);
-        } else if opts.scale_up == 2 {
-            fill_bicubic_pel2(dst, dst_stride, level_y[0], base_w, base_h);
+    if let Some(filter) = ReduceFilter::from_option(opts.scale_down) {
+        for (level, pair) in regions.windows(2).enumerate() {
+            let source = if level == 0 && !opts.full {
+                Source::Separate(src, src_pitch)
+            } else {
+                Source::Within(pair[0].offset, pitch)
+            };
+            let compact = matches!(source, Source::Separate(..));
+            reduce(filter, source, &mut canvas, pair[1], pitch, compact);
         }
     }
-}
-
-fn fill_bicubic_pel2(dst: &mut [u8], stride: usize, row0: usize, w: usize, h: usize) {
-    let planes = [row0, row0 + h, row0 + 2 * h, row0 + 3 * h];
-    bicubic_horizontal(dst, stride, planes[0], planes[1], w, h);
-    bicubic_vertical(dst, stride, planes[0], planes[2], w, h);
-    bicubic_horizontal(dst, stride, planes[2], planes[3], w, h);
-}
-
-fn bicubic_horizontal(buf: &mut [u8], stride: usize, src: usize, dst: usize, w: usize, h: usize) {
-    for y in 0..h {
-        let src = (src + y) * stride;
-        let dst = (dst + y) * stride;
-        let mut x = 0;
-        while x < w {
-            #[cfg(target_arch = "x86_64")]
-            if x >= 2 && x + 8 <= w.saturating_sub(4) {
-                unsafe { cubic8(buf, dst + x, src + x, 1) };
-                x += 8;
-                continue;
-            }
-            buf[dst + x] = half(buf, src + x, 1, x, w);
-            x += 1;
-        }
-    }
-}
-
-fn bicubic_vertical(buf: &mut [u8], stride: usize, src: usize, dst: usize, w: usize, h: usize) {
-    for y in 0..h {
-        let mut x = 0;
-        while x < w {
-            #[cfg(target_arch = "x86_64")]
-            if y >= 2 && y + 4 < h && x + 8 <= w {
-                unsafe { cubic8(buf, (dst + y) * stride + x, (src + y) * stride + x, stride) };
-                x += 8;
-                continue;
-            }
-            buf[(dst + y) * stride + x] = half(buf, (src + y) * stride + x, stride, y, h);
-            x += 1;
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-unsafe fn cubic8(buf: &mut [u8], dst: usize, src: usize, step: usize) {
-    unsafe {
-        let zero = _mm_setzero_si128();
-        let load = |i| _mm_unpacklo_epi8(_mm_loadl_epi64(buf.as_ptr().add(i).cast()), zero);
-        let outer = _mm_add_epi16(load(src - 2 * step), load(src + 3 * step));
-        let inner = _mm_mullo_epi16(
-            _mm_add_epi16(load(src), load(src + step)),
-            _mm_set1_epi16(20),
-        );
-        let near = _mm_mullo_epi16(
-            _mm_add_epi16(load(src - step), load(src + 2 * step)),
-            _mm_set1_epi16(5),
-        );
-        let value = _mm_srai_epi16::<5>(_mm_add_epi16(
-            _mm_sub_epi16(_mm_add_epi16(outer, inner), near),
-            _mm_set1_epi16(16),
-        ));
-        _mm_storel_epi64(
-            buf.as_mut_ptr().add(dst).cast::<__m128i>(),
-            _mm_packus_epi16(value, zero),
-        );
-    }
-}
-
-#[inline]
-fn half(buf: &[u8], i: usize, step: usize, p: usize, n: usize) -> u8 {
-    if p < 2 || p + 4 >= n {
-        return if p + 1 == n {
-            buf[i]
-        } else {
-            avg_epu8(buf[i], buf[i + step])
+    if opts.pel > 1 && opts.gpu < 2 && opts.full {
+        let upscale = match opts.scale_up {
+            0 => Upscale::Bilinear,
+            1 => Upscale::Bicubic,
+            _ => Upscale::Wiener,
         };
+        refine(&mut canvas, level0, pitch, opts.pel as usize, upscale);
     }
-    let value = i32::from(buf[i - 2 * step])
-        + i32::from(buf[i + 3 * step])
-        + 5 * (4 * i32::from(buf[i]) - i32::from(buf[i - step]) + 4 * i32::from(buf[i + step])
-            - i32::from(buf[i + 2 * step]))
-        + 16;
-    (value >> 5).clamp(0, 255) as u8
 }
 
-fn fill_bilinear_pel2(dst: &mut [u8], stride: usize, row0: usize, w: usize, h: usize) {
-    let full = row0;
-    let h_plane = row0 + h;
-    let v_plane = row0 + 2 * h;
-    let hv_plane = row0 + 3 * h;
-
-    for y in 0..h {
-        let src_base = (full + y) * stride;
-        let dst_base = (h_plane + y) * stride;
-        average_row(dst, dst_base, src_base, src_base + 1, w);
-    }
-
-    for y in 0..h {
-        let src_base = (full + y) * stride;
-        let next_base = (full + y + 1) * stride;
-        let dst_base = (v_plane + y) * stride;
-        average_row(dst, dst_base, src_base, next_base, w);
-    }
-    copy_row(dst, v_plane * stride, full * stride, w);
-
-    for y in 0..h {
-        let src_base = (full + y) * stride;
-        let diag_base = (full + y + 1) * stride + 1;
-        let dst_base = (hv_plane + y) * stride;
-        average_row(dst, dst_base, src_base, diag_base, w);
-    }
-    copy_row(dst, hv_plane * stride, full * stride + 1, w);
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Separate(&'a [u8], usize),
+    Within(usize, usize),
 }
 
-fn average_row(buf: &mut [u8], dst: usize, a: usize, b: usize, width: usize) {
-    let end = width
-        .min(buf.len().saturating_sub(dst))
-        .min(buf.len().saturating_sub(a))
-        .min(buf.len().saturating_sub(b));
-    let mut x = 0;
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: end bounds both sources and the disjoint destination plane.
-    unsafe {
-        while x + 16 <= end {
-            let av = _mm_loadu_si128(buf.as_ptr().add(a + x).cast());
-            let bv = _mm_loadu_si128(buf.as_ptr().add(b + x).cast());
-            _mm_storeu_si128(buf.as_mut_ptr().add(dst + x).cast(), _mm_avg_epu8(av, bv));
-            x += 16;
+struct Canvas<'a> {
+    frame: &'a mut [u8],
+    spill: Vec<u8>,
+}
+
+impl Canvas<'_> {
+    fn fetch(&self, start: isize, out: &mut [u8]) {
+        if let Ok(begin) = usize::try_from(start)
+            && let Some(bytes) = self.frame.get(begin..begin + out.len())
+        {
+            out.copy_from_slice(bytes);
+            return;
+        }
+        let len = self.frame.len() as isize;
+        for (i, value) in out.iter_mut().enumerate() {
+            let at = start + i as isize;
+            *value = match at {
+                ..0 => 0,
+                _ if at < len => self.frame[at as usize],
+                _ => self.spill.get((at - len) as usize).copied().unwrap_or(0),
+            };
         }
     }
-    for x in x..width.min(buf.len().saturating_sub(dst)) {
-        let av = buf.get(a + x).copied().unwrap_or(0);
-        let bv = buf.get(b + x).copied().unwrap_or(av);
-        buf[dst + x] = avg_epu8(av, bv);
-    }
-}
 
-fn copy_row(buf: &mut [u8], dst_off: usize, src_off: usize, n: usize) {
-    let n = n
-        .min(buf.len().saturating_sub(dst_off))
-        .min(buf.len().saturating_sub(src_off));
-    if n == 0 {
-        return;
-    }
-    if dst_off == src_off {
-        return;
-    }
-
-    if dst_off < src_off {
-        for i in 0..n {
-            buf[dst_off + i] = buf[src_off + i];
+    fn store(&mut self, start: usize, data: &[u8]) {
+        let len = self.frame.len();
+        if let Some(bytes) = self.frame.get_mut(start..start + data.len()) {
+            bytes.copy_from_slice(data);
+            return;
         }
-    } else if dst_off > src_off + n || src_off > dst_off + n {
-        buf.copy_within(src_off..src_off + n, dst_off);
-    } else {
-        let tmp = buf[src_off..src_off + n].to_vec();
-        buf[dst_off..dst_off + n].copy_from_slice(&tmp);
-    }
-}
-
-#[inline]
-fn avg_epu8(a: u8, b: u8) -> u8 {
-    ((u16::from(a) + u16::from(b) + 1) >> 1) as u8
-}
-
-fn reduce_6tap(
-    buf: &[u8],
-    stride: usize,
-    src_row0: usize,
-    src_w: usize,
-    src_h: usize,
-    dst: &mut [u8],
-    dst_stride: usize,
-    dst_w: usize,
-    dst_h: usize,
-) {
-    if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
-        return;
-    }
-
-    let inter_w = 2 * dst_w;
-    let mut inter = vec![0u8; inter_w.saturating_mul(dst_h)];
-
-    for dy in 0..dst_h {
-        let sy = dy * 2;
-        let win0 = sy as isize - 2;
-        let use_edge = dy == 0 || dy + 1 == dst_h || win0 < 0 || (sy + 3) >= src_h;
-        if use_edge {
-            let y0 = sy.min(src_h.saturating_sub(1));
-            let y1 = (sy + 1).min(src_h.saturating_sub(1));
-            for x in 0..inter_w {
-                let a = sample(buf, stride, src_row0, y0, x);
-                let b = sample(buf, stride, src_row0, y1, x);
-                inter[dy * inter_w + x] = avg_epu8(a, b);
-            }
-        } else {
-            let start = win0 as usize;
-            let mut x = 0;
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                while x + 8 <= inter_w {
-                    vertical_6tap8(
-                        buf.as_ptr().add((src_row0 + start) * stride + x),
-                        stride,
-                        inter.as_mut_ptr().add(dy * inter_w + x),
-                    );
-                    x += 8;
+        for (i, &value) in data.iter().enumerate() {
+            match (start + i).checked_sub(len) {
+                None => self.frame[start + i] = value,
+                Some(beyond) => {
+                    if beyond >= self.spill.len() {
+                        self.spill.resize(beyond + 1, 0);
+                    }
+                    self.spill[beyond] = value;
                 }
             }
-            let center = (src_row0 + sy) * stride;
-            let half = stride / 2;
-            let tap = |offset: usize| u32::from(buf.get(offset).copied().unwrap_or(0));
-            for x in x..inter_w {
-                let at = center + x;
-                let v = tap(at - half)
-                    + 5 * tap(at - stride)
-                    + 10 * (tap(at) + tap(at + stride))
-                    + 5 * tap(at + half)
-                    + tap(at + stride + half);
-                inter[dy * inter_w + x] = ((v + 16) >> 5).min(255) as u8;
+        }
+    }
+
+    fn fetch_source(&self, source: Source<'_>, offset: isize, out: &mut [u8]) {
+        match source {
+            Source::Within(base, _) => self.fetch(base as isize + offset, out),
+            Source::Separate(src, _) => {
+                for (i, value) in out.iter_mut().enumerate() {
+                    let at = usize::try_from(offset + i as isize).ok();
+                    *value = at.and_then(|at| src.get(at)).copied().unwrap_or(0);
+                }
             }
         }
     }
+}
 
-    let mut row_scratch = vec![0; inter_w];
-    for dy in 0..dst_h {
-        let row = &mut inter[dy * inter_w..dy * inter_w + inter_w];
-        horizontal_6tap_inplace(row, dst_w, &mut row_scratch);
-        let dst_base = dy * dst_stride;
-        let n = inter_w
-            .min(dst_stride)
-            .min(dst.len().saturating_sub(dst_base));
-        if n > 0 {
-            dst[dst_base..dst_base + n].copy_from_slice(&row[..n]);
+fn reduce(
+    filter: ReduceFilter,
+    source: Source<'_>,
+    canvas: &mut Canvas<'_>,
+    target: Region,
+    pitch: usize,
+    compact: bool,
+) {
+    let src_pitch = match source {
+        Source::Separate(_, p) | Source::Within(_, p) => p as isize,
+    };
+    let row_step = if compact { 2 * pitch } else { pitch };
+    let (width2, height) = (2 * target.width, target.height);
+    let exact_end = match filter {
+        ReduceFilter::Cubic if width2 >= 8 => width2 / 8 * 8,
+        ReduceFilter::Cubic => 0,
+        _ => width2,
+    };
+    let mut rows = [const { Vec::new() }; 6];
+    let mut halves = [const { Vec::new() }; 3];
+    let mut out = vec![0u8; width2];
+    for y in 0..height {
+        let center = (2 * y) as isize * src_pitch;
+        let edge = filter.vertical_edge(y, height);
+        let needed = if edge { 0..=1 } else { filter.rows() };
+        for k in needed {
+            let row = &mut rows[(k + 2) as usize];
+            row.resize(width2, 0);
+            canvas.fetch_source(source, center + k * src_pitch, row);
+        }
+        let computed = if edge { width2 } else { exact_end };
+        let [m2, m1, c0, p1, p2, p3] = &rows;
+        if edge {
+            vertical_average(&mut out[..computed], c0, p1);
+        } else {
+            vertical_filter(filter, &mut out[..computed], [m2, m1, c0, p1, p2, p3]);
+        }
+        let tap = |k: isize, x: usize| u32::from(rows[(k + 2) as usize][x]);
+        if computed < width2 {
+            let tail = width2 - computed;
+            for (half, k) in halves.iter_mut().zip([-1, 1, 3]) {
+                half.resize(tail, 0);
+                canvas.fetch_source(
+                    source,
+                    center + computed as isize + k * (src_pitch / 2),
+                    half,
+                );
+            }
+            for i in 0..tail {
+                let x = computed + i;
+                let h = |n: usize| u32::from(halves[n][i]);
+                let value =
+                    h(0) + 5 * tap(-1, x) + 10 * (tap(0, x) + tap(1, x)) + 5 * h(1) + h(2) + 16;
+                out[x] = (value >> 5) as u8;
+            }
+        }
+        canvas.store(target.offset + y * row_step, &out);
+    }
+    let mut row = vec![0u8; width2];
+    for y in 0..height {
+        let start = target.offset + y * row_step;
+        canvas.fetch(start as isize, &mut row);
+        reduce_row_in_place(filter, &mut row, target.width);
+        canvas.store(start, &row[..target.width]);
+    }
+    if compact {
+        let mut line = vec![0u8; pitch];
+        for y in 1..height {
+            canvas.fetch((target.offset + 2 * y * pitch) as isize, &mut line);
+            canvas.store(target.offset + y * pitch, &line);
         }
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-unsafe fn vertical_6tap8(src: *const u8, stride: usize, dst: *mut u8) {
-    let zero = _mm_setzero_si128();
-    let tap = |row| {
-        // SAFETY: reduce_6tap verifies six complete source rows and eight output columns.
-        _mm_unpacklo_epi8(
-            unsafe { _mm_loadl_epi64(src.add(row * stride).cast()) },
-            zero,
-        )
-    };
-    let sum = _mm_add_epi16(
-        _mm_add_epi16(tap(0), tap(5)),
-        _mm_add_epi16(
-            _mm_mullo_epi16(_mm_add_epi16(tap(1), tap(4)), _mm_set1_epi16(5)),
-            _mm_mullo_epi16(_mm_add_epi16(tap(2), tap(3)), _mm_set1_epi16(10)),
-        ),
-    );
-    let rounded = _mm_srai_epi16(_mm_add_epi16(sum, _mm_set1_epi16(16)), 5);
-    unsafe { _mm_storel_epi64(dst.cast(), _mm_packus_epi16(rounded, zero)) };
+fn vertical_average(out: &mut [u8], a: &[u8], b: &[u8]) {
+    for ((value, &a), &b) in out.iter_mut().zip(a).zip(b) {
+        *value = ((u16::from(a) + u16::from(b) + 1) >> 1) as u8;
+    }
 }
 
-fn horizontal_6tap_inplace(row: &mut [u8], dst_w: usize, scratch: &mut [u8]) {
-    if dst_w == 0 || row.is_empty() {
-        return;
-    }
-    if dst_w <= 2 {
-        for i in 0..dst_w {
-            let a = row.get(2 * i).copied().unwrap_or(0);
-            let b = row.get(2 * i + 1).copied().unwrap_or(a);
-            row[i] = avg_epu8(a, b);
+fn vertical_filter(filter: ReduceFilter, out: &mut [u8], rows: [&Vec<u8>; 6]) {
+    let n = out.len();
+    let used = filter.rows();
+    let row = |k: isize| -> &[u8] {
+        if used.contains(&k) {
+            &rows[(k + 2) as usize][..n]
+        } else {
+            &rows[2][..n]
         }
+    };
+    let (m2, m1, c0, p1, p2, p3) = (row(-2), row(-1), row(0), row(1), row(2), row(3));
+    for x in 0..n {
+        let t = |r: &[u8]| u32::from(r[x]);
+        out[x] = filter.apply([t(m2), t(m1), t(c0), t(p1), t(p2), t(p3)]) as u8;
+    }
+}
+
+fn reduce_row_in_place(filter: ReduceFilter, row: &mut [u8], width: usize) {
+    if width == 0 || row.len() < 2 {
         return;
     }
-
-    let Some(src) = scratch.get_mut(..row.len()) else {
-        return;
+    let at = |row: &[u8], i: isize| u32::from(row.get(i as usize).copied().unwrap_or(0));
+    row[0] = ((at(row, 0) + at(row, 1) + 1) >> 1) as u8;
+    let tail = match filter {
+        ReduceFilter::Average => width,
+        _ => (width - 1).max(1),
     };
-    src.copy_from_slice(row);
-    let src_w = src.len();
+    for x in 1..tail.min(row.len()) {
+        let base = 2 * x as isize;
+        let value = match filter {
+            ReduceFilter::Average => {
+                (at(row, base - 1) + 2 * at(row, base) + at(row, base + 1) + 2) >> 2
+            }
+            _ => filter.apply(std::array::from_fn(|i| at(row, base + i as isize - 2))),
+        };
+        row[x] = value as u8;
+    }
+    for x in tail..width.min(row.len()) {
+        row[x] = ((at(row, 2 * x as isize) + at(row, 2 * x as isize + 1) + 1) >> 1) as u8;
+    }
+}
 
-    row[0] = avg_epu8(src[0], src.get(1).copied().unwrap_or(src[0]));
-
-    let p5 = src.get(5).copied().unwrap_or_else(|| src[src_w - 1]);
-    let v = (u32::from(row[0])
-        + u32::from(p5)
-        + 10 * (u32::from(src.get(2).copied().unwrap_or(0))
-            + u32::from(src.get(3).copied().unwrap_or(0)))
-        + 5 * (u32::from(src.get(1).copied().unwrap_or(0))
-            + u32::from(src.get(4).copied().unwrap_or(0)))
-        + 16)
-        >> 5;
-    row[1] = v.min(255) as u8;
-
-    let end = dst_w - 1;
-    let mut out = 2;
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        while out + 3 < end && 2 * out + 14 <= src_w {
-            horizontal_6tap4(src.as_ptr().add(2 * out - 2), row.as_mut_ptr().add(out));
-            out += 4;
+fn refine(canvas: &mut Canvas<'_>, level0: Region, pitch: usize, pel: usize, upscale: Upscale) {
+    let plane = |k: usize| level0.offset + k * pitch * level0.height;
+    let (w, h) = (level0.width, level0.height);
+    let full = Interp {
+        pitch,
+        width: w,
+        height: h,
+    };
+    let (horizontal, vertical, diagonal) = if pel == 2 { (1, 2, 3) } else { (2, 8, 10) };
+    match upscale {
+        Upscale::Bilinear => {
+            full.pair(canvas, plane(horizontal), plane(0), plane(0) + 1);
+            full.pair(canvas, plane(vertical), plane(0), plane(0) + pitch);
+            full.copy_first_row(canvas, plane(vertical), plane(0));
+            full.pair(canvas, plane(diagonal), plane(0), plane(0) + pitch + 1);
+            full.copy_first_row(canvas, plane(diagonal), plane(0) + 1);
+        }
+        Upscale::Bicubic => {
+            full.horizontal(canvas, plane(horizontal), plane(0), HalfPel::CatmullRom);
+            full.vertical(canvas, plane(vertical), plane(0), HalfPel::CatmullRom);
+            full.horizontal(
+                canvas,
+                plane(diagonal),
+                plane(vertical),
+                HalfPel::CatmullRom,
+            );
+        }
+        Upscale::Wiener => {
+            full.horizontal(canvas, plane(horizontal), plane(0), HalfPel::Wiener);
+            full.vertical(canvas, plane(vertical), plane(0), HalfPel::Wiener);
+            full.horizontal(canvas, plane(diagonal), plane(vertical), HalfPel::Wiener);
         }
     }
-    while out < end {
-        let base = 2 * out - 2;
-        let v = (u32::from(src[base])
-            + u32::from(src[base + 5])
-            + 5 * (u32::from(src[base + 1]) + u32::from(src[base + 4]))
-            + 10 * (u32::from(src[base + 2]) + u32::from(src[base + 3]))
-            + 16)
-            >> 5;
-        row[out] = v.min(255) as u8;
-        out += 1;
+    if pel == 2 {
+        return;
     }
-
-    let mut i = dst_w.saturating_sub(1).max(1);
-    while i < dst_w {
-        let a = src.get(2 * i).copied().unwrap_or(0);
-        let b = src.get(2 * i + 1).copied().unwrap_or(a);
-        row[i] = avg_epu8(a, b);
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "ssse3")]
-unsafe fn horizontal_6tap4(src: *const u8, dst: *mut u8) {
-    let mask = |offset| {
-        _mm_setr_epi8(
-            offset,
-            offset + 2,
-            offset + 4,
-            offset + 6,
-            -1,
-            -1,
-            -1,
-            -1,
-            -1,
-            -1,
-            -1,
-            -1,
-            -1,
-            -1,
-            -1,
-            -1,
-        )
+    let short_row = Interp {
+        width: w - 1,
+        ..full
     };
-    // SAFETY: the caller checks 16 readable source bytes and four writable outputs.
-    let input = unsafe { _mm_loadu_si128(src.cast()) };
-    let zero = _mm_setzero_si128();
-    let tap = |offset| _mm_unpacklo_epi8(_mm_shuffle_epi8(input, mask(offset)), zero);
-    let sum = _mm_add_epi16(
-        _mm_add_epi16(tap(0), tap(5)),
-        _mm_add_epi16(
-            _mm_mullo_epi16(_mm_add_epi16(tap(1), tap(4)), _mm_set1_epi16(5)),
-            _mm_mullo_epi16(_mm_add_epi16(tap(2), tap(3)), _mm_set1_epi16(10)),
-        ),
-    );
-    let rounded = _mm_srai_epi16(_mm_add_epi16(sum, _mm_set1_epi16(16)), 5);
-    let packed = _mm_packus_epi16(rounded, zero);
-    unsafe { std::ptr::write_unaligned(dst.cast::<i32>(), _mm_cvtsi128_si32(packed)) };
+    let short_col = Interp {
+        height: h - 1,
+        ..full
+    };
+    full.pair(canvas, plane(1), plane(0), plane(2));
+    full.pair(canvas, plane(9), plane(8), plane(10));
+    full.pair(canvas, plane(4), plane(0), plane(8));
+    full.pair(canvas, plane(6), plane(2), plane(10));
+    full.pair(canvas, plane(5), plane(4), plane(6));
+    short_row.pair(canvas, plane(3), plane(0) + 1, plane(2));
+    short_row.pair(canvas, plane(11), plane(8) + 1, plane(10));
+    short_col.pair(canvas, plane(12), plane(0) + pitch, plane(8));
+    short_col.pair(canvas, plane(14), plane(2) + pitch, plane(10));
+    full.pair(canvas, plane(13), plane(12), plane(14));
+    short_row.pair(canvas, plane(7), plane(4) + 1, plane(6));
+    short_row.pair(canvas, plane(15), plane(12) + 1, plane(14));
 }
 
-#[inline]
-fn sample(buf: &[u8], stride: usize, row0: usize, y: usize, x: usize) -> u8 {
-    buf.get((row0 + y) * stride + x).copied().unwrap_or(0)
+#[derive(Clone, Copy)]
+enum HalfPel {
+    CatmullRom,
+    Wiener,
+}
+
+impl HalfPel {
+    const fn edges(self) -> (usize, usize) {
+        match self {
+            Self::CatmullRom => (1, 3),
+            Self::Wiener => (2, 4),
+        }
+    }
+
+    fn apply(self, t: [i32; 6]) -> u8 {
+        let [m2, m1, c0, p1, p2, p3] = t;
+        let value = match self {
+            Self::CatmullRom => (-(m1 + p2) + (c0 + p1) * 9 + 8) >> 4,
+            Self::Wiener => (m2 + (-m1 + (c0 << 2) + (p1 << 2) - p2) * 5 + p3 + 16) >> 5,
+        };
+        value.clamp(0, 255) as u8
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Interp {
+    pitch: usize,
+    width: usize,
+    height: usize,
+}
+
+impl Interp {
+    fn pair(self, canvas: &mut Canvas<'_>, dst: usize, first: usize, second: usize) {
+        let span = self.width.div_ceil(SSE_CHUNK) * SSE_CHUNK;
+        let (mut a, mut b) = (vec![0u8; span], vec![0u8; span]);
+        for y in 0..self.height {
+            let row = y * self.pitch;
+            canvas.fetch((first + row) as isize, &mut a);
+            canvas.fetch((second + row) as isize, &mut b);
+            for (x, y) in a.iter_mut().zip(&b) {
+                *x = ((u16::from(*x) + u16::from(*y) + 1) >> 1) as u8;
+            }
+            canvas.store(dst + row, &a);
+        }
+    }
+
+    fn copy_first_row(self, canvas: &mut Canvas<'_>, dst: usize, src: usize) {
+        let mut row = vec![0u8; self.width];
+        canvas.fetch(src as isize, &mut row);
+        canvas.store(dst, &row);
+    }
+
+    fn horizontal(self, canvas: &mut Canvas<'_>, dst: usize, src: usize, kernel: HalfPel) {
+        let (lead, tail) = kernel.edges();
+        let w = self.width;
+        let inner = w.saturating_sub(tail).saturating_sub(lead);
+        let mut padded = vec![0u8; w + 5];
+        let mut out = vec![0u8; w];
+        for y in 0..self.height {
+            let row = y * self.pitch;
+            canvas.fetch((src + row) as isize - 2, &mut padded);
+            let taps: [&[u8]; 6] = std::array::from_fn(|k| &padded[lead + k..][..inner]);
+            apply_half_pel(kernel, &mut out[lead..lead + inner], taps);
+            let pixel = &padded[2..];
+            for i in (0..lead).chain(lead + inner..w.saturating_sub(1)) {
+                out[i] = ((u16::from(pixel[i]) + u16::from(pixel[i + 1]) + 1) >> 1) as u8;
+            }
+            out[w - 1] = pixel[w - 1];
+            canvas.store(dst + row, &out);
+        }
+    }
+
+    fn vertical(self, canvas: &mut Canvas<'_>, dst: usize, src: usize, kernel: HalfPel) {
+        let (lead, tail) = kernel.edges();
+        let (w, h, p) = (self.width, self.height, self.pitch as isize);
+        let mut rows = [const { Vec::new() }; 6];
+        let mut out = vec![0u8; w];
+        for j in 0..h {
+            let base = (src + j * self.pitch) as isize;
+            for (k, row) in rows.iter_mut().enumerate() {
+                row.resize(w, 0);
+                canvas.fetch(base + (k as isize - 2) * p, row);
+            }
+            if j + 1 == h {
+                out.copy_from_slice(&rows[2]);
+            } else if j < lead || j >= h.saturating_sub(tail) {
+                vertical_average(&mut out, &rows[2], &rows[3]);
+            } else {
+                apply_half_pel(kernel, &mut out, std::array::from_fn(|k| &rows[k][..w]));
+            }
+            canvas.store(dst + j * self.pitch, &out);
+        }
+    }
+}
+
+fn apply_half_pel(kernel: HalfPel, out: &mut [u8], taps: [&[u8]; 6]) {
+    let n = out.len();
+    let [m2, m1, c0, p1, p2, p3] = taps.map(|t| &t[..n]);
+    for i in 0..n {
+        let t = |r: &[u8]| i32::from(r[i]);
+        out[i] = kernel.apply([t(m2), t(m1), t(c0), t(p1), t(p2), t(p3)]);
+    }
 }

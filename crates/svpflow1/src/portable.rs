@@ -97,7 +97,6 @@ impl SuperBuilder {
         let width = usize::try_from(self.opts.width).map_err(|_| "invalid width")?;
         let height = usize::try_from(self.opts.height).map_err(|_| "invalid height")?;
         let chroma_width = width / 2;
-        let chroma_height = height / 2;
         let (source_y, chroma) = source.split_at(self.source_y_len);
         let (source_u, source_v) = chroma.split_at(self.source_chroma_len);
         let mut y = vec![0; self.output_y_len];
@@ -107,7 +106,14 @@ impl SuperBuilder {
         rayon::join(
             || {
                 super_build::build_plane(
-                    &mut y, width, source_y, width, width, height, width, height, 1, 1, &opts,
+                    &mut y,
+                    width,
+                    source_y,
+                    width,
+                    width,
+                    height,
+                    (0, 0),
+                    &opts,
                 );
             },
             || {
@@ -118,12 +124,9 @@ impl SuperBuilder {
                             chroma_width,
                             source_u,
                             chroma_width,
-                            chroma_width,
-                            chroma_height,
                             width,
                             height,
-                            2,
-                            2,
+                            (1, 1),
                             &opts,
                         );
                     },
@@ -133,12 +136,9 @@ impl SuperBuilder {
                             chroma_width,
                             source_v,
                             chroma_width,
-                            chroma_width,
-                            chroma_height,
                             width,
                             height,
-                            2,
-                            2,
+                            (1, 1),
                             &opts,
                         );
                     },
