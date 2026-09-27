@@ -1,20 +1,14 @@
-use crate::analyse_opts::AnalyseOpts;
-use crate::analyse_search::{self, SuperPlanes};
+use crate::analyse::{self, AnalyseParams, RawPlane, SuperFrameView, SuperParams};
 use crate::{params, video_format, vs};
 
 struct AnalyseState {
     super_node: vs::Raw,
     src_node: vs::Raw,
     vi: vs::VideoInfo,
-    opts: AnalyseOpts,
-
-    #[allow(dead_code)]
-    vdata: Box<[i32]>,
-    #[allow(dead_code)]
-    vdata_handle: i64,
+    params: AnalyseParams,
+    super_height: usize,
+    _header: Box<[i32]>,
     gray_format: vs::ConstRaw,
-    payload_len: i32,
-    chroma_divisors: (usize, usize),
 }
 
 pub(crate) unsafe extern "system" fn create_analyse(
@@ -24,7 +18,11 @@ pub(crate) unsafe extern "system" fn create_analyse(
     core: vs::Raw,
     vsapi: vs::ConstRaw,
 ) -> isize {
-    unsafe { create_analyse_inner(input, output, core, vsapi) }
+    if let Err(message) = unsafe { create_analyse_inner(input, output, core, vsapi) } {
+        let message = std::ffi::CString::new(message).unwrap_or_default();
+        unsafe { vs::set_error(output, vsapi, message.as_ptr()) };
+    }
+    0
 }
 
 unsafe fn create_analyse_inner(
@@ -32,166 +30,113 @@ unsafe fn create_analyse_inner(
     output: vs::Raw,
     core: vs::Raw,
     vsapi: vs::ConstRaw,
-) -> isize {
-    let Some(get_node) = (unsafe { vs::table_fn::<vs::PropGetNode>(vsapi, vs::PROP_GET_NODE) })
-    else {
-        unsafe { vs::set_error(output, vsapi, c"SVAnalyse: invalid VSAPI".as_ptr()) };
-        return 0;
-    };
-    let Some(get_vi) = (unsafe { vs::table_fn::<vs::GetVideoInfo>(vsapi, vs::GET_VIDEO_INFO) })
-    else {
-        unsafe { vs::set_error(output, vsapi, c"SVAnalyse: invalid VSAPI".as_ptr()) };
-        return 0;
-    };
-    let Some(create_filter) =
-        (unsafe { vs::table_fn::<vs::CreateFilter>(vsapi, vs::CREATE_FILTER) })
-    else {
-        unsafe { vs::set_error(output, vsapi, c"SVAnalyse: invalid VSAPI".as_ptr()) };
-        return 0;
-    };
-    let Some(prop_set_int) = (unsafe { vs::table_fn::<vs::PropSetInt>(vsapi, vs::PROP_SET_INT) })
-    else {
-        unsafe { vs::set_error(output, vsapi, c"SVAnalyse: invalid VSAPI".as_ptr()) };
-        return 0;
-    };
-    let Some(get_int) = (unsafe { vs::table_fn::<vs::PropGetInt>(vsapi, vs::PROP_GET_INT) }) else {
-        unsafe { vs::set_error(output, vsapi, c"SVAnalyse: invalid VSAPI".as_ptr()) };
-        return 0;
-    };
+) -> Result<(), String> {
+    const INVALID_API: &str = "SVAnalyse: invalid VSAPI";
+    let get_node =
+        unsafe { vs::table_fn::<vs::PropGetNode>(vsapi, vs::PROP_GET_NODE) }.ok_or(INVALID_API)?;
+    let get_vi = unsafe { vs::table_fn::<vs::GetVideoInfo>(vsapi, vs::GET_VIDEO_INFO) }
+        .ok_or(INVALID_API)?;
+    let create_filter =
+        unsafe { vs::table_fn::<vs::CreateFilter>(vsapi, vs::CREATE_FILTER) }.ok_or(INVALID_API)?;
+    let prop_set_int =
+        unsafe { vs::table_fn::<vs::PropSetInt>(vsapi, vs::PROP_SET_INT) }.ok_or(INVALID_API)?;
+    let get_int =
+        unsafe { vs::table_fn::<vs::PropGetInt>(vsapi, vs::PROP_GET_INT) }.ok_or(INVALID_API)?;
 
     let mut err = 0;
     let super_node = unsafe { get_node(input, c"clip".as_ptr(), 0, &raw mut err) };
     if super_node.is_null() {
-        unsafe { vs::set_error(output, vsapi, c"SVAnalyse: clip (super) required".as_ptr()) };
-        return 0;
+        return Err("SVAnalyse: clip (super) required".into());
     }
     let src_node = unsafe { get_node(input, c"src".as_ptr(), 0, &raw mut err) };
-    if src_node.is_null() {
-        unsafe { vs::free_node(super_node, vsapi) };
-        unsafe { vs::set_error(output, vsapi, c"SVAnalyse: src required".as_ptr()) };
-        return 0;
-    }
-    let sdata = unsafe { get_int(input, c"sdata".as_ptr(), 0, &raw mut err) };
-    if err != 0 {
-        unsafe { vs::free_node(super_node, vsapi) };
-        unsafe { vs::free_node(src_node, vsapi) };
-        unsafe { vs::set_error(output, vsapi, c"SVAnalyse: sdata required".as_ptr()) };
-        return 0;
-    }
-
-    let src_vi = unsafe { *get_vi(src_node) };
-    let super_vi = unsafe { *get_vi(super_node) };
-    if !video_format::is_supported(&src_vi) {
-        unsafe { vs::free_node(super_node, vsapi) };
-        unsafe { vs::free_node(src_node, vsapi) };
-        unsafe {
-            vs::set_error(
-                output,
-                vsapi,
-                c"SVAnalyse: src must be YUV420P8 or YUV444P8".as_ptr(),
-            );
-        };
-        return 0;
-    }
-    let chroma_divisors = video_format::chroma_divisors(&src_vi);
-
-    let opt_raw = unsafe { read_opt_bytes(input, vsapi) };
-    let opt_val = opt_raw.as_ref().and_then(|b| params::parse(b).ok());
-    let mut opts = match AnalyseOpts::from_opt(opt_val.as_ref(), sdata, None) {
-        Ok(o) => o,
-        Err(msg) => {
-            unsafe { vs::free_node(super_node, vsapi) };
-            unsafe { vs::free_node(src_node, vsapi) };
-            let cmsg = std::ffi::CString::new(msg).unwrap_or_default();
-            unsafe { vs::set_error(output, vsapi, cmsg.as_ptr()) };
-            return 0;
+    let free_nodes = || unsafe {
+        vs::free_node(super_node, vsapi);
+        if !src_node.is_null() {
+            vs::free_node(src_node, vsapi);
         }
     };
-    if src_vi.width > 0 {
-        opts.width = src_vi.width;
+    if src_node.is_null() {
+        free_nodes();
+        return Err("SVAnalyse: src required".into());
     }
-    if src_vi.height > 0 {
-        opts.height = src_vi.height;
-    }
+    let result = (|| {
+        let sdata = unsafe { get_int(input, c"sdata".as_ptr(), 0, &raw mut err) };
+        if err != 0 {
+            return Err("SVAnalyse: sdata required".to_string());
+        }
+        let src_vi = unsafe { *get_vi(src_node) };
+        let super_vi = unsafe { *get_vi(super_node) };
+        if !video_format::is_supported(&src_vi) {
+            return Err("SVAnalyse: src must be YUV420P8 or YUV444P8".into());
+        }
+        let (x_div, y_div) = video_format::chroma_divisors(&src_vi);
+        let chroma_shift = (x_div.trailing_zeros(), y_div.trailing_zeros());
 
-    let expected_width = if opts.super_full {
-        opts.width
-    } else {
-        crate::super_opts::reduce_dim(opts.width, 1)
-    };
-    let expected_height = crate::super_opts::super_plane_height(
-        opts.width,
-        opts.height,
-        opts.pel,
-        opts.super_levels,
-        opts.super_full,
-    );
-    if super_vi.width != expected_width
-        || super_vi.height != expected_height
-        || super_vi.format != src_vi.format
-    {
-        unsafe { vs::free_node(super_node, vsapi) };
-        unsafe { vs::free_node(src_node, vsapi) };
-        unsafe {
-            vs::set_error(
-                output,
-                vsapi,
-                c"SVAnalyse: invalid super clip layout".as_ptr(),
-            );
+        let options = unsafe { read_opt_bytes(input, vsapi) };
+        let options = options
+            .as_deref()
+            .and_then(|bytes| params::parse(bytes).ok());
+        let super_params = SuperParams::unpack(sdata)?;
+        let params = AnalyseParams::new(options.as_ref(), super_params, chroma_shift)?;
+
+        let full = super_params.has_finest_level();
+        let expected_width = if full {
+            super_params.width
+        } else {
+            analyse::plane_size(super_params.width, 1)
         };
-        return 0;
-    }
+        let super_height = crate::super_opts::super_plane_height(
+            super_params.width,
+            super_params.height,
+            super_params.pel,
+            super_params.levels,
+            full,
+        );
+        if super_vi.width != expected_width
+            || super_vi.height != super_height
+            || super_vi.format != src_vi.format
+        {
+            return Err("SVAnalyse: invalid super clip layout".into());
+        }
+        let gray = unsafe { get_gray8_format(core, vsapi, super_vi.format) };
+        if gray.is_null() {
+            return Err("SVAnalyse: cannot get Gray8 format".into());
+        }
 
-    let gray = unsafe { get_gray8_format(core, vsapi, super_vi.format) };
-    if gray.is_null() {
-        unsafe { vs::free_node(super_node, vsapi) };
-        unsafe { vs::free_node(src_node, vsapi) };
-        unsafe {
-            vs::set_error(
-                output,
-                vsapi,
-                c"SVAnalyse: cannot get Gray8 format".as_ptr(),
-            );
+        let header: Box<[i32]> = Box::new(analyse::analysis_header(&params));
+        unsafe { prop_set_int(output, c"data".as_ptr(), header.as_ptr() as i64, 0) };
+
+        let mut num_frames = src_vi.num_frames;
+        if super_vi.num_frames > 0 && super_vi.num_frames < num_frames {
+            num_frames = super_vi.num_frames;
+        }
+        let vi = vs::VideoInfo {
+            format: gray,
+            fps_num: src_vi.fps_num,
+            fps_den: src_vi.fps_den,
+            width: analyse::frame_len(&params) as i32,
+            height: 1,
+            num_frames,
+            flags: 0,
         };
-        return 0;
-    }
-
-    let vdata_vec = analyse_search::pack_vdata_header(&opts);
-    let vdata: Box<[i32]> = vdata_vec.into_boxed_slice();
-    let vdata_handle = vdata.as_ptr() as usize as i64;
-    unsafe { prop_set_int(output, c"data".as_ptr(), vdata_handle, 0) };
-
-    let (bw, bh, ox, oy) = opts.output_block();
-    let (gw, gh) = opts.grid(bw, bh, ox, oy);
-    let count = (gw * gh) as usize;
-    let payload_len = (0x40 + 2 * (4 + count * 8)) as i32;
-
-    let mut out_vi = vs::VideoInfo {
-        format: gray,
-        fps_num: src_vi.fps_num,
-        fps_den: src_vi.fps_den,
-        width: payload_len,
-        height: 1,
-        num_frames: src_vi.num_frames,
-        flags: 0,
+        Ok(AnalyseState {
+            super_node,
+            src_node,
+            vi,
+            params,
+            super_height: super_height as usize,
+            _header: header,
+            gray_format: gray,
+        })
+    })();
+    let state = match result {
+        Ok(state) => state,
+        Err(message) => {
+            free_nodes();
+            return Err(message);
+        }
     };
-
-    if super_vi.num_frames > 0 && super_vi.num_frames < out_vi.num_frames {
-        out_vi.num_frames = super_vi.num_frames;
-    }
-
-    let state = Box::into_raw(Box::new(AnalyseState {
-        super_node,
-        src_node,
-        vi: out_vi,
-        opts,
-        vdata,
-        vdata_handle,
-        gray_format: gray,
-        payload_len,
-        chroma_divisors,
-    }));
-
+    let state = Box::into_raw(Box::new(state));
     unsafe {
         create_filter(
             input,
@@ -206,7 +151,7 @@ unsafe fn create_analyse_inner(
             core,
         );
     }
-    0
+    Ok(())
 }
 
 unsafe fn read_opt_bytes(input: vs::ConstRaw, vsapi: vs::ConstRaw) -> Option<Vec<u8>> {
@@ -232,10 +177,10 @@ unsafe fn get_gray8_format(
     type GetFormatPreset = unsafe extern "system" fn(i32, vs::Raw) -> vs::ConstRaw;
     const GET_FORMAT_PRESET: usize = 176;
     const PF_GRAY8: i32 = 1_000_010;
-    if let Some(gp) = unsafe { vs::table_fn::<GetFormatPreset>(vsapi, GET_FORMAT_PRESET) } {
-        let fmt = unsafe { gp(PF_GRAY8, core) };
-        if !fmt.is_null() {
-            return fmt;
+    if let Some(preset) = unsafe { vs::table_fn::<GetFormatPreset>(vsapi, GET_FORMAT_PRESET) } {
+        let format = unsafe { preset(PF_GRAY8, core) };
+        if !format.is_null() {
+            return format;
         }
     }
     fallback
@@ -265,6 +210,40 @@ unsafe extern "system" fn free_analyse(
     unsafe { vs::free_node(state.src_node, vsapi) };
 }
 
+struct FrameApi {
+    get_frame: vs::GetFrameFilter,
+    get_stride: vs::GetStride,
+    get_read: vs::GetReadPtr,
+    free_frame: vs::FreeFrame,
+}
+
+impl FrameApi {
+    unsafe fn load(vsapi: vs::ConstRaw) -> Option<Self> {
+        Some(Self {
+            get_frame: unsafe { vs::table_fn::<vs::GetFrameFilter>(vsapi, vs::GET_FRAME_FILTER)? },
+            get_stride: unsafe { vs::table_fn::<vs::GetStride>(vsapi, vs::GET_STRIDE)? },
+            get_read: unsafe { vs::table_fn::<vs::GetReadPtr>(vsapi, vs::GET_READ_PTR)? },
+            free_frame: unsafe { vs::table_fn::<vs::FreeFrame>(vsapi, vs::FREE_FRAME)? },
+        })
+    }
+
+    unsafe fn planes<'f>(
+        &self,
+        frame: vs::ConstRaw,
+        rows: usize,
+        y_shift: u32,
+    ) -> [RawPlane<'f>; 3] {
+        std::array::from_fn(|plane| {
+            let pitch = unsafe { (self.get_stride)(frame, plane as i32) } as usize;
+            let rows = if plane == 0 { rows } else { rows >> y_shift };
+            let data = unsafe {
+                std::slice::from_raw_parts((self.get_read)(frame, plane as i32), pitch * rows)
+            };
+            RawPlane { data, pitch }
+        })
+    }
+}
+
 unsafe extern "system" fn get_frame_analyse(
     n: i32,
     activation: i32,
@@ -275,18 +254,19 @@ unsafe extern "system" fn get_frame_analyse(
     vsapi: vs::ConstRaw,
 ) -> vs::ConstRaw {
     let state = unsafe { &*(*instance_data).cast::<AnalyseState>() };
+    let params = &state.params;
+    let full = params.super_params.has_finest_level();
+    let next = (n + params.delta).min(state.vi.num_frames - 1);
 
     if activation == vs::AR_INITIAL {
         if let Some(request) =
             unsafe { vs::table_fn::<vs::RequestFrameFilter>(vsapi, vs::REQUEST_FRAME_FILTER) }
         {
-            let delta = state.opts.delta.max(1);
-            let n2 = (n + delta).min(state.vi.num_frames.saturating_sub(1));
-            unsafe { request(n, state.super_node, frame_ctx) };
-            unsafe { request(n2, state.super_node, frame_ctx) };
-            if !state.opts.super_full {
-                unsafe { request(n, state.src_node, frame_ctx) };
-                unsafe { request(n2, state.src_node, frame_ctx) };
+            for frame in [n, next] {
+                unsafe { request(frame, state.super_node, frame_ctx) };
+                if !full {
+                    unsafe { request(frame, state.src_node, frame_ctx) };
+                }
             }
         }
         return std::ptr::null();
@@ -294,10 +274,7 @@ unsafe extern "system" fn get_frame_analyse(
     if activation != vs::AR_ALL_FRAMES_READY {
         return std::ptr::null();
     }
-
-    let Some(get_frame) =
-        (unsafe { vs::table_fn::<vs::GetFrameFilter>(vsapi, vs::GET_FRAME_FILTER) })
-    else {
+    let Some(api) = (unsafe { FrameApi::load(vsapi) }) else {
         return std::ptr::null();
     };
     let Some(new_frame) =
@@ -305,181 +282,49 @@ unsafe extern "system" fn get_frame_analyse(
     else {
         return std::ptr::null();
     };
-    let Some(get_stride) = (unsafe { vs::table_fn::<vs::GetStride>(vsapi, vs::GET_STRIDE) }) else {
-        return std::ptr::null();
-    };
-    let Some(get_read) = (unsafe { vs::table_fn::<vs::GetReadPtr>(vsapi, vs::GET_READ_PTR) })
-    else {
-        return std::ptr::null();
-    };
     let Some(get_write) = (unsafe { vs::table_fn::<vs::GetWritePtr>(vsapi, vs::GET_WRITE_PTR) })
     else {
         return std::ptr::null();
     };
-    let free_frame = unsafe { vs::table_fn::<vs::FreeFrame>(vsapi, vs::FREE_FRAME) };
 
-    let delta = state.opts.delta.max(1);
-
-    let n2 = (n + delta).min(state.vi.num_frames.saturating_sub(1));
-
-    let f0 = unsafe { get_frame(n, state.super_node, frame_ctx) };
-    let f1 = unsafe { get_frame(n2, state.super_node, frame_ctx) };
-    let (s0, s1) = if state.opts.super_full {
-        (std::ptr::null(), std::ptr::null())
+    let fetch = |node: vs::Raw, frame: i32| unsafe { (api.get_frame)(frame, node, frame_ctx) };
+    let supers = [fetch(state.super_node, n), fetch(state.super_node, next)];
+    let sources = if full {
+        [std::ptr::null(); 2]
     } else {
-        unsafe {
-            (
-                get_frame(n, state.src_node, frame_ctx),
-                get_frame(n2, state.src_node, frame_ctx),
-            )
+        [fetch(state.src_node, n), fetch(state.src_node, next)]
+    };
+    let release = |frames: &[vs::ConstRaw]| {
+        for &frame in frames.iter().filter(|f| !f.is_null()) {
+            unsafe { (api.free_frame)(frame) };
         }
     };
-    if f0.is_null() || f1.is_null() || (!state.opts.super_full && (s0.is_null() || s1.is_null())) {
-        if let Some(ff) = free_frame {
-            for frame in [f0, f1, s0, s1] {
-                if !frame.is_null() {
-                    unsafe { ff(frame) };
-                }
-            }
-        }
+    if supers.iter().any(|f| f.is_null()) || (!full && sources.iter().any(|f| f.is_null())) {
+        release(&supers);
+        release(&sources);
         return std::ptr::null();
     }
 
-    let mut source_opts = state.opts.clone();
-    source_opts.super_full = true;
-    source_opts.super_levels = 1;
-    source_opts.pel = 1;
-    let source0 = unsafe {
-        load_super_planes(
-            get_stride,
-            get_read,
-            s0,
-            &source_opts,
-            state.chroma_divisors,
-            None,
-        )
+    let sp = params.super_params;
+    let y_shift = params.chroma_shift.1;
+    let view = |index: usize| SuperFrameView {
+        planes: unsafe { api.planes(supers[index], state.super_height, y_shift) },
+        source: (!full).then(|| unsafe { api.planes(sources[index], sp.height as usize, y_shift) }),
+        width: sp.width,
+        height: sp.height,
+        pel: sp.pel,
+        chroma_shift: params.chroma_shift,
     };
-    let source1 = unsafe {
-        load_super_planes(
-            get_stride,
-            get_read,
-            s1,
-            &source_opts,
-            state.chroma_divisors,
-            None,
-        )
-    };
-    let planes0 = unsafe {
-        load_super_planes(
-            get_stride,
-            get_read,
-            f0,
-            &state.opts,
-            state.chroma_divisors,
-            source0.as_ref(),
-        )
-    };
-    let planes1 = unsafe {
-        load_super_planes(
-            get_stride,
-            get_read,
-            f1,
-            &state.opts,
-            state.chroma_divisors,
-            source1.as_ref(),
-        )
-    };
+    let payload = analyse::analyse(params, &view(0), &view(1));
+    release(&sources);
 
-    let (bwd, fwd) = match (planes0.as_ref(), planes1.as_ref()) {
-        (Some(p0), Some(p1)) => analyse_search::analyse_pair(p0, p1, &state.opts),
-        _ => (None, None),
-    };
-
-    if let Some(ff) = free_frame {
-        for frame in [s0, s1] {
-            if !frame.is_null() {
-                unsafe { ff(frame) };
-            }
+    let out = unsafe { new_frame(state.gray_format, payload.len() as i32, 1, supers[0], core) };
+    if !out.is_null() {
+        let dst = unsafe { get_write(out, 0) };
+        if !dst.is_null() {
+            unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), dst, payload.len()) };
         }
     }
-
-    let payload = analyse_search::pack_vector_frame(&state.opts, bwd.as_deref(), fwd.as_deref());
-
-    let out = unsafe { new_frame(state.gray_format, payload.len() as i32, 1, f0, core) };
-    if out.is_null() {
-        if let Some(ff) = free_frame {
-            unsafe { ff(f0) };
-            unsafe { ff(f1) };
-        }
-        return std::ptr::null();
-    }
-
-    let stride = unsafe { get_stride(out.cast_const(), 0) } as usize;
-    let ptr = unsafe { get_write(out, 0) };
-    if !ptr.is_null() && stride > 0 {
-        let ncopy = payload.len().min(stride);
-        unsafe {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), ptr, ncopy);
-            if stride > ncopy {
-                std::ptr::write_bytes(ptr.add(ncopy), 0, stride - ncopy);
-            }
-        }
-    }
-
-    if let Some(ff) = free_frame {
-        unsafe { ff(f0) };
-        unsafe { ff(f1) };
-    }
-    let _ = state.vdata_handle;
-    let _ = state.payload_len;
+    release(&supers);
     out.cast_const()
-}
-
-unsafe fn load_super_planes<'a>(
-    get_stride: vs::GetStride,
-    get_read: vs::GetReadPtr,
-    frame: vs::ConstRaw,
-    opts: &AnalyseOpts,
-    chroma_divisors: (usize, usize),
-    finest: Option<&'a SuperPlanes<'a>>,
-) -> Option<SuperPlanes<'a>> {
-    if frame.is_null() {
-        return None;
-    }
-    let y_stride = unsafe { get_stride(frame, 0) } as usize;
-    let u_stride = unsafe { get_stride(frame, 1) } as usize;
-    let v_stride = unsafe { get_stride(frame, 2) } as usize;
-    let y_ptr = unsafe { get_read(frame, 0) };
-    let u_ptr = unsafe { get_read(frame, 1) };
-    let v_ptr = unsafe { get_read(frame, 2) };
-    if y_ptr.is_null() || u_ptr.is_null() || v_ptr.is_null() {
-        return None;
-    }
-    let y_h = crate::super_opts::super_plane_height(
-        opts.width,
-        opts.height,
-        opts.pel,
-        opts.super_levels,
-        opts.super_full,
-    ) as usize;
-    let uv_h = y_h / chroma_divisors.1;
-    let y = unsafe { std::slice::from_raw_parts(y_ptr, y_stride * y_h) };
-    let u = unsafe { std::slice::from_raw_parts(u_ptr, u_stride * uv_h) };
-    let v = unsafe { std::slice::from_raw_parts(v_ptr, v_stride * uv_h) };
-    Some(SuperPlanes {
-        y,
-        y_stride,
-        u,
-        u_stride,
-        v,
-        v_stride,
-        chroma_x_div: chroma_divisors.0,
-        chroma_y_div: chroma_divisors.1,
-        luma_w: opts.width as usize,
-        luma_h: opts.height as usize,
-        pel: opts.pel,
-        levels: opts.super_levels,
-        full: opts.super_full,
-        finest,
-    })
 }

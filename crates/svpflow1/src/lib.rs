@@ -24,10 +24,9 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 mod abi;
+mod analyse;
 #[cfg(not(target_arch = "wasm32"))]
 mod analyse_filter;
-mod analyse_opts;
-mod analyse_search;
 mod portable;
 mod super_build;
 #[cfg(not(target_arch = "wasm32"))]

@@ -1,7 +1,6 @@
 use crate::{
-    analyse_opts::{AnalyseOpts, auto_search_levels, overlap_from_mode},
-    analyse_search::{self, SuperPlanes},
-    super_build,
+    analyse::{self, AnalyseParams, RawPlane, SuperFrameView, SuperParams},
+    params, super_build,
     super_opts::SuperOpts,
 };
 
@@ -22,7 +21,7 @@ pub struct SuperFrame {
 }
 
 pub struct Analyser {
-    opts: AnalyseOpts,
+    params: AnalyseParams,
     super_opts: SuperOpts,
 }
 
@@ -170,22 +169,28 @@ impl SuperFrame {
         output
     }
 
-    fn planes(&self) -> SuperPlanes<'_> {
-        SuperPlanes {
-            y: &self.y,
-            y_stride: usize::try_from(self.opts.width).unwrap_or(0),
-            u: &self.u,
-            u_stride: usize::try_from(self.opts.width / 2).unwrap_or(0),
-            v: &self.v,
-            v_stride: usize::try_from(self.opts.width / 2).unwrap_or(0),
-            chroma_x_div: 2,
-            chroma_y_div: 2,
-            luma_w: usize::try_from(self.opts.width).unwrap_or(0),
-            luma_h: usize::try_from(self.opts.height).unwrap_or(0),
+    fn view(&self) -> SuperFrameView<'_> {
+        let width = usize::try_from(self.opts.width).unwrap_or(0);
+        SuperFrameView {
+            planes: [
+                RawPlane {
+                    data: &self.y,
+                    pitch: width,
+                },
+                RawPlane {
+                    data: &self.u,
+                    pitch: width / 2,
+                },
+                RawPlane {
+                    data: &self.v,
+                    pitch: width / 2,
+                },
+            ],
+            source: None,
+            width: self.opts.width,
+            height: self.opts.height,
             pel: self.opts.pel,
-            levels: self.opts.levels,
-            full: self.opts.full,
-            finest: None,
+            chroma_shift: (1, 1),
         }
     }
 }
@@ -198,44 +203,22 @@ impl Analyser {
         overlap_mode: i32,
         vectors: i32,
     ) -> Result<Self, String> {
-        if !matches!(block_width, 4 | 8 | 16 | 32) || !matches!(block_height, 4 | 8 | 16 | 32) {
-            return Err("block dimensions must be 4, 8, 16 or 32".into());
-        }
-        if !(1..=3).contains(&vectors) {
-            return Err("vectors must be 1, 2 or 3".into());
-        }
-        let (overlap_x, overlap_y) = overlap_from_mode(block_width, block_height, overlap_mode)?;
-        let mut opts = AnalyseOpts::from_opt(
-            None,
-            super_builder.opts.pack_data(),
-            Some(&super_builder.opts),
-        )?;
-        opts.vectors = vectors;
-        opts.block_w = block_width;
-        opts.block_h = block_height;
-        opts.overlap_mode = overlap_mode;
-        opts.overlap_x = overlap_x;
-        opts.overlap_y = overlap_y;
-        opts.levels = auto_search_levels(
-            opts.width,
-            opts.height,
-            block_width,
-            block_height,
-            overlap_x,
-            overlap_y,
-        )
-        .min(opts.super_levels)
-        .max(1);
-        opts.lambda = (f64::from(block_width * block_height) * 312.5) as i32;
+        let options = format!(
+            "{{block:{{w:{block_width},h:{block_height},overlap:{overlap_mode}}},vectors:{vectors}}}"
+        );
+        let options = params::parse(options.as_bytes())?;
+        let super_params = SuperParams::unpack(super_builder.opts.pack_data())?;
         Ok(Self {
-            opts,
+            params: AnalyseParams::new(Some(&options), super_params, (1, 1))?,
             super_opts: super_builder.opts,
         })
     }
 
     #[must_use]
     pub fn vector_header(&self) -> Vec<i32> {
-        analyse_search::pack_vdata_header(&self.opts)
+        let mut header = analyse::analysis_header(&self.params).to_vec();
+        header.push(0);
+        header
     }
 
     pub fn analyse(&self, current: &SuperFrame, reference: &SuperFrame) -> Result<Vec<u8>, String> {
@@ -244,13 +227,10 @@ impl Analyser {
         {
             return Err("super frame configuration mismatch".into());
         }
-        let current = current.planes();
-        let reference = reference.planes();
-        let (previous, next) = analyse_search::analyse_pair(&current, &reference, &self.opts);
-        Ok(analyse_search::pack_vector_frame(
-            &self.opts,
-            previous.as_deref(),
-            next.as_deref(),
+        Ok(analyse::analyse(
+            &self.params,
+            &current.view(),
+            &reference.view(),
         ))
     }
 }
