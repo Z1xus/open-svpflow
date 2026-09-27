@@ -2803,7 +2803,7 @@ pub(crate) fn pack_vector_frame(
 fn write_vecs(out: &mut [u8], mut cursor: usize, vecs: &[Vec8], count: usize) -> usize {
     for i in 0..count {
         let v = vecs.get(i).copied().unwrap_or_default();
-        let d0 = ((v.dx as u32) << 16) | (v.dy as u16 as u32);
+        let d0 = (i32::from(v.dx) << 16).wrapping_add(i32::from(v.dy)) as u32;
         let d1 = (v.score & 0x00FF_FFFF) | ((v.luma as u32) << 24);
         write_u32(out, cursor, d0);
         write_u32(out, cursor + 4, d1);
