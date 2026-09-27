@@ -285,7 +285,7 @@ fn reduce_6tap(
         return;
     }
 
-    let inter_w = src_w;
+    let inter_w = 2 * dst_w;
     let mut inter = vec![0u8; inter_w.saturating_mul(dst_h)];
 
     for dy in 0..dst_h {
@@ -314,15 +314,17 @@ fn reduce_6tap(
                     x += 8;
                 }
             }
+            let center = (src_row0 + sy) * stride;
+            let half = stride / 2;
+            let tap = |offset: usize| u32::from(buf.get(offset).copied().unwrap_or(0));
             for x in x..inter_w {
-                let p0 = u32::from(sample(buf, stride, src_row0, start, x));
-                let p1 = u32::from(sample(buf, stride, src_row0, start + 1, x));
-                let p2 = u32::from(sample(buf, stride, src_row0, start + 2, x));
-                let p3 = u32::from(sample(buf, stride, src_row0, start + 3, x));
-                let p4 = u32::from(sample(buf, stride, src_row0, start + 4, x));
-                let p5 = u32::from(sample(buf, stride, src_row0, start + 5, x));
-                let v = (p0 + p5 + 5 * (p1 + p4) + 10 * (p2 + p3) + 16) >> 5;
-                inter[dy * inter_w + x] = v.min(255) as u8;
+                let at = center + x;
+                let v = tap(at - half)
+                    + 5 * tap(at - stride)
+                    + 10 * (tap(at) + tap(at + stride))
+                    + 5 * tap(at + half)
+                    + tap(at + stride + half);
+                inter[dy * inter_w + x] = ((v + 16) >> 5).min(255) as u8;
             }
         }
     }
