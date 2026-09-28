@@ -89,6 +89,7 @@ const NO_CONTRAST_BLUR_FLAG: i32 = 0x10;
 struct Kernels {
     luma: Kernel,
     chroma: Kernel,
+    pair: Option<metric::PairKernel>,
 }
 
 pub(crate) struct Field {
@@ -141,10 +142,14 @@ impl Field {
             full: Kernels {
                 luma: metric::luma_kernel(shape, satd),
                 chroma,
+                pair: (chroma_shift == (1, 1))
+                    .then(|| metric::chroma420_pair(shape, satd))
+                    .flatten(),
             },
             half: Kernels {
                 luma: metric::chroma420_kernel(shape, satd),
                 chroma: metric::null_kernel,
+                pair: None,
             },
             vectors: vec![Mv::default(); count],
             reverse: vec![Mv::default(); count],
@@ -954,18 +959,45 @@ impl BlockSearch<'_> {
                 return false;
             }
         }
-        let (luma, chroma_kernel) = (self.kernels.luma, self.kernels.chroma);
+        let spans = (luma_span, chroma_span);
+        match pel {
+            1 => self.exhaustive_run::<0>((min_x, max_x), (min_y, max_y), spans),
+            2 => self.exhaustive_run::<1>((min_x, max_x), (min_y, max_y), spans),
+            _ => self.exhaustive_run::<2>((min_x, max_x), (min_y, max_y), spans),
+        }
+        true
+    }
+
+    fn exhaustive_run<const BITS: u32>(
+        &mut self,
+        (min_x, max_x): (i32, i32),
+        (min_y, max_y): (i32, i32),
+        (luma_span, chroma_span): (usize, usize),
+    ) {
+        let s = self.state;
+        let pel = 1 << BITS;
+        let (y, u) = (self.reference.y, self.reference.u);
+        let (lx, ly) = (s.pos[0] * pel, s.pos_y[0] * pel);
+        let (cx, cy) = (s.pos[1] * pel, s.pos_y[1] * pel);
+        let (sx, sy) = self.chroma_shift;
+        let chroma = !self.half;
+        let (luma, chroma_kernel, pair) =
+            (self.kernels.luma, self.kernels.chroma, self.kernels.pair);
         let pnew = self.settings.pnew;
         let penalty = |sad: i32| sad.wrapping_add(pnew.wrapping_mul(sad) >> 8);
         let (px, py, lambda) = (i32::from(s.predictor.x), i32::from(s.predictor.y), s.lambda);
         let shift = sx + sy;
-        let (yd, ud, vd) = (y.data(), u.data(), v.data());
+        let yd = y.data().as_ptr();
+        let (ud, vd) = (u.data().as_ptr(), self.reference.v.data().as_ptr());
+        let (luma_pitch, chroma_pitch) = (y.pitch, u.pitch);
         let buffer = &self.buffers[self.active];
         let mut min_cost = s.min_cost;
         let mut best = s.best;
         for vy in min_y..=max_y {
             let dy = py - vy;
             let dy2 = dy.wrapping_mul(dy);
+            let luma_row = y.row_offset::<BITS>(ly + vy);
+            let chroma_row = u.row_offset::<BITS>(cy + (vy >> sy));
             let mut luma_x = min_x;
             for vx in min_x..=max_x {
                 let dx = px - vx;
@@ -973,20 +1005,32 @@ impl BlockSearch<'_> {
                 if cost >= min_cost {
                     continue;
                 }
-                let at = if pel == 1 { luma_x } else { vx };
-                if pel == 1 {
+                let at = if BITS == 0 { luma_x } else { vx };
+                if BITS == 0 {
                     luma_x += 1;
                 }
-                let offset = y.subpel(lx + at, ly + vy) as usize;
-                let sad = luma(&buffer.y, &yd[offset..offset + luma_span], y.pitch) as i32;
+                let offset = (luma_row + y.column_offset::<BITS>(lx + at)) as usize;
+                let block = unsafe { std::slice::from_raw_parts(yd.add(offset), luma_span) };
+                let sad = luma(&buffer.y, block, luma_pitch) as i32;
                 cost = cost.wrapping_add(penalty(sad));
                 if cost >= min_cost {
                     continue;
                 }
                 let sad_uv = if chroma {
-                    let offset = u.subpel(cx + (vx >> sx), cy + (vy >> sy)) as usize;
-                    let sum = chroma_kernel(&buffer.u, &ud[offset..offset + chroma_span], u.pitch)
-                        + chroma_kernel(&buffer.v, &vd[offset..offset + chroma_span], v.pitch);
+                    let offset = (chroma_row + u.column_offset::<BITS>(cx + (vx >> sx))) as usize;
+                    let (ur, vr) = unsafe {
+                        (
+                            std::slice::from_raw_parts(ud.add(offset), chroma_span),
+                            std::slice::from_raw_parts(vd.add(offset), chroma_span),
+                        )
+                    };
+                    let sum = match pair {
+                        Some(pair) => pair([&buffer.u, &buffer.v], [ur, vr], chroma_pitch),
+                        None => {
+                            chroma_kernel(&buffer.u, ur, chroma_pitch)
+                                + chroma_kernel(&buffer.v, vr, chroma_pitch)
+                        }
+                    };
                     (sum as i32) << shift
                 } else {
                     0
@@ -1001,7 +1045,6 @@ impl BlockSearch<'_> {
         }
         self.state.best = best;
         self.state.min_cost = min_cost;
-        true
     }
 
     fn hex2(&mut self, range: i32) {

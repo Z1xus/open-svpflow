@@ -28,6 +28,18 @@ impl<'a> PlaneView<'a> {
         self.pel1(x >> bits, y >> bits) + subplane
     }
 
+    pub(crate) fn row_offset<const BITS: u32>(&self, y: i32) -> isize {
+        let mask = (1 << BITS) - 1;
+        let subplane = ((y & mask) << BITS) as isize * self.pitch as isize * self.height as isize;
+        self.base as isize + (y >> BITS) as isize * self.pitch as isize + subplane
+    }
+
+    pub(crate) fn column_offset<const BITS: u32>(&self, x: i32) -> isize {
+        let mask = (1 << BITS) - 1;
+        let subplane = (x & mask) as isize * self.pitch as isize * self.height as isize;
+        (x >> BITS) as isize + subplane
+    }
+
     pub(crate) fn data(&self) -> &'a [u8] {
         self.data
     }

@@ -16,6 +16,7 @@ use core::arch::x86_64::{
 };
 
 pub(crate) type Kernel = fn(&[u8], &[u8], usize) -> u32;
+pub(crate) type PairKernel = fn([&[u8]; 2], [&[u8]; 2], usize) -> u32;
 #[derive(Clone, Copy)]
 pub(crate) struct Shape {
     pub(crate) width: usize,
@@ -54,6 +55,19 @@ pub(crate) fn chroma420_kernel(luma: Shape, satd: bool) -> Kernel {
         (8, 4) => sad_4x2_swapped,
         _ => generic(luma.half(), satd),
     }
+}
+
+pub(crate) fn chroma420_pair(luma: Shape, satd: bool) -> Option<PairKernel> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if satd && (luma.width, luma.height) == (8, 8) {
+        return Some(|src, reference, pitch| {
+            assert!(src.iter().all(|s| s.len() >= 16));
+            assert!(reference.iter().all(|r| r.len() >= 3 * pitch + 4));
+            unsafe { satd_4x4_pair_avx2(src, reference, pitch) }
+        });
+    }
+    let _ = (luma, satd);
+    None
 }
 
 pub(crate) fn null_kernel(_: &[u8], _: &[u8], _: usize) -> u32 {
@@ -466,4 +480,36 @@ unsafe fn satd_avx512<const W: usize, const H: usize>(
         }
     }
     _mm512_reduce_add_epi32(acc) as u32
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+unsafe fn satd_4x4_pair_avx2(src: [&[u8]; 2], reference: [&[u8]; 2], pitch: usize) -> u32 {
+    use core::arch::x86_64::{
+        _mm256_set_m128i, _mm256_set1_epi32, _mm256_srli_epi32, _mm256_unpackhi_epi64,
+        _mm256_unpacklo_epi64,
+    };
+    let s: [[__m128i; 2]; 2] = src.map(|p| unsafe { rows_4x4(p.as_ptr(), 4) });
+    let r: [[__m128i; 2]; 2] = reference.map(|p| unsafe { rows_4x4(p.as_ptr(), pitch) });
+    let even = _mm256_sub_epi16(
+        _mm256_set_m128i(s[1][0], s[0][0]),
+        _mm256_set_m128i(r[1][0], r[0][0]),
+    );
+    let odd = _mm256_sub_epi16(
+        _mm256_set_m128i(s[1][1], s[0][1]),
+        _mm256_set_m128i(r[1][1], r[0][1]),
+    );
+    let columns = |v: __m256i| {
+        let swapped = _mm256_unpackhi_epi64(v, v);
+        _mm256_unpacklo_epi64(_mm256_add_epi16(v, swapped), _mm256_sub_epi16(v, swapped))
+    };
+    let a = columns(_mm256_add_epi16(even, odd));
+    let b = columns(_mm256_sub_epi16(even, odd));
+    let sums = _mm256_abs_epi16(_mm256_hadd_epi16(a, b));
+    let diffs = _mm256_abs_epi16(_mm256_hsub_epi16(a, b));
+    let maxima = _mm256_add_epi16(
+        _mm256_max_epi16(sums, _mm256_srli_epi32::<16>(sums)),
+        _mm256_max_epi16(diffs, _mm256_srli_epi32::<16>(diffs)),
+    );
+    horizontal_sum(_mm256_madd_epi16(maxima, _mm256_set1_epi32(1)))
 }
