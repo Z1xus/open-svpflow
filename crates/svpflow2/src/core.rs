@@ -2000,7 +2000,7 @@ impl FilterState {
     }
 
     #[allow(clippy::similar_names)]
-    unsafe fn apply_light_border(
+    pub(crate) unsafe fn apply_light_border(
         &self,
         api: &frame::PlaneApi,
         output: vs::Raw,

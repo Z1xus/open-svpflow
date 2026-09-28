@@ -129,7 +129,7 @@ impl FilterState {
             && (self.render_mode == 1 || (self.render_mode == 2 && self.gpu.is_some()))
             && !self.source_8bit_mode
             && !(self.render_mode == 2 && self.options.block_enabled())
-            && self.options.reference_supported(&self.video_info)
+            && self.options.reference_supported()
             && matches!(self.vector_data(), metadata::VectorRecord::Ready(_))
     }
 
@@ -208,10 +208,26 @@ impl FilterState {
         }) else {
             return std::ptr::null();
         };
+        let (pad_x, pad_y) = self.options.padding(&self.video_info);
+        let bytes = if crate::video_format::source_depth(&self.video_info) > 8 {
+            2
+        } else {
+            1
+        };
         let plane = |p: i32, rows: usize| -> Option<(&'static mut [u8], i32)> {
-            let (ptr, pitch, len) = unsafe { api.write_plane(output, p, rows) }?;
+            let div = if p == 0 { 1 } else { 2 };
+            let (px, py) = (
+                usize::try_from(pad_x / div).ok()?,
+                usize::try_from(pad_y / div).ok()?,
+            );
+            let (ptr, pitch, len) = unsafe { api.write_plane(output, p, rows + 2 * py) }?;
+            let start = py * pitch + px * bytes;
+            let span = (rows.checked_sub(1)?) * pitch + (w / div as usize) * bytes;
+            if start + span > len {
+                return None;
+            }
             Some((
-                unsafe { slice::from_raw_parts_mut(ptr, len) },
+                unsafe { slice::from_raw_parts_mut(ptr.add(start), span) },
                 i32::try_from(pitch).ok()?,
             ))
         };
@@ -245,6 +261,7 @@ impl FilterState {
             unsafe { api.free(output.cast_const()) };
             return std::ptr::null();
         }
+        unsafe { self.apply_light_border(api, output, frame) };
         let timing = self.options.timing(&self.video_info);
         let ratio = crate::core::f64_i64(timing.frame_num) / crate::core::f64_i64(timing.frame_den);
         let raw_phase = timing.raw_phase_256(frame, n);
@@ -778,10 +795,22 @@ impl FilterState {
             return std::ptr::null();
         };
         let h = usize::try_from(self.video_info.height).unwrap_or(0);
+        let w = usize::try_from(self.video_info.width).unwrap_or(0);
+        let (pad_x, pad_y) = self.options.padding(&self.video_info);
         let plane_mut = |p: i32, rows: usize| -> Option<PlaneMut<'static>> {
-            let (ptr, pitch, len) = unsafe { api.write_plane(output, p, rows) }?;
+            let div = if p == 0 { 1 } else { 2 };
+            let (px, py) = (
+                usize::try_from(pad_x / div).ok()?,
+                usize::try_from(pad_y / div).ok()?,
+            );
+            let (ptr, pitch, len) = unsafe { api.write_plane(output, p, rows + 2 * py) }?;
+            let start = py * pitch + px;
+            let span = (rows.checked_sub(1)?) * pitch + w / div as usize;
+            if start + span > len {
+                return None;
+            }
             Some(PlaneMut {
-                data: unsafe { slice::from_raw_parts_mut(ptr, len) },
+                data: unsafe { slice::from_raw_parts_mut(ptr.add(start), span) },
                 pitch,
             })
         };
@@ -806,6 +835,7 @@ impl FilterState {
             sad: sad.as_deref().unwrap_or(&[]),
         };
         renderer.render(kind, interp, &mut dst, nxt.frame(), cur.frame(), &vectors);
+        unsafe { self.apply_light_border(api, output, frame) };
         let timing = self.options.timing(&self.video_info);
         let ratio = crate::core::f64_i64(timing.frame_num) / crate::core::f64_i64(timing.frame_den);
         let raw_phase = timing.raw_phase_256(frame, n);

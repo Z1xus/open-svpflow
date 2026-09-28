@@ -342,10 +342,9 @@ impl Options {
         }
     }
 
-    pub(crate) fn reference_supported(&self, source: &vs::VideoInfo) -> bool {
+    pub(crate) fn reference_supported(&self) -> bool {
         let debug = self.debug;
-        self.padding(source) == (0, 0)
-            && !self.hdr_enabled()
+        !self.hdr_enabled()
             && !debug.vectors
             && !debug.qmap
             && !debug.qmode
