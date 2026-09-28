@@ -586,10 +586,20 @@ impl FilterState {
         if neither {
             selected = 11;
         }
-        let sad = sad_masks.map(|(first, second)| match selected {
-            1 => first,
-            2 => second,
-            _ => first.iter().zip(&second).map(|(a, b)| *a.max(b)).collect(),
+        let sad = sad_masks.map(|(first, second)| {
+            let spill = |mask: Vec<u8>, next: &[u8]| {
+                let chunk = (mask.len() + 8 + 15) & !15;
+                let mut out = mask;
+                out.resize(chunk - 8, 0);
+                out.extend_from_slice(&((chunk as u64) | 1).to_le_bytes());
+                out.extend_from_slice(next);
+                out
+            };
+            match selected {
+                1 => spill(first, &[]),
+                2 => spill(second, &[]),
+                _ => first.iter().zip(&second).map(|(a, b)| *a.max(b)).collect(),
+            }
         });
         let sad_on = sad.is_some();
         let kind = match selected {

@@ -710,6 +710,7 @@ impl Renderer {
                     interp,
                     [&x, &y],
                     [None; 2],
+                    false,
                     aux,
                     planes,
                     |out, p, base, n, l| {
@@ -725,6 +726,7 @@ impl Renderer {
                     interp,
                     [&bx, &by, &fx, &fy],
                     [None; 4],
+                    false,
                     aux,
                     planes,
                     |out, p, base, n, l| {
@@ -744,6 +746,7 @@ impl Renderer {
                     interp,
                     [&x, &y, &sad],
                     [None, None, Some(v.sad)],
+                    true,
                     aux,
                     planes,
                     |out, p, base, n, l| {
@@ -760,6 +763,7 @@ impl Renderer {
                     interp,
                     [&bx, &by, &fx, &fy, &sad],
                     [None, None, None, None, Some(v.sad)],
+                    false,
                     aux,
                     planes,
                     |out, p, base, n, l| {
@@ -785,6 +789,7 @@ impl Renderer {
                         Some(v.cover_bwd),
                         Some(v.sad),
                     ],
+                    false,
                     aux,
                     planes,
                     |out, p, base, n, l| row::normal_sad(out, p, base, n, l, &weights, simple),
@@ -799,6 +804,7 @@ impl Renderer {
                     interp,
                     [&bx, &by, &fx, &fy, &m9, &m8],
                     [None, None, None, None, Some(v.cover_fwd), Some(v.cover_bwd)],
+                    false,
                     aux,
                     planes,
                     |out, p, base, n, l| row::normal(out, p, base, n, l, &weights, simple),
@@ -826,6 +832,7 @@ impl Renderer {
                         Some(v.cover_fwd),
                         Some(v.cover_bwd),
                     ],
+                    false,
                     aux,
                     planes,
                     |out, p, base, n, l| row::extended(out, p, base, n, l, &weights),
@@ -835,7 +842,7 @@ impl Renderer {
         }
     }
 
-    fn bilinear(&self, buf: &[u8], x: i32, y: i32, pass: &Pass<'_>) -> u8 {
+    fn bilinear(&self, buf: &[u8], skip: i32, x: i32, y: i32, pass: &Pass<'_>) -> u8 {
         let s = &self.shape;
         let (ox, oy, sx, sy) = if pass.div_x == 2 {
             (
@@ -860,7 +867,10 @@ impl Renderer {
             (0, 0)
         };
         let at = |cx: i32, cy: i32| {
-            let index = cy.wrapping_mul(s.grid_w).wrapping_add(cx);
+            let index = cy
+                .wrapping_mul(s.grid_w)
+                .wrapping_add(cx)
+                .wrapping_add(skip);
             usize::try_from(index)
                 .ok()
                 .and_then(|index| buf.get(index))
@@ -885,6 +895,7 @@ impl Renderer {
         interp: bool,
         channels: [&[i16]; N],
         samplers: [Option<&[u8]>; N],
+        skip_rows: bool,
         aux: Option<(Plane<'_>, Plane<'_>)>,
         planes: &mut [(&mut PlaneMut<'_>, Plane<'_>, Plane<'_>)],
         kernel: K,
@@ -975,7 +986,9 @@ impl Renderer {
                 let br = (lower * grid_w + right) as usize;
                 for k in 0..N {
                     if !interp && let Some(buf) = samplers[k] {
-                        let corner = |x: i32, y: i32| i16::from(self.bilinear(buf, x, y, pass));
+                        let skip = if skip_rows { upper * grid_w } else { 0 };
+                        let corner =
+                            |x: i32, y: i32| i16::from(self.bilinear(buf, skip, x, y, pass));
                         top[k] = [corner(px0, py0), corner(px0 + cols, py0)];
                         bottom[k] = [corner(px0, py0 + rows), corner(px0 + cols, py0 + rows)];
                         continue;
