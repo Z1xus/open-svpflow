@@ -140,6 +140,8 @@ pub(crate) struct ReferenceParams {
     pub(crate) algo: i32,
     pub(crate) linear: bool,
     pub(crate) cubic: i64,
+    pub(crate) block: bool,
+    pub(crate) sad: Option<(f64, f64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -328,6 +330,11 @@ impl Options {
             algo: i32_saturating(self.algo_for_mode(0)),
             linear: self.render.linear,
             cubic: self.cubic.unwrap_or(0),
+            block: self.block,
+            sad: (self.mask.area > 0).then(|| {
+                let area = i32::try_from(self.mask.area).unwrap_or(i32::MAX);
+                (f64::from(area) / 15000.0, self.mask.area_sharp)
+            }),
         }
     }
 
@@ -335,8 +342,6 @@ impl Options {
         let debug = self.debug;
         self.padding(source) == (0, 0)
             && !self.hdr_enabled()
-            && !self.mask.area_enabled
-            && !self.block
             && !debug.vectors
             && !debug.qmap
             && !debug.qmode

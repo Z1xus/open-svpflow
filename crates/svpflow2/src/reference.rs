@@ -128,6 +128,8 @@ impl FilterState {
         matches!(self.mode, Mode::SmoothFps)
             && (self.render_mode == 1 || (self.render_mode == 2 && self.gpu.is_some()))
             && !self.source_8bit_mode
+            && !(self.render_mode == 2
+                && (self.options.mask_area_enabled() || self.options.block_enabled()))
             && self.options.reference_supported(&self.video_info)
             && matches!(self.vector_data(), metadata::VectorRecord::Ready(_))
     }
@@ -541,6 +543,16 @@ impl FilterState {
                 buf.fill(1024);
             }
         }
+        let sad_masks = match params.sad {
+            Some((scale, sharp)) if !neither => {
+                let mut first = vec![0u8; count];
+                let mut second = vec![0u8; count];
+                field.sad_mask(false, &mut first, scale, sharp, width, height);
+                field.sad_mask(true, &mut second, scale, sharp, width, height);
+                Some((first, second))
+            }
+            _ => None,
+        };
         let mut extended = false;
         if neighbors_ok && algo == 23 && !neither {
             let load = |field: &mut VectorField, k: i32| {
@@ -570,11 +582,23 @@ impl FilterState {
                 selected = 13;
             }
         }
-        let interp = !neither;
+        let interp = !neither && !params.block;
         if neither {
             selected = 11;
         }
+        let sad = sad_masks.map(|(first, second)| match selected {
+            1 => first,
+            2 => second,
+            _ => first.iter().zip(&second).map(|(a, b)| *a.max(b)).collect(),
+        });
+        let sad_on = sad.is_some();
         let kind = match selected {
+            1 if sad_on => Algo::FastSad { next: true },
+            2 if sad_on => Algo::FastSad { next: false },
+            11 if sad_on => Algo::NoMaskSad { median: false },
+            13 if sad_on => Algo::NoMaskSad { median: true },
+            21 if sad_on => Algo::NormalSad { simple: true },
+            22 if sad_on => Algo::NormalSad { simple: false },
             1 => Algo::Fast { next: true },
             2 => Algo::Fast { next: false },
             11 => Algo::NoMask { median: false },
@@ -765,6 +789,7 @@ impl FilterState {
             prev_bwd_y: &prev_y,
             cover_bwd: &cover_bwd,
             cover_fwd: &cover_fwd,
+            sad: sad.as_deref().unwrap_or(&[]),
         };
         renderer.render(kind, interp, &mut dst, nxt.frame(), cur.frame(), &vectors);
         let timing = self.options.timing(&self.video_info);
