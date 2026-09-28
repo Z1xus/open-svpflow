@@ -3436,7 +3436,7 @@ fn gpu_render_frame(
         (next0.x, next0.y),
         (prev1.x, prev1.y),
     ];
-    let make = |chroma: bool| {
+    let make = |chroma: bool, offset_x: i32, offset_y: i32| {
         let p = cpu.gpu_plane_params(chroma);
         crate::gpu::KernelParams {
             algorithm,
@@ -3453,6 +3453,10 @@ fn gpu_render_frame(
             has_sad: i32::from(area.is_some()),
             linear_luma: i32::from(!chroma),
             cubic: i32::from(cubic),
+            cubic_ref: 0,
+            offset_x,
+            offset_y,
+            sad_blend: 0.0,
         }
     };
     gpu.render_frame(
@@ -3460,13 +3464,13 @@ fn gpu_render_frame(
         src1.bufs(),
         dst.y.data,
         dst.y.stride as i32,
-        make(false),
+        make(false, 0, 0),
         dst.u.data,
         dst.u.stride as i32,
-        make(true),
+        make(true, 0, plane_y.height),
         dst.v.data,
         dst.v.stride as i32,
-        make(true),
+        make(true, plane_uv.width, plane_y.height),
         i64::from(source_frame),
         grid_w,
         grid_h,

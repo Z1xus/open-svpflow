@@ -192,7 +192,9 @@ impl OpenCl {
 pub struct GpuContext {
     cl: OpenCl,
     context: ClContext,
+    device: ClDeviceId,
     program: ClProgram,
+    variants: std::sync::Mutex<Vec<(u32, ClProgram)>>,
     device_name: String,
 
     units: Vec<std::sync::Mutex<Unit>>,
@@ -218,8 +220,8 @@ unsafe impl Send for SuperEntry {}
 unsafe impl Sync for SuperEntry {}
 impl Drop for SuperEntry {
     fn drop(&mut self) {
-        for &m in &self.mems {
-            if !m.is_null() {
+        for (i, &m) in self.mems.iter().enumerate() {
+            if !m.is_null() && !self.mems[..i].contains(&m) {
                 unsafe { (self.release)(m) };
             }
         }
@@ -238,6 +240,15 @@ impl SuperHandle {
             GpuBuf(self.entry.mems[2]),
         ]
     }
+
+    #[must_use]
+    pub fn sources(&self, linear: bool) -> [GpuBuf; 3] {
+        [
+            GpuBuf(self.entry.mems[if linear { 0 } else { 3 }]),
+            GpuBuf(self.entry.mems[1]),
+            GpuBuf(self.entry.mems[2]),
+        ]
+    }
 }
 
 struct Unit {
@@ -250,6 +261,7 @@ struct Unit {
     packed_base: Vec<u16>,
     packed_ext: Vec<u16>,
     packed_mask: Vec<u8>,
+    variant_kernels: Vec<(u32, ClKernel)>,
 }
 
 #[derive(Clone, Copy)]
@@ -284,6 +296,7 @@ impl Unit {
             packed_base: Vec::new(),
             packed_ext: Vec::new(),
             packed_mask: Vec::new(),
+            variant_kernels: Vec::new(),
         }
     }
 }
@@ -327,12 +340,20 @@ impl Drop for GpuContext {
                         }
                     }
                     (self.cl.ReleaseKernel)(u.kernel);
+                    for &(_, kernel) in &u.variant_kernels {
+                        (self.cl.ReleaseKernel)(kernel);
+                    }
                     (self.cl.ReleaseCommandQueue)(u.queue);
                 }
             }
             if let Ok(cache) = self.cache_resources.lock() {
                 (self.cl.ReleaseKernel)(cache.kernel);
                 (self.cl.ReleaseCommandQueue)(cache.queue);
+            }
+            if let Ok(variants) = self.variants.lock() {
+                for &(_, program) in variants.iter() {
+                    (self.cl.ReleaseProgram)(program);
+                }
             }
             (self.cl.ReleaseProgram)(self.program);
             (self.cl.ReleaseContext)(self.context);
@@ -463,7 +484,9 @@ impl GpuContext {
             return Ok(Self {
                 cl,
                 context,
+                device,
                 program,
+                variants: std::sync::Mutex::new(Vec::new()),
                 device_name,
                 units,
                 next_unit: std::sync::atomic::AtomicUsize::new(0),
@@ -516,6 +539,10 @@ pub struct KernelParams {
     pub has_sad: i32,
     pub linear_luma: i32,
     pub cubic: i32,
+    pub cubic_ref: i32,
+    pub offset_x: i32,
+    pub offset_y: i32,
+    pub sad_blend: f32,
 }
 
 struct Buf<'a> {
@@ -559,27 +586,28 @@ impl GpuContext {
     }
 
     fn upload_frame(&self, planes: [UploadPlane<'_>; 3]) -> Option<SuperEntry> {
-        let y_source =
-            unsafe { self.create_image(CL_R, CL_UNORM_INT8, planes[0].width, planes[0].height) }?;
-        let y_linear =
-            unsafe { self.create_image(CL_R, CL_FLOAT, planes[0].width, planes[0].height) }?;
-        let u =
-            unsafe { self.create_image(CL_R, CL_UNORM_INT8, planes[1].width, planes[1].height) }?;
-        let v =
-            unsafe { self.create_image(CL_R, CL_UNORM_INT8, planes[2].width, planes[2].height) }?;
+        let width = planes[0].width;
+        let height = planes[0].height;
+        let packed =
+            unsafe { self.create_image(CL_R, CL_UNORM_INT8, width, height + planes[1].height) }?;
+        let y_linear = unsafe { self.create_image(CL_R, CL_FLOAT, width, height) }?;
         let entry = SuperEntry {
-            mems: [y_linear.mem, u.mem, v.mem, y_source.mem],
+            mems: [y_linear.mem, packed.mem, packed.mem, packed.mem],
             release: self.cl.ReleaseMemObject,
         };
-        std::mem::forget(y_source);
         std::mem::forget(y_linear);
-        std::mem::forget(u);
-        std::mem::forget(v);
         let resources = self.cache_resources.lock().ok()?;
         unsafe {
-            self.enqueue_image(resources.queue, entry.mems[3], planes[0])?;
-            self.enqueue_image(resources.queue, entry.mems[1], planes[1])?;
-            self.enqueue_image(resources.queue, entry.mems[2], planes[2])?;
+            self.enqueue_plane_at(resources.queue, packed.mem, planes[0], 0, 0)?;
+            self.enqueue_plane_at(resources.queue, packed.mem, planes[1], 0, height)?;
+            self.enqueue_plane_at(
+                resources.queue,
+                packed.mem,
+                planes[2],
+                planes[1].width,
+                height,
+            )?;
+            std::mem::forget(packed);
             if (self.cl.SetKernelArg)(
                 resources.kernel,
                 0,
@@ -595,7 +623,7 @@ impl GpuContext {
             {
                 return None;
             }
-            let global = [planes[0].width, planes[0].height];
+            let global = [width, height];
             if (self.cl.EnqueueNDRangeKernel)(
                 resources.queue,
                 resources.kernel,
@@ -613,6 +641,42 @@ impl GpuContext {
             }
         }
         Some(entry)
+    }
+
+    unsafe fn enqueue_plane_at(
+        &self,
+        q: ClCommandQueue,
+        mem: ClMem,
+        plane: UploadPlane<'_>,
+        x: usize,
+        y: usize,
+    ) -> Option<()> {
+        if plane.data.len()
+            < plane
+                .stride
+                .saturating_mul(plane.height.saturating_sub(1))
+                .saturating_add(plane.width)
+        {
+            return None;
+        }
+        let origin = [x, y, 0];
+        let region = [plane.width, plane.height, 1];
+        let rc = unsafe {
+            (self.cl.EnqueueWriteImage)(
+                q,
+                mem,
+                CL_FALSE,
+                origin.as_ptr(),
+                region.as_ptr(),
+                plane.stride,
+                0,
+                plane.data.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        (rc == CL_SUCCESS).then_some(())
     }
 
     unsafe fn create_image(
@@ -643,32 +707,6 @@ impl GpuContext {
             )
         };
         (err == CL_SUCCESS && !mem.is_null()).then_some(Buf { ctx: self, mem })
-    }
-
-    unsafe fn enqueue_image(
-        &self,
-        q: ClCommandQueue,
-        mem: ClMem,
-        plane: UploadPlane<'_>,
-    ) -> Option<()> {
-        if plane.data.len()
-            < plane
-                .stride
-                .saturating_mul(plane.height.saturating_sub(1))
-                .saturating_add(plane.width)
-        {
-            return None;
-        }
-        unsafe {
-            self.enqueue_image_raw(
-                q,
-                mem,
-                plane.width,
-                plane.height,
-                plane.stride,
-                plane.data.as_ptr().cast(),
-            )
-        }
     }
 
     unsafe fn enqueue_image_raw(
@@ -753,6 +791,40 @@ impl GpuContext {
         Some(slot.0)
     }
 
+    fn variant_kernel(&self, kernels: &mut Vec<(u32, ClKernel)>, variant: u32) -> Option<ClKernel> {
+        if let Some(&(_, kernel)) = kernels.iter().find(|(key, _)| *key == variant) {
+            return Some(kernel);
+        }
+        let program = {
+            let mut variants = self.variants.lock().ok()?;
+            if let Some(&(_, program)) = variants.iter().find(|(key, _)| *key == variant) {
+                program
+            } else {
+                let source = format!(
+                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n{}",
+                    variant & 0xFF,
+                    (variant >> 8) & 1,
+                    (variant >> 9) & 1,
+                    (variant >> 10) & 1,
+                    (variant >> 11) & 1,
+                    KERNEL_SRC
+                );
+                let program =
+                    unsafe { build_program(&self.cl, self.context, self.device, &source) }.ok()?;
+                variants.push((variant, program));
+                program
+            }
+        };
+        let name = CString::new("render_frame").ok()?;
+        let mut err = 0;
+        let kernel = unsafe { (self.cl.CreateKernel)(program, name.as_ptr(), &raw mut err) };
+        if err != CL_SUCCESS || kernel.is_null() {
+            return None;
+        }
+        kernels.push((variant, kernel));
+        Some(kernel)
+    }
+
     unsafe fn set_i32(&self, k: ClKernel, i: u32, v: i32) -> bool {
         unsafe { (self.cl.SetKernelArg)(k, i, 4, (&raw const v).cast()) == CL_SUCCESS }
     }
@@ -798,8 +870,15 @@ impl GpuContext {
             packed_base,
             packed_ext,
             packed_mask,
+            variant_kernels,
         } = &mut *unit;
-        let k = *kernel;
+        let _ = kernel;
+        let variant = u32::try_from(py.algorithm & 0xFF).unwrap_or(23)
+            | u32::from(py.cubic != 0) << 8
+            | u32::from(py.cubic_ref != 0) << 9
+            | u32::from(py.has_sad != 0) << 10
+            | u32::from(py.linear_luma != 0) << 11;
+        let k = self.variant_kernel(variant_kernels, variant)?;
         let q = *queue;
         packed_base.clear();
         packed_ext.clear();
@@ -1045,6 +1124,23 @@ unsafe fn device_name(cl: &OpenCl, device: ClDeviceId) -> String {
 }
 
 pub(crate) const KERNEL_SRC: &str = r"
+#ifndef ALGO
+#define ALGO 23
+#endif
+#ifndef CUBIC
+#define CUBIC 0
+#endif
+#ifndef CUBIC_REF
+#define CUBIC_REF 0
+#endif
+#ifndef HAS_SAD
+#define HAS_SAD 0
+#endif
+#ifndef LINEAR_LUMA
+#define LINEAR_LUMA 1
+#endif
+const sampler_t field_sampler = CLK_NORMALIZED_COORDS_TRUE |
+    CLK_ADDRESS_CLAMP_TO_EDGE | CLK_FILTER_LINEAR;
 const sampler_t linear_sampler = CLK_NORMALIZED_COORDS_FALSE |
     CLK_ADDRESS_CLAMP_TO_EDGE | CLK_FILTER_LINEAR;
 const sampler_t nearest_sampler = CLK_NORMALIZED_COORDS_FALSE |
@@ -1053,11 +1149,14 @@ const sampler_t nearest_sampler = CLK_NORMALIZED_COORDS_FALSE |
 typedef struct {
     int algorithm, width, height, x_ratio, y_ratio, pel;
     int block_w, block_h, origin_x, origin_y, phase, has_sad, linear_luma, cubic;
+    int cubic_ref, offset_x, offset_y;
+    float sad_blend;
 } Params;
 
 inline float median3(float a, float b, float c) {
     float lo = fmin(a, b);
-    return fmax(lo, fmin(a + b - lo, c));
+    float hi = a + b - lo;
+    return fmax(lo, fmin(hi, c));
 }
 
 inline float4 cubic_sample(read_only image2d_t image, float2 position) {
@@ -1065,52 +1164,76 @@ inline float4 cubic_sample(read_only image2d_t image, float2 position) {
     float2 index = floor(grid);
     float2 f = grid - index;
     float2 r = 1.0f - f;
-    float2 w0 = r*r*r / 6.0f;
-    float2 w1 = 2.0f/3.0f - 0.5f*f*f*(2.0f-f);
-    float2 w2 = 2.0f/3.0f - 0.5f*r*r*(2.0f-r);
-    float2 w3 = f*f*f / 6.0f;
+    float2 r2 = r * r;
+    float2 f2 = f * f;
+    float2 w0 = 1.0f/6.0f * r2 * r;
+    float2 w1 = 2.0f/3.0f - 0.5f * f2 * (2.0f - f);
+    float2 w2 = 2.0f/3.0f - 0.5f * r2 * (2.0f - r);
+    float2 w3 = 1.0f/6.0f * f2 * f;
     float2 g0 = w0 + w1;
     float2 g1 = w2 + w3;
-    float2 h0 = w1/g0 - 0.5f + index;
-    float2 h1 = w3/g1 + 1.5f + index;
+    float2 h0 = (w1 / g0) - 0.5f + index;
+    float2 h1 = (w3 / g1) + 1.5f + index;
     float4 a = read_imagef(image, linear_sampler, h0);
     float4 b = read_imagef(image, linear_sampler, (float2)(h1.x, h0.y));
     float4 c = read_imagef(image, linear_sampler, (float2)(h0.x, h1.y));
     float4 d = read_imagef(image, linear_sampler, h1);
-    return mix(mix(d, b, g0.y), mix(c, a, g0.y), g0.x);
+    a = mix(c, a, g0.y);
+    b = mix(d, b, g0.y);
+    return mix(b, a, g0.x);
 }
 
 inline float4 field_sample(read_only image2d_t image, float2 position, int cubic) {
-    if (cubic)
-        return cubic_sample(image, position);
-    return read_imagef(image, linear_sampler, position);
+#if CUBIC
+    return cubic_sample(image, position);
+#else
+    return read_imagef(image, field_sampler, position);
+#endif
+}
+
+inline float2 moved(const Params *p, float vx, float vy, int time) {
+    float2 step = native_divide(
+        (float2)(vx*65535.0f-1024.0f, vy*65535.0f-1024.0f) * time,
+        (float2)((float)(p->x_ratio*p->pel), (float)(p->y_ratio*p->pel)) * 256.0f);
+    return clamp((float2)(get_global_id(0), get_global_id(1)) + step,
+        (float2)(0.0f, 0.0f), (float2)(p->width-1, p->height-1));
 }
 
 inline float source_sample(
     read_only image2d_t source, const Params *p, float vx, float vy, int time)
 {
-    float2 displacement = (float2)(vx*65535.0f-1024.0f, vy*65535.0f-1024.0f);
-    displacement = native_divide(
-        displacement * (float)time,
-        (float2)(p->x_ratio*p->pel, p->y_ratio*p->pel) * 256.0f);
-    float2 max_pos = (float2)(p->width-1, p->height-1);
-    float2 position = clamp(
-        (float2)(get_global_id(0), get_global_id(1)) + displacement,
-        (float2)(0.0f, 0.0f), max_pos);
-    return 255.0f * read_imagef(source, linear_sampler, position + 0.5f).x;
+    float2 position = ((float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f))
+        + moved(p, vx, vy, time);
+#if CUBIC_REF
+    return 255.0f * cubic_sample(source, position).x;
+#else
+    return 255.0f * read_imagef(source, linear_sampler, position).x;
+#endif
 }
 
-inline float base_sample(read_only image2d_t source) {
-    float2 position = (float2)(get_global_id(0), get_global_id(1)) + 0.5f;
+inline float linear_source_sample(
+    read_only image2d_t source, const Params *p, float vx, float vy, int time)
+{
+    float2 position = ((float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f))
+        + moved(p, vx, vy, time);
     return 255.0f * read_imagef(source, linear_sampler, position).x;
+}
+
+inline float base_sample(read_only image2d_t source, const Params *p) {
+    float2 position = ((float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f))
+        + (float2)(get_global_id(0), get_global_id(1));
+#if CUBIC_REF
+    return 255.0f * cubic_sample(source, position).x;
+#else
+    return 255.0f * read_imagef(source, linear_sampler, position).x;
+#endif
 }
 
 kernel void linear_luma(read_only image2d_t source, write_only image2d_t destination) {
     int2 position = (int2)(get_global_id(0), get_global_id(1));
     float value = read_imagef(source, nearest_sampler, position).x;
-    value = value < 0.081f
-        ? native_divide(value, 4.5f)
-        : native_powr(native_divide(value+0.099f, 1.099f), 1.0f/0.45f);
+    if (value < 0.081f) value = native_divide(value, 4.5f);
+    else value = native_powr(native_divide(value+0.099f, 1.099f), 1.0f/0.45f);
     write_imagef(destination, position, (float4)(value, 0.0f, 0.0f, 0.0f));
 }
 
@@ -1123,60 +1246,68 @@ kernel void render_frame(
     int x = get_global_id(0), y = get_global_id(1);
     if (x >= p.width || y >= p.height) return;
 
-    float2 vector_position = (float2)(
-        (float)(x*p.x_ratio-p.origin_x)/(float)p.block_w,
-        (float)(y*p.y_ratio-p.origin_y)/(float)p.block_h);
-    float4 vector = field_sample(vectors, vector_position, p.cubic);
-    float ref_f = source_sample(source_f, &p, vector.x, vector.w, p.phase);
-    float ref_b = source_sample(source_b, &p, vector.z, vector.y, 256-p.phase);
-    float ref_f0 = base_sample(source_f);
-    float ref_b0 = base_sample(source_b);
+    float2 field_position = native_divide(
+        (float2)(x*p.x_ratio-p.origin_x, y*p.y_ratio-p.origin_y),
+        (float2)(p.block_w, p.block_h));
+    float4 vector = field_sample(vectors, field_position, CUBIC);
+#if ALGO >= 21 || HAS_SAD
+    float4 mask = field_sample(masks, field_position, CUBIC);
+#endif
     float time = native_divide((float)p.phase, 256.0f);
+
+    float ref_b = source_sample(source_b, &p, vector.z, vector.y, 256-p.phase);
+    float ref_f = source_sample(source_f, &p, vector.x, vector.w, p.phase);
+#if ALGO == 13 || ALGO == 22 || HAS_SAD
+    float ref_b0 = base_sample(source_b, &p);
+    float ref_f0 = base_sample(source_f, &p);
+#endif
+#if ALGO == 23
+    float4 ext = field_sample(vectors_ext, field_position, CUBIC);
+    float ref_bb = linear_source_sample(source_b, &p, ext.z, ext.y, 256-p.phase);
+    float ref_ff = linear_source_sample(source_f, &p, ext.x, ext.w, p.phase);
+#endif
     float result;
-    float4 mask = (float4)(0.0f);
 
-    if (p.algorithm >= 21 || p.has_sad)
-        mask = field_sample(masks, vector_position, p.cubic);
+#if ALGO == 1
+    result = ref_b + ref_f*0.00001f;
+#elif ALGO == 2
+    result = ref_f + ref_b*0.00001f;
+#elif ALGO == 11
+    result = mix(ref_f, ref_b, time);
+#elif ALGO == 13
+    result = median3(ref_f, ref_b, mix(ref_f0, ref_b0, p.sad_blend));
+#elif ALGO == 21
+    result = mix(mix(ref_f, ref_b, mask.y), mix(ref_b, ref_f, mask.z), time);
+#elif ALGO == 22
+    result = median3(
+        mix(ref_f, ref_b, mask.y),
+        mix(ref_b, ref_f, mask.z),
+        mix(ref_f0, ref_b0, time));
+#else
+    result = mix(
+        mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y),
+        mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z),
+        time);
+#endif
 
-    if (p.algorithm == 1) {
-        result = ref_b;
-    } else if (p.algorithm == 2) {
-        result = ref_f;
-    } else if (p.algorithm == 11) {
-        result = mix(ref_f, ref_b, time);
-    } else if (p.algorithm == 13) {
-        result = median3(ref_f, ref_b, mix(ref_f0, ref_b0, time));
-    } else if (p.algorithm == 21) {
-        result = mix(mix(ref_f, ref_b, mask.y), mix(ref_b, ref_f, mask.z), time);
-    } else if (p.algorithm == 22) {
-        result = median3(
-            mix(ref_f, ref_b, mask.y),
-            mix(ref_b, ref_f, mask.z),
-            mix(ref_f0, ref_b0, time));
-    } else {
-        float4 ext = field_sample(vectors_ext, vector_position, p.cubic);
-        float ref_ff = source_sample(source_f, &p, ext.x, ext.w, p.phase);
-        float ref_bb = source_sample(source_b, &p, ext.z, ext.y, 256-p.phase);
-        result = mix(
-            mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y),
-            mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z),
-            time);
-    }
+#if HAS_SAD
+# if ALGO == 1
+    result = mix(result, ref_b0, mask.x);
+# elif ALGO == 2
+    result = mix(result, ref_f0, mask.w);
+# else
+    result = mix(result, mix(ref_f0, ref_b0, p.sad_blend), fmax(mask.w, mask.x));
+# endif
+#endif
 
-    if (p.has_sad) {
-        if (p.algorithm == 1)
-            result = mix(result, ref_b0, mask.x);
-        else if (p.algorithm == 2)
-            result = mix(result, ref_f0, mask.w);
-        else
-            result = mix(result, mix(ref_f0, ref_b0, time), mix(mask.x, mask.w, time));
-    }
-
+#if LINEAR_LUMA
     if (p.linear_luma) {
-        float value = native_divide(result, 255.0f);
-        value = value < 0.018f ? value*4.5f : 1.099f*native_powr(value, 0.45f)-0.099f;
-        result = value*255.0f;
+        result = native_divide(result, 255.0f);
+        if (result < 0.018f) result *= 4.5f;
+        else result = 1.099f*native_powr(result, 0.45f)-0.099f;
+        result *= 255.0f;
     }
+#endif
     destination[y*destination_stride+x] = (uchar)clamp(round(result), 0.0f, 255.0f);
 }
 ";

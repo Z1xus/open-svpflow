@@ -126,7 +126,7 @@ impl Merged {
 impl FilterState {
     pub(crate) fn reference_enabled(&self) -> bool {
         matches!(self.mode, Mode::SmoothFps)
-            && self.render_mode == 1
+            && (self.render_mode == 1 || (self.render_mode == 2 && self.gpu.is_some()))
             && !self.source_8bit_mode
             && self.options.reference_supported(&self.video_info)
             && matches!(self.vector_data(), metadata::VectorRecord::Ready(_))
@@ -147,6 +147,107 @@ impl FilterState {
             }
             cache.push((frame, class));
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn reference_gpu(
+        &self,
+        api: &frame::PlaneApi,
+        gpu: &crate::gpu::GpuContext,
+        source: vs::ConstRaw,
+        next_source: vs::ConstRaw,
+        n: i32,
+        frame: i32,
+        params: [crate::gpu::KernelParams; 3],
+        linear: bool,
+        width: i32,
+        height: i32,
+        motions: [(&[u16], &[u16]); 4],
+        coverage: (&[u8], &[u8]),
+        core: vs::Raw,
+    ) -> vs::ConstRaw {
+        let w = usize::try_from(self.video_info.width).unwrap_or(0);
+        let h = usize::try_from(self.video_info.height).unwrap_or(0);
+        let uploads = |raw: vs::ConstRaw| -> Option<[crate::gpu::UploadPlane<'static>; 3]> {
+            let plane =
+                |p: i32, pw: usize, ph: usize| -> Option<crate::gpu::UploadPlane<'static>> {
+                    let (ptr, stride, len) = unsafe { api.read_plane(raw, p, ph) }?;
+                    Some(crate::gpu::UploadPlane {
+                        data: unsafe { slice::from_raw_parts(ptr, len) },
+                        stride,
+                        width: pw,
+                        height: ph,
+                    })
+                };
+            Some([
+                plane(0, w, h)?,
+                plane(1, w / 2, h / 2)?,
+                plane(2, w / 2, h / 2)?,
+            ])
+        };
+        let (Some(current), Some(next)) = (uploads(source), uploads(next_source)) else {
+            return std::ptr::null();
+        };
+        let (Some(current), Some(next)) = (
+            gpu.cache_frame(i64::from(n), current),
+            gpu.cache_frame(i64::from(n) + 1, next),
+        ) else {
+            return std::ptr::null();
+        };
+        let output_info = self.output_info();
+        let Some(output) = (unsafe {
+            api.new_frame(
+                self.video_info.format,
+                output_info.width,
+                output_info.height,
+                source,
+                core,
+            )
+        }) else {
+            return std::ptr::null();
+        };
+        let plane = |p: i32, rows: usize| -> Option<(&'static mut [u8], i32)> {
+            let (ptr, pitch, len) = unsafe { api.write_plane(output, p, rows) }?;
+            Some((
+                unsafe { slice::from_raw_parts_mut(ptr, len) },
+                i32::try_from(pitch).ok()?,
+            ))
+        };
+        let (Some((y, sy)), Some((u, su)), Some((v, sv))) =
+            (plane(0, h), plane(1, h / 2), plane(2, h / 2))
+        else {
+            unsafe { api.free(output.cast_const()) };
+            return std::ptr::null();
+        };
+        let key = i64::from(frame);
+        let done = gpu.render_frame(
+            current.sources(linear),
+            next.sources(linear),
+            y,
+            sy,
+            params[0],
+            u,
+            su,
+            params[1],
+            v,
+            sv,
+            params[2],
+            key,
+            usize::try_from(width).unwrap_or(0),
+            usize::try_from(height).unwrap_or(0),
+            motions,
+            coverage,
+            None,
+        );
+        if done.is_none() {
+            unsafe { api.free(output.cast_const()) };
+            return std::ptr::null();
+        }
+        let timing = self.options.timing(&self.video_info);
+        let ratio = crate::core::f64_i64(timing.frame_num) / crate::core::f64_i64(timing.frame_den);
+        let raw_phase = timing.raw_phase_256(frame, n);
+        unsafe { api.copy_interpolated_timing(source, next_source, output, raw_phase, ratio) };
+        output.cast_const()
     }
 
     fn rates(&self, params: &ReferenceParams) -> Rates {
@@ -406,7 +507,8 @@ impl FilterState {
         };
         let neither = !use_fwd && !use_bwd;
         let algo = params.algo;
-        let neutral = || vec![1024u16; count];
+        let unset = u16::from(self.render_mode != 2) * 1024;
+        let neutral = || vec![unset; count];
         let (mut fwd_x, mut fwd_y, mut bwd_x, mut bwd_y) =
             (neutral(), neutral(), neutral(), neutral());
         let (mut next_x, mut next_y, mut prev_x, mut prev_y) =
@@ -494,6 +596,85 @@ impl FilterState {
             blend: params.area_blend,
         });
         renderer.set_time(time);
+        if self.render_mode == 2
+            && let Some(gpu) = self.gpu.as_ref()
+        {
+            let area_blend = params.area_blend;
+            let gpu_time = if selected == 1 { 256 - time } else { time };
+            let fraction = (f64::from(gpu_time) * 0.003_906_25) as f32;
+            let blend = area_blend as f32;
+            let sad_blend = if gpu_time > 126 {
+                (1.0 - f64::from(blend * (1.0 - f64::from(fraction)) as f32)) as f32
+            } else {
+                fraction * blend
+            };
+            let cubic = params.cubic & 1 != 0;
+            let cubic_ref = params.cubic & 2 != 0;
+            let linear = params.linear && self.video_info.width < 3001;
+            let block = vector_data.effective_block();
+            let make = |chroma: bool, offset_x: i32, offset_y: i32| crate::gpu::KernelParams {
+                algorithm: selected,
+                width: if chroma {
+                    self.video_info.width / 2
+                } else {
+                    self.video_info.width
+                },
+                height: if chroma {
+                    self.video_info.height / 2
+                } else {
+                    self.video_info.height
+                },
+                x_ratio: if chroma { 2 } else { 1 },
+                y_ratio: if chroma { 2 } else { 1 },
+                pel: shape.pel,
+                block_w: if cubic {
+                    block.width
+                } else {
+                    block.width * width
+                },
+                block_h: if cubic {
+                    block.height
+                } else {
+                    block.height * height
+                },
+                origin_x: shape.overlap_x / 2,
+                origin_y: shape.overlap_y / 2,
+                phase: gpu_time,
+                has_sad: 0,
+                linear_luma: i32::from(!chroma && linear),
+                cubic: i32::from(cubic),
+                cubic_ref: i32::from(cubic_ref),
+                offset_x,
+                offset_y,
+                sad_blend,
+            };
+            return unsafe {
+                self.reference_gpu(
+                    api,
+                    gpu,
+                    source,
+                    next_source,
+                    n,
+                    frame,
+                    [
+                        make(false, 0, 0),
+                        make(true, 0, self.video_info.height),
+                        make(true, self.video_info.width / 2, self.video_info.height),
+                    ],
+                    linear,
+                    width,
+                    height,
+                    [
+                        (&bwd_x, &bwd_y),
+                        (&fwd_x, &fwd_y),
+                        (&prev_x, &prev_y),
+                        (&next_x, &next_y),
+                    ],
+                    (&cover_fwd, &cover_bwd),
+                    core,
+                )
+            };
+        }
         let merged = |k: i32, raw: vs::ConstRaw| -> Option<Merged> {
             if shape.pel <= 1 || !self.request_super {
                 let h = usize::try_from(self.video_info.height).ok()?;

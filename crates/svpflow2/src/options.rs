@@ -118,6 +118,7 @@ pub(crate) struct SceneLimits {
     pub(crate) scene: i64,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy)]
 pub(crate) struct ReferenceParams {
     pub(crate) absolute: bool,
@@ -137,6 +138,8 @@ pub(crate) struct ReferenceParams {
     pub(crate) cover: i32,
     pub(crate) area_blend: f64,
     pub(crate) algo: i32,
+    pub(crate) linear: bool,
+    pub(crate) cubic: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -323,6 +326,8 @@ impl Options {
             cover: self.mask_cover(),
             area_blend: self.mask.area_blend,
             algo: i32_saturating(self.algo_for_mode(0)),
+            linear: self.render.linear,
+            cubic: self.cubic.unwrap_or(0),
         }
     }
 
