@@ -4,6 +4,7 @@ use crate::{strings, video_format, vs};
 
 pub(crate) struct PlaneApi {
     new_video_frame: vs::NewVideoFrame,
+    copy_frame: Option<vs::CopyFrame>,
     free_frame: Option<vs::FreeFrame>,
     get_frame_props_ro: Option<vs::GetFramePropsRo>,
     get_frame_props_rw: Option<vs::GetFramePropsRw>,
@@ -39,6 +40,7 @@ impl PlaneApi {
     pub(crate) unsafe fn load(vsapi: vs::ConstRaw) -> Option<Self> {
         Some(Self {
             new_video_frame: unsafe { vs::table_fn(vsapi, vs::NEW_VIDEO_FRAME) }?,
+            copy_frame: unsafe { vs::table_fn(vsapi, vs::COPY_FRAME) },
             free_frame: unsafe { vs::table_fn(vsapi, vs::FREE_FRAME) },
             get_frame_props_ro: unsafe { vs::table_fn(vsapi, vs::GET_FRAME_PROPS_RO) },
             get_frame_props_rw: unsafe { vs::table_fn(vsapi, vs::GET_FRAME_PROPS_RW) },
@@ -69,13 +71,23 @@ impl PlaneApi {
         if source.is_null() || input.format.is_null() {
             return source;
         }
+        let shared = padding == (0, 0)
+            && output.width == input.width
+            && output.height == input.height
+            && self.copy_frame.is_some();
         let frame = unsafe {
-            (self.new_video_frame)(input.format, output.width, output.height, source, core)
+            match self.copy_frame {
+                Some(copy_frame) if shared => copy_frame(source, core),
+                _ => {
+                    (self.new_video_frame)(input.format, output.width, output.height, source, core)
+                }
+            }
         };
         if frame.is_null() {
             return source;
         }
-        if !unsafe { self.copy_planes(source, frame, input, padding, bytes_per_sample) } {
+        if !shared && !unsafe { self.copy_planes(source, frame, input, padding, bytes_per_sample) }
+        {
             if let Some(free_frame) = self.free_frame {
                 unsafe { free_frame(frame.cast_const()) };
             }
