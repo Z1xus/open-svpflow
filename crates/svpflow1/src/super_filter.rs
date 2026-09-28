@@ -237,7 +237,7 @@ unsafe extern "system" fn get_frame_super(
         let untouched = if stride > width {
             0
         } else {
-            regions.get(1).map_or(0, |r| r.offset)
+            super_build::written_end(&regions, stride, &state.opts)
         };
         if !ptr.is_null() && stride * h > untouched {
             unsafe { std::ptr::write_bytes(ptr.add(untouched), 0, stride * h - untouched) };

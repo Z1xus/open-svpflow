@@ -32,16 +32,6 @@ impl ReduceFilter {
     fn vertical_edge(self, y: usize, height: usize) -> bool {
         y == 0 || (self != Self::Average && y + 1 >= height.max(2))
     }
-
-    fn apply(self, t: [u32; 6]) -> u32 {
-        let [m2, m1, c0, p1, p2, p3] = t;
-        match self {
-            Self::Average => (m1 + 2 * c0 + p1 + 2) >> 2,
-            Self::Bilinear => (m1 + 3 * (c0 + p1) + p2 + 4) >> 3,
-            Self::Quadratic => (m2 + 9 * (m1 + p2) + 22 * (c0 + p1) + p3 + 32) >> 6,
-            Self::Cubic => (m2 + 5 * (m1 + p2) + 10 * (c0 + p1) + p3 + 16) >> 5,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +75,18 @@ pub(crate) fn level_regions(
             region
         })
         .collect()
+}
+
+pub(crate) fn written_end(regions: &[Region], pitch: usize, opts: &SuperOpts) -> usize {
+    let pel = opts.pel as usize;
+    regions.last().map_or(0, |last| {
+        let stored = match (regions.len(), opts.full) {
+            (1, true) => pel * pel,
+            (1, false) => 0,
+            _ => 1,
+        };
+        last.offset + stored * last.height * pitch
+    })
 }
 
 pub(crate) fn build_plane(
@@ -183,6 +185,39 @@ impl Canvas<'_> {
         }
     }
 
+    fn window<'a>(&'a self, start: isize, len: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        if let Ok(begin) = usize::try_from(start)
+            && let Some(bytes) = self.frame.get(begin..begin + len)
+        {
+            return bytes;
+        }
+        scratch.resize(len, 0);
+        self.fetch(start, scratch);
+        scratch
+    }
+
+    fn view<'a>(
+        &'a self,
+        source: Source<'a>,
+        offset: isize,
+        len: usize,
+        scratch: &'a mut Vec<u8>,
+    ) -> &'a [u8] {
+        match source {
+            Source::Within(base, _) => self.window(base as isize + offset, len, scratch),
+            Source::Separate(src, _) => {
+                if let Ok(begin) = usize::try_from(offset)
+                    && let Some(bytes) = src.get(begin..begin + len)
+                {
+                    return bytes;
+                }
+                scratch.resize(len, 0);
+                self.fetch_source(source, offset, scratch);
+                scratch
+            }
+        }
+    }
+
     fn fetch_source(&self, source: Source<'_>, offset: isize, out: &mut [u8]) {
         match source {
             Source::Within(base, _) => self.fetch(base as isize + offset, out),
@@ -221,19 +256,21 @@ fn reduce(
         let center = (2 * y) as isize * src_pitch;
         let edge = filter.vertical_edge(y, height);
         let needed = if edge { 0..=1 } else { filter.rows() };
-        for k in needed {
-            let row = &mut rows[(k + 2) as usize];
-            row.resize(width2, 0);
-            canvas.fetch_source(source, center + k * src_pitch, row);
+        let mut views: [&[u8]; 6] = [&[]; 6];
+        for (index, scratch) in rows.iter_mut().enumerate() {
+            let k = index as isize - 2;
+            if needed.contains(&k) {
+                views[index] = canvas.view(source, center + k * src_pitch, width2, scratch);
+            }
         }
         let computed = if edge { width2 } else { exact_end };
-        let [m2, m1, c0, p1, p2, p3] = &rows;
+        let [m2, m1, c0, p1, p2, p3] = views;
         if edge {
             vertical_average(&mut out[..computed], c0, p1);
         } else {
             vertical_filter(filter, &mut out[..computed], [m2, m1, c0, p1, p2, p3]);
         }
-        let tap = |k: isize, x: usize| u32::from(rows[(k + 2) as usize][x]);
+        let tap = |k: isize, x: usize| u32::from(views[(k + 2) as usize][x]);
         if computed < width2 {
             let tail = width2 - computed;
             for (half, k) in halves.iter_mut().zip([-1, 1, 3]) {
@@ -254,12 +291,14 @@ fn reduce(
         }
         canvas.store(target.offset + y * row_step, &out);
     }
-    let mut row = vec![0u8; width2];
+    let mut scratch = Vec::new();
+    let mut deinterleaved = Deinterleaved::default();
+    let mut row = vec![0u8; target.width];
     for y in 0..height {
         let start = target.offset + y * row_step;
-        canvas.fetch(start as isize, &mut row);
-        reduce_row_in_place(filter, &mut row, target.width);
-        canvas.store(start, &row[..target.width]);
+        let view = canvas.window(start as isize, width2, &mut scratch);
+        reduce_row(filter, view, &mut row, &mut deinterleaved);
+        canvas.store(start, &row);
     }
     if compact {
         let mut line = vec![0u8; pitch];
@@ -276,7 +315,7 @@ fn vertical_average(out: &mut [u8], a: &[u8], b: &[u8]) {
     }
 }
 
-fn vertical_filter(filter: ReduceFilter, out: &mut [u8], rows: [&Vec<u8>; 6]) {
+fn vertical_filter(filter: ReduceFilter, out: &mut [u8], rows: [&[u8]; 6]) {
     let n = out.len();
     let used = filter.rows();
     let row = |k: isize| -> &[u8] {
@@ -287,34 +326,98 @@ fn vertical_filter(filter: ReduceFilter, out: &mut [u8], rows: [&Vec<u8>; 6]) {
         }
     };
     let (m2, m1, c0, p1, p2, p3) = (row(-2), row(-1), row(0), row(1), row(2), row(3));
-    for x in 0..n {
-        let t = |r: &[u8]| u32::from(r[x]);
-        out[x] = filter.apply([t(m2), t(m1), t(c0), t(p1), t(p2), t(p3)]) as u8;
+    macro_rules! run {
+        ($f:expr) => {
+            for x in 0..n {
+                let t = |r: &[u8]| u16::from(r[x]);
+                out[x] = ($f)(t(m2), t(m1), t(c0), t(p1), t(p2), t(p3)) as u8;
+            }
+        };
+    }
+    match filter {
+        ReduceFilter::Average => {
+            run!(|_, m1: u16, c0: u16, p1: u16, _, _| (m1 + 2 * c0 + p1 + 2) >> 2)
+        }
+        ReduceFilter::Bilinear => {
+            run!(|_, m1: u16, c0: u16, p1: u16, p2: u16, _| (m1 + 3 * (c0 + p1) + p2 + 4) >> 3);
+        }
+        ReduceFilter::Quadratic => run!(|m2: u16, m1: u16, c0: u16, p1: u16, p2: u16, p3: u16| (m2
+            + 9 * (m1 + p2)
+            + 22 * (c0 + p1)
+            + p3
+            + 32)
+            >> 6),
+        ReduceFilter::Cubic => run!(|m2: u16, m1: u16, c0: u16, p1: u16, p2: u16, p3: u16| (m2
+            + 5 * (m1 + p2)
+            + 10 * (c0 + p1)
+            + p3
+            + 16)
+            >> 5),
     }
 }
 
-fn reduce_row_in_place(filter: ReduceFilter, row: &mut [u8], width: usize) {
-    if width == 0 || row.len() < 2 {
+#[derive(Default)]
+struct Deinterleaved {
+    even: Vec<u16>,
+    odd: Vec<u16>,
+}
+
+fn reduce_row(filter: ReduceFilter, src: &[u8], out: &mut [u8], split: &mut Deinterleaved) {
+    let width = out.len();
+    if width == 0 || src.len() < 2 {
         return;
     }
-    let at = |row: &[u8], i: isize| u32::from(row.get(i as usize).copied().unwrap_or(0));
-    row[0] = ((at(row, 0) + at(row, 1) + 1) >> 1) as u8;
+    let first = ((u16::from(src[0]) + u16::from(src[1]) + 1) >> 1) as u8;
+    let pairs = src.len() / 2;
+    split.even.clear();
+    split.odd.clear();
+    for pair in src.as_chunks::<2>().0 {
+        split.even.push(u16::from(pair[0]));
+        split.odd.push(u16::from(pair[1]));
+    }
+    split.even[0] = u16::from(first);
+    let (e, o) = (&split.even[..pairs], &split.odd[..pairs]);
+    out[0] = first;
     let tail = match filter {
         ReduceFilter::Average => width,
         _ => (width - 1).max(1),
     };
-    for x in 1..tail.min(row.len()) {
-        let base = 2 * x as isize;
-        let value = match filter {
+    let end = tail.min(width).min(pairs);
+    if end > 1 {
+        let n = end - 1;
+        let (em, om) = (&e[..n], &o[..n]);
+        let (ec, oc) = (&e[1..=n], &o[1..=n]);
+        let dst = &mut out[1..=n];
+        match filter {
             ReduceFilter::Average => {
-                (at(row, base - 1) + 2 * at(row, base) + at(row, base + 1) + 2) >> 2
+                for i in 0..n {
+                    dst[i] = ((om[i] + 2 * ec[i] + oc[i] + 2) >> 2) as u8;
+                }
             }
-            _ => filter.apply(std::array::from_fn(|i| at(row, base + i as isize - 2))),
-        };
-        row[x] = value as u8;
+            ReduceFilter::Bilinear => {
+                let en = &e[2..=n + 1];
+                for i in 0..n {
+                    dst[i] = ((om[i] + 3 * (ec[i] + oc[i]) + en[i] + 4) >> 3) as u8;
+                }
+            }
+            ReduceFilter::Quadratic => {
+                let (en, on) = (&e[2..=n + 1], &o[2..=n + 1]);
+                for i in 0..n {
+                    dst[i] = ((em[i] + 9 * (om[i] + en[i]) + 22 * (ec[i] + oc[i]) + on[i] + 32)
+                        >> 6) as u8;
+                }
+            }
+            ReduceFilter::Cubic => {
+                let (en, on) = (&e[2..=n + 1], &o[2..=n + 1]);
+                for i in 0..n {
+                    dst[i] = ((em[i] + 5 * (om[i] + en[i]) + 10 * (ec[i] + oc[i]) + on[i] + 16)
+                        >> 5) as u8;
+                }
+            }
+        }
     }
-    for x in tail..width.min(row.len()) {
-        row[x] = ((at(row, 2 * x as isize) + at(row, 2 * x as isize + 1) + 1) >> 1) as u8;
+    for x in tail.max(1)..width.min(pairs) {
+        out[x] = ((e[x] + o[x] + 1) >> 1) as u8;
     }
 }
 
