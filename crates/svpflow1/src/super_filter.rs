@@ -242,6 +242,10 @@ unsafe extern "system" fn get_frame_super(
         if !ptr.is_null() && stride * h > untouched {
             unsafe { std::ptr::write_bytes(ptr.add(untouched), 0, stride * h - untouched) };
         }
+        if !ptr.is_null() && untouched > 0 {
+            let plane = unsafe { std::slice::from_raw_parts_mut(ptr, untouched) };
+            super_build::clear_margins(plane, &regions, stride);
+        }
     }
 
     let src_w = state.opts.width as usize;

@@ -89,6 +89,17 @@ pub(crate) fn written_end(regions: &[Region], pitch: usize, opts: &SuperOpts) ->
     })
 }
 
+pub(crate) fn clear_margins(dst: &mut [u8], regions: &[Region], pitch: usize) {
+    for region in regions.iter().skip(1) {
+        for row in 0..region.height {
+            let start = region.offset + row * pitch;
+            if let Some(margin) = dst.get_mut(start + region.width..start + pitch) {
+                margin.fill(0);
+            }
+        }
+    }
+}
+
 pub(crate) fn build_plane(
     dst: &mut [u8],
     pitch: usize,
