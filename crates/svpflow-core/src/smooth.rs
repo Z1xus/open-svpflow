@@ -13,6 +13,7 @@ const LOG2_STEP: [i8; 32] = [
 ];
 const LUT_LEN: usize = 2048;
 const NEUTRAL: u16 = 1024;
+const MAX_STEP: usize = 64;
 
 #[derive(Clone, Copy, Default)]
 pub struct BlockVector {
@@ -304,12 +305,24 @@ impl VectorField {
             }
         }
         let scale = f64::from(cover) / 100.0;
+        let table: Vec<u8> = (0..=area.max(0))
+            .map(|covered| {
+                let value = (f64::from(area - covered) * scale * 256.0 / f64::from(area)) as i32;
+                if value > 255 { 255 } else { value as u8 }
+            })
+            .collect();
+        let top = table.len() as i32 - 1;
         for y in 0..height as usize {
             let row = &self.cover[(y + 1) * stride + 1..(y + 1) * stride + 1 + width as usize];
             for (out, &sum) in out[y * width as usize..].iter_mut().zip(row) {
                 let covered = (sum >> 3).min(area);
-                let value = (f64::from(area - covered) * scale * 256.0 / f64::from(area)) as i32;
-                *out = if value > 255 { 255 } else { value as u8 };
+                *out = if covered < 0 {
+                    let value =
+                        (f64::from(area - covered) * scale * 256.0 / f64::from(area)) as i32;
+                    if value > 255 { 255 } else { value as u8 }
+                } else {
+                    table[covered.min(top) as usize]
+                };
             }
         }
     }
@@ -424,6 +437,7 @@ pub struct Renderer {
 pub struct Plane<'a> {
     pub data: &'a [u8],
     pub pitch: usize,
+    pub slack: usize,
 }
 
 pub struct PlaneMut<'a> {
@@ -503,10 +517,6 @@ fn weights(count: i32, scale: f64) -> Vec<i16> {
 
 fn sra16(value: i16, shift: u32) -> i16 {
     value >> shift.min(15)
-}
-
-fn sra32(value: i32, shift: u32) -> i32 {
-    value >> shift.min(31)
 }
 
 impl Renderer {
@@ -625,7 +635,6 @@ impl Renderer {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub fn render(
         &self,
         algo: Algo,
@@ -642,24 +651,25 @@ impl Renderer {
         for chroma in [false, true] {
             let pitch = if chroma { next.u.pitch } else { next.y.pitch };
             let pass = self.pass(chroma, interp, pitch);
-            let planes: &mut [(&mut PlaneMut<'_>, Plane<'_>, Plane<'_>)] = if chroma {
-                &mut [
+            let mut planes: Vec<(&mut PlaneMut<'_>, Plane<'_>, Plane<'_>)> = if chroma {
+                vec![
                     (&mut dst.u, next.u, current.u),
                     (&mut dst.v, next.v, current.v),
                 ]
             } else {
-                &mut [(&mut dst.y, next.y, current.y)]
+                vec![(&mut dst.y, next.y, current.y)]
             };
-            self.render_pass(algo, interp, &pass, planes, vectors);
+            self.render_algo(algo, interp, &pass, &mut planes, vectors);
         }
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation
-    )]
-    fn render_pass(
+    fn channel(raw: &[u16], lut: &[i16], div: i32) -> Vec<i16> {
+        raw.iter()
+            .map(|&value| (i32::from(lut[usize::from(value)]) / div) as i16)
+            .collect()
+    }
+
+    fn render_algo(
         &self,
         algo: Algo,
         interp: bool,
@@ -667,41 +677,135 @@ impl Renderer {
         planes: &mut [(&mut PlaneMut<'_>, Plane<'_>, Plane<'_>)],
         v: &PackedVectors<'_>,
     ) {
-        let grid_w = self.shape.grid_w;
-        let grid_h = self.shape.grid_h;
-        let pel = self.shape.pel as isize;
-        let pitch = pass.pitch as isize;
         let t = self.time;
         let rt = 256 - t;
         let tb = self.time_blend;
         let rtb = 256 - tb;
-        let fwd = |lut: &[i16], raw: u16, div: i32| -> i16 {
-            (i32::from(lut[usize::from(raw)]) / div) as i16
+        let fwd = &self.lut_fwd;
+        let rev = &self.lut_rev;
+        let vec2 = |x: &[u16], y: &[u16], lut: &[i16]| {
+            (
+                Self::channel(x, lut, pass.div_x),
+                Self::channel(y, lut, pass.div_y),
+            )
         };
-        let mut channels: Vec<[i16; 4]> = Vec::with_capacity(10);
-        let mut row_values: Vec<[i16; 2]> = Vec::with_capacity(10);
-        let mut lanes = [0i32; 10];
+        let mask = |m: &[u8]| m.iter().map(|&x| i16::from(x)).collect::<Vec<i16>>();
+        let weights = row::Weights { t, rt, tb, rtb };
+        match algo {
+            Algo::Fast { next } => {
+                let (x, y) = if next {
+                    vec2(v.fwd_x, v.fwd_y, fwd)
+                } else {
+                    vec2(v.bwd_x, v.bwd_y, fwd)
+                };
+                self.walk(pass, interp, [&x, &y], planes, |out, p, base, n, l| {
+                    row::fast(out, p, next, base, n, l);
+                });
+            }
+            Algo::NoMask { median } => {
+                let (bx, by) = vec2(v.bwd_x, v.bwd_y, fwd);
+                let (fx, fy) = vec2(v.fwd_x, v.fwd_y, rev);
+                self.walk(
+                    pass,
+                    interp,
+                    [&bx, &by, &fx, &fy],
+                    planes,
+                    |out, p, base, n, l| {
+                        row::no_mask(out, p, base, n, l, &weights, median);
+                    },
+                );
+            }
+            Algo::Normal { simple } => {
+                let (bx, by) = vec2(v.bwd_x, v.bwd_y, fwd);
+                let (fx, fy) = vec2(v.fwd_x, v.fwd_y, rev);
+                let (m9, m8) = (mask(v.cover_fwd), mask(v.cover_bwd));
+                self.walk(
+                    pass,
+                    interp,
+                    [&bx, &by, &fx, &fy, &m9, &m8],
+                    planes,
+                    |out, p, base, n, l| row::normal(out, p, base, n, l, &weights, simple),
+                );
+            }
+            Algo::Extended => {
+                let (bx, by) = vec2(v.bwd_x, v.bwd_y, fwd);
+                let (fx, fy) = vec2(v.fwd_x, v.fwd_y, rev);
+                let (px, py) = vec2(v.prev_bwd_x, v.prev_bwd_y, fwd);
+                let (nx, ny) = vec2(v.next_fwd_x, v.next_fwd_y, rev);
+                let (m9, m8) = (mask(v.cover_fwd), mask(v.cover_bwd));
+                self.walk(
+                    pass,
+                    interp,
+                    [&bx, &by, &fx, &fy, &px, &py, &nx, &ny, &m9, &m8],
+                    planes,
+                    |out, p, base, n, l| row::extended(out, p, base, n, l, &weights),
+                );
+            }
+            Algo::Fill => {}
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn walk<const N: usize, K>(
+        &self,
+        pass: &Pass<'_>,
+        interp: bool,
+        channels: [&[i16]; N],
+        planes: &mut [(&mut PlaneMut<'_>, Plane<'_>, Plane<'_>)],
+        kernel: K,
+    ) where
+        K: Fn(&mut [u8], &row::Prepared<'_>, i32, usize, &[i32; N]),
+    {
+        let grid_w = self.shape.grid_w;
+        let grid_h = self.shape.grid_h;
+        let pel = self.shape.pel;
+        let pitch = pass.pitch as i32;
+        let mut weights = [0i32; MAX_STEP];
+        if interp {
+            for (pair, w) in weights.iter_mut().zip(pass.x_weights) {
+                *pair = i32::from(w[0] as u16) | (i32::from(w[1] as u16) << 16);
+            }
+        } else {
+            weights.fill(1);
+        }
+        let shift_x = if interp { pass.shift_x } else { 0 };
+        let setup = row::Setup {
+            pel,
+            pitch,
+            weights: &weights,
+            shift: shift_x,
+        };
+        let sources: Vec<(Plane<'_>, Plane<'_>)> =
+            planes.iter().map(|(_, a, b)| (*a, *b)).collect();
+        let prepared: Vec<row::Prepared<'_>> = sources
+            .iter()
+            .map(|(a, b)| row::Prepared::new(&setup, a, b))
+            .collect();
+        let mut top = [[0i16; 2]; N];
+        let mut bottom = [[0i16; 2]; N];
+        let mut pairs = [0i32; N];
         for by in -1..grid_h {
             let py0 = if by < 0 {
                 0
             } else {
                 pass.origin_y + by * pass.step_y
             };
-            let rows = if py0 + pass.step_y < pass.height {
+            let mut rows = if py0 + pass.step_y < pass.height {
                 if by == -1 { pass.origin_y } else { pass.step_y }
             } else {
                 pass.height - py0
             };
-            let rows = if !interp && by == grid_h - 1 {
-                pass.height - py0
+            if !interp && by == grid_h - 1 {
+                rows = pass.height - py0;
+            }
+            if rows <= 0 {
+                continue;
+            }
+            let upper = by.max(0);
+            let lower = if by == -1 || by == grid_h - 1 {
+                upper
             } else {
-                rows
-            };
-            let top = by.max(0);
-            let bottom = if by == -1 || by == grid_h - 1 {
-                top
-            } else {
-                top + 1
+                upper + 1
             };
             for bx in -1..grid_w {
                 let px0 = if bx < 0 {
@@ -717,7 +821,7 @@ impl Renderer {
                 if !interp && bx == grid_w - 1 {
                     cols = pass.width - px0;
                 }
-                if rows <= 0 || cols <= 0 {
+                if cols <= 0 {
                     continue;
                 }
                 let left = bx.max(0);
@@ -726,137 +830,552 @@ impl Renderer {
                 } else {
                     left + 1
                 };
-                let idx = |row: i32, col: i32| (row * grid_w + col) as usize;
-                let corners = [
-                    idx(top, left),
-                    idx(top, right),
-                    idx(bottom, left),
-                    idx(bottom, right),
-                ];
-                channels.clear();
-                let mut push_vec = |xs: &[u16], ys: &[u16], lut: &[i16]| {
-                    channels.push(corners.map(|c| fwd(lut, xs[c], pass.div_x)));
-                    channels.push(corners.map(|c| fwd(lut, ys[c], pass.div_y)));
-                };
-                match algo {
-                    Algo::Fast { next: true } => push_vec(v.fwd_x, v.fwd_y, &self.lut_fwd),
-                    Algo::Fast { next: false } => push_vec(v.bwd_x, v.bwd_y, &self.lut_fwd),
-                    Algo::NoMask { .. } | Algo::Normal { .. } => {
-                        push_vec(v.bwd_x, v.bwd_y, &self.lut_fwd);
-                        push_vec(v.fwd_x, v.fwd_y, &self.lut_rev);
-                    }
-                    Algo::Extended => {
-                        push_vec(v.bwd_x, v.bwd_y, &self.lut_fwd);
-                        push_vec(v.fwd_x, v.fwd_y, &self.lut_rev);
-                        push_vec(v.prev_bwd_x, v.prev_bwd_y, &self.lut_fwd);
-                        push_vec(v.next_fwd_x, v.next_fwd_y, &self.lut_rev);
-                    }
-                    Algo::Fill => {}
+                let tl = (upper * grid_w + left) as usize;
+                let tr = (upper * grid_w + right) as usize;
+                let bl = (lower * grid_w + left) as usize;
+                let br = (lower * grid_w + right) as usize;
+                for k in 0..N {
+                    let ch = channels[k];
+                    top[k] = [ch[tl], ch[tr]];
+                    bottom[k] = [ch[bl], ch[br]];
                 }
-                if matches!(algo, Algo::Normal { .. } | Algo::Extended) {
-                    channels.push(corners.map(|c| i16::from(v.cover_fwd[c])));
-                    channels.push(corners.map(|c| i16::from(v.cover_bwd[c])));
-                }
+                let cols = cols as usize;
                 for r in 0..rows {
                     let py = py0 + r;
-                    let wt = pass.y_weights[(pass.step_y - r) as usize];
-                    let wb = pass.y_weights[r as usize];
-                    row_values.clear();
-                    for ch in &channels {
+                    if interp {
+                        let wt = pass.y_weights[(pass.step_y - r) as usize];
+                        let wb = pass.y_weights[r as usize];
                         let mix = |a: i16, b: i16| {
                             sra16(
                                 wt.wrapping_mul(a).wrapping_add(wb.wrapping_mul(b)),
                                 pass.shift_y,
                             )
                         };
-                        row_values.push([mix(ch[0], ch[2]), mix(ch[1], ch[3])]);
+                        for ((pair, t), b) in pairs.iter_mut().zip(&top).zip(&bottom) {
+                            *pair = i32::from(mix(t[0], b[0]) as u16)
+                                | (i32::from(mix(t[1], b[1]) as u16) << 16);
+                        }
+                    } else {
+                        for (pair, t) in pairs.iter_mut().zip(&top) {
+                            *pair = i32::from(t[0] as u16);
+                        }
                     }
-                    for c in 0..cols {
-                        let px = px0 + c;
-                        if interp {
-                            let [wl, wr] = pass.x_weights[c as usize];
-                            for (lane, rv) in lanes.iter_mut().zip(&row_values) {
-                                let sum = i32::from(rv[0]) * i32::from(wl)
-                                    + i32::from(rv[1]) * i32::from(wr);
-                                *lane = i32::from(sra32(sum, pass.shift_x) as i16);
-                            }
-                        } else {
-                            for (lane, ch) in lanes.iter_mut().zip(&channels) {
-                                *lane = i32::from(ch[0]);
-                            }
-                        }
-                        let base = pel * (px as isize + py as isize * pitch);
-                        let at = |dx: i32, dy: i32| base + dx as isize + pitch * dy as isize;
-                        for (dst, a, b) in planes.iter_mut() {
-                            let get = |p: &Plane<'_>, i: isize| -> i32 {
-                                usize::try_from(i)
-                                    .ok()
-                                    .and_then(|i| p.data.get(i))
-                                    .map_or(0, |&x| i32::from(x))
-                            };
-                            let value = match algo {
-                                Algo::Fast { next } => {
-                                    let src = if next { *a } else { *b };
-                                    get(&src, at(lanes[0], lanes[1]))
-                                }
-                                Algo::NoMask { median: false } => {
-                                    let pb = get(b, at(lanes[0], lanes[1]));
-                                    let pa = get(a, at(lanes[2], lanes[3]));
-                                    i32::from(((rt * pb + t * pa) as u16) >> 8)
-                                }
-                                Algo::NoMask { median: true } => {
-                                    let pb = get(b, at(lanes[0], lanes[1]));
-                                    let pa = get(a, at(lanes[2], lanes[3]));
-                                    let lo = pb.min(pa);
-                                    let hi = pb.max(pa);
-                                    let mid = (rtb * get(b, base) + tb * get(a, base)) >> 8;
-                                    mid.min(hi).max(lo)
-                                }
-                                Algo::Normal { simple } => {
-                                    let pb = get(b, at(lanes[0], lanes[1]));
-                                    let pa = get(a, at(lanes[2], lanes[3]));
-                                    let m9 = lanes[4];
-                                    let m8 = lanes[5];
-                                    if simple {
-                                        let first = ((255 - m9) * pb + m9 * pa + 255) >> 8;
-                                        let second = ((255 - m8) * pa + m8 * pb + 255) >> 8;
-                                        i32::from(((rt * first + t * second) as u16) >> 8)
-                                    } else {
-                                        let bb = (255 - m9) * pb;
-                                        let aa = (255 - m8) * pa;
-                                        let first = (bb
-                                            + ((m9 * (aa + m8 * get(b, base)) + 255) >> 8)
-                                            + 255)
-                                            >> 8;
-                                        let second = (aa
-                                            + (((bb + get(a, base) * m9) * m8 + 255) >> 8)
-                                            + 255)
-                                            >> 8;
-                                        i32::from(((rt * first + t * second) as u16) >> 8)
-                                    }
-                                }
-                                Algo::Extended => {
-                                    let c0 = get(b, at(lanes[0], lanes[1]));
-                                    let n0 = get(a, at(lanes[2], lanes[3]));
-                                    let c1 = get(b, at(lanes[4], lanes[5]));
-                                    let n1 = get(a, at(lanes[6], lanes[7]));
-                                    let m9 = lanes[8];
-                                    let m8 = lanes[9];
-                                    let lo = c0.min(n0);
-                                    let hi = c0.max(n0);
-                                    let clamp = |x: i32| if x > lo { x.min(hi) } else { lo };
-                                    let first = (m9 * clamp(n1) + c0 * (255 - m9) + 255) >> 8;
-                                    let second = (m8 * clamp(c1) + n0 * (255 - m8) + 255) >> 8;
-                                    i32::from(((rt * first + t * second) as u16) >> 8)
-                                }
-                                Algo::Fill => 0,
-                            };
-                            let di = py as usize * dst.pitch + px as usize;
-                            dst.data[di] = value as u8;
-                        }
+                    let base = pel * (px0 + py * pitch);
+                    for ((dst, _, _), prepared) in planes.iter_mut().zip(&prepared) {
+                        let row_start = py as usize * dst.pitch;
+                        let start = row_start + px0 as usize;
+                        let end = (start + cols.next_multiple_of(8))
+                            .min(row_start + pass.width as usize)
+                            .min(dst.data.len());
+                        kernel(&mut dst.data[start..end], prepared, base, cols, &pairs);
                     }
                 }
             }
         }
     }
+}
+
+mod row {
+    use super::MAX_STEP;
+
+    pub(super) struct Setup<'a> {
+        pub(super) pel: i32,
+        pub(super) pitch: i32,
+        pub(super) weights: &'a [i32; MAX_STEP],
+        pub(super) shift: u32,
+    }
+
+    pub(super) struct Weights {
+        pub(super) t: i32,
+        pub(super) rt: i32,
+        pub(super) tb: i32,
+        pub(super) rtb: i32,
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[allow(
+        unsafe_code,
+        unused_unsafe,
+        clippy::cast_ptr_alignment,
+        clippy::inline_always,
+        clippy::many_single_char_names,
+        clippy::trivially_copy_pass_by_ref
+    )]
+    mod imp {
+        use std::arch::x86_64::{
+            __m128i, __m256i, _mm_cvtsi32_si128, _mm_loadl_epi64, _mm_loadu_si128, _mm_packs_epi32,
+            _mm_packus_epi16, _mm_storel_epi64, _mm256_add_epi32, _mm256_and_si256,
+            _mm256_castsi256_si128, _mm256_cvtepu8_epi32, _mm256_cvtepu16_epi32,
+            _mm256_extracti128_si256, _mm256_i32gather_epi32, _mm256_loadu_si256,
+            _mm256_madd_epi16, _mm256_max_epi32, _mm256_min_epi32, _mm256_mullo_epi32,
+            _mm256_set1_epi32, _mm256_setr_epi32, _mm256_slli_epi32, _mm256_sra_epi32,
+            _mm256_srai_epi32, _mm256_srlv_epi32, _mm256_sub_epi32,
+        };
+        use std::marker::PhantomData;
+
+        use super::super::Plane;
+        use super::{MAX_STEP, Setup, Weights};
+
+        #[derive(Clone, Copy)]
+        struct Source {
+            ptr: *const i32,
+            bytes: *const u8,
+            last: __m256i,
+            safe: __m256i,
+            valid: bool,
+            padded: bool,
+            readable: usize,
+            pel: i32,
+        }
+
+        impl Source {
+            #[inline(always)]
+            fn new(plane: &Plane<'_>, pel: i32) -> Self {
+                unsafe {
+                    let len = i32::try_from(plane.data.len()).unwrap_or(i32::MAX);
+                    Self {
+                        ptr: plane.data.as_ptr().cast::<i32>(),
+                        bytes: plane.data.as_ptr(),
+                        last: _mm256_set1_epi32(len - 1),
+                        safe: _mm256_set1_epi32(len - 4),
+                        valid: len >= 4,
+                        padded: plane.slack >= 3,
+                        readable: plane.data.len() + plane.slack,
+                        pel,
+                    }
+                }
+            }
+
+            #[inline(always)]
+            fn fetch(&self, index: __m256i) -> __m256i {
+                unsafe {
+                    let zero = _mm256_set1_epi32(0);
+                    if !self.valid {
+                        return zero;
+                    }
+                    let index = _mm256_min_epi32(_mm256_max_epi32(index, zero), self.last);
+                    if self.padded {
+                        let words = _mm256_i32gather_epi32::<1>(self.ptr, index);
+                        return _mm256_and_si256(words, _mm256_set1_epi32(0xFF));
+                    }
+                    let base = _mm256_min_epi32(index, self.safe);
+                    let shift = _mm256_slli_epi32::<3>(_mm256_sub_epi32(index, base));
+                    let words = _mm256_i32gather_epi32::<1>(self.ptr, base);
+                    _mm256_and_si256(_mm256_srlv_epi32(words, shift), _mm256_set1_epi32(0xFF))
+                }
+            }
+
+            #[inline(always)]
+            fn still(&self, start: i32, chunk: __m256i) -> __m256i {
+                unsafe {
+                    let start = start as usize;
+                    let span = 8 * self.pel as usize;
+                    if start + span.max(16) <= self.readable {
+                        let at = self.bytes.add(start);
+                        match self.pel {
+                            1 => {
+                                return _mm256_cvtepu8_epi32(_mm_loadl_epi64(at.cast::<__m128i>()));
+                            }
+                            2 => {
+                                let words =
+                                    _mm256_cvtepu16_epi32(_mm_loadu_si128(at.cast::<__m128i>()));
+                                return _mm256_and_si256(words, _mm256_set1_epi32(0xFF));
+                            }
+                            4 => {
+                                let words = _mm256_loadu_si256(at.cast::<__m256i>());
+                                return _mm256_and_si256(words, _mm256_set1_epi32(0xFF));
+                            }
+                            _ => {}
+                        }
+                    }
+                    self.fetch(chunk)
+                }
+            }
+        }
+
+        pub(in super::super) struct Prepared<'a> {
+            a: Source,
+            b: Source,
+            offsets: __m256i,
+            step: __m256i,
+            pel: i32,
+            pitch: __m256i,
+            shift: __m128i,
+            weights: *const i32,
+            _life: PhantomData<&'a [u8]>,
+        }
+
+        impl<'a> Prepared<'a> {
+            pub(in super::super) fn new(setup: &Setup<'a>, a: &Plane<'a>, b: &Plane<'a>) -> Self {
+                unsafe {
+                    let pel = setup.pel;
+                    Self {
+                        a: Source::new(a, pel),
+                        b: Source::new(b, pel),
+                        offsets: _mm256_setr_epi32(
+                            0,
+                            pel,
+                            2 * pel,
+                            3 * pel,
+                            4 * pel,
+                            5 * pel,
+                            6 * pel,
+                            7 * pel,
+                        ),
+                        step: _mm256_set1_epi32(8 * pel),
+                        pel,
+                        pitch: _mm256_set1_epi32(setup.pitch),
+                        shift: _mm_cvtsi32_si128(setup.shift as i32),
+                        weights: setup.weights.as_ptr(),
+                        _life: PhantomData,
+                    }
+                }
+            }
+
+            #[inline(always)]
+            fn lane(&self, pair: i32, c: usize) -> __m256i {
+                debug_assert!(c + 8 <= MAX_STEP);
+                unsafe {
+                    let w = _mm256_loadu_si256(self.weights.add(c).cast::<__m256i>());
+                    let sum =
+                        _mm256_sra_epi32(_mm256_madd_epi16(_mm256_set1_epi32(pair), w), self.shift);
+                    _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(sum))
+                }
+            }
+
+            #[inline(always)]
+            fn at(&self, chunk: __m256i, x: i32, y: i32, c: usize) -> __m256i {
+                unsafe {
+                    let x = self.lane(x, c);
+                    let y = self.lane(y, c);
+                    _mm256_add_epi32(
+                        _mm256_add_epi32(chunk, x),
+                        _mm256_mullo_epi32(y, self.pitch),
+                    )
+                }
+            }
+
+            #[inline(always)]
+            fn run(
+                &self,
+                out: &mut [u8],
+                base: i32,
+                n: usize,
+                mut body: impl FnMut(usize, __m256i, i32) -> __m256i,
+            ) {
+                unsafe {
+                    let mut chunk = _mm256_add_epi32(_mm256_set1_epi32(base), self.offsets);
+                    let mut start = base;
+                    let mut c = 0;
+                    while c < n {
+                        let value = body(c, chunk, start);
+                        start += 8 * self.pel;
+                        let lo = _mm256_castsi256_si128(value);
+                        let hi = _mm256_extracti128_si256::<1>(value);
+                        let words = _mm_packs_epi32(lo, hi);
+                        let bytes = _mm_packus_epi16(words, words);
+                        if c + 8 <= out.len() {
+                            _mm_storel_epi64(out.as_mut_ptr().add(c).cast::<__m128i>(), bytes);
+                        } else {
+                            let mut tmp = [0u8; 16];
+                            _mm_storel_epi64(tmp.as_mut_ptr().cast::<__m128i>(), bytes);
+                            let take = (n - c).min(8);
+                            out[c..c + take].copy_from_slice(&tmp[..take]);
+                        }
+                        chunk = _mm256_add_epi32(chunk, self.step);
+                        c += 8;
+                    }
+                }
+            }
+        }
+
+        #[inline(always)]
+        fn splat(v: i32) -> __m256i {
+            unsafe { _mm256_set1_epi32(v) }
+        }
+
+        #[inline(always)]
+        fn mul(a: __m256i, b: __m256i) -> __m256i {
+            unsafe { _mm256_mullo_epi32(a, b) }
+        }
+
+        #[inline(always)]
+        fn add(a: __m256i, b: __m256i) -> __m256i {
+            unsafe { _mm256_add_epi32(a, b) }
+        }
+
+        #[inline(always)]
+        fn sub(a: __m256i, b: __m256i) -> __m256i {
+            unsafe { _mm256_sub_epi32(a, b) }
+        }
+
+        #[inline(always)]
+        fn min(a: __m256i, b: __m256i) -> __m256i {
+            unsafe { _mm256_min_epi32(a, b) }
+        }
+
+        #[inline(always)]
+        fn max(a: __m256i, b: __m256i) -> __m256i {
+            unsafe { _mm256_max_epi32(a, b) }
+        }
+
+        #[inline(always)]
+        fn shr8(a: __m256i) -> __m256i {
+            unsafe { _mm256_srai_epi32::<8>(a) }
+        }
+
+        pub(in super::super) fn fast(
+            out: &mut [u8],
+            p: &Prepared<'_>,
+            next: bool,
+            base: i32,
+            n: usize,
+            l: &[i32; 2],
+        ) {
+            let src = if next { p.a } else { p.b };
+            p.run(out, base, n, |c, chunk, _| {
+                src.fetch(p.at(chunk, l[0], l[1], c))
+            });
+        }
+
+        pub(in super::super) fn no_mask(
+            out: &mut [u8],
+            p: &Prepared<'_>,
+            base: i32,
+            n: usize,
+            l: &[i32; 4],
+            w: &Weights,
+            median: bool,
+        ) {
+            let (t, rt, tb, rtb) = (splat(w.t), splat(w.rt), splat(w.tb), splat(w.rtb));
+            p.run(out, base, n, |c, chunk, start| {
+                let pb = p.b.fetch(p.at(chunk, l[0], l[1], c));
+                let pa = p.a.fetch(p.at(chunk, l[2], l[3], c));
+                if median {
+                    let b0 = p.b.still(start, chunk);
+                    let a0 = p.a.still(start, chunk);
+                    let mid = shr8(add(mul(rtb, b0), mul(tb, a0)));
+                    max(min(mid, max(pb, pa)), min(pb, pa))
+                } else {
+                    shr8(add(mul(rt, pb), mul(t, pa)))
+                }
+            });
+        }
+
+        pub(in super::super) fn normal(
+            out: &mut [u8],
+            p: &Prepared<'_>,
+            base: i32,
+            n: usize,
+            l: &[i32; 6],
+            w: &Weights,
+            simple: bool,
+        ) {
+            let (t, rt, full) = (splat(w.t), splat(w.rt), splat(255));
+            p.run(out, base, n, |c, chunk, start| {
+                let pb = p.b.fetch(p.at(chunk, l[0], l[1], c));
+                let pa = p.a.fetch(p.at(chunk, l[2], l[3], c));
+                let m9 = p.lane(l[4], c);
+                let m8 = p.lane(l[5], c);
+                let (first, second) = if simple {
+                    (
+                        shr8(add(add(mul(sub(full, m9), pb), mul(m9, pa)), full)),
+                        shr8(add(add(mul(sub(full, m8), pa), mul(m8, pb)), full)),
+                    )
+                } else {
+                    let bb = mul(sub(full, m9), pb);
+                    let aa = mul(sub(full, m8), pa);
+                    let b0 = p.b.still(start, chunk);
+                    let a0 = p.a.still(start, chunk);
+                    let inner = shr8(add(mul(m9, add(aa, mul(m8, b0))), full));
+                    let first = shr8(add(add(bb, inner), full));
+                    let inner = shr8(add(mul(add(bb, mul(a0, m9)), m8), full));
+                    (first, shr8(add(add(aa, inner), full)))
+                };
+                shr8(add(mul(rt, first), mul(t, second)))
+            });
+        }
+
+        pub(in super::super) fn extended(
+            out: &mut [u8],
+            p: &Prepared<'_>,
+            base: i32,
+            n: usize,
+            l: &[i32; 10],
+            w: &Weights,
+        ) {
+            let (t, rt, full) = (splat(w.t), splat(w.rt), splat(255));
+            p.run(out, base, n, |c, chunk, _| {
+                let c0 = p.b.fetch(p.at(chunk, l[0], l[1], c));
+                let n0 = p.a.fetch(p.at(chunk, l[2], l[3], c));
+                let c1 = p.b.fetch(p.at(chunk, l[4], l[5], c));
+                let n1 = p.a.fetch(p.at(chunk, l[6], l[7], c));
+                let m9 = p.lane(l[8], c);
+                let m8 = p.lane(l[9], c);
+                let lo = min(c0, n0);
+                let hi = max(c0, n0);
+                let cn = max(lo, min(n1, hi));
+                let cc = max(lo, min(c1, hi));
+                let first = shr8(add(add(mul(m9, cn), mul(c0, sub(full, m9))), full));
+                let second = shr8(add(add(mul(m8, cc), mul(n0, sub(full, m8))), full));
+                shr8(add(mul(rt, first), mul(t, second)))
+            });
+        }
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[allow(
+        clippy::inline_always,
+        clippy::many_single_char_names,
+        clippy::trivially_copy_pass_by_ref
+    )]
+    mod imp {
+        use super::super::Plane;
+        use super::{MAX_STEP, Setup, Weights};
+
+        pub(in super::super) struct Prepared<'a> {
+            a: &'a [u8],
+            b: &'a [u8],
+            pel: i32,
+            pitch: i32,
+            weights: &'a [i32; MAX_STEP],
+            shift: u32,
+        }
+
+        impl<'a> Prepared<'a> {
+            pub(in super::super) fn new(setup: &Setup<'a>, a: &Plane<'a>, b: &Plane<'a>) -> Self {
+                Self {
+                    a: a.data,
+                    b: b.data,
+                    pel: setup.pel,
+                    pitch: setup.pitch,
+                    weights: setup.weights,
+                    shift: setup.shift,
+                }
+            }
+
+            #[inline(always)]
+            fn lane(&self, pair: i32, c: usize) -> i32 {
+                let w = self.weights[c];
+                let sum = i32::from(pair as i16) * i32::from(w as i16) + (pair >> 16) * (w >> 16);
+                i32::from((sum >> self.shift.min(31)) as i16)
+            }
+
+            #[inline(always)]
+            fn at(&self, plane: &[u8], base: i32, x: i32, y: i32, c: usize) -> i32 {
+                px(
+                    plane,
+                    base + self.pel * c as i32 + self.lane(x, c) + self.pitch * self.lane(y, c),
+                )
+            }
+
+            #[inline(always)]
+            fn still(&self, plane: &[u8], base: i32, c: usize) -> i32 {
+                px(plane, base + self.pel * c as i32)
+            }
+        }
+
+        #[inline(always)]
+        fn px(plane: &[u8], index: i32) -> i32 {
+            let last = plane.len().saturating_sub(1);
+            plane
+                .get((index.max(0) as usize).min(last))
+                .map_or(0, |&v| i32::from(v))
+        }
+
+        pub(in super::super) fn fast(
+            out: &mut [u8],
+            p: &Prepared<'_>,
+            next: bool,
+            base: i32,
+            n: usize,
+            l: &[i32; 2],
+        ) {
+            let src = if next { p.a } else { p.b };
+            for (c, o) in out.iter_mut().enumerate().take(n) {
+                *o = p.at(src, base, l[0], l[1], c) as u8;
+            }
+        }
+
+        pub(in super::super) fn no_mask(
+            out: &mut [u8],
+            p: &Prepared<'_>,
+            base: i32,
+            n: usize,
+            l: &[i32; 4],
+            w: &Weights,
+            median: bool,
+        ) {
+            for (c, o) in out.iter_mut().enumerate().take(n) {
+                let pb = p.at(p.b, base, l[0], l[1], c);
+                let pa = p.at(p.a, base, l[2], l[3], c);
+                *o = if median {
+                    let mid = (w.rtb * p.still(p.b, base, c) + w.tb * p.still(p.a, base, c)) >> 8;
+                    mid.min(pb.max(pa)).max(pb.min(pa)) as u8
+                } else {
+                    ((w.rt * pb + w.t * pa) >> 8) as u8
+                };
+            }
+        }
+
+        pub(in super::super) fn normal(
+            out: &mut [u8],
+            p: &Prepared<'_>,
+            base: i32,
+            n: usize,
+            l: &[i32; 6],
+            w: &Weights,
+            simple: bool,
+        ) {
+            for (c, o) in out.iter_mut().enumerate().take(n) {
+                let pb = p.at(p.b, base, l[0], l[1], c);
+                let pa = p.at(p.a, base, l[2], l[3], c);
+                let (m9, m8) = (p.lane(l[4], c), p.lane(l[5], c));
+                let (first, second) = if simple {
+                    (
+                        ((255 - m9) * pb + m9 * pa + 255) >> 8,
+                        ((255 - m8) * pa + m8 * pb + 255) >> 8,
+                    )
+                } else {
+                    let bb = (255 - m9) * pb;
+                    let aa = (255 - m8) * pa;
+                    let b0 = p.still(p.b, base, c);
+                    let a0 = p.still(p.a, base, c);
+                    (
+                        (bb + ((m9 * (aa + m8 * b0) + 255) >> 8) + 255) >> 8,
+                        (aa + (((bb + a0 * m9) * m8 + 255) >> 8) + 255) >> 8,
+                    )
+                };
+                *o = ((w.rt * first + w.t * second) >> 8) as u8;
+            }
+        }
+
+        pub(in super::super) fn extended(
+            out: &mut [u8],
+            p: &Prepared<'_>,
+            base: i32,
+            n: usize,
+            l: &[i32; 10],
+            w: &Weights,
+        ) {
+            for (c, o) in out.iter_mut().enumerate().take(n) {
+                let c0 = p.at(p.b, base, l[0], l[1], c);
+                let n0 = p.at(p.a, base, l[2], l[3], c);
+                let c1 = p.at(p.b, base, l[4], l[5], c);
+                let n1 = p.at(p.a, base, l[6], l[7], c);
+                let (m9, m8) = (p.lane(l[8], c), p.lane(l[9], c));
+                let lo = c0.min(n0);
+                let hi = c0.max(n0);
+                let cn = lo.max(n1.min(hi));
+                let cc = lo.max(c1.min(hi));
+                let first = (m9 * cn + c0 * (255 - m9) + 255) >> 8;
+                let second = (m8 * cc + n0 * (255 - m8) + 255) >> 8;
+                *o = ((w.rt * first + w.t * second) >> 8) as u8;
+            }
+        }
+    }
+
+    pub(super) use imp::{Prepared, extended, fast, no_mask, normal};
+
+    const _: () = assert!(MAX_STEP.is_multiple_of(8));
 }

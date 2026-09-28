@@ -92,27 +92,32 @@ impl Fetch {
 }
 
 struct Merged {
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
+    _keep: Option<std::sync::Arc<crate::core::SuperExpand>>,
+    y: &'static [u8],
+    u: &'static [u8],
+    v: &'static [u8],
     y_pitch: usize,
     uv_pitch: usize,
+    slack: usize,
 }
 
 impl Merged {
     fn frame(&self) -> Frame<'_> {
         Frame {
             y: Plane {
-                data: &self.y,
+                data: self.y,
                 pitch: self.y_pitch,
+                slack: self.slack,
             },
             u: Plane {
-                data: &self.u,
+                data: self.u,
                 pitch: self.uv_pitch,
+                slack: self.slack,
             },
             v: Plane {
-                data: &self.v,
+                data: self.v,
                 pitch: self.uv_pitch,
+                slack: self.slack,
             },
         }
     }
@@ -125,6 +130,23 @@ impl FilterState {
             && !self.source_8bit_mode
             && self.options.reference_supported(&self.video_info)
             && matches!(self.vector_data(), metadata::VectorRecord::Ready(_))
+    }
+
+    fn cached_quality(&self, frame: i32) -> Option<i32> {
+        let cache = self.quality_cache.lock().ok()?;
+        cache
+            .iter()
+            .find(|(k, _)| *k == frame)
+            .map(|&(_, class)| class)
+    }
+
+    fn store_quality(&self, frame: i32, class: i32) {
+        if let Ok(mut cache) = self.quality_cache.lock() {
+            if cache.len() >= 64 {
+                cache.remove(0);
+            }
+            cache.push((frame, class));
+        }
     }
 
     fn rates(&self, params: &ReferenceParams) -> Rates {
@@ -155,7 +177,8 @@ impl FilterState {
                 request_node(request_frame, self.clips.super_clip, k, frame_ctx);
             }
         }
-        for k in (n - 2).max(0)..=n + 2 {
+        let reach = if params.level >= 2 { 2 } else { 1 };
+        for k in (n - reach).max(0)..=n + reach {
             request_node(request_frame, self.clips.vectors, k, frame_ctx);
         }
     }
@@ -215,11 +238,16 @@ impl FilterState {
             true
         };
         let mut quality = |field: &mut VectorField, k: i32| -> i32 {
+            if let Some(class) = self.cached_quality(k) {
+                return class;
+            }
             if !load(field, k) {
                 return 3;
             }
             field.avg_luma(&mut luma, params.luma);
-            field.quality(false, &limits, &luma)
+            let class = field.quality(false, &limits, &luma);
+            self.store_quality(k, class);
+            class
         };
         let algo = params.algo;
         let mut class = 3;
@@ -473,11 +501,13 @@ impl FilterState {
                 let (u, up, ul) = unsafe { api.read_plane(raw, 1, h / 2) }?;
                 let (v, _, vl) = unsafe { api.read_plane(raw, 2, h / 2) }?;
                 return Some(Merged {
-                    y: unsafe { slice::from_raw_parts(y, yl) }.to_vec(),
-                    u: unsafe { slice::from_raw_parts(u, ul) }.to_vec(),
-                    v: unsafe { slice::from_raw_parts(v, vl) }.to_vec(),
+                    _keep: None,
+                    y: unsafe { slice::from_raw_parts(y, yl) },
+                    u: unsafe { slice::from_raw_parts(u, ul) },
+                    v: unsafe { slice::from_raw_parts(v, vl) },
                     y_pitch: yp,
                     uv_pitch: up,
+                    slack: 0,
                 });
             }
             let sup = fetch.get(self.clips.super_clip, k);
@@ -494,12 +524,21 @@ impl FilterState {
             fetch.drop(sup);
             let expand = expand?;
             let (y, u, v, y_pitch, uv_pitch) = expand.parts();
+            let (y, u, v) = unsafe {
+                (
+                    slice::from_raw_parts(y.as_ptr(), y.len()),
+                    slice::from_raw_parts(u.as_ptr(), u.len()),
+                    slice::from_raw_parts(v.as_ptr(), v.len()),
+                )
+            };
             Some(Merged {
-                y: y.to_vec(),
-                u: u.to_vec(),
-                v: v.to_vec(),
+                _keep: Some(expand),
+                y,
+                u,
+                v,
                 y_pitch,
                 uv_pitch,
+                slack: crate::core::EXPAND_SLACK,
             })
         };
         let (Some(cur), Some(nxt)) = (merged(n, source), merged(n + 1, next_source)) else {

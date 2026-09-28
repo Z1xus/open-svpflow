@@ -82,6 +82,7 @@ pub(crate) struct FilterState {
     pub(crate) prep_cache: PrepCache,
     pub(crate) decode_cache: DecodeCache,
     pub(crate) expand_cache: ExpandCache,
+    pub(crate) quality_cache: std::sync::Mutex<Vec<(i32, i32)>>,
 }
 
 pub(crate) struct SuperExpand {
@@ -90,6 +91,35 @@ pub(crate) struct SuperExpand {
     v: Vec<u8>,
     y_stride: usize,
     uv_stride: usize,
+}
+
+static EXPAND_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+const EXPAND_POOL_CAP: usize = 48;
+
+fn pooled_buffer(len: usize) -> Vec<u8> {
+    let reused = EXPAND_POOL.lock().ok().and_then(|mut pool| {
+        let index = pool
+            .iter()
+            .position(|buffer| buffer.capacity() >= len + EXPAND_SLACK)?;
+        Some(pool.swap_remove(index))
+    });
+    let mut buffer = reused.unwrap_or_else(|| Vec::with_capacity(len + EXPAND_SLACK));
+    buffer.clear();
+    buffer.resize(len + EXPAND_SLACK, 0);
+    buffer.truncate(len);
+    buffer
+}
+
+impl Drop for SuperExpand {
+    fn drop(&mut self) {
+        if let Ok(mut pool) = EXPAND_POOL.lock() {
+            for buffer in [&mut self.y, &mut self.u, &mut self.v] {
+                if pool.len() < EXPAND_POOL_CAP {
+                    pool.push(std::mem::take(buffer));
+                }
+            }
+        }
+    }
 }
 
 impl SuperExpand {
@@ -101,7 +131,8 @@ impl SuperExpand {
 type ExpandCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<SuperExpand>>>>;
 pub(crate) type ExpandCache = std::sync::Mutex<Vec<(i64, ExpandCell)>>;
 
-const EXPAND_CACHE_CAP: usize = 8;
+const EXPAND_CACHE_CAP: usize = 32;
+pub(crate) const EXPAND_SLACK: usize = 32;
 
 type PrepCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<FramePrep>>>>;
 type PrepCache = std::sync::Mutex<Vec<(i64, PrepCell)>>;
@@ -3209,7 +3240,7 @@ fn expand_plane(
     }
     let pel = 1usize << shift;
     let out_stride = width.checked_mul(pel)?;
-    let mut out = vec![0u8; out_stride.checked_mul(height.checked_mul(pel)?)?];
+    let mut out = pooled_buffer(out_stride.checked_mul(height.checked_mul(pel)?)?);
     for sy in 0..pel {
         for row in 0..height {
             let dst = out.get_mut(
