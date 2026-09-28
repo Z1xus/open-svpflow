@@ -184,6 +184,10 @@ impl VectorData {
         }
     }
 
+    pub const fn selector(&self) -> i32 {
+        self.selector
+    }
+
     pub const fn marker_is_one(&self) -> bool {
         self.marker == 1
     }
@@ -337,69 +341,42 @@ pub fn classify_scene_pair(
     })
 }
 
-#[allow(clippy::cast_possible_truncation)]
 fn classify_scene_with_luma(
     vectors: &[DecodedVector],
     shape: VectorShape,
     thresholds: SceneThresholds,
     mut luma_at: impl FnMut(usize) -> u8,
 ) -> i32 {
-    let width = shape.width.max(0);
-    let height = shape.height.max(0);
-    let border = i32::from(thresholds.ignore > 0.01);
-    let border_x = ((f64::from(width) * thresholds.ignore) as i32).max(border);
-    let border_y = ((f64::from(height) * thresholds.ignore) as i32).max(border);
-    let zero_limit = width.saturating_mul(height).saturating_mul(2) / 3;
-    let mut zero_count = 0;
+    let count = usize::try_from(shape.width.saturating_mul(shape.height)).unwrap_or(0);
+    if count == 0 {
+        return 3;
+    }
+    let mut considered = 0;
     let mut scene_count = 0;
     let mut m2_count = 0;
     let mut m1_count = 0;
-    let mut considered = 0;
-    for y in 0..height {
-        for x in 0..width {
-            if x < border_x || x >= width - border_x || y < border_y || y >= height - border_y {
-                continue;
-            }
-            let index =
-                usize::try_from(y.saturating_mul(width).saturating_add(x)).unwrap_or(usize::MAX);
-            let Some(vector) = vectors.get(index) else {
-                continue;
-            };
-            let luma = i32::from(luma_at(index).max(1));
-            let score = i32::try_from(vector.score)
-                .unwrap_or(i32::MAX)
-                .saturating_mul(255)
-                / luma;
-            if score < thresholds.zero {
-                zero_count += 1;
-                if zero_count <= zero_limit {
-                    continue;
-                }
-            }
-            considered += 1;
-            if score >= thresholds.scene {
-                scene_count += 1;
-            } else if score >= thresholds.m2 {
-                m2_count += 1;
-            } else if score >= thresholds.m1 {
-                m1_count += 1;
-            }
+    for (index, vector) in vectors.iter().take(count).enumerate() {
+        let luma = i32::from(luma_at(index).max(1));
+        let score = vector.score.cast_signed().wrapping_mul(255) / luma;
+        if score < thresholds.zero {
+            continue;
+        }
+        considered += 1;
+        if score >= thresholds.scene {
+            scene_count += 1;
+        } else if score >= thresholds.m2 {
+            m2_count += 1;
+        } else if score >= thresholds.m1 {
+            m1_count += 1;
         }
     }
-
-    let required = considered * thresholds.blocks_pct / 100;
-    let high = scene_count + m2_count;
-    let mid = high + m1_count;
-    if scene_count >= required {
+    let required = thresholds.blocks_pct.wrapping_mul(considered) / 100;
+    if required <= scene_count {
         3
-    } else if high >= required {
+    } else if required <= scene_count + m2_count {
         2
-    } else if mid >= required {
-        1
-    } else if thresholds.blocks13_pct > 0 && mid >= considered * thresholds.blocks13_pct / 100 {
-        -1
     } else {
-        0
+        i32::from(required <= scene_count + m2_count + m1_count)
     }
 }
 

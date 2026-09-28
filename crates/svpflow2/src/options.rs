@@ -119,6 +119,27 @@ pub(crate) struct SceneLimits {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct ReferenceParams {
+    pub(crate) absolute: bool,
+    pub(crate) rate_num: u64,
+    pub(crate) rate_den: u64,
+    pub(crate) scene_mode: i64,
+    pub(crate) adaptive: [i32; 3],
+    pub(crate) blocks: i32,
+    pub(crate) zero: i32,
+    pub(crate) m1: i32,
+    pub(crate) m2: i32,
+    pub(crate) scene: i32,
+    pub(crate) luma: f64,
+    pub(crate) level: i32,
+    pub(crate) force13: bool,
+    pub(crate) blend: bool,
+    pub(crate) cover: i32,
+    pub(crate) area_blend: f64,
+    pub(crate) algo: i32,
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct LightParams {
     pub(crate) border: i32,
     pub(crate) lights: i32,
@@ -274,6 +295,51 @@ impl Options {
         let x = trunc_i32(f64::from(target_w) * zoom / 100.0) + target_w - source.width;
         let y = trunc_i32(f64::from(target_h) * zoom / 100.0) + target_h - source.height;
         (pad_x(x), pad_y(y))
+    }
+
+    pub(crate) fn reference(&self) -> ReferenceParams {
+        let limits = self.scene.limits;
+        let positive = |value: Option<i64>, default: u64| {
+            u64::try_from(value.unwrap_or(0))
+                .ok()
+                .filter(|value| *value != 0)
+                .unwrap_or(default)
+        };
+        ReferenceParams {
+            absolute: self.rate.absolute,
+            rate_num: positive(self.rate.num, if self.rate.absolute { 60 } else { 2 }),
+            rate_den: positive(self.rate.den, 1),
+            scene_mode: self.scene.mode,
+            adaptive: self.scene.adaptive,
+            blocks: i32_saturating(limits.blocks),
+            zero: i32_saturating(limits.zero),
+            m1: i32_saturating(limits.m1),
+            m2: i32_saturating(limits.m2),
+            scene: i32_saturating(limits.scene),
+            luma: self.scene.luma,
+            level: i32::try_from((self.debug.flags >> 3) & 3).unwrap_or(0),
+            force13: self.scene.force13,
+            blend: self.scene.blend,
+            cover: self.mask_cover(),
+            area_blend: self.mask.area_blend,
+            algo: i32_saturating(self.algo_for_mode(0)),
+        }
+    }
+
+    pub(crate) fn reference_supported(&self, source: &vs::VideoInfo) -> bool {
+        let debug = self.debug;
+        self.padding(source) == (0, 0)
+            && !self.hdr_enabled()
+            && !self.mask.area_enabled
+            && !self.block
+            && !debug.vectors
+            && !debug.qmap
+            && !debug.qmode
+            && !debug.zerox
+            && !debug.zeroy
+            && !debug.tt
+            && debug.flags.trailing_zeros() >= 3
+            && matches!(self.algo_for_mode(0), 1 | 2 | 11 | 13 | 21 | 22 | 23)
     }
 
     pub(crate) fn light_params(&self) -> LightParams {

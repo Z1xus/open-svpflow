@@ -20,6 +20,7 @@ mod light;
 mod metadata;
 mod nvof;
 mod options;
+mod reference;
 mod strings;
 mod video_format;
 mod vs;

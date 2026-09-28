@@ -92,6 +92,12 @@ pub(crate) struct SuperExpand {
     uv_stride: usize,
 }
 
+impl SuperExpand {
+    pub(crate) fn parts(&self) -> (&[u8], &[u8], &[u8], usize, usize) {
+        (&self.y, &self.u, &self.v, self.y_stride, self.uv_stride)
+    }
+}
+
 type ExpandCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<SuperExpand>>>>;
 pub(crate) type ExpandCache = std::sync::Mutex<Vec<(i64, ExpandCell)>>;
 
@@ -153,6 +159,16 @@ impl FilterState {
         if let Some(request_frame) =
             unsafe { vs::table_fn::<vs::RequestFrameFilter>(vsapi, vs::REQUEST_FRAME_FILTER) }
         {
+            if self.reference_enabled() {
+                request_node(
+                    request_frame,
+                    self.clips.src,
+                    self.source_frame(frame),
+                    frame_ctx,
+                );
+                self.reference_request(request_frame, frame, frame_ctx);
+                return;
+            }
             let source_frame = self.source_frame(frame);
             request_node(request_frame, self.clips.src, source_frame, frame_ctx);
             request_node(request_frame, self.clips.source, source_frame, frame_ctx);
@@ -218,6 +234,13 @@ impl FilterState {
         };
         let free_frame = unsafe { vs::table_fn::<vs::FreeFrame>(vsapi, vs::FREE_FRAME) };
         let source_frame = self.source_frame(frame);
+        if self.reference_enabled() {
+            drop_frame(
+                get_node(get_frame, self.clips.src, source_frame, frame_ctx),
+                free_frame,
+            );
+            return unsafe { self.reference_get(frame, frame_ctx, core, vsapi) };
+        }
 
         drop_frame(
             get_node(get_frame, self.clips.src, source_frame, frame_ctx),
@@ -702,7 +725,7 @@ impl FilterState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    unsafe fn padded_output(
+    pub(crate) unsafe fn padded_output(
         &self,
         source: vs::ConstRaw,
         timing_source: vs::ConstRaw,
@@ -1125,7 +1148,7 @@ impl FilterState {
         cell.get_or_init(decode).clone()
     }
 
-    fn cached_expand(
+    pub(crate) fn cached_expand(
         &self,
         key: i64,
         planes: &renderer::FramePlanes<'_>,
@@ -2139,12 +2162,7 @@ impl FilterState {
 
     fn source_frame(&self, frame: i32) -> i32 {
         let timing = self.options.timing(&self.video_info);
-        let round_nearest = matches!(self.mode, Mode::SmoothFps | Mode::Nvof)
-            && frame > 0
-            && !self.options.scene_blend()
-            && self.options.request_scene_mode(self.mode.raw()) != 0
-            && self.options.request_scene_mode(self.mode.raw()) != 2;
-        timing.source_frame(frame, round_nearest)
+        timing.source_frame(frame, false)
     }
 
     fn phase_256(&self, frame: i32, source_frame: i32) -> i32 {
@@ -2599,7 +2617,7 @@ fn neighbor_keys(source_frame: i32) -> [i64; 4] {
     ]
 }
 
-fn request_node(
+pub(crate) fn request_node(
     request_frame: vs::RequestFrameFilter,
     node: vs::Raw,
     frame: i32,
@@ -2610,7 +2628,7 @@ fn request_node(
     }
 }
 
-fn get_node(
+pub(crate) fn get_node(
     get_frame: vs::GetFrameFilter,
     node: vs::Raw,
     frame: i32,
@@ -2633,7 +2651,7 @@ fn fetch_node(
     drop_frame(get_node(get_frame, node, frame, frame_ctx), free_frame);
 }
 
-fn drop_frame(frame: vs::ConstRaw, free_frame: Option<vs::FreeFrame>) {
+pub(crate) fn drop_frame(frame: vs::ConstRaw, free_frame: Option<vs::FreeFrame>) {
     if frame.is_null() {
         return;
     }
@@ -3434,7 +3452,7 @@ fn gpu_render_frame(
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss
 )]
-unsafe fn super_frame_planes(
+pub(crate) unsafe fn super_frame_planes(
     api: &frame::PlaneApi,
     frame: vs::ConstRaw,
     info: &vs::VideoInfo,
@@ -3511,6 +3529,6 @@ unsafe fn offset_plane_mut(
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn f64_i64(value: i64) -> f64 {
+pub(crate) fn f64_i64(value: i64) -> f64 {
     value as f64
 }

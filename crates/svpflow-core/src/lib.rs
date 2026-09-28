@@ -9,3 +9,4 @@ pub mod frame_math;
 pub mod metadata;
 pub mod params;
 pub mod renderer;
+pub mod smooth;
