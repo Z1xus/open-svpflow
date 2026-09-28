@@ -80,11 +80,6 @@ pub struct VectorField {
     cover: Vec<i32>,
 }
 
-pub struct AvgLuma {
-    pub geomean: f64,
-    pub max: f64,
-}
-
 pub struct SceneLimits {
     pub blocks: i32,
     pub zero: i32,
@@ -144,26 +139,23 @@ impl VectorField {
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    pub fn avg_luma(&self, out: &mut [u8], gamma: f64) -> AvgLuma {
+    pub fn luma_table(&self, gamma: f64) -> [u8; 511] {
         let denom = if self.shape.flags == 3 { 510.0 } else { 255.0 };
+        std::array::from_fn(|sum| {
+            let scaled = ((f64::from(sum as u16) / denom).powf(gamma) * 255.0) as i32;
+            if scaled < 20 { 20 } else { scaled as u8 }
+        })
+    }
+
+    pub fn avg_luma(&self, out: &mut [u8], table: &[u8; 511]) {
         let count = self.shape.blocks();
-        let mut max = 0.0f64;
-        let mut log_sum = 0.0;
         for ((out, back), fwd) in out
             .iter_mut()
             .zip(&self.backward)
             .zip(&self.forward)
             .take(count)
         {
-            let x = f64::from(u16::from(back.luma) + u16::from(fwd.luma)) / denom;
-            let scaled = (x.powf(gamma) * 255.0) as i32;
-            max = x.max(max);
-            *out = if scaled < 20 { 20 } else { scaled as u8 };
-            log_sum += x.ln();
-        }
-        AvgLuma {
-            geomean: (log_sum / count as f64).exp(),
-            max,
+            *out = table[usize::from(back.luma) + usize::from(fwd.luma)];
         }
     }
 
@@ -245,7 +237,7 @@ impl VectorField {
         let stride = (width + 2) as usize;
         let len = stride * (height + 2) as usize;
         self.cover.clear();
-        self.cover.resize(len, 0);
+        self.cover.resize(len * 2, 0);
         let area = s.block_w * s.block_h;
         let step_x = s.block_w - s.overlap_x;
         let step_y = s.block_h - s.overlap_y;
@@ -255,14 +247,10 @@ impl VectorField {
         } else {
             &self.backward
         };
-        let buf = &mut self.cover;
+        let (points, rows) = self.cover.split_at_mut(len);
         let mut add = |cx: i32, cy: i32, value: i32| {
-            let base = cy as usize * stride + cx as usize;
-            for row in 0..3 {
-                for cell in &mut buf[base + row * stride..base + row * stride + 3] {
-                    *cell = cell.wrapping_add(value);
-                }
-            }
+            let cell = &mut points[(cy as usize + 1) * stride + cx as usize + 1];
+            *cell = cell.wrapping_add(value);
         };
         for by in 0..s.grid_h {
             for bx in 0..s.grid_w {
@@ -304,22 +292,34 @@ impl VectorField {
                 }
             }
         }
+        for (row, point) in rows
+            .chunks_exact_mut(stride)
+            .zip(points.chunks_exact(stride))
+        {
+            for ((cell, window), _) in row[1..].iter_mut().zip(point.windows(3)).zip(0..width) {
+                *cell = window[0].wrapping_add(window[1]).wrapping_add(window[2]);
+            }
+        }
         let scale = f64::from(cover) / 100.0;
-        let table: Vec<u8> = (0..=area.max(0))
-            .map(|covered| {
-                let value = (f64::from(area - covered) * scale * 256.0 / f64::from(area)) as i32;
-                if value > 255 { 255 } else { value as u8 }
-            })
-            .collect();
+        let level = |covered: i32| {
+            let value = (f64::from(area - covered) * scale * 256.0 / f64::from(area)) as i32;
+            if value > 255 { 255 } else { value as u8 }
+        };
+        let table: Vec<u8> = (0..=area.max(0)).map(level).collect();
         let top = table.len() as i32 - 1;
-        for y in 0..height as usize {
-            let row = &self.cover[(y + 1) * stride + 1..(y + 1) * stride + 1 + width as usize];
-            for (out, &sum) in out[y * width as usize..].iter_mut().zip(row) {
-                let covered = (sum >> 3).min(area);
+        let width = width as usize;
+        for (y, out) in out
+            .chunks_exact_mut(width)
+            .take(height as usize)
+            .enumerate()
+        {
+            let above = &rows[y * stride + 1..y * stride + 1 + width];
+            let middle = &rows[(y + 1) * stride + 1..(y + 1) * stride + 1 + width];
+            let below = &rows[(y + 2) * stride + 1..(y + 2) * stride + 1 + width];
+            for (((out, &a), &m), &b) in out.iter_mut().zip(above).zip(middle).zip(below) {
+                let covered = (a.wrapping_add(m).wrapping_add(b) >> 3).min(area);
                 *out = if covered < 0 {
-                    let value =
-                        (f64::from(area - covered) * scale * 256.0 / f64::from(area)) as i32;
-                    if value > 255 { 255 } else { value as u8 }
+                    level(covered)
                 } else {
                     table[covered.min(top) as usize]
                 };

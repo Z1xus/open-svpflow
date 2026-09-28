@@ -319,6 +319,7 @@ impl FilterState {
         let shape = FieldShape::from_data(&vector_data);
         let mut field = VectorField::new(shape);
         let mut luma = vec![0u8; shape.blocks()];
+        let mut luma_table = None;
         let limits = SceneLimits {
             blocks: params.blocks,
             zero: params.zero,
@@ -345,7 +346,8 @@ impl FilterState {
             if !load(field, k) {
                 return 3;
             }
-            field.avg_luma(&mut luma, params.luma);
+            let table = luma_table.get_or_insert_with(|| field.luma_table(params.luma));
+            field.avg_luma(&mut luma, table);
             let class = field.quality(false, &limits, &luma);
             self.store_quality(k, class);
             class
