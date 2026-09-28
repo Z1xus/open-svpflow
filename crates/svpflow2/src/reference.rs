@@ -128,8 +128,7 @@ impl FilterState {
         matches!(self.mode, Mode::SmoothFps)
             && (self.render_mode == 1 || (self.render_mode == 2 && self.gpu.is_some()))
             && !self.source_8bit_mode
-            && !(self.render_mode == 2
-                && (self.options.mask_area_enabled() || self.options.block_enabled()))
+            && !(self.render_mode == 2 && self.options.block_enabled())
             && self.options.reference_supported(&self.video_info)
             && matches!(self.vector_data(), metadata::VectorRecord::Ready(_))
     }
@@ -166,6 +165,7 @@ impl FilterState {
         height: i32,
         motions: [(&[u16], &[u16]); 4],
         coverage: (&[u8], &[u8]),
+        area: Option<(&[u8], &[u8])>,
         core: vs::Raw,
     ) -> vs::ConstRaw {
         let w = usize::try_from(self.video_info.width).unwrap_or(0);
@@ -239,7 +239,7 @@ impl FilterState {
             usize::try_from(height).unwrap_or(0),
             motions,
             coverage,
-            None,
+            area,
         );
         if done.is_none() {
             unsafe { api.free(output.cast_const()) };
@@ -586,7 +586,7 @@ impl FilterState {
         if neither {
             selected = 11;
         }
-        let sad = sad_masks.map(|(first, second)| {
+        let sad = sad_masks.as_ref().map(|(first, second)| {
             let spill = |mask: Vec<u8>, next: &[u8]| {
                 let chunk = (mask.len() + 8 + 15) & !15;
                 let mut out = mask;
@@ -596,9 +596,9 @@ impl FilterState {
                 out
             };
             match selected {
-                1 => spill(first, &[]),
-                2 => spill(second, &[]),
-                _ => first.iter().zip(&second).map(|(a, b)| *a.max(b)).collect(),
+                1 => spill(first.clone(), &[]),
+                2 => spill(second.clone(), &[]),
+                _ => first.iter().zip(second).map(|(a, b)| *a.max(b)).collect(),
             }
         });
         let sad_on = sad.is_some();
@@ -676,13 +676,14 @@ impl FilterState {
                 origin_x: shape.overlap_x / 2,
                 origin_y: shape.overlap_y / 2,
                 phase: gpu_time,
-                has_sad: 0,
+                has_sad: i32::from(sad_masks.is_some()),
                 linear_luma: i32::from(!chroma && linear),
                 cubic: i32::from(cubic),
                 cubic_ref: i32::from(cubic_ref),
                 offset_x,
                 offset_y,
                 sad_blend,
+                dither: i32::from(self.options.dither()),
             };
             return unsafe {
                 self.reference_gpu(
@@ -707,6 +708,9 @@ impl FilterState {
                         (&next_x, &next_y),
                     ],
                     (&cover_fwd, &cover_bwd),
+                    sad_masks
+                        .as_ref()
+                        .map(|(first, second)| (&second[..], &first[..])),
                     core,
                 )
             };

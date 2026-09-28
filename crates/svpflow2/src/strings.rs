@@ -12,7 +12,7 @@ pub(crate) const SMOOTH_FPS_RIFE: &[u8] = b"SmoothFps_RIFE\0";
 pub(crate) const ARGS_SMOOTH_FPS: &[u8] =
     b"clip:clip;super:clip;sdata:int;vectors:clip;vdata:int;opt:data;src:clip:opt;fps:float:opt\0";
 pub(crate) const ARGS_NVOF: &[u8] =
-    b"clip:clip;opt:data;vec_src:clip:opt;src:clip:opt;fps:float:opt\0";
+    b"clip:clip;opt:data;vec_src:clip:opt;nvof_src:clip:opt;src:clip:opt;fps:float:opt\0";
 pub(crate) const ARGS_RIFE: &[u8] =
     b"clip:clip;opt:data;rife_out:clip;vec_src:clip:opt;vdata:int:opt;src:clip:opt;fps:float:opt\0";
 
@@ -22,6 +22,8 @@ pub(crate) const ERR_PARAMS: &[u8] = b"SVSmoothFps: invalid 'params' syntax: \0"
 pub(crate) const ERR_ALGO: &[u8] = b"SVSmoothFps: incorrect 'algo' value\0";
 pub(crate) const ERR_CUBIC: &[u8] =
     b"SVSmoothFps: 'cubic' mode isn't available with CPU rendering\0";
+pub(crate) const ERR_BLOCK_GPU: &[u8] =
+    b"SVSmoothFps: 'block' mode is unsupported with GPU rendering\0";
 pub(crate) const ERR_SCENE_MODE: &[u8] = b"SVSmoothFps: 'scene.mode' must be in [0;3]\0";
 pub(crate) const ERR_SCENE_MODE_RATE: &[u8] =
     b"SVSmoothFps: 'scene.mode' value isn't supported for selected frame rate\0";
@@ -58,6 +60,7 @@ pub(crate) const SRC: &[u8] = b"src\0";
 pub(crate) const SUPER: &[u8] = b"super\0";
 pub(crate) const VDATA: &[u8] = b"vdata\0";
 pub(crate) const VEC_SRC: &[u8] = b"vec_src\0";
+pub(crate) const NVOF_SRC: &[u8] = b"nvof_src\0";
 pub(crate) const VECTORS: &[u8] = b"vectors\0";
 
 pub(crate) const DURATION_NUM: &[u8] = b"_DurationNum\0";

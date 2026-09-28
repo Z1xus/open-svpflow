@@ -236,6 +236,10 @@ impl Options {
         self.scene.limits.scale(block);
     }
 
+    pub(crate) const fn dither(&self) -> bool {
+        self.render.dither
+    }
+
     pub(crate) fn apply_source_depth(&mut self, depth: i32) {
         if depth != 0 {
             self.render.dither = false;

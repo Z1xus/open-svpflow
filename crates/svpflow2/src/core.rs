@@ -3457,6 +3457,7 @@ fn gpu_render_frame(
             offset_x,
             offset_y,
             sad_blend: 0.0,
+            dither: 0,
         }
     };
     gpu.render_frame(

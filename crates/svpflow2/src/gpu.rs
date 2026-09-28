@@ -228,6 +228,7 @@ pub struct GpuContext {
     program: ClProgram,
     variants: std::sync::Mutex<Vec<(u32, ClProgram)>>,
     device_name: String,
+    hi10: bool,
 
     units: Vec<std::sync::Mutex<Unit>>,
     next_unit: std::sync::atomic::AtomicUsize,
@@ -444,14 +445,14 @@ impl Drop for GpuContext {
 }
 
 impl GpuContext {
-    pub fn new(gpuid: i32, qn: i64) -> Option<Self> {
+    pub fn new(gpuid: i32, qn: i64, hi10: bool) -> Option<Self> {
         let units = usize::try_from(qn)
             .unwrap_or(DEFAULT_UNITS)
             .clamp(MIN_UNITS, MAX_UNITS);
-        unsafe { Self::try_new(gpuid, units) }.ok()
+        unsafe { Self::try_new(gpuid, units, hi10) }.ok()
     }
 
-    unsafe fn try_new(gpuid: i32, num_units: usize) -> Result<Self, String> {
+    unsafe fn try_new(gpuid: i32, num_units: usize, hi10: bool) -> Result<Self, String> {
         let cl = unsafe { OpenCl::load()? };
 
         let mut num_plat = 0u32;
@@ -509,7 +510,8 @@ impl GpuContext {
                 continue;
             }
 
-            let program = match unsafe { build_program(&cl, context, device, KERNEL_SRC) } {
+            let base = format!("#define HI10P {}\n{KERNEL_SRC}", u8::from(hi10));
+            let program = match unsafe { build_program(&cl, context, device, &base) } {
                 Ok(p) => p,
                 Err(e) => {
                     unsafe { (cl.ReleaseContext)(context) };
@@ -591,6 +593,7 @@ impl GpuContext {
                 device,
                 program,
                 variants: std::sync::Mutex::new(Vec::new()),
+                hi10,
                 device_name,
                 units,
                 next_unit: std::sync::atomic::AtomicUsize::new(0),
@@ -646,6 +649,7 @@ pub struct KernelParams {
     pub offset_x: i32,
     pub offset_y: i32,
     pub sad_blend: f32,
+    pub dither: i32,
 }
 
 struct Buf<'a> {
@@ -699,7 +703,12 @@ impl GpuContext {
         let (linear, packed) = if let Some(images) = reused {
             (images.linear, images.packed)
         } else {
-            let packed = unsafe { self.create_image(CL_R, CL_UNORM_INT8, dims.0, dims.1) }?;
+            let depth = if self.hi10 {
+                CL_UNORM_INT16
+            } else {
+                CL_UNORM_INT8
+            };
+            let packed = unsafe { self.create_image(CL_R, depth, dims.0, dims.1) }?;
             let linear = unsafe { self.create_image(CL_R, CL_FLOAT, width, height) }?;
             let mems = (linear.mem, packed.mem);
             std::mem::forget(linear);
@@ -763,11 +772,12 @@ impl GpuContext {
         x: usize,
         y: usize,
     ) -> Option<()> {
+        let bytes = if self.hi10 { 2 } else { 1 };
         if plane.data.len()
             < plane
                 .stride
                 .saturating_mul(plane.height.saturating_sub(1))
-                .saturating_add(plane.width)
+                .saturating_add(plane.width * bytes)
         {
             return None;
         }
@@ -926,12 +936,14 @@ impl GpuContext {
                 program
             } else {
                 let source = format!(
-                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n{}",
+                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define HI10P {}\n{}",
                     variant & 0xFF,
                     (variant >> 8) & 1,
                     (variant >> 9) & 1,
                     (variant >> 10) & 1,
                     (variant >> 11) & 1,
+                    (variant >> 12) & 1,
+                    u8::from(self.hi10),
                     KERNEL_SRC
                 );
                 let program =
@@ -1039,7 +1051,8 @@ impl GpuContext {
             | u32::from(py.cubic != 0) << 8
             | u32::from(py.cubic_ref != 0) << 9
             | u32::from(py.has_sad != 0) << 10
-            | u32::from(py.linear_luma != 0) << 11;
+            | u32::from(py.linear_luma != 0) << 11
+            | u32::from(py.dither != 0 && !self.hi10) << 12;
         let k = self.variant_kernel(variant_kernels, variant)?;
         let q = *queue;
         packed_base.clear();
@@ -1149,6 +1162,7 @@ impl GpuContext {
              -> Option<ClMem> {
                 let dmem = self.ensure_buffer(dslot, dst.len())?;
                 (self.cl.SetKernelArg)(k, 0, size_of::<ClMem>(), (&raw const dmem).cast());
+                let stride = if self.hi10 { stride / 2 } else { stride };
                 self.set_i32(k, 1, stride).then_some(())?;
                 (self.cl.SetKernelArg)(k, 2, size_of::<ClMem>(), (&raw const s0.0).cast());
                 (self.cl.SetKernelArg)(k, 3, size_of::<ClMem>(), (&raw const s1.0).cast());
@@ -1324,6 +1338,17 @@ pub(crate) const KERNEL_SRC: &str = r"
 #ifndef LINEAR_LUMA
 #define LINEAR_LUMA 1
 #endif
+#ifndef DITHER
+#define DITHER 0
+#endif
+#ifndef HI10P
+#define HI10P 0
+#endif
+#if HI10P
+#define REF_SCALE(p) ((p)->linear_luma ? 256.0f : 16384.0f)
+#else
+#define REF_SCALE(p) 255.0f
+#endif
 const sampler_t field_sampler = CLK_NORMALIZED_COORDS_TRUE |
     CLK_ADDRESS_CLAMP_TO_EDGE | CLK_FILTER_LINEAR;
 const sampler_t linear_sampler = CLK_NORMALIZED_COORDS_FALSE |
@@ -1336,7 +1361,16 @@ typedef struct {
     int block_w, block_h, origin_x, origin_y, phase, has_sad, linear_luma, cubic;
     int cubic_ref, offset_x, offset_y;
     float sad_blend;
+    int dither;
 } Params;
+
+#if DITHER
+__constant int bayer[8][8] = {
+    1,49,13,61,4,52,16,64, 33,17,45,29,36,20,48,32,
+    9,57,5,53,12,60,8,56, 41,25,37,21,44,28,40,24,
+    3,51,15,63,2,50,14,62, 35,19,47,31,34,18,46,30,
+    11,59,7,55,10,58,6,54, 43,27,39,23,42,26,38,22};
+#endif
 
 inline float median3(float a, float b, float c) {
     float lo = fmin(a, b);
@@ -1390,9 +1424,9 @@ inline float source_sample(
     float2 position = ((float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f))
         + moved(p, vx, vy, time);
 #if CUBIC_REF
-    return 255.0f * cubic_sample(source, position).x;
+    return REF_SCALE(p) * cubic_sample(source, position).x;
 #else
-    return 255.0f * read_imagef(source, linear_sampler, position).x;
+    return REF_SCALE(p) * read_imagef(source, linear_sampler, position).x;
 #endif
 }
 
@@ -1401,22 +1435,26 @@ inline float linear_source_sample(
 {
     float2 position = ((float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f))
         + moved(p, vx, vy, time);
-    return 255.0f * read_imagef(source, linear_sampler, position).x;
+    return REF_SCALE(p) * read_imagef(source, linear_sampler, position).x;
 }
 
 inline float base_sample(read_only image2d_t source, const Params *p) {
     float2 position = ((float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f))
         + (float2)(get_global_id(0), get_global_id(1));
 #if CUBIC_REF
-    return 255.0f * cubic_sample(source, position).x;
+    return REF_SCALE(p) * cubic_sample(source, position).x;
 #else
-    return 255.0f * read_imagef(source, linear_sampler, position).x;
+    return REF_SCALE(p) * read_imagef(source, linear_sampler, position).x;
 #endif
 }
 
 kernel void linear_luma(read_only image2d_t source, write_only image2d_t destination) {
     int2 position = (int2)(get_global_id(0), get_global_id(1));
+#if HI10P
+    float value = 64.0f * read_imagef(source, nearest_sampler, position).x;
+#else
     float value = read_imagef(source, nearest_sampler, position).x;
+#endif
     if (value < 0.081f) value = native_divide(value, 4.5f);
     else value = native_powr(native_divide(value+0.099f, 1.099f), 1.0f/0.45f);
     write_imagef(destination, position, (float4)(value, 0.0f, 0.0f, 0.0f));
@@ -1487,12 +1525,28 @@ kernel void render_frame(
 
 #if LINEAR_LUMA
     if (p.linear_luma) {
+#if HI10P
+        result = native_divide(result, 256.0f);
+#else
         result = native_divide(result, 255.0f);
+#endif
         if (result < 0.018f) result *= 4.5f;
         else result = 1.099f*native_powr(result, 0.45f)-0.099f;
+#if HI10P
+        result *= 256.0f;
+#else
         result *= 255.0f;
+#endif
     }
 #endif
+#if HI10P
+    ((global ushort *)destination)[y*destination_stride+x] =
+        (ushort)clamp(round(4.0f*result), 0.0f, 1023.0f);
+#else
+# if DITHER
+    result += native_divide((float)(bayer[x%8][y%8]-32), 65.0f);
+# endif
     destination[y*destination_stride+x] = (uchar)clamp(round(result), 0.0f, 255.0f);
+#endif
 }
 ";

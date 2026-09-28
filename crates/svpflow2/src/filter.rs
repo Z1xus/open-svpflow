@@ -107,6 +107,11 @@ unsafe fn create_filter(
         unsafe { data.free(vsapi) };
         return 0;
     }
+    if data.render_mode == 2 && data.options.block_enabled() {
+        unsafe { set_error(output, vsapi, strings::ERR_BLOCK_GPU.as_ptr().cast()) };
+        unsafe { data.free(vsapi) };
+        return 0;
+    }
     if !unsafe { validate_overlap(&data, output, vsapi) } {
         unsafe { data.free(vsapi) };
         return 0;
@@ -320,6 +325,7 @@ unsafe fn collect_state(
         crate::gpu::GpuContext::new(
             i32::try_from(options.gpu_id()).unwrap_or(0),
             options.gpu_qn(),
+            video_format::source_depth(&video_info) == 10,
         )
     } else {
         None
@@ -418,8 +424,13 @@ unsafe fn collect_mode_clips(
         get_int_prop(get_int, input, strings::SDATA.as_ptr().cast())
     } else {
         let mut error = 0;
-        let vec_src =
+        let mut vec_src =
             unsafe { (api.get_node)(input, strings::VEC_SRC.as_ptr().cast(), 0, &raw mut error) };
+        if vec_src.is_null() {
+            vec_src = unsafe {
+                (api.get_node)(input, strings::NVOF_SRC.as_ptr().cast(), 0, &raw mut error)
+            };
+        }
         let vec_src = if mode == 1 && vec_src.is_null() {
             unsafe {
                 (api.get_node)(
