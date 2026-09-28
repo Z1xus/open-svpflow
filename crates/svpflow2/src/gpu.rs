@@ -24,6 +24,7 @@ const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
 const CL_DEVICE_NAME: ClUint = 0x102B;
 const CL_MEM_READ_WRITE: u64 = 1 << 0;
 const CL_FALSE: ClUint = 0;
+const CL_TRUE: ClUint = 1;
 const CL_PROGRAM_BUILD_LOG: ClUint = 0x1183;
 const CL_R: ClUint = 0x10B0;
 const CL_RGBA: ClUint = 0x10B5;
@@ -112,7 +113,30 @@ type FnEnqueueNDRangeKernel = unsafe extern "C" fn(
     *mut c_void,
 ) -> ClInt;
 type FnFinish = unsafe extern "C" fn(ClCommandQueue) -> ClInt;
+type ClEvent = *mut c_void;
+type FnEventCallback = unsafe extern "C" fn(ClEvent, ClInt, *mut c_void);
+type FnSetEventCallback =
+    unsafe extern "C" fn(ClEvent, ClInt, FnEventCallback, *mut c_void) -> ClInt;
+type FnWaitForEvents = unsafe extern "C" fn(ClUint, *const ClEvent) -> ClInt;
 type FnRelease = unsafe extern "C" fn(*mut c_void) -> ClInt;
+
+const CL_COMPLETE: ClInt = 0;
+
+#[derive(Default)]
+struct Signal {
+    state: std::sync::Mutex<Option<ClInt>>,
+    ready: std::sync::Condvar,
+}
+
+unsafe extern "C" fn signal_event(_event: ClEvent, status: ClInt, data: *mut c_void) {
+    let signal = unsafe { std::sync::Arc::from_raw(data.cast_const().cast::<Signal>()) };
+    let mut guard = signal
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(status);
+    signal.ready.notify_all();
+}
 
 #[allow(non_snake_case)]
 struct OpenCl {
@@ -133,6 +157,10 @@ struct OpenCl {
     SetKernelArg: FnSetKernelArg,
     EnqueueNDRangeKernel: FnEnqueueNDRangeKernel,
     Finish: FnFinish,
+    Flush: FnFinish,
+    SetEventCallback: FnSetEventCallback,
+    WaitForEvents: FnWaitForEvents,
+    ReleaseEvent: FnRelease,
     ReleaseMemObject: FnRelease,
     ReleaseKernel: FnRelease,
     ReleaseProgram: FnRelease,
@@ -177,6 +205,10 @@ impl OpenCl {
                 SetKernelArg: sym!("clSetKernelArg"),
                 EnqueueNDRangeKernel: sym!("clEnqueueNDRangeKernel"),
                 Finish: sym!("clFinish"),
+                Flush: sym!("clFlush"),
+                SetEventCallback: sym!("clSetEventCallback"),
+                WaitForEvents: sym!("clWaitForEvents"),
+                ReleaseEvent: sym!("clReleaseEvent"),
                 ReleaseMemObject: sym!("clReleaseMemObject"),
                 ReleaseKernel: sym!("clReleaseKernel"),
                 ReleaseProgram: sym!("clReleaseProgram"),
@@ -199,9 +231,11 @@ pub struct GpuContext {
 
     units: Vec<std::sync::Mutex<Unit>>,
     next_unit: std::sync::atomic::AtomicUsize,
-    cache_resources: std::sync::Mutex<CacheResources>,
+    cache_resources: Vec<std::sync::Mutex<CacheResources>>,
+    next_upload: std::sync::atomic::AtomicUsize,
 
     super_cache: std::sync::Mutex<Vec<(i64, SuperCell)>>,
+    image_pool: std::sync::Arc<ImagePool>,
 }
 
 type SuperCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<SuperEntry>>>>;
@@ -213,13 +247,46 @@ struct CacheResources {
 
 struct SuperEntry {
     mems: [ClMem; 4],
+    ready: ClEvent,
+    wait: FnWaitForEvents,
+    release_event: FnRelease,
     release: FnRelease,
+    pool: std::sync::Arc<ImagePool>,
+    dims: (usize, usize),
 }
+
+struct PooledImages {
+    dims: (usize, usize),
+    linear: ClMem,
+    packed: ClMem,
+}
+
+unsafe impl Send for PooledImages {}
+
+type ImagePool = std::sync::Mutex<Vec<PooledImages>>;
+
+const IMAGE_POOL_CAP: usize = 16;
 
 unsafe impl Send for SuperEntry {}
 unsafe impl Sync for SuperEntry {}
 impl Drop for SuperEntry {
     fn drop(&mut self) {
+        if !self.ready.is_null() {
+            unsafe {
+                (self.wait)(1, &raw const self.ready);
+                (self.release_event)(self.ready);
+            }
+        }
+        if let Ok(mut pool) = self.pool.lock()
+            && pool.len() < IMAGE_POOL_CAP
+        {
+            pool.push(PooledImages {
+                dims: self.dims,
+                linear: self.mems[0],
+                packed: self.mems[1],
+            });
+            return;
+        }
         for (i, &m) in self.mems.iter().enumerate() {
             if !m.is_null() && !self.mems[..i].contains(&m) {
                 unsafe { (self.release)(m) };
@@ -235,18 +302,21 @@ impl SuperHandle {
     #[must_use]
     pub fn bufs(&self) -> [GpuBuf; 3] {
         [
-            GpuBuf(self.entry.mems[0]),
-            GpuBuf(self.entry.mems[1]),
-            GpuBuf(self.entry.mems[2]),
+            GpuBuf(self.entry.mems[0], self.entry.ready),
+            GpuBuf(self.entry.mems[1], self.entry.ready),
+            GpuBuf(self.entry.mems[2], self.entry.ready),
         ]
     }
 
     #[must_use]
     pub fn sources(&self, linear: bool) -> [GpuBuf; 3] {
         [
-            GpuBuf(self.entry.mems[if linear { 0 } else { 3 }]),
-            GpuBuf(self.entry.mems[1]),
-            GpuBuf(self.entry.mems[2]),
+            GpuBuf(
+                self.entry.mems[if linear { 0 } else { 3 }],
+                self.entry.ready,
+            ),
+            GpuBuf(self.entry.mems[1], self.entry.ready),
+            GpuBuf(self.entry.mems[2], self.entry.ready),
         ]
     }
 }
@@ -314,9 +384,10 @@ const MIN_UNITS: usize = 1;
 const MAX_UNITS: usize = 8;
 
 #[derive(Clone, Copy)]
-pub struct GpuBuf(ClMem);
+pub struct GpuBuf(ClMem, ClEvent);
 
-const SUPER_CACHE_CAP: usize = 8;
+const SUPER_CACHE_CAP: usize = 32;
+const UPLOAD_QUEUES: usize = 4;
 
 unsafe impl Send for GpuContext {}
 unsafe impl Sync for GpuContext {}
@@ -346,9 +417,20 @@ impl Drop for GpuContext {
                     (self.cl.ReleaseCommandQueue)(u.queue);
                 }
             }
-            if let Ok(cache) = self.cache_resources.lock() {
-                (self.cl.ReleaseKernel)(cache.kernel);
-                (self.cl.ReleaseCommandQueue)(cache.queue);
+            for resources in &self.cache_resources {
+                if let Ok(cache) = resources.lock() {
+                    (self.cl.ReleaseKernel)(cache.kernel);
+                    (self.cl.ReleaseCommandQueue)(cache.queue);
+                }
+            }
+            if let Ok(mut cache) = self.super_cache.lock() {
+                cache.clear();
+            }
+            if let Ok(mut pool) = self.image_pool.lock() {
+                for images in pool.drain(..) {
+                    (self.cl.ReleaseMemObject)(images.linear);
+                    (self.cl.ReleaseMemObject)(images.packed);
+                }
             }
             if let Ok(variants) = self.variants.lock() {
                 for &(_, program) in variants.iter() {
@@ -480,6 +562,28 @@ impl GpuContext {
                 }
                 return Err("linear-luma render unit unavailable".into());
             }
+            let mut cache_resources = vec![std::sync::Mutex::new(CacheResources {
+                kernel: linear_kernel,
+                queue: cache_queue,
+            })];
+            for _ in 1..UPLOAD_QUEUES {
+                let mut kerr = 0;
+                let kernel =
+                    unsafe { (cl.CreateKernel)(program, linear_name.as_ptr(), &raw mut kerr) };
+                let queue = unsafe { (cl.CreateCommandQueue)(context, device, 0, &raw mut err) };
+                if kerr != CL_SUCCESS || kernel.is_null() || err != CL_SUCCESS || queue.is_null() {
+                    unsafe {
+                        if !kernel.is_null() {
+                            (cl.ReleaseKernel)(kernel);
+                        }
+                        if !queue.is_null() {
+                            (cl.ReleaseCommandQueue)(queue);
+                        }
+                    }
+                    break;
+                }
+                cache_resources.push(std::sync::Mutex::new(CacheResources { kernel, queue }));
+            }
             let device_name = unsafe { device_name(&cl, device) };
             return Ok(Self {
                 cl,
@@ -490,11 +594,10 @@ impl GpuContext {
                 device_name,
                 units,
                 next_unit: std::sync::atomic::AtomicUsize::new(0),
-                cache_resources: std::sync::Mutex::new(CacheResources {
-                    kernel: linear_kernel,
-                    queue: cache_queue,
-                }),
+                cache_resources,
+                next_upload: std::sync::atomic::AtomicUsize::new(0),
                 super_cache: std::sync::Mutex::new(Vec::new()),
+                image_pool: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             });
         }
         Err("no usable GPU device".into())
@@ -588,26 +691,35 @@ impl GpuContext {
     fn upload_frame(&self, planes: [UploadPlane<'_>; 3]) -> Option<SuperEntry> {
         let width = planes[0].width;
         let height = planes[0].height;
-        let packed =
-            unsafe { self.create_image(CL_R, CL_UNORM_INT8, width, height + planes[1].height) }?;
-        let y_linear = unsafe { self.create_image(CL_R, CL_FLOAT, width, height) }?;
-        let entry = SuperEntry {
-            mems: [y_linear.mem, packed.mem, packed.mem, packed.mem],
-            release: self.cl.ReleaseMemObject,
-        };
-        std::mem::forget(y_linear);
-        let resources = self.cache_resources.lock().ok()?;
-        unsafe {
-            self.enqueue_plane_at(resources.queue, packed.mem, planes[0], 0, 0)?;
-            self.enqueue_plane_at(resources.queue, packed.mem, planes[1], 0, height)?;
-            self.enqueue_plane_at(
-                resources.queue,
-                packed.mem,
-                planes[2],
-                planes[1].width,
-                height,
-            )?;
+        let dims = (width, height + planes[1].height);
+        let reused = self.image_pool.lock().ok().and_then(|mut pool| {
+            let index = pool.iter().position(|images| images.dims == dims)?;
+            Some(pool.swap_remove(index))
+        });
+        let (linear, packed) = if let Some(images) = reused {
+            (images.linear, images.packed)
+        } else {
+            let packed = unsafe { self.create_image(CL_R, CL_UNORM_INT8, dims.0, dims.1) }?;
+            let linear = unsafe { self.create_image(CL_R, CL_FLOAT, width, height) }?;
+            let mems = (linear.mem, packed.mem);
+            std::mem::forget(linear);
             std::mem::forget(packed);
+            mems
+        };
+        let mut entry = SuperEntry {
+            mems: [linear, packed, packed, packed],
+            ready: std::ptr::null_mut(),
+            wait: self.cl.WaitForEvents,
+            release_event: self.cl.ReleaseEvent,
+            release: self.cl.ReleaseMemObject,
+            pool: std::sync::Arc::clone(&self.image_pool),
+            dims,
+        };
+        let resources = self.upload_resources()?;
+        unsafe {
+            self.enqueue_plane_at(resources.queue, packed, planes[0], 0, 0)?;
+            self.enqueue_plane_at(resources.queue, packed, planes[1], 0, height)?;
+            self.enqueue_plane_at(resources.queue, packed, planes[2], planes[1].width, height)?;
             if (self.cl.SetKernelArg)(
                 resources.kernel,
                 0,
@@ -633,9 +745,9 @@ impl GpuContext {
                 std::ptr::null(),
                 0,
                 std::ptr::null(),
-                std::ptr::null_mut(),
+                (&raw mut entry.ready).cast(),
             ) != CL_SUCCESS
-                || (self.cl.Finish)(resources.queue) != CL_SUCCESS
+                || (self.cl.Flush)(resources.queue) != CL_SUCCESS
             {
                 return None;
             }
@@ -665,7 +777,7 @@ impl GpuContext {
             (self.cl.EnqueueWriteImage)(
                 q,
                 mem,
-                CL_FALSE,
+                CL_TRUE,
                 origin.as_ptr(),
                 region.as_ptr(),
                 plane.stride,
@@ -791,6 +903,19 @@ impl GpuContext {
         Some(slot.0)
     }
 
+    fn upload_resources(&self) -> Option<std::sync::MutexGuard<'_, CacheResources>> {
+        let count = self.cache_resources.len();
+        let start = self
+            .next_upload
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for offset in 0..count {
+            if let Ok(guard) = self.cache_resources[(start + offset) % count].try_lock() {
+                return Some(guard);
+            }
+        }
+        self.cache_resources[start % count].lock().ok()
+    }
+
     fn variant_kernel(&self, kernels: &mut Vec<(u32, ClKernel)>, variant: u32) -> Option<ClKernel> {
         if let Some(&(_, kernel)) = kernels.iter().find(|(key, _)| *key == variant) {
             return Some(kernel);
@@ -823,6 +948,43 @@ impl GpuContext {
         }
         kernels.push((variant, kernel));
         Some(kernel)
+    }
+
+    unsafe fn wait_event(&self, queue: ClCommandQueue, event: ClEvent) -> bool {
+        let signal = std::sync::Arc::new(Signal::default());
+        let data = std::sync::Arc::into_raw(std::sync::Arc::clone(&signal));
+        let ok = unsafe {
+            (self.cl.Flush)(queue) == CL_SUCCESS
+                && (self.cl.SetEventCallback)(
+                    event,
+                    CL_COMPLETE,
+                    signal_event,
+                    data.cast_mut().cast(),
+                ) == CL_SUCCESS
+        };
+        if !ok {
+            unsafe {
+                drop(std::sync::Arc::from_raw(data));
+                let done = (self.cl.WaitForEvents)(1, &raw const event) == CL_SUCCESS;
+                (self.cl.ReleaseEvent)(event);
+                return done;
+            }
+        }
+        let status = {
+            let mut guard = signal
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while guard.is_none() {
+                guard = signal
+                    .ready
+                    .wait(guard)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            guard.unwrap_or(-1)
+        };
+        unsafe { (self.cl.ReleaseEvent)(event) };
+        status >= 0
     }
 
     unsafe fn set_i32(&self, k: ClKernel, i: u32, v: i32) -> bool {
@@ -982,7 +1144,8 @@ impl GpuContext {
                        stride: i32,
                        p: KernelParams,
                        s0: GpuBuf,
-                       s1: GpuBuf|
+                       s1: GpuBuf,
+                       waits: &[ClEvent]|
              -> Option<ClMem> {
                 let dmem = self.ensure_buffer(dslot, dst.len())?;
                 (self.cl.SetKernelArg)(k, 0, size_of::<ClMem>(), (&raw const dmem).cast());
@@ -1005,8 +1168,12 @@ impl GpuContext {
                     std::ptr::null(),
                     global.as_ptr(),
                     std::ptr::null(),
-                    0,
-                    std::ptr::null(),
+                    ClUint::try_from(waits.len()).ok()?,
+                    if waits.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        waits.as_ptr().cast()
+                    },
                     std::ptr::null_mut(),
                 ) != CL_SUCCESS
                 {
@@ -1014,10 +1181,20 @@ impl GpuContext {
                 }
                 Some(dmem)
             };
-            let y_mem = run(&mut dst[0], dst_y, sy, py, src0[0], src1[0])?;
-            let u_mem = run(&mut dst[1], dst_u, su, pu, src0[1], src1[1])?;
-            let v_mem = run(&mut dst[2], dst_v, sv, pv, src0[2], src1[2])?;
-            for (dmem, output) in [(y_mem, dst_y), (u_mem, dst_u), (v_mem, dst_v)] {
+            let mut waits = Vec::with_capacity(2);
+            for event in [src0[0].1, src1[0].1] {
+                if !event.is_null() && !waits.contains(&event) {
+                    waits.push(event);
+                }
+            }
+            let y_mem = run(&mut dst[0], dst_y, sy, py, src0[0], src1[0], &waits)?;
+            let u_mem = run(&mut dst[1], dst_u, su, pu, src0[1], src1[1], &[])?;
+            let v_mem = run(&mut dst[2], dst_v, sv, pv, src0[2], src1[2], &[])?;
+            let mut done: ClEvent = std::ptr::null_mut();
+            for (index, (dmem, output)) in [(y_mem, dst_y), (u_mem, dst_u), (v_mem, dst_v)]
+                .into_iter()
+                .enumerate()
+            {
                 if (self.cl.EnqueueReadBuffer)(
                     q,
                     dmem,
@@ -1027,13 +1204,21 @@ impl GpuContext {
                     output.as_mut_ptr().cast(),
                     0,
                     std::ptr::null(),
-                    std::ptr::null_mut(),
+                    if index == 2 {
+                        (&raw mut done).cast()
+                    } else {
+                        std::ptr::null_mut()
+                    },
                 ) != CL_SUCCESS
                 {
+                    if !done.is_null() {
+                        (self.cl.ReleaseEvent)(done);
+                    }
+                    (self.cl.Finish)(q);
                     return None;
                 }
             }
-            if (self.cl.Finish)(q) != CL_SUCCESS {
+            if !self.wait_event(q, done) {
                 return None;
             }
         }
