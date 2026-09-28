@@ -1,15 +1,22 @@
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_feature = "avx2", target_feature = "ssse3")
+))]
+use core::arch::x86_64::{__m128i, _mm_unpacklo_epi64};
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use core::arch::x86_64::{
-    __m128i, __m256i, _mm_add_epi32, _mm_add_epi64, _mm_cvtsi128_si32, _mm_loadl_epi64,
-    _mm_loadu_si128, _mm_sad_epu8, _mm_setzero_si128, _mm_shuffle_epi32, _mm_unpacklo_epi64,
-    _mm256_abs_epi16, _mm256_add_epi16, _mm256_add_epi32, _mm256_castsi256_si128,
+    __m256i, _mm256_abs_epi16, _mm256_add_epi16, _mm256_add_epi32, _mm256_castsi256_si128,
     _mm256_cvtepu8_epi16, _mm256_extracti128_si256, _mm256_madd_epi16, _mm256_set1_epi16,
     _mm256_setr_epi16, _mm256_setzero_si256, _mm256_shufflehi_epi16, _mm256_shufflelo_epi16,
     _mm256_sign_epi16, _mm256_sub_epi16,
 };
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::{
+    _mm_add_epi32, _mm_add_epi64, _mm_cvtsi128_si32, _mm_loadl_epi64, _mm_loadu_si128,
+    _mm_sad_epu8, _mm_setzero_si128, _mm_shuffle_epi32,
+};
 
 pub(crate) type Kernel = fn(&[u8], &[u8], usize) -> u32;
-
 #[derive(Clone, Copy)]
 pub(crate) struct Shape {
     pub(crate) width: usize,
@@ -158,6 +165,10 @@ fn satd<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usi
     if W >= 16 || (W == 8 && H.is_multiple_of(8)) {
         return unsafe { satd_avx2::<W, H>(src, reference, pitch) };
     }
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    if W == 4 && H == 4 {
+        return unsafe { satd_4x4_ssse3(src, reference, pitch) };
+    }
     satd_scalar(src, W, reference, pitch, W, H)
 }
 
@@ -218,38 +229,56 @@ fn satd_rows32<const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u3
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+const fn rows_per_tile(width: usize) -> usize {
+    if width == 8 { 8 } else { 4 }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2")]
-unsafe fn satd_avx2<const W: usize, const H: usize>(
-    src: &[u8],
-    reference: &[u8],
-    pitch: usize,
-) -> u32 {
-    assert!(src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
-    let row = |base: *const u8, stride: usize, y: usize, x: usize| -> __m256i {
+unsafe fn load_tile<const W: usize>(
+    base: *const u8,
+    stride: usize,
+    ty: usize,
+    tx: usize,
+) -> [__m256i; 4] {
+    std::array::from_fn(|y| {
         if W == 8 {
-            let low = unsafe { _mm_loadl_epi64(base.add(y * stride + x).cast()) };
-            let high = unsafe { _mm_loadl_epi64(base.add((y + 4) * stride + x).cast()) };
+            let low = unsafe { _mm_loadl_epi64(base.add((ty + y) * stride + tx).cast()) };
+            let high = unsafe { _mm_loadl_epi64(base.add((ty + y + 4) * stride + tx).cast()) };
             _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(low, high))
         } else {
             _mm256_cvtepu8_epi16(unsafe {
-                _mm_loadu_si128(base.add(y * stride + x).cast::<__m128i>())
+                _mm_loadu_si128(base.add((ty + y) * stride + tx).cast())
             })
         }
-    };
-    let rows_per_tile = if W == 8 { 8 } else { 4 };
-    let mut acc = _mm256_setzero_si256();
-    for ty in (0..H).step_by(rows_per_tile) {
-        for tx in (0..W).step_by(16) {
-            let diff = |y: usize| {
-                _mm256_sub_epi16(
-                    row(src.as_ptr(), W, ty + y, tx),
-                    row(reference.as_ptr(), pitch, ty + y, tx),
-                )
-            };
-            let sums = hadamard_tile_abs(diff(0), diff(1), diff(2), diff(3));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(sums, _mm256_set1_epi16(1)));
-        }
-    }
+    })
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+fn tile_coefficients([r0, r1, r2, r3]: [__m256i; 4]) -> [__m256i; 4] {
+    let (s0, d0) = (_mm256_add_epi16(r0, r1), _mm256_sub_epi16(r0, r1));
+    let (s1, d1) = (_mm256_add_epi16(r2, r3), _mm256_sub_epi16(r2, r3));
+    let odd = _mm256_setr_epi16(1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1);
+    let upper = _mm256_setr_epi16(1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1);
+    [
+        _mm256_add_epi16(s0, s1),
+        _mm256_sub_epi16(s0, s1),
+        _mm256_add_epi16(d0, d1),
+        _mm256_sub_epi16(d0, d1),
+    ]
+    .map(|v| {
+        let pairs = _mm256_shufflehi_epi16::<0b1011_0001>(_mm256_shufflelo_epi16::<0b1011_0001>(v));
+        let stage1 = _mm256_add_epi16(_mm256_sign_epi16(v, odd), pairs);
+        let quads =
+            _mm256_shufflehi_epi16::<0b0100_1110>(_mm256_shufflelo_epi16::<0b0100_1110>(stage1));
+        _mm256_add_epi16(_mm256_sign_epi16(stage1, upper), quads)
+    })
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+fn horizontal_sum_halved(acc: __m256i) -> u32 {
     let folded = _mm_add_epi32(
         _mm256_castsi256_si128(acc),
         _mm256_extracti128_si256::<1>(acc),
@@ -261,25 +290,85 @@ unsafe fn satd_avx2<const W: usize, const H: usize>(
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2")]
-fn hadamard_tile_abs(r0: __m256i, r1: __m256i, r2: __m256i, r3: __m256i) -> __m256i {
-    let (s0, d0) = (_mm256_add_epi16(r0, r1), _mm256_sub_epi16(r0, r1));
-    let (s1, d1) = (_mm256_add_epi16(r2, r3), _mm256_sub_epi16(r2, r3));
-    let columns = [
-        _mm256_add_epi16(s0, s1),
-        _mm256_sub_epi16(s0, s1),
-        _mm256_add_epi16(d0, d1),
-        _mm256_sub_epi16(d0, d1),
-    ];
-    let odd = _mm256_setr_epi16(1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1);
-    let upper = _mm256_setr_epi16(1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1);
-    let mut total = _mm256_setzero_si256();
-    for v in columns {
-        let pairs = _mm256_shufflehi_epi16::<0b1011_0001>(_mm256_shufflelo_epi16::<0b1011_0001>(v));
-        let stage1 = _mm256_add_epi16(_mm256_sign_epi16(v, odd), pairs);
-        let quads =
-            _mm256_shufflehi_epi16::<0b0100_1110>(_mm256_shufflelo_epi16::<0b0100_1110>(stage1));
-        let stage2 = _mm256_add_epi16(_mm256_sign_epi16(stage1, upper), quads);
-        total = _mm256_add_epi16(total, _mm256_abs_epi16(stage2));
+unsafe fn satd_avx2<const W: usize, const H: usize>(
+    src: &[u8],
+    reference: &[u8],
+    pitch: usize,
+) -> u32 {
+    assert!(src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
+    let mut acc = _mm256_setzero_si256();
+    for ty in (0..H).step_by(rows_per_tile(W)) {
+        for tx in (0..W).step_by(16) {
+            let s = unsafe { load_tile::<W>(src.as_ptr(), W, ty, tx) };
+            let r = unsafe { load_tile::<W>(reference.as_ptr(), pitch, ty, tx) };
+            let diff = std::array::from_fn(|k| _mm256_sub_epi16(s[k], r[k]));
+            let sums = tile_coefficients(diff)
+                .into_iter()
+                .fold(_mm256_setzero_si256(), |sum, c| {
+                    _mm256_add_epi16(sum, _mm256_abs_epi16(c))
+                });
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(sums, _mm256_set1_epi16(1)));
+        }
     }
-    total
+    horizontal_sum_halved(acc)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[target_feature(enable = "ssse3")]
+unsafe fn rows_4x4(base: *const u8, stride: usize) -> [__m128i; 2] {
+    use core::arch::x86_64::{_mm_cvtsi32_si128, _mm_unpacklo_epi8, _mm_unpacklo_epi32};
+    let load = |row: usize| {
+        _mm_cvtsi32_si128(unsafe { base.add(row * stride).cast::<i32>().read_unaligned() })
+    };
+    let zero = _mm_setzero_si128();
+    [(0, 2), (1, 3)].map(|(a, b)| _mm_unpacklo_epi8(_mm_unpacklo_epi32(load(a), load(b)), zero))
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[target_feature(enable = "ssse3")]
+fn coefficients_4x4([even, odd]: [__m128i; 2]) -> [__m128i; 2] {
+    use core::arch::x86_64::{
+        _mm_add_epi16, _mm_setr_epi16, _mm_shufflehi_epi16, _mm_shufflelo_epi16, _mm_sign_epi16,
+        _mm_sub_epi16, _mm_unpackhi_epi64,
+    };
+    let columns = |v: __m128i| {
+        let swapped = _mm_unpackhi_epi64(v, v);
+        _mm_unpacklo_epi64(_mm_add_epi16(v, swapped), _mm_sub_epi16(v, swapped))
+    };
+    let odd_lanes = _mm_setr_epi16(1, -1, 1, -1, 1, -1, 1, -1);
+    let upper_lanes = _mm_setr_epi16(1, 1, -1, -1, 1, 1, -1, -1);
+    [
+        columns(_mm_add_epi16(even, odd)),
+        columns(_mm_sub_epi16(even, odd)),
+    ]
+    .map(|v| {
+        let pairs = _mm_shufflehi_epi16::<0b1011_0001>(_mm_shufflelo_epi16::<0b1011_0001>(v));
+        let stage1 = _mm_add_epi16(_mm_sign_epi16(v, odd_lanes), pairs);
+        let quads = _mm_shufflehi_epi16::<0b0100_1110>(_mm_shufflelo_epi16::<0b0100_1110>(stage1));
+        _mm_add_epi16(_mm_sign_epi16(stage1, upper_lanes), quads)
+    })
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[target_feature(enable = "ssse3")]
+fn abs_sum_halved(values: [__m128i; 2]) -> u32 {
+    use core::arch::x86_64::{_mm_abs_epi16, _mm_add_epi16, _mm_madd_epi16, _mm_set1_epi16};
+    let total = _mm_add_epi16(_mm_abs_epi16(values[0]), _mm_abs_epi16(values[1]));
+    let wide = _mm_madd_epi16(total, _mm_set1_epi16(1));
+    let wide = _mm_add_epi32(wide, _mm_shuffle_epi32::<0b1110>(wide));
+    let wide = _mm_add_epi32(wide, _mm_shuffle_epi32::<0b0001>(wide));
+    (_mm_cvtsi128_si32(wide) as u32) / 2
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[target_feature(enable = "ssse3")]
+unsafe fn satd_4x4_ssse3(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
+    use core::arch::x86_64::_mm_sub_epi16;
+    assert!(src.len() >= 16 && reference.len() >= 3 * pitch + 4);
+    let s = unsafe { rows_4x4(src.as_ptr(), 4) };
+    let r = unsafe { rows_4x4(reference.as_ptr(), pitch) };
+    abs_sum_halved(coefficients_4x4([
+        _mm_sub_epi16(s[0], r[0]),
+        _mm_sub_epi16(s[1], r[1]),
+    ]))
 }

@@ -493,6 +493,8 @@ impl Field {
             active: 0,
             block_luma: 0,
             scratch: [0; MAX_BLOCK_AREA],
+            flat: [0; MAX_BLOCK_AREA],
+            blurred: [0; MAX_BLOCK_AREA],
         };
         let mut processed = vec![false; ((self.blk_x + 1) * (self.blk_y + 1)) as usize];
         let l = self.layout;
@@ -556,9 +558,9 @@ impl Field {
             ctx.set_half(negative, self.full, self.half, self.layout);
             ctx.state = state;
             if searching {
-                let neighbours = self.neighbours(bx, by, &processed);
+                let (neighbours, count) = self.neighbours(bx, by, &processed);
                 let reverse = index.map_or(Mv::UNSET, |i| self.reverse[i]);
-                ctx.search_block(negative, reverse, &neighbours);
+                ctx.search_block(negative, reverse, &neighbours[..count]);
             } else {
                 ctx.recalculate_block(output.is_some());
             }
@@ -580,7 +582,7 @@ impl Field {
         }
     }
 
-    fn neighbours(&self, bx: i32, by: i32, processed: &[bool]) -> Vec<Mv> {
+    fn neighbours(&self, bx: i32, by: i32, processed: &[bool]) -> ([Mv; 9], usize) {
         let x1 = (bx - 1).max(0);
         let x2 = if bx < self.blk_x {
             (self.blk_x - 1).min(bx + 1)
@@ -593,16 +595,18 @@ impl Field {
         } else {
             by - 1
         };
-        let mut found = Vec::with_capacity(9);
+        let mut found = [Mv::default(); 9];
+        let mut count = 0;
         for y in y1..=y2 {
             for x in x1..=x2 {
                 let index = y * self.blk_x + x;
                 if processed[(index + y) as usize] {
-                    found.push(self.vectors[index as usize]);
+                    found[count] = self.vectors[index as usize];
+                    count += 1;
                 }
             }
         }
-        found
+        (found, count)
     }
 }
 
@@ -692,6 +696,8 @@ struct BlockSearch<'a> {
     active: usize,
     block_luma: i32,
     scratch: [u8; MAX_BLOCK_AREA],
+    flat: [u8; MAX_BLOCK_AREA],
+    blurred: [u8; MAX_BLOCK_AREA],
 }
 
 const HEX2: [(i32, i32); 8] = [
@@ -825,9 +831,11 @@ impl BlockSearch<'_> {
     }
 
     fn luma_sad(&mut self, vx: i32, vy: i32) -> i32 {
-        let s = &self.state;
         let plane = self.reference.y;
-        let offset = plane.subpel(s.pos[0] * self.pel + vx, s.pos_y[0] * self.pel + vy);
+        let offset = plane.subpel(
+            self.state.pos[0] * self.pel + vx,
+            self.state.pos_y[0] * self.pel + vy,
+        );
         let (block, pitch) = plane.block(offset, self.shape, &mut self.scratch);
         (self.kernels.luma)(&self.buffers[self.active].y, block, pitch) as i32
     }
@@ -836,18 +844,17 @@ impl BlockSearch<'_> {
         if self.half {
             return 0;
         }
-        let s = self.state;
         let shape = self.chroma_shape();
-        let cx = s.pos[1] * self.pel + (vx >> self.chroma_shift.0);
-        let cy = s.pos_y[1] * self.pel + (vy >> self.chroma_shift.1);
-        let mut sum = 0;
-        for (plane, src) in [(self.reference.u, 0), (self.reference.v, 1)] {
-            let buffer = &self.buffers[self.active];
-            let src = if src == 0 { &buffer.u } else { &buffer.v };
-            let (block, pitch) = plane.block(plane.subpel(cx, cy), shape, &mut self.scratch);
-            sum += (self.kernels.chroma)(src, block, pitch) as i32;
-        }
-        sum << (self.chroma_shift.0 + self.chroma_shift.1)
+        let cx = self.state.pos[1] * self.pel + (vx >> self.chroma_shift.0);
+        let cy = self.state.pos_y[1] * self.pel + (vy >> self.chroma_shift.1);
+        let (u, v) = (self.reference.u, self.reference.v);
+        let offset = u.subpel(cx, cy);
+        let buffer = &self.buffers[self.active];
+        let (block, pitch) = u.block(offset, shape, &mut self.scratch);
+        let mut sum = (self.kernels.chroma)(&buffer.u, block, pitch);
+        let (block, pitch) = v.block(offset, shape, &mut self.scratch);
+        sum += (self.kernels.chroma)(&buffer.v, block, pitch);
+        (sum as i32) << (self.chroma_shift.0 + self.chroma_shift.1)
     }
 
     fn full_sad(&mut self, vx: i32, vy: i32) -> i32 {
@@ -1017,51 +1024,53 @@ impl BlockSearch<'_> {
         accepted
     }
 
-    fn contrast(block: &[u8], shape: Shape, kernel: Kernel, measure: bool) -> (i32, i32) {
+    fn contrast(
+        block: &[u8],
+        shape: Shape,
+        kernel: Kernel,
+        flat: &mut [u8; MAX_BLOCK_AREA],
+    ) -> (i32, i32) {
         let average = metric::block_average(block, shape);
-        if !measure {
-            return (average, 0);
-        }
-        let flat = [average as u8; MAX_BLOCK_AREA];
-        let deviation = kernel(block, &flat, shape.width) as i32;
-        (average, deviation / shape.area() as i32)
+        let area = shape.area();
+        flat[..area].fill(average as u8);
+        let deviation = kernel(block, &flat[..], shape.width) as i32;
+        (average, deviation / area as i32)
     }
 
     fn block_contrast(&mut self, negative: bool, need: bool) -> i32 {
         let shape = self.shape;
         let area = shape.area();
         let source = &self.buffers[0];
-        let blurred;
         let luma: &[u8] =
             if need && self.level > 0 && self.settings.flags & NO_CONTRAST_BLUR_FLAG == 0 {
                 let shift = shape.width + 1;
-                blurred = std::array::from_fn::<u8, MAX_BLOCK_AREA, _>(|i| {
-                    if i < area {
-                        u16::midpoint(
-                            u16::from(source.y[(i + shift) % area]),
-                            u16::from(source.y[i]),
-                        ) as u8
-                    } else {
-                        0
-                    }
-                });
-                &blurred
+                let (head, rest) = self.blurred[..area].split_at_mut(area - shift);
+                let pixels = &source.y[..area];
+                for ((value, &a), &b) in head.iter_mut().zip(&pixels[shift..]).zip(pixels) {
+                    *value = u16::midpoint(u16::from(a), u16::from(b)) as u8;
+                }
+                for ((value, &a), &b) in rest.iter_mut().zip(pixels).zip(&pixels[area - shift..]) {
+                    *value = u16::midpoint(u16::from(a), u16::from(b)) as u8;
+                }
+                &self.blurred
             } else {
                 &source.y
             };
-        let (average, mut contrast) = Self::contrast(luma, shape, self.kernels.luma, need);
-        self.block_luma = average;
-        if need {
-            if negative {
-                contrast *= 2;
-            } else {
-                let chroma = self.chroma_shape();
-                contrast += Self::contrast(&source.u, chroma, self.kernels.chroma, true).1;
-                contrast += Self::contrast(&source.v, chroma, self.kernels.chroma, true).1;
-            }
-            contrast = contrast.min(255);
+        if !need {
+            self.block_luma = metric::block_average(luma, shape);
+            return 0;
         }
-        contrast
+        let (average, mut contrast) =
+            Self::contrast(luma, shape, self.kernels.luma, &mut self.flat);
+        self.block_luma = average;
+        if negative {
+            contrast *= 2;
+        } else {
+            let chroma = self.chroma_shape();
+            contrast += Self::contrast(&source.u, chroma, self.kernels.chroma, &mut self.flat).1;
+            contrast += Self::contrast(&source.v, chroma, self.kernels.chroma, &mut self.flat).1;
+        }
+        contrast.min(255)
     }
 
     fn search_block(&mut self, negative: bool, reverse: Mv, neighbours: &[Mv]) {

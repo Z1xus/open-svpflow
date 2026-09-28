@@ -29,13 +29,19 @@ impl<'a> PlaneView<'a> {
     }
 
     pub(crate) fn copy_block(&self, offset: isize, shape: Shape, out: &mut [u8]) {
-        for row in 0..shape.height {
-            let start = offset + (row * self.pitch) as isize;
-            let dst = &mut out[row * shape.width..][..shape.width];
-            match self.slice(start, shape.width) {
-                Some(src) => dst.copy_from_slice(src),
-                None => self.copy_clamped(start, dst),
+        let Some(block) = self.slice(offset, shape.span(self.pitch)) else {
+            for row in 0..shape.height {
+                let start = offset + (row * self.pitch) as isize;
+                self.copy_clamped(start, &mut out[row * shape.width..][..shape.width]);
             }
+            return;
+        };
+        match shape.width {
+            2 => copy_rows::<2>(block, self.pitch, out, shape.height),
+            4 => copy_rows::<4>(block, self.pitch, out, shape.height),
+            8 => copy_rows::<8>(block, self.pitch, out, shape.height),
+            16 => copy_rows::<16>(block, self.pitch, out, shape.height),
+            _ => copy_rows::<32>(block, self.pitch, out, shape.height),
         }
     }
 
@@ -145,4 +151,12 @@ impl<'a> SuperFrameView<'a> {
 
 pub(crate) fn plane_size(size: i32, level: i32) -> i32 {
     (0..level).fold(size, |size, _| 2 * (size / 4))
+}
+
+fn copy_rows<const W: usize>(block: &[u8], pitch: usize, out: &mut [u8], rows: usize) {
+    assert!(out.len() >= rows * W && block.len() >= (rows - 1) * pitch + W);
+    let (src, dst) = (block.as_ptr(), out.as_mut_ptr());
+    for row in 0..rows {
+        unsafe { std::ptr::copy_nonoverlapping(src.add(row * pitch), dst.add(row * W), W) };
+    }
 }
