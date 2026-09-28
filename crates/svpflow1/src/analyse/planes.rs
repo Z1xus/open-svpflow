@@ -28,6 +28,23 @@ impl<'a> PlaneView<'a> {
         self.pel1(x >> bits, y >> bits) + subplane
     }
 
+    pub(crate) fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    pub(crate) fn subpel_extent(&self, x: (i32, i32), y: (i32, i32), span: usize) -> bool {
+        let bits = match self.pel {
+            1 => 0,
+            2 => 1,
+            _ => 2,
+        };
+        let pel = 1isize << bits;
+        let low = self.pel1(x.0 >> bits, y.0 >> bits);
+        let high = self.pel1(x.1 >> bits, y.1 >> bits)
+            + (pel * pel - 1) * self.pitch as isize * self.height as isize;
+        low >= 0 && high >= low && (high as usize).saturating_add(span) <= self.data.len()
+    }
+
     pub(crate) fn copy_block(&self, offset: isize, shape: Shape, out: &mut [u8]) {
         let Some(block) = self.slice(offset, shape.span(self.pitch)) else {
             for row in 0..shape.height {

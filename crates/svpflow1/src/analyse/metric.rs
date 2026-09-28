@@ -6,9 +6,8 @@ use core::arch::x86_64::{__m128i, _mm_unpacklo_epi64};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use core::arch::x86_64::{
     __m256i, _mm256_abs_epi16, _mm256_add_epi16, _mm256_add_epi32, _mm256_castsi256_si128,
-    _mm256_cvtepu8_epi16, _mm256_extracti128_si256, _mm256_madd_epi16, _mm256_set1_epi16,
-    _mm256_setr_epi16, _mm256_setzero_si256, _mm256_shufflehi_epi16, _mm256_shufflelo_epi16,
-    _mm256_sign_epi16, _mm256_sub_epi16,
+    _mm256_cvtepu8_epi16, _mm256_extracti128_si256, _mm256_hadd_epi16, _mm256_hsub_epi16,
+    _mm256_madd_epi16, _mm256_max_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_sub_epi16,
 };
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
@@ -70,9 +69,9 @@ fn generic(shape: Shape, use_satd: bool) -> Kernel {
         (8, 8, false) => sad::<8, 8>,
         (8, 4, false) => sad::<8, 4>,
         (4, 4, false) => sad::<4, 4>,
-        (16, 16, true) => satd::<16, 16>,
-        (16, 8, true) => satd::<16, 8>,
-        (8, 8, true) => satd::<8, 8>,
+        (16, 16, true) => wide_satd::<16, 16>().unwrap_or(satd::<16, 16>),
+        (16, 8, true) => wide_satd::<16, 8>().unwrap_or(satd::<16, 8>),
+        (8, 8, true) => wide_satd::<8, 8>().unwrap_or(satd::<8, 8>),
         (8, 4, true) => satd::<8, 4>,
         (4, 4, true) => satd::<4, 4>,
         (32, 32, true) => satd::<32, 32>,
@@ -256,36 +255,32 @@ unsafe fn load_tile<const W: usize>(
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2")]
-fn tile_coefficients([r0, r1, r2, r3]: [__m256i; 4]) -> [__m256i; 4] {
+fn tile_maxima([r0, r1, r2, r3]: [__m256i; 4]) -> __m256i {
     let (s0, d0) = (_mm256_add_epi16(r0, r1), _mm256_sub_epi16(r0, r1));
     let (s1, d1) = (_mm256_add_epi16(r2, r3), _mm256_sub_epi16(r2, r3));
-    let odd = _mm256_setr_epi16(1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1);
-    let upper = _mm256_setr_epi16(1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1);
-    [
-        _mm256_add_epi16(s0, s1),
-        _mm256_sub_epi16(s0, s1),
-        _mm256_add_epi16(d0, d1),
-        _mm256_sub_epi16(d0, d1),
-    ]
-    .map(|v| {
-        let pairs = _mm256_shufflehi_epi16::<0b1011_0001>(_mm256_shufflelo_epi16::<0b1011_0001>(v));
-        let stage1 = _mm256_add_epi16(_mm256_sign_epi16(v, odd), pairs);
-        let quads =
-            _mm256_shufflehi_epi16::<0b0100_1110>(_mm256_shufflelo_epi16::<0b0100_1110>(stage1));
-        _mm256_add_epi16(_mm256_sign_epi16(stage1, upper), quads)
-    })
+    let pair = |a: __m256i, b: __m256i| {
+        let sums = _mm256_hadd_epi16(a, b);
+        let diffs = _mm256_hsub_epi16(a, b);
+        (
+            _mm256_abs_epi16(_mm256_hadd_epi16(sums, diffs)),
+            _mm256_abs_epi16(_mm256_hsub_epi16(sums, diffs)),
+        )
+    };
+    let (x0, y0) = pair(s0, d0);
+    let (x1, y1) = pair(s1, d1);
+    _mm256_add_epi16(_mm256_max_epi16(x0, x1), _mm256_max_epi16(y0, y1))
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2")]
-fn horizontal_sum_halved(acc: __m256i) -> u32 {
+fn horizontal_sum(acc: __m256i) -> u32 {
     let folded = _mm_add_epi32(
         _mm256_castsi256_si128(acc),
         _mm256_extracti128_si256::<1>(acc),
     );
     let folded = _mm_add_epi32(folded, _mm_shuffle_epi32::<0b1110>(folded));
     let folded = _mm_add_epi32(folded, _mm_shuffle_epi32::<0b0001>(folded));
-    (_mm_cvtsi128_si32(folded) as u32) / 2
+    _mm_cvtsi128_si32(folded) as u32
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -302,15 +297,13 @@ unsafe fn satd_avx2<const W: usize, const H: usize>(
             let s = unsafe { load_tile::<W>(src.as_ptr(), W, ty, tx) };
             let r = unsafe { load_tile::<W>(reference.as_ptr(), pitch, ty, tx) };
             let diff = std::array::from_fn(|k| _mm256_sub_epi16(s[k], r[k]));
-            let sums = tile_coefficients(diff)
-                .into_iter()
-                .fold(_mm256_setzero_si256(), |sum, c| {
-                    _mm256_add_epi16(sum, _mm256_abs_epi16(c))
-                });
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(sums, _mm256_set1_epi16(1)));
+            acc = _mm256_add_epi32(
+                acc,
+                _mm256_madd_epi16(tile_maxima(diff), _mm256_set1_epi16(1)),
+            );
         }
     }
-    horizontal_sum_halved(acc)
+    horizontal_sum(acc)
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
@@ -371,4 +364,106 @@ unsafe fn satd_4x4_ssse3(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
         _mm_sub_epi16(s[0], r[0]),
         _mm_sub_epi16(s[1], r[1]),
     ]))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn wide_satd<const W: usize, const H: usize>() -> Option<Kernel> {
+    (std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl"))
+    .then_some(|src: &[u8], reference: &[u8], pitch: usize| {
+        assert!(src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
+        unsafe { satd_avx512::<W, H>(src.as_ptr(), reference.as_ptr(), pitch) }
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn wide_satd<const W: usize, const H: usize>() -> Option<Kernel> {
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn satd_8x8_avx512(
+    src: *const u8,
+    src_pitch: usize,
+    reference: *const u8,
+    pitch: usize,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::{
+        _mm256_mask_set1_epi64, _mm256_set1_epi64x, _mm256_setr_epi8, _mm512_abs_epi16,
+        _mm512_add_epi16, _mm512_broadcast_i64x4, _mm512_bsrli_epi128, _mm512_maddubs_epi16,
+        _mm512_mask_set1_epi64, _mm512_max_epi16, _mm512_srli_epi32, _mm512_sub_epi16,
+        _mm512_unpackhi_epi64, _mm512_unpacklo_epi64, _mm512_zextsi256_si512,
+    };
+    macro_rules! row {
+        ($base:expr, $stride:expr, $y:expr) => {
+            unsafe { $base.add($y * $stride).cast::<i64>().read_unaligned() }
+        };
+    }
+    macro_rules! gather {
+        ($base:expr, $stride:expr, $a:expr, $b:expr, $c:expr, $d:expr) => {{
+            let low = _mm256_mask_set1_epi64(
+                _mm256_set1_epi64x(row!($base, $stride, $a)),
+                0b0101,
+                row!($base, $stride, $b),
+            );
+            let wide = _mm512_mask_set1_epi64(
+                _mm512_zextsi256_si512(low),
+                0b1010_0000,
+                row!($base, $stride, $c),
+            );
+            _mm512_mask_set1_epi64(wide, 0b0101_0000, row!($base, $stride, $d))
+        }};
+    }
+    let hmul = _mm512_broadcast_i64x4(_mm256_setr_epi8(
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1,
+        1, -1, 1, -1,
+    ));
+    macro_rules! widen {
+        ($a:expr, $b:expr, $c:expr, $d:expr) => {
+            _mm512_sub_epi16(
+                _mm512_maddubs_epi16(gather!(src, src_pitch, $a, $b, $c, $d), hmul),
+                _mm512_maddubs_epi16(gather!(reference, pitch, $a, $b, $c, $d), hmul),
+            )
+        };
+    }
+    let even = widen!(0, 2, 4, 6);
+    let odd = widen!(1, 3, 5, 7);
+    let sums = _mm512_add_epi16(even, odd);
+    let diffs = _mm512_sub_epi16(odd, even);
+    let high = _mm512_unpackhi_epi64(sums, diffs);
+    let low = _mm512_unpacklo_epi64(sums, diffs);
+    let first = _mm512_abs_epi16(_mm512_add_epi16(low, high));
+    let second = _mm512_abs_epi16(_mm512_sub_epi16(high, low));
+    let first = _mm512_max_epi16(first, _mm512_bsrli_epi128::<2>(first));
+    let second = _mm512_max_epi16(second, _mm512_srli_epi32::<16>(second));
+    _mm512_add_epi16(first, second)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn satd_avx512<const W: usize, const H: usize>(
+    src: *const u8,
+    reference: *const u8,
+    pitch: usize,
+) -> u32 {
+    use core::arch::x86_64::{
+        _mm512_add_epi32, _mm512_madd_epi16, _mm512_reduce_add_epi32, _mm512_set1_epi32,
+        _mm512_setzero_si512,
+    };
+    let mut acc = _mm512_setzero_si512();
+    for ty in (0..H).step_by(8) {
+        for tx in (0..W).step_by(8) {
+            let block = unsafe {
+                satd_8x8_avx512(
+                    src.add(ty * W + tx),
+                    W,
+                    reference.add(ty * pitch + tx),
+                    pitch,
+                )
+            };
+            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(block, _mm512_set1_epi32(1)));
+        }
+    }
+    _mm512_reduce_add_epi32(acc) as u32
 }

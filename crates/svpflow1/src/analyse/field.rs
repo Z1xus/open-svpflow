@@ -906,6 +906,11 @@ impl BlockSearch<'_> {
         let (b, best) = (self.state.bounds, self.state.best);
         let (mx, my) = (i32::from(best.x), i32::from(best.y));
         let (min_x, max_x) = ((mx - radius).max(b.min_x), (mx + radius).min(b.max_x - 1));
+        let (min_y, max_y) = ((my - radius).max(b.min_y), (my + radius).min(b.max_y - 1));
+        if min_x <= max_x && min_y <= max_y && self.exhaustive_fast((min_x, max_x), (min_y, max_y))
+        {
+            return;
+        }
         for vy in (my - radius).max(b.min_y)..=(my + radius).min(b.max_y - 1) {
             let mut luma_x = min_x;
             for vx in min_x..=max_x {
@@ -919,6 +924,84 @@ impl BlockSearch<'_> {
                 }
             }
         }
+    }
+
+    fn exhaustive_fast(&mut self, (min_x, max_x): (i32, i32), (min_y, max_y): (i32, i32)) -> bool {
+        let s = self.state;
+        let pel = self.pel;
+        let (y, u, v) = (self.reference.y, self.reference.u, self.reference.v);
+        let luma_span = self.shape.span(y.pitch);
+        let (lx, ly) = (s.pos[0] * pel, s.pos_y[0] * pel);
+        if !y.subpel_extent(
+            (lx + min_x, lx + max_x),
+            (ly + min_y, ly + max_y),
+            luma_span,
+        ) {
+            return false;
+        }
+        let (sx, sy) = self.chroma_shift;
+        let chroma = !self.half;
+        let chroma_shape = self.chroma_shape();
+        let chroma_span = chroma_shape.span(u.pitch);
+        let (cx, cy) = (s.pos[1] * pel, s.pos_y[1] * pel);
+        if chroma {
+            let xs = (cx + (min_x >> sx), cx + (max_x >> sx));
+            let ys = (cy + (min_y >> sy), cy + (max_y >> sy));
+            if u.pitch != v.pitch
+                || !u.subpel_extent(xs, ys, chroma_span)
+                || !v.subpel_extent(xs, ys, chroma_span)
+            {
+                return false;
+            }
+        }
+        let (luma, chroma_kernel) = (self.kernels.luma, self.kernels.chroma);
+        let pnew = self.settings.pnew;
+        let penalty = |sad: i32| sad.wrapping_add(pnew.wrapping_mul(sad) >> 8);
+        let (px, py, lambda) = (i32::from(s.predictor.x), i32::from(s.predictor.y), s.lambda);
+        let shift = sx + sy;
+        let (yd, ud, vd) = (y.data(), u.data(), v.data());
+        let buffer = &self.buffers[self.active];
+        let mut min_cost = s.min_cost;
+        let mut best = s.best;
+        for vy in min_y..=max_y {
+            let dy = py - vy;
+            let dy2 = dy.wrapping_mul(dy);
+            let mut luma_x = min_x;
+            for vx in min_x..=max_x {
+                let dx = px - vx;
+                let mut cost = lambda.wrapping_mul(dx.wrapping_mul(dx).wrapping_add(dy2)) >> 8;
+                if cost >= min_cost {
+                    continue;
+                }
+                let at = if pel == 1 { luma_x } else { vx };
+                if pel == 1 {
+                    luma_x += 1;
+                }
+                let offset = y.subpel(lx + at, ly + vy) as usize;
+                let sad = luma(&buffer.y, &yd[offset..offset + luma_span], y.pitch) as i32;
+                cost = cost.wrapping_add(penalty(sad));
+                if cost >= min_cost {
+                    continue;
+                }
+                let sad_uv = if chroma {
+                    let offset = u.subpel(cx + (vx >> sx), cy + (vy >> sy)) as usize;
+                    let sum = chroma_kernel(&buffer.u, &ud[offset..offset + chroma_span], u.pitch)
+                        + chroma_kernel(&buffer.v, &vd[offset..offset + chroma_span], v.pitch);
+                    (sum as i32) << shift
+                } else {
+                    0
+                };
+                cost = cost.wrapping_add(penalty(sad_uv));
+                if cost >= min_cost {
+                    continue;
+                }
+                best = Mv::new(vx, vy, sad + sad_uv);
+                min_cost = cost;
+            }
+        }
+        self.state.best = best;
+        self.state.min_cost = min_cost;
+        true
     }
 
     fn hex2(&mut self, range: i32) {
