@@ -219,6 +219,7 @@ impl FilterState {
                 );
             }
             match self.mode {
+                Mode::SmoothFps if self.passthrough() => {}
                 Mode::SmoothFps => {
                     self.request_vectors(request_frame, frame, source_frame, frame_ctx);
                     if self.request_super {
@@ -305,6 +306,22 @@ impl FilterState {
             std::ptr::null()
         };
         match self.mode {
+            Mode::SmoothFps if self.passthrough() => {
+                let output = unsafe {
+                    self.padded_output(
+                        source,
+                        source,
+                        next_source,
+                        frame,
+                        source_frame,
+                        std::ptr::null(),
+                        core,
+                        vsapi,
+                    )
+                };
+                drop_frame(next_source, free_frame);
+                return output;
+            }
             Mode::SmoothFps => {
                 let vectors = get_node(get_frame, self.clips.vectors, source_frame, frame_ctx);
                 if self.options.request_hdr_vectors() {
@@ -750,6 +767,13 @@ impl FilterState {
         } else {
             metadata::VectorRecord::Missing
         }
+    }
+
+    fn passthrough(&self) -> bool {
+        self.render_mode == 0
+            && !self.options.debug_qmap()
+            && !self.options.debug_vectors()
+            && !self.options.request_hdr_vectors()
     }
 
     pub(crate) const fn requires_cpu_source(&self) -> bool {

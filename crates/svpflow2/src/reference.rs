@@ -370,7 +370,19 @@ impl FilterState {
         frame_ctx: vs::Raw,
     ) {
         let params = self.options.reference();
-        let n = self.rates(&params).source_frame(frame);
+        let rates = self.rates(&params);
+        let n = rates.source_frame(frame);
+        let raw = rates.raw_phase(frame, n);
+        let mut phase = (raw + 0.5) as i32;
+        if matches!(params.scene_mode, 1 | 2) {
+            phase = rates.time_to_fixed(raw, if params.scene_mode == 1 { 0 } else { 2 });
+        }
+        if phase & !0x100 == 0 {
+            for k in [n, n + 1] {
+                request_node(request_frame, self.clips.source, k, frame_ctx);
+            }
+            return;
+        }
         for k in [n, n + 1] {
             request_node(request_frame, self.clips.source, k, frame_ctx);
             if self.request_super {
