@@ -20,6 +20,7 @@ struct ClImageFormat {
 }
 
 const CL_SUCCESS: ClInt = 0;
+const CL_EVENT_COMMAND_EXECUTION_STATUS: ClUint = 0x11D3;
 const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
 const CL_DEVICE_NAME: ClUint = 0x102B;
 const CL_MEM_READ_WRITE: u64 = 1 << 0;
@@ -115,6 +116,8 @@ type FnEnqueueNDRangeKernel = unsafe extern "C" fn(
 type FnFinish = unsafe extern "C" fn(ClCommandQueue) -> ClInt;
 type ClEvent = *mut c_void;
 type FnWaitForEvents = unsafe extern "C" fn(ClUint, *const ClEvent) -> ClInt;
+type FnGetEventInfo =
+    unsafe extern "C" fn(ClEvent, ClUint, usize, *mut c_void, *mut usize) -> ClInt;
 type FnRelease = unsafe extern "C" fn(*mut c_void) -> ClInt;
 
 #[allow(non_snake_case)]
@@ -138,6 +141,7 @@ struct OpenCl {
     Finish: FnFinish,
     Flush: FnFinish,
     WaitForEvents: FnWaitForEvents,
+    GetEventInfo: FnGetEventInfo,
     ReleaseEvent: FnRelease,
     ReleaseMemObject: FnRelease,
     ReleaseKernel: FnRelease,
@@ -185,6 +189,7 @@ impl OpenCl {
                 Finish: sym!("clFinish"),
                 Flush: sym!("clFlush"),
                 WaitForEvents: sym!("clWaitForEvents"),
+                GetEventInfo: sym!("clGetEventInfo"),
                 ReleaseEvent: sym!("clReleaseEvent"),
                 ReleaseMemObject: sym!("clReleaseMemObject"),
                 ReleaseKernel: sym!("clReleaseKernel"),
@@ -940,12 +945,28 @@ impl GpuContext {
     }
 
     unsafe fn wait_event(&self, queue: ClCommandQueue, event: ClEvent) -> bool {
-        unsafe {
-            (self.cl.Flush)(queue);
-            let done = (self.cl.WaitForEvents)(1, &raw const event) == CL_SUCCESS;
-            (self.cl.ReleaseEvent)(event);
-            done
-        }
+        unsafe { (self.cl.Flush)(queue) };
+        let done = loop {
+            let mut status: ClInt = 1;
+            let got = unsafe {
+                (self.cl.GetEventInfo)(
+                    event,
+                    CL_EVENT_COMMAND_EXECUTION_STATUS,
+                    size_of::<ClInt>(),
+                    (&raw mut status).cast(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if got != CL_SUCCESS || status < 0 {
+                break false;
+            }
+            if status == 0 {
+                break true;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        };
+        unsafe { (self.cl.ReleaseEvent)(event) };
+        done
     }
 
     unsafe fn set_i32(&self, k: ClKernel, i: u32, v: i32) -> bool {
