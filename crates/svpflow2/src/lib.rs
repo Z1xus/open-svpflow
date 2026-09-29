@@ -19,12 +19,11 @@ mod hdr;
 mod light;
 mod metadata;
 mod nvof;
-mod options;
 mod reference;
 mod strings;
 mod video_format;
 mod vs;
 
-pub(crate) use svpflow_core::{params, renderer};
+pub(crate) use svpflow_core::{params, renderer, smooth_options as options};
 
 pub use abi::{VapourSynthPluginInit, VapourSynthPluginInit2, svpGetVersion};

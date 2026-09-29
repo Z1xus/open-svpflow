@@ -679,7 +679,7 @@ impl FilterState {
             unsafe { api.free(output.cast_const()) };
             return None;
         }
-        let timing = self.options.timing(&self.video_info);
+        let timing = self.options.timing(&self.video_info.source());
         let ratio = f64_i64(timing.frame_num) / f64_i64(timing.frame_den);
         let raw_phase = timing.raw_phase_256(frame, source_frame);
         unsafe { api.copy_interpolated_timing(source, next_source, output, raw_phase, ratio) };
@@ -713,7 +713,7 @@ impl FilterState {
                 v: plane(src_v, src_v_stride, src_v_len),
             }
         };
-        let padding = self.options.padding(&self.video_info);
+        let padding = self.options.padding(&self.video_info.source());
         let dst = unsafe {
             renderer::FramePlanesMut {
                 y: offset_plane_mut(dst_y, dst_y_stride, dst_y_len, padding.0, padding.1, 1),
@@ -744,12 +744,12 @@ impl FilterState {
     }
 
     pub(crate) fn output_info(&self) -> vs::VideoInfo {
-        let timing = self.options.timing(&self.video_info);
+        let timing = self.options.timing(&self.video_info.source());
         let mut info = self.video_info;
         info.fps_num = timing.fps_num;
         info.fps_den = timing.fps_den;
         info.num_frames = timing.scale_frame_count(info.num_frames);
-        let (pad_x, pad_y) = self.options.padding(&self.video_info);
+        let (pad_x, pad_y) = self.options.padding(&self.video_info.source());
         info.width = info.width.saturating_add(pad_x.saturating_mul(2));
         info.height = info.height.saturating_add(pad_y.saturating_mul(2));
         info
@@ -792,12 +792,12 @@ impl FilterState {
         core: vs::Raw,
         vsapi: vs::ConstRaw,
     ) -> vs::ConstRaw {
-        let padding = self.options.padding(&self.video_info);
+        let padding = self.options.padding(&self.video_info.source());
         let Some(api) = (unsafe { frame::PlaneApi::load(vsapi) }) else {
             return source;
         };
         let output_info = self.output_info();
-        let timing = self.options.timing(&self.video_info);
+        let timing = self.options.timing(&self.video_info.source());
         let ratio = f64_i64(timing.frame_num) / f64_i64(timing.frame_den);
         let raw_phase = timing.raw_phase_256(frame, source_frame);
         let output_phase = timing.output_phase_256(frame);
@@ -929,7 +929,7 @@ impl FilterState {
             && !self.options.scene_blend()
             && self.options.request_scene_mode(self.mode.raw()) == 3
         {
-            let timing = self.options.timing(&self.video_info);
+            let timing = self.options.timing(&self.video_info.source());
             if timing.frame_den != 0 && f64_i64(timing.frame_num) / f64_i64(timing.frame_den) < 2.0
             {
                 return None;
@@ -1022,7 +1022,7 @@ impl FilterState {
             unsafe { api.free(output.cast_const()) };
             return None;
         }
-        let timing = self.options.timing(&self.video_info);
+        let timing = self.options.timing(&self.video_info.source());
         let ratio = f64_i64(timing.frame_num) / f64_i64(timing.frame_den);
         let raw_phase = timing.raw_phase_256(frame, source_frame);
         unsafe { api.copy_interpolated_timing(source, next_source, output, raw_phase, ratio) };
@@ -1720,7 +1720,7 @@ impl FilterState {
         };
         let sources0 = expanded(&expand0).or(super0).unwrap_or(raw_sources0);
         let sources1 = expanded(&expand1).or(super1).unwrap_or(raw_sources1);
-        let padding = self.options.padding(&self.video_info);
+        let padding = self.options.padding(&self.video_info.source());
         let dst = unsafe {
             renderer::FramePlanesMut {
                 y: offset_plane_mut(dst_y, dst_y_stride, dst_y_len, padding.0, padding.1, 1),
@@ -2055,7 +2055,7 @@ impl FilterState {
         output: vs::Raw,
         frame: i32,
     ) -> Option<()> {
-        let padding = self.options.padding(&self.video_info);
+        let padding = self.options.padding(&self.video_info.source());
         if padding == (0, 0) {
             return Some(());
         }
@@ -2241,12 +2241,12 @@ impl FilterState {
     }
 
     fn source_frame(&self, frame: i32) -> i32 {
-        let timing = self.options.timing(&self.video_info);
+        let timing = self.options.timing(&self.video_info.source());
         timing.source_frame(frame, false)
     }
 
     fn phase_256(&self, frame: i32, source_frame: i32) -> i32 {
-        let timing = self.options.timing(&self.video_info);
+        let timing = self.options.timing(&self.video_info.source());
         if timing.frame_num <= 0 {
             return 0;
         }
@@ -2315,7 +2315,7 @@ impl FilterState {
         if self.options.request_scene_mode(self.mode.raw()) != 3 || scene_class >= 3 {
             return phase;
         }
-        let timing = self.options.timing(&self.video_info);
+        let timing = self.options.timing(&self.video_info.source());
         if timing.frame_den == 0 {
             return phase;
         }

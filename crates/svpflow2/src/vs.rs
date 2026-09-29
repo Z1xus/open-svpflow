@@ -123,3 +123,14 @@ pub(crate) unsafe fn free_nodes<const N: usize>(nodes: [Raw; N], vsapi: ConstRaw
         }
     }
 }
+
+impl VideoInfo {
+    pub(crate) const fn source(&self) -> crate::options::SourceInfo {
+        crate::options::SourceInfo {
+            fps_num: self.fps_num,
+            fps_den: self.fps_den,
+            width: self.width,
+            height: self.height,
+        }
+    }
+}

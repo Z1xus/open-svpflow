@@ -1,10 +1,18 @@
-use crate::{metadata, params::Value, vs};
+use crate::{metadata, params::Value};
 
-pub(crate) use svpflow_core::frame_math::Timing;
+#[derive(Clone, Copy, Debug)]
+pub struct SourceInfo {
+    pub fps_num: i64,
+    pub fps_den: i64,
+    pub width: i32,
+    pub height: i32,
+}
+
+pub use crate::frame_math::Timing;
 
 #[derive(Default)]
 #[allow(dead_code)]
-pub(crate) struct Options {
+pub struct Options {
     rate: Rate,
     light: Light,
     scene: Scene,
@@ -41,126 +49,126 @@ struct Light {
 
 #[allow(dead_code, clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Default)]
-pub(crate) struct DebugOptions {
-    pub(crate) flags: i64,
-    pub(crate) vectors: bool,
-    pub(crate) qmap: bool,
-    pub(crate) qmode: bool,
-    pub(crate) zerox: bool,
-    pub(crate) zeroy: bool,
-    pub(crate) tt: bool,
+pub struct DebugOptions {
+    pub flags: i64,
+    pub vectors: bool,
+    pub qmap: bool,
+    pub qmode: bool,
+    pub zerox: bool,
+    pub zeroy: bool,
+    pub tt: bool,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
-pub(crate) struct RenderOptions {
-    pub(crate) linear: bool,
-    pub(crate) dither: bool,
+pub struct RenderOptions {
+    pub linear: bool,
+    pub dither: bool,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
-pub(crate) struct HdrOptions {
-    pub(crate) mluminance: f64,
-    pub(crate) contrast: f64,
-    pub(crate) adaptive: bool,
-    pub(crate) dovi: bool,
+pub struct HdrOptions {
+    pub mluminance: f64,
+    pub contrast: f64,
+    pub adaptive: bool,
+    pub dovi: bool,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
-pub(crate) struct NvofOptions {
-    pub(crate) q: i64,
-    pub(crate) gpuid: i64,
+pub struct NvofOptions {
+    pub q: i64,
+    pub gpuid: i64,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
-pub(crate) struct GpuOptions {
-    pub(crate) render_cpu: bool,
-    pub(crate) id: i64,
-    pub(crate) qn: i64,
-    pub(crate) api: i64,
+pub struct GpuOptions {
+    pub render_cpu: bool,
+    pub id: i64,
+    pub qn: i64,
+    pub api: i64,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
-pub(crate) struct Mask {
-    pub(crate) cover: i64,
-    pub(crate) area: i64,
-    pub(crate) area_enabled: bool,
-    pub(crate) area_scale: f64,
-    pub(crate) area_sharp: f64,
-    pub(crate) area_blend: f64,
+pub struct Mask {
+    pub cover: i64,
+    pub area: i64,
+    pub area_enabled: bool,
+    pub area_scale: f64,
+    pub area_sharp: f64,
+    pub area_blend: f64,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
-pub(crate) struct Scene {
-    pub(crate) mode: i64,
-    pub(crate) blend: bool,
-    pub(crate) adaptive: [i32; 3],
-    pub(crate) force13: bool,
-    pub(crate) limits: SceneLimits,
-    pub(crate) qmap_limits: SceneLimits,
-    pub(crate) luma: f64,
+pub struct Scene {
+    pub mode: i64,
+    pub blend: bool,
+    pub adaptive: [i32; 3],
+    pub force13: bool,
+    pub limits: SceneLimits,
+    pub qmap_limits: SceneLimits,
+    pub luma: f64,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
-pub(crate) struct SceneLimits {
-    pub(crate) blocks: i64,
-    pub(crate) blocks13: i64,
-    pub(crate) ignore: f64,
-    pub(crate) zero: i64,
-    pub(crate) m1: i64,
-    pub(crate) m2: i64,
-    pub(crate) scene: i64,
+pub struct SceneLimits {
+    pub blocks: i64,
+    pub blocks13: i64,
+    pub ignore: f64,
+    pub zero: i64,
+    pub m1: i64,
+    pub m2: i64,
+    pub scene: i64,
 }
 
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy)]
-pub(crate) struct ReferenceParams {
-    pub(crate) absolute: bool,
-    pub(crate) rate_num: u64,
-    pub(crate) rate_den: u64,
-    pub(crate) scene_mode: i64,
-    pub(crate) adaptive: [i32; 3],
-    pub(crate) blocks: i32,
-    pub(crate) zero: i32,
-    pub(crate) m1: i32,
-    pub(crate) m2: i32,
-    pub(crate) scene: i32,
-    pub(crate) luma: f64,
-    pub(crate) level: i32,
-    pub(crate) force13: bool,
-    pub(crate) blend: bool,
-    pub(crate) cover: i32,
-    pub(crate) area_blend: f64,
-    pub(crate) algo: i32,
-    pub(crate) linear: bool,
-    pub(crate) cubic: i64,
-    pub(crate) block: bool,
-    pub(crate) sad: Option<(f64, f64)>,
+pub struct ReferenceParams {
+    pub absolute: bool,
+    pub rate_num: u64,
+    pub rate_den: u64,
+    pub scene_mode: i64,
+    pub adaptive: [i32; 3],
+    pub blocks: i32,
+    pub zero: i32,
+    pub m1: i32,
+    pub m2: i32,
+    pub scene: i32,
+    pub luma: f64,
+    pub level: i32,
+    pub force13: bool,
+    pub blend: bool,
+    pub cover: i32,
+    pub area_blend: f64,
+    pub algo: i32,
+    pub linear: bool,
+    pub cubic: i64,
+    pub block: bool,
+    pub sad: Option<(f64, f64)>,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct LightParams {
-    pub(crate) border: i32,
-    pub(crate) lights: i32,
-    pub(crate) length: i32,
-    pub(crate) cell: f64,
+pub struct LightParams {
+    pub border: i32,
+    pub lights: i32,
+    pub length: i32,
+    pub cell: f64,
 }
 
 impl Options {
-    pub(crate) fn for_mode(mode: i32) -> Self {
+    pub fn for_mode(mode: i32) -> Self {
         Self {
             scene: Scene::for_mode(mode),
             ..Self::default()
         }
     }
 
-    pub(crate) fn from_value(value: &Value, mode: i32) -> Self {
+    pub fn from_value(value: &Value, mode: i32) -> Self {
         let hdr = HdrOptions::from_value(value);
         let mut render = RenderOptions::from_value(value);
         render.linear &= hdr.mluminance <= 0.0;
@@ -194,7 +202,7 @@ impl Options {
         }
     }
 
-    pub(crate) fn validate(&self, mode: i32) -> Result<(), ValidateError> {
+    pub fn validate(&self, mode: i32) -> Result<(), ValidateError> {
         if mode <= 1 && !valid_algo(self.algo.unwrap_or(21)) {
             return Err(ValidateError::Algo);
         }
@@ -204,11 +212,7 @@ impl Options {
         Ok(())
     }
 
-    pub(crate) fn validate_timing(
-        &self,
-        mode: i32,
-        source: &vs::VideoInfo,
-    ) -> Result<(), ValidateError> {
+    pub fn validate_timing(&self, mode: i32, source: &SourceInfo) -> Result<(), ValidateError> {
         if mode > 1 {
             return Ok(());
         }
@@ -220,7 +224,7 @@ impl Options {
         }
     }
 
-    pub(crate) fn normalize_scene_mode(&mut self, mode: i32, source: &vs::VideoInfo) {
+    pub fn normalize_scene_mode(&mut self, mode: i32, source: &SourceInfo) {
         if mode > 1 {
             self.scene.mode = 0;
             return;
@@ -232,38 +236,38 @@ impl Options {
         }
     }
 
-    pub(crate) fn scale_scene_limits(&mut self, block: metadata::VectorShape) {
+    pub fn scale_scene_limits(&mut self, block: metadata::VectorShape) {
         self.scene.limits.scale(block);
     }
 
-    pub(crate) const fn dither(&self) -> bool {
+    pub const fn dither(&self) -> bool {
         self.render.dither
     }
 
-    pub(crate) fn apply_source_depth(&mut self, depth: i32) {
+    pub fn apply_source_depth(&mut self, depth: i32) {
         if depth != 0 {
             self.render.dither = false;
         }
     }
 
-    pub(crate) fn apply_core_threads(&mut self, threads: i32) {
+    pub fn apply_core_threads(&mut self, threads: i32) {
         self.mt = i64::from(threads);
     }
 
-    pub(crate) fn apply_mask_area_scale(&mut self, source_8bit: bool) {
+    pub fn apply_mask_area_scale(&mut self, source_8bit: bool) {
         if self.mask.area > 0 {
             let area = i32::try_from(self.mask.area).unwrap_or(i32::MAX);
             self.mask.area_scale = f64::from(area) / if source_8bit { 10000.0 } else { 15000.0 };
         }
     }
 
-    pub(crate) fn apply_debug_mask_scale(&mut self) {
+    pub fn apply_debug_mask_scale(&mut self) {
         if self.debug.vectors && !self.mask.area_enabled {
             self.mask.area_scale = 0.01;
         }
     }
 
-    pub(crate) fn apply_mask_cover_algo(&mut self, mode: i32) {
+    pub fn apply_mask_cover_algo(&mut self, mode: i32) {
         if mode > 1 || self.mask.cover != 0 {
             return;
         }
@@ -273,7 +277,7 @@ impl Options {
         }
     }
 
-    pub(crate) fn timing(&self, source: &vs::VideoInfo) -> Timing {
+    pub fn timing(&self, source: &SourceInfo) -> Timing {
         let num = non_zero(
             self.rate
                 .num
@@ -283,7 +287,7 @@ impl Options {
         Timing::new(source.fps_num, source.fps_den, self.rate.absolute, num, den)
     }
 
-    pub(crate) fn padding(&self, source: &vs::VideoInfo) -> (i32, i32) {
+    pub fn padding(&self, source: &SourceInfo) -> (i32, i32) {
         if source.width <= 0 || source.height <= 0 {
             return (0, 0);
         }
@@ -306,7 +310,7 @@ impl Options {
         (pad_x(x), pad_y(y))
     }
 
-    pub(crate) fn reference(&self) -> ReferenceParams {
+    pub fn reference(&self) -> ReferenceParams {
         let limits = self.scene.limits;
         let positive = |value: Option<i64>, default: u64| {
             u64::try_from(value.unwrap_or(0))
@@ -342,14 +346,14 @@ impl Options {
         }
     }
 
-    pub(crate) fn reference_supported(&self) -> bool {
+    pub fn reference_supported(&self) -> bool {
         let debug = self.debug;
         !self.hdr_enabled()
             && debug.flags.trailing_zeros() >= 3
             && matches!(self.algo_for_mode(0), 1 | 2 | 11 | 13 | 21 | 22 | 23)
     }
 
-    pub(crate) fn light_params(&self) -> LightParams {
+    pub fn light_params(&self) -> LightParams {
         LightParams {
             border: i32_saturating(self.light.border.unwrap_or(12)),
             lights: i32_saturating(self.light.lights.unwrap_or(16)).max(1),
@@ -358,34 +362,34 @@ impl Options {
         }
     }
 
-    pub(crate) const fn cpu_render(&self) -> bool {
+    pub const fn cpu_render(&self) -> bool {
         self.gpu.render_cpu
     }
 
-    pub(crate) const fn gpu_id(&self) -> i64 {
+    pub const fn gpu_id(&self) -> i64 {
         self.gpu.id
     }
 
-    pub(crate) const fn gpu_qn(&self) -> i64 {
+    pub const fn gpu_qn(&self) -> i64 {
         self.gpu.qn
     }
 
-    pub(crate) fn cubic_positive(&self) -> bool {
+    pub fn cubic_positive(&self) -> bool {
         self.cubic.unwrap_or(0) > 0
     }
 
-    pub(crate) fn apply_cubic_default(&mut self, enabled: bool) {
+    pub fn apply_cubic_default(&mut self, enabled: bool) {
         if self.cubic.is_none() {
             self.cubic = Some(i64::from(enabled));
         }
     }
 
-    pub(crate) fn request_source_plus_two(&self, mode: i32) -> bool {
+    pub fn request_source_plus_two(&self, mode: i32) -> bool {
         let algo = self.algo_for_mode(mode);
         ((self.debug.flags >> 3) & 3) != 0 || algo == 23 || algo >= 90
     }
 
-    pub(crate) fn vector_neighbor_level(&self, mode: i32, source_frame: i32) -> i32 {
+    pub fn vector_neighbor_level(&self, mode: i32, source_frame: i32) -> i32 {
         let level = i32::try_from((self.debug.flags >> 3) & 3).unwrap_or(0);
         let level_limit = if source_frame >= 3 { 3 } else { 1 };
         if level != 0 {
@@ -399,120 +403,120 @@ impl Options {
         }
     }
 
-    pub(crate) fn request_scene_mode(&self, mode: i32) -> i64 {
+    pub fn request_scene_mode(&self, mode: i32) -> i64 {
         if mode <= 1 { self.scene.mode } else { 0 }
     }
 
-    pub(crate) fn scene_adaptive(&self, class: i32) -> Option<i32> {
+    pub fn scene_adaptive(&self, class: i32) -> Option<i32> {
         usize::try_from(class)
             .ok()
             .and_then(|index| self.scene.adaptive.get(index).copied())
             .filter(|value| *value >= 0)
     }
 
-    pub(crate) fn algorithm(&self, mode: i32) -> i64 {
+    pub fn algorithm(&self, mode: i32) -> i64 {
         self.algo_for_mode(mode)
     }
 
-    pub(crate) const fn scene_force13(&self) -> bool {
+    pub const fn scene_force13(&self) -> bool {
         self.scene.force13
     }
 
-    pub(crate) const fn scene_blend(&self) -> bool {
+    pub const fn scene_blend(&self) -> bool {
         self.scene.blend
     }
 
-    pub(crate) fn scene_luma(&self) -> f64 {
+    pub fn scene_luma(&self) -> f64 {
         self.scene.luma
     }
 
-    pub(crate) fn scene_thresholds(&self) -> metadata::SceneThresholds {
+    pub fn scene_thresholds(&self) -> metadata::SceneThresholds {
         scene_thresholds(self.scene.limits)
     }
 
-    pub(crate) fn qmap_thresholds(&self) -> metadata::SceneThresholds {
+    pub fn qmap_thresholds(&self) -> metadata::SceneThresholds {
         let mut thresholds = scene_thresholds(self.scene.limits);
         thresholds.zero = i32_saturating(self.scene.qmap_limits.zero);
         thresholds
     }
 
-    pub(crate) fn dovi_enabled(&self) -> bool {
+    pub fn dovi_enabled(&self) -> bool {
         self.hdr.dovi
     }
 
-    pub(crate) fn mask_cover(&self) -> i32 {
+    pub fn mask_cover(&self) -> i32 {
         i32::try_from(self.mask.cover).unwrap_or(i32::MAX)
     }
 
-    pub(crate) const fn mask_area_enabled(&self) -> bool {
+    pub const fn mask_area_enabled(&self) -> bool {
         self.mask.area_enabled
     }
 
-    pub(crate) const fn fallback_enabled(&self) -> bool {
+    pub const fn fallback_enabled(&self) -> bool {
         self.fallback
     }
 
-    pub(crate) const fn gpu_api(&self) -> i64 {
+    pub const fn gpu_api(&self) -> i64 {
         self.gpu.api
     }
 
-    pub(crate) const fn nvof_quality(&self) -> i64 {
+    pub const fn nvof_quality(&self) -> i64 {
         self.nvof.q
     }
 
-    pub(crate) const fn nvof_gpu_id(&self) -> i64 {
+    pub const fn nvof_gpu_id(&self) -> i64 {
         self.nvof.gpuid
     }
 
-    pub(crate) const fn mask_area_scale(&self) -> f64 {
+    pub const fn mask_area_scale(&self) -> f64 {
         self.mask.area_scale
     }
 
-    pub(crate) const fn mask_area_sharp(&self) -> f64 {
+    pub const fn mask_area_sharp(&self) -> f64 {
         self.mask.area_sharp
     }
 
-    pub(crate) const fn block_enabled(&self) -> bool {
+    pub const fn block_enabled(&self) -> bool {
         self.block
     }
 
-    pub(crate) const fn debug_zerox(&self) -> bool {
+    pub const fn debug_zerox(&self) -> bool {
         self.debug.zerox
     }
 
-    pub(crate) const fn debug_zeroy(&self) -> bool {
+    pub const fn debug_zeroy(&self) -> bool {
         self.debug.zeroy
     }
 
-    pub(crate) const fn debug_qmode(&self) -> bool {
+    pub const fn debug_qmode(&self) -> bool {
         self.debug.qmode
     }
 
-    pub(crate) const fn debug_qmap(&self) -> bool {
+    pub const fn debug_qmap(&self) -> bool {
         self.debug.qmap
     }
 
-    pub(crate) const fn debug_vectors(&self) -> bool {
+    pub const fn debug_vectors(&self) -> bool {
         self.debug.vectors
     }
 
-    pub(crate) const fn debug_tt(&self) -> bool {
+    pub const fn debug_tt(&self) -> bool {
         self.debug.tt
     }
 
-    pub(crate) fn request_hdr_vectors(&self) -> bool {
+    pub fn request_hdr_vectors(&self) -> bool {
         self.hdr.mluminance > 0.0 && self.hdr.adaptive
     }
 
-    pub(crate) fn hdr_enabled(&self) -> bool {
+    pub fn hdr_enabled(&self) -> bool {
         self.hdr.mluminance > 0.0
     }
 
-    pub(crate) fn fast_output_enabled(&self) -> bool {
+    pub fn fast_output_enabled(&self) -> bool {
         self.hdr.mluminance <= 0.0
     }
 
-    pub(crate) fn disables_render_for_identity_rate(&self, source: &vs::VideoInfo) -> bool {
+    pub fn disables_render_for_identity_rate(&self, source: &SourceInfo) -> bool {
         let timing = self.timing(source);
         if timing.frame_den == 0 {
             return false;
@@ -778,7 +782,7 @@ impl SceneLimits {
     }
 }
 
-pub(crate) enum ValidateError {
+pub enum ValidateError {
     Algo,
     SceneMode,
     SceneModeRate,

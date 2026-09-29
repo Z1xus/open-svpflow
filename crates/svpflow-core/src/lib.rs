@@ -10,3 +10,4 @@ pub mod metadata;
 pub mod params;
 pub mod renderer;
 pub mod smooth;
+pub mod smooth_options;

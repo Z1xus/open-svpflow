@@ -230,7 +230,7 @@ impl FilterState {
         }) else {
             return std::ptr::null();
         };
-        let (pad_x, pad_y) = self.options.padding(&self.video_info);
+        let (pad_x, pad_y) = self.options.padding(&self.video_info.source());
         let bytes = if crate::video_format::source_depth(&self.video_info) > 8 {
             2
         } else {
@@ -283,7 +283,7 @@ impl FilterState {
             unsafe { api.free(output.cast_const()) };
             return std::ptr::null();
         }
-        let timing = self.options.timing(&self.video_info);
+        let timing = self.options.timing(&self.video_info.source());
         let ratio = crate::core::f64_i64(timing.frame_num) / crate::core::f64_i64(timing.frame_den);
         let raw_phase = timing.raw_phase_256(frame, n);
         unsafe { api.copy_interpolated_timing(source, next_source, output, raw_phase, ratio) };
@@ -302,7 +302,7 @@ impl FilterState {
     ) {
         let phase = self
             .options
-            .timing(&self.video_info)
+            .timing(&self.video_info.source())
             .output_phase_256(frame);
         let backward = phase > 127;
         let shape = *field.shape();
@@ -984,7 +984,7 @@ impl FilterState {
         };
         let h = usize::try_from(self.video_info.height).unwrap_or(0);
         let w = usize::try_from(self.video_info.width).unwrap_or(0);
-        let (pad_x, pad_y) = self.options.padding(&self.video_info);
+        let (pad_x, pad_y) = self.options.padding(&self.video_info.source());
         let plane_mut = |p: i32, rows: usize| -> Option<PlaneMut<'static>> {
             let div = if p == 0 { 1 } else { 2 };
             let (px, py) = (
@@ -1028,7 +1028,7 @@ impl FilterState {
         if self.options.debug_tt() {
             unsafe { self.apply_timing_bar(api, output, frame) };
         }
-        let timing = self.options.timing(&self.video_info);
+        let timing = self.options.timing(&self.video_info.source());
         let ratio = crate::core::f64_i64(timing.frame_num) / crate::core::f64_i64(timing.frame_den);
         let raw_phase = timing.raw_phase_256(frame, n);
         unsafe { api.copy_interpolated_timing(source, next_source, output, raw_phase, ratio) };

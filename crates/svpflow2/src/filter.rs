@@ -67,7 +67,7 @@ unsafe fn create_filter(
     {
         return 0;
     }
-    options.normalize_scene_mode(mode, &video_info);
+    options.normalize_scene_mode(mode, &video_info.source());
     options.apply_source_depth(video_format::source_depth(&video_info));
     let mut data = unsafe { collect_state(mode, input, vsapi, &api, source, video_info, options) };
     if let metadata::VectorRecord::Ready(vectors) = data.vector_data() {
@@ -174,7 +174,9 @@ unsafe fn validate_timing_options(
     output: vs::Raw,
     vsapi: vs::ConstRaw,
 ) -> bool {
-    if let Err(options::ValidateError::SceneModeRate) = options.validate_timing(mode, video_info) {
+    if let Err(options::ValidateError::SceneModeRate) =
+        options.validate_timing(mode, &video_info.source())
+    {
         unsafe { set_error(output, vsapi, strings::ERR_SCENE_MODE_RATE.as_ptr().cast()) };
         unsafe { vs::free_nodes([source], vsapi) };
         return false;
@@ -186,7 +188,7 @@ unsafe fn validate_mode0_options(data: &FilterData, output: vs::Raw, vsapi: vs::
     if !unsafe { validate_options(&data.options, 0, output, vsapi) } {
         return false;
     }
-    match data.options.validate_timing(0, &data.video_info) {
+    match data.options.validate_timing(0, &data.video_info.source()) {
         Err(options::ValidateError::SceneModeRate) => {
             unsafe { set_error(output, vsapi, strings::ERR_SCENE_MODE_RATE.as_ptr().cast()) };
             false
@@ -311,7 +313,7 @@ unsafe fn collect_state(
         &video_info,
         options.request_scene_mode(mode),
     );
-    let render_mode = if options.disables_render_for_identity_rate(&video_info) {
+    let render_mode = if options.disables_render_for_identity_rate(&video_info.source()) {
         0
     } else {
         unsafe { render_mode(&options, vdata, generated_vdata) }
