@@ -8,6 +8,8 @@ It started as a side project, mostly to see if I could get couler's [smoothie-rs
 
 This proof of concept runs open-svpflow's analysis pipeline as WASM and renders with WebGPU, using [WebCodecs](https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API) for video decoding and encoding.
 
+In the browser it runs about 2-3x slower than native, since WASM can't use AVX2 or AVX-512. If it's a lot slower than that for you, check `chrome://gpu` (or `about:support` for Firefox) and make sure hardware acceleration and WebGPU are enabled, otherwise it falls back to rendering on the CPU.
+
 ## What's implemented
 
 - `svpflow1`: `Super` and `Analyse`, including super-frame pyramids, multi-level predictors, SAD/SATD and chroma costs, and hex2, UMH, and exhaustive motion search.
