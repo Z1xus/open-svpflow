@@ -112,4 +112,4 @@ jobs:
           gh release create "$tag" ./*.zip SHA256SUMS \
             --target "$GITHUB_SHA" --title "$tag" \
             --notes "Built from $GITHUB_SHA." \
-            --prerelease --draft
+            --latest
