@@ -1085,6 +1085,15 @@ impl BlockSearch<'_> {
                 self.exhaustive_loop::<BITS, _, _>(ranges, spans, &luma, &chroma);
             return;
         }
+        #[cfg(target_feature = "avx2")]
+        if self.kernels.pair.is_some() && (W, H) == (16, 8) {
+            let chroma = metric::Pair8x4 {
+                src: [&buffer.u, &buffer.v],
+            };
+            (self.state.best, self.state.min_cost) =
+                self.exhaustive_loop::<BITS, _, _>(ranges, spans, &luma, &chroma);
+            return;
+        }
         let chroma = metric::IndirectChroma {
             kernel: self.kernels.chroma,
             pair: self.kernels.pair,

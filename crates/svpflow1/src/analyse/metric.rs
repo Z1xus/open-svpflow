@@ -66,6 +66,14 @@ pub(crate) fn chroma420_pair(luma: Shape, satd: bool) -> Option<PairKernel> {
             unsafe { satd_4x4_pair_avx2(src, reference, pitch) }
         });
     }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if satd && (luma.width, luma.height) == (16, 8) {
+        return Some(|src, reference, pitch| {
+            assert!(src.iter().all(|s| s.len() >= 32));
+            assert!(reference.iter().all(|r| r.len() >= 3 * pitch + 8));
+            unsafe { satd_8x4_pair_avx2(src, reference, pitch) }
+        });
+    }
     let _ = (luma, satd);
     None
 }
@@ -186,6 +194,10 @@ fn satd<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usi
     if W >= 16 || (W == 8 && H.is_multiple_of(8)) {
         return unsafe { satd_avx2::<W, H>(src, reference, pitch) };
     }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if W == 8 && H.is_multiple_of(4) {
+        return unsafe { satd_8x4_avx2(src, reference, pitch, H) };
+    }
     #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
     if W == 4 && H == 4 {
         return unsafe { satd_4x4_ssse3(src, reference, pitch) };
@@ -248,6 +260,8 @@ fn satd_rows32<const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u3
             )
         })
         .sum();
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    return unsafe { satd_rows32_avx2::<H>(src, reference, pitch) };
     #[allow(unreachable_code)]
     (0..H)
         .map(|row| {
@@ -291,6 +305,7 @@ unsafe fn load_tile<const W: usize>(
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2")]
+#[inline]
 fn tile_maxima([r0, r1, r2, r3]: [__m256i; 4]) -> __m256i {
     let (s0, d0) = (_mm256_add_epi16(r0, r1), _mm256_sub_epi16(r0, r1));
     let (s1, d1) = (_mm256_add_epi16(r2, r3), _mm256_sub_epi16(r2, r3));
@@ -309,6 +324,7 @@ fn tile_maxima([r0, r1, r2, r3]: [__m256i; 4]) -> __m256i {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2")]
+#[inline]
 fn horizontal_sum(acc: __m256i) -> u32 {
     let folded = _mm_add_epi32(
         _mm256_castsi256_si128(acc),
@@ -338,6 +354,84 @@ unsafe fn satd_avx2<const W: usize, const H: usize>(
                 _mm256_madd_epi16(tile_maxima(diff), _mm256_set1_epi16(1)),
             );
         }
+    }
+    horizontal_sum(acc)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn satd_8x4_tiles(
+    src: [Option<*const u8>; 2],
+    src_pitch: usize,
+    reference: [Option<*const u8>; 2],
+    pitch: usize,
+) -> __m256i {
+    let load = |base: [Option<*const u8>; 2], stride: usize, y: usize| {
+        let half = |ptr: Option<*const u8>| {
+            ptr.map_or(_mm_setzero_si128(), |ptr| unsafe {
+                _mm_loadl_epi64(ptr.add(y * stride).cast())
+            })
+        };
+        _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(half(base[0]), half(base[1])))
+    };
+    let diff = std::array::from_fn(|y| {
+        _mm256_sub_epi16(load(src, src_pitch, y), load(reference, pitch, y))
+    });
+    _mm256_madd_epi16(tile_maxima(diff), _mm256_set1_epi16(1))
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn satd_8x4_pair_avx2(src: [&[u8]; 2], reference: [&[u8]; 2], pitch: usize) -> u32 {
+    horizontal_sum(unsafe {
+        satd_8x4_tiles(
+            src.map(|s| Some(s.as_ptr())),
+            8,
+            reference.map(|r| Some(r.as_ptr())),
+            pitch,
+        )
+    })
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+unsafe fn satd_8x4_avx2(src: &[u8], reference: &[u8], pitch: usize, height: usize) -> u32 {
+    assert!(src.len() >= 8 * height && reference.len() >= (height - 1) * pitch + 8);
+    let (s, r) = (src.as_ptr(), reference.as_ptr());
+    let mut acc = _mm256_setzero_si256();
+    for ty in (0..height).step_by(8) {
+        let second = ty + 4 < height;
+        let pick = |base: *const u8, stride: usize| {
+            [
+                Some(unsafe { base.add(ty * stride) }),
+                second.then(|| unsafe { base.add((ty + 4) * stride) }),
+            ]
+        };
+        acc = _mm256_add_epi32(acc, unsafe {
+            satd_8x4_tiles(pick(s, 8), 8, pick(r, pitch), pitch)
+        });
+    }
+    horizontal_sum(acc)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+unsafe fn satd_rows32_avx2<const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
+    assert!(src.len() >= 32 * H && reference.len() >= (H - 1) * pitch + 32);
+    let (s, r) = (src.as_ptr(), reference.as_ptr());
+    let mut acc = _mm256_setzero_si256();
+    for row in (0..H).step_by(2) {
+        let pick = |base: *const u8, stride: usize| {
+            [
+                Some(unsafe { base.add(row * stride) }),
+                (row + 1 < H).then(|| unsafe { base.add((row + 1) * stride) }),
+            ]
+        };
+        acc = _mm256_add_epi32(acc, unsafe {
+            satd_8x4_tiles(pick(s, 32), 8, pick(r, pitch), 8)
+        });
     }
     horizontal_sum(acc)
 }
@@ -650,6 +744,21 @@ impl ChromaCost for Pair4x4<'_> {
         assert!(self.src.iter().all(|s| s.len() >= 16));
         assert!(u.len() >= 3 * pitch + 4 && v.len() >= 3 * pitch + 4);
         unsafe { satd_4x4_pair_avx2(self.src, [u, v], pitch) }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub(crate) struct Pair8x4<'a> {
+    pub(crate) src: [&'a [u8]; 2],
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+impl ChromaCost for Pair8x4<'_> {
+    #[inline]
+    fn cost(&self, u: &[u8], v: &[u8], pitch: usize) -> u32 {
+        assert!(self.src.iter().all(|s| s.len() >= 32));
+        assert!(u.len() >= 3 * pitch + 8 && v.len() >= 3 * pitch + 8);
+        unsafe { satd_8x4_pair_avx2(self.src, [u, v], pitch) }
     }
 }
 
