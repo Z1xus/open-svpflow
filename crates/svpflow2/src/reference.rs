@@ -165,6 +165,7 @@ impl FilterState {
         motions: [(&[u16], &[u16]); 4],
         coverage: (&[u8], &[u8]),
         area: Option<(&[u8], &[u8])>,
+        motion_key: i64,
         core: vs::Raw,
     ) -> vs::ConstRaw {
         let w = usize::try_from(self.video_info.width).unwrap_or(0);
@@ -236,7 +237,7 @@ impl FilterState {
             unsafe { api.free(output.cast_const()) };
             return std::ptr::null();
         };
-        let key = i64::from(frame);
+        let key = motion_key;
         let done = gpu.render_frame(
             current.sources(linear),
             next.sources(linear),
@@ -847,6 +848,12 @@ impl FilterState {
                     sad_masks
                         .as_ref()
                         .map(|(first, second)| (&second[..], &first[..])),
+                    (i64::from(n) << 8)
+                        | i64::from(use_fwd)
+                        | i64::from(use_bwd) << 1
+                        | i64::from(extended) << 2
+                        | i64::from(self.options.debug_zerox()) << 3
+                        | i64::from(self.options.debug_zeroy()) << 4,
                     core,
                 )
             };
