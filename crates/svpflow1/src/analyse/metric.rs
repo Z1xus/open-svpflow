@@ -107,6 +107,10 @@ fn sad<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usiz
     if W >= 8 {
         return unsafe { sad_sse2::<W, H>(src, reference, pitch) };
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if W >= 4 {
+        return simd128::sad(src, W, reference, pitch, W, H);
+    }
     sad_scalar(src, reference, pitch, W, H)
 }
 
@@ -174,6 +178,10 @@ fn sad_rows_swapped(src: &[u8], reference: &[u8], pitch: usize, width: usize) ->
 }
 
 fn satd<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if W.is_multiple_of(4) && H.is_multiple_of(4) {
+        return simd128::satd(src, W, reference, pitch, W, H);
+    }
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     if W >= 16 || (W == 8 && H.is_multiple_of(8)) {
         return unsafe { satd_avx2::<W, H>(src, reference, pitch) };
@@ -227,6 +235,20 @@ fn hadamard4x4_abs_sum(mut d: [[i32; 4]; 4]) -> u32 {
 }
 
 fn satd_rows32<const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    return (0..H)
+        .map(|row| {
+            simd128::satd(
+                &src[row * 32..][..32],
+                8,
+                &reference[row * pitch..][..32],
+                8,
+                8,
+                4,
+            )
+        })
+        .sum();
+    #[allow(unreachable_code)]
     (0..H)
         .map(|row| {
             satd_scalar(
@@ -717,4 +739,150 @@ unsafe fn satd_4x4_pair_avx2(src: [&[u8]; 2], reference: [&[u8]; 2], pitch: usiz
         _mm256_max_epi16(diffs, _mm256_srli_epi32::<16>(diffs)),
     );
     horizontal_sum(_mm256_madd_epi16(maxima, _mm256_set1_epi32(1)))
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[allow(unsafe_code, clippy::many_single_char_names)]
+mod simd128 {
+    use core::arch::wasm32::{
+        i16x8_abs, i16x8_add, i16x8_shuffle, i16x8_sub, i32x4_add, i32x4_extadd_pairwise_i16x8,
+        i32x4_extract_lane, i32x4_shuffle, u8x16_sub_sat, u16x8_extadd_pairwise_u8x16,
+        u16x8_load_extend_u8x8, u32x4_extadd_pairwise_u16x8, v128, v128_load, v128_load32_zero,
+        v128_load64_zero, v128_or,
+    };
+
+    fn span(width: usize, height: usize, pitch: usize) -> usize {
+        (height - 1) * pitch + width
+    }
+
+    fn horizontal(v: v128) -> v128 {
+        let swapped = i16x8_shuffle::<1, 0, 3, 2, 5, 4, 7, 6>(v, v);
+        let sums = i16x8_add(v, swapped);
+        let diffs = i16x8_sub(v, swapped);
+        let u = i16x8_shuffle::<0, 8, 2, 10, 4, 12, 6, 14>(sums, diffs);
+        let w = i16x8_shuffle::<2, 3, 0, 1, 6, 7, 4, 5>(u, u);
+        i16x8_add(i16x8_abs(i16x8_add(u, w)), i16x8_abs(i16x8_sub(u, w)))
+    }
+
+    fn total(acc: v128) -> u32 {
+        let folded = i32x4_add(acc, i32x4_shuffle::<2, 3, 0, 1>(acc, acc));
+        let folded = i32x4_add(folded, i32x4_shuffle::<1, 0, 3, 2>(folded, folded));
+        i32x4_extract_lane::<0>(folded) as u32
+    }
+
+    unsafe fn row8(src: *const u8, reference: *const u8) -> v128 {
+        unsafe {
+            i16x8_sub(
+                u16x8_load_extend_u8x8(src),
+                u16x8_load_extend_u8x8(reference),
+            )
+        }
+    }
+
+    unsafe fn row4x2(src: *const u8, sp: usize, reference: *const u8, rp: usize) -> v128 {
+        let mut a = [0u8; 8];
+        let mut b = [0u8; 8];
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, a.as_mut_ptr(), 4);
+            std::ptr::copy_nonoverlapping(src.add(sp), a.as_mut_ptr().add(4), 4);
+            std::ptr::copy_nonoverlapping(reference, b.as_mut_ptr(), 4);
+            std::ptr::copy_nonoverlapping(reference.add(rp), b.as_mut_ptr().add(4), 4);
+            row8(a.as_ptr(), b.as_ptr())
+        }
+    }
+
+    pub(super) fn satd(
+        src: &[u8],
+        sp: usize,
+        reference: &[u8],
+        rp: usize,
+        width: usize,
+        height: usize,
+    ) -> u32 {
+        assert!(src.len() >= span(width, height, sp) && reference.len() >= span(width, height, rp));
+        let (s, r) = (src.as_ptr(), reference.as_ptr());
+        let mut acc = v128_zero();
+        if width == 4 {
+            for ty in (0..height).step_by(4) {
+                let (top, bottom) = unsafe {
+                    (
+                        row4x2(s.add(ty * sp), sp, r.add(ty * rp), rp),
+                        row4x2(s.add((ty + 2) * sp), sp, r.add((ty + 2) * rp), rp),
+                    )
+                };
+                let sum = i16x8_add(top, bottom);
+                let diff = i16x8_sub(top, bottom);
+                let sum_swap = i16x8_shuffle::<4, 5, 6, 7, 0, 1, 2, 3>(sum, sum);
+                let diff_swap = i16x8_shuffle::<4, 5, 6, 7, 0, 1, 2, 3>(diff, diff);
+                let part = i16x8_add(
+                    i16x8_add(
+                        horizontal(i16x8_add(sum, sum_swap)),
+                        horizontal(i16x8_sub(sum, sum_swap)),
+                    ),
+                    i16x8_add(
+                        horizontal(i16x8_add(diff, diff_swap)),
+                        horizontal(i16x8_sub(diff, diff_swap)),
+                    ),
+                );
+                acc = i32x4_add(acc, i32x4_extadd_pairwise_i16x8(part));
+            }
+            return total(acc) / 8;
+        }
+        for ty in (0..height).step_by(4) {
+            for tx in (0..width).step_by(8) {
+                let d: [v128; 4] = std::array::from_fn(|k| unsafe {
+                    row8(s.add((ty + k) * sp + tx), r.add((ty + k) * rp + tx))
+                });
+                let (a, b) = (i16x8_add(d[0], d[1]), i16x8_add(d[2], d[3]));
+                let (c, e) = (i16x8_sub(d[0], d[1]), i16x8_sub(d[2], d[3]));
+                let part = i16x8_add(
+                    i16x8_add(horizontal(i16x8_add(a, b)), horizontal(i16x8_sub(a, b))),
+                    i16x8_add(horizontal(i16x8_add(c, e)), horizontal(i16x8_sub(c, e))),
+                );
+                acc = i32x4_add(acc, i32x4_extadd_pairwise_i16x8(part));
+            }
+        }
+        total(acc) / 4
+    }
+
+    fn v128_zero() -> v128 {
+        core::arch::wasm32::i32x4_splat(0)
+    }
+
+    pub(super) fn sad(
+        src: &[u8],
+        sp: usize,
+        reference: &[u8],
+        rp: usize,
+        width: usize,
+        height: usize,
+    ) -> u32 {
+        assert!(src.len() >= span(width, height, sp) && reference.len() >= span(width, height, rp));
+        let (s, r) = (src.as_ptr(), reference.as_ptr());
+        let mut acc = v128_zero();
+        let mut wide = v128_zero();
+        for y in 0..height {
+            let mut x = 0;
+            while x < width {
+                let (a, b, step) = unsafe {
+                    let (a, b) = (s.add(y * sp + x), r.add(y * rp + x));
+                    if width - x >= 16 {
+                        (v128_load(a.cast()), v128_load(b.cast()), 16)
+                    } else if width - x >= 8 {
+                        (v128_load64_zero(a.cast()), v128_load64_zero(b.cast()), 8)
+                    } else {
+                        (v128_load32_zero(a.cast()), v128_load32_zero(b.cast()), 4)
+                    }
+                };
+                let d = v128_or(u8x16_sub_sat(a, b), u8x16_sub_sat(b, a));
+                acc = i16x8_add(acc, u16x8_extadd_pairwise_u8x16(d));
+                x += step;
+            }
+            if y % 32 == 31 {
+                wide = i32x4_add(wide, u32x4_extadd_pairwise_u16x8(acc));
+                acc = v128_zero();
+            }
+        }
+        total(i32x4_add(wide, u32x4_extadd_pairwise_u16x8(acc)))
+    }
 }

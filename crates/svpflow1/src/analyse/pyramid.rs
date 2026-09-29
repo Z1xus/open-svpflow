@@ -56,24 +56,31 @@ impl Pyramid {
         let top_settings = stage.settings(params, top, true);
         {
             let (f, b) = self.pair(top as usize);
-            f.search(
-                &first.level(top),
-                &second.level(top),
-                &top_settings,
-                global_forward,
-                None,
-                None,
+            let (first_top, second_top) = (first.level(top), second.level(top));
+            both(
+                || {
+                    f.search(
+                        &first_top,
+                        &second_top,
+                        &top_settings,
+                        global_forward,
+                        None,
+                        None,
+                    );
+                },
+                || {
+                    if let Some(b) = b {
+                        b.search(
+                            &second_top,
+                            &first_top,
+                            &top_settings,
+                            global_backward,
+                            None,
+                            None,
+                        );
+                    }
+                },
             );
-            if let Some(b) = b {
-                b.search(
-                    &second.level(top),
-                    &first.level(top),
-                    &top_settings,
-                    global_backward,
-                    None,
-                    None,
-                );
-            }
         }
         for level in (min_level..top).rev() {
             let settings = stage.settings(params, level, false);
@@ -111,19 +118,50 @@ impl Pyramid {
             }
             let (src, reference) = (first.level(level), second.level(level));
             let lambda = Some(&mut *lambda_out);
-            f.search(
-                &src,
-                &reference,
-                &settings,
-                global_forward,
-                lambda,
-                if finest { out_forward.take() } else { None },
-            );
+            let out_f = if finest { out_forward.take() } else { None };
+            let out_b = if finest { out_backward.take() } else { None };
+            if cfg!(target_arch = "wasm32") {
+                let settings = &settings;
+                let (src_ref, reference_ref) = (&src, &reference);
+                let b_ref = b.as_deref_mut();
+                both(
+                    || {
+                        f.search(
+                            src_ref,
+                            reference_ref,
+                            settings,
+                            global_forward,
+                            lambda,
+                            out_f,
+                        );
+                    },
+                    || {
+                        if let Some(b) = b_ref {
+                            b.search(
+                                reference_ref,
+                                src_ref,
+                                settings,
+                                global_backward,
+                                None,
+                                out_b,
+                            );
+                        }
+                    },
+                );
+                if finest {
+                    on_finest(0, f, *lambda_out);
+                    if let Some(b) = b {
+                        on_finest(1, b, *lambda_out);
+                    }
+                }
+                continue;
+            }
+            f.search(&src, &reference, &settings, global_forward, lambda, out_f);
             if finest {
                 on_finest(0, f, *lambda_out);
             }
             if let Some(b) = b {
-                let out = if finest { out_backward.take() } else { None };
+                let out = out_b;
                 b.search(&reference, &src, &settings, global_backward, None, out);
                 if finest {
                     on_finest(1, b, *lambda_out);
@@ -159,10 +197,15 @@ impl Pyramid {
         let (src, reference) = (first.level(0), second.level(0));
         let (f, b) = self.pair(0);
         if session.is_none() {
-            f.recalculate(&src, &reference, &settings, Some(lambda_out), out_forward);
-            if let Some(b) = b {
-                b.recalculate(&reference, &src, &settings, None, out_backward);
-            }
+            let (src, reference, settings) = (&src, &reference, &settings);
+            both(
+                || f.recalculate(src, reference, settings, Some(lambda_out), out_forward),
+                || {
+                    if let Some(b) = b {
+                        b.recalculate(reference, src, settings, None, out_backward);
+                    }
+                },
+            );
             return;
         }
         let mut plans = [RecalcPlan::default(), RecalcPlan::default()];
@@ -300,6 +343,13 @@ impl Pyramid {
             field.finish_recalculate(&start.plan, &bests, output);
         }
     }
+}
+
+fn both<A: Send, B: Send>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B + Send) -> (A, B) {
+    #[cfg(target_arch = "wasm32")]
+    return rayon::join(a, b);
+    #[cfg(not(target_arch = "wasm32"))]
+    (a(), b())
 }
 
 fn order_level(fields: &mut [Option<Field>], level: usize, sort: bool) {
