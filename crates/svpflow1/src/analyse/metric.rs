@@ -535,16 +535,76 @@ pub(crate) struct WideLuma<const W: usize, const H: usize> {
 
 #[cfg(target_arch = "x86_64")]
 impl<const W: usize, const H: usize> WideLuma<W, H> {
-    #[inline]
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-    pub(crate) unsafe fn new(src: &[u8]) -> Self {
-        assert!(src.len() >= W * H);
-        let mut rows = [[core::arch::x86_64::_mm512_setzero_si512(); 2]; 4];
-        for (index, (ty, tx)) in tiles::<W, H>().enumerate() {
-            rows[index] = unsafe { widen_8x8_avx512(src.as_ptr().add(ty * W + tx), W) };
-        }
-        Self { rows }
+    pub(crate) unsafe fn from_source(source: &WideSource) -> Self {
+        Self { rows: source.rows }
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct WideSource {
+    #[cfg(target_arch = "x86_64")]
+    rows: [[core::arch::x86_64::__m512i; 2]; 4],
+}
+
+impl Default for WideSource {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+impl WideSource {
+    pub(crate) fn prepare(&mut self, wide: Wide, src: &[u8]) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match wide {
+                Wide::S8x8 => fill_wide::<8, 8>(&mut self.rows, src),
+                Wide::S16x8 => fill_wide::<16, 8>(&mut self.rows, src),
+                Wide::S16x16 => fill_wide::<16, 16>(&mut self.rows, src),
+            }
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (self, wide, src);
+            unreachable!()
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "x86_64"), allow(clippy::trivially_copy_pass_by_ref))]
+    pub(crate) fn cost(&self, wide: Wide, reference: &[u8], pitch: usize) -> u32 {
+        #[cfg(target_arch = "x86_64")]
+        match wide {
+            Wide::S8x8 => wide_cost::<8, 8>(&self.rows, reference, pitch),
+            Wide::S16x8 => wide_cost::<16, 8>(&self.rows, reference, pitch),
+            Wide::S16x16 => wide_cost::<16, 16>(&self.rows, reference, pitch),
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (self, wide, reference, pitch);
+            unreachable!()
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn fill_wide<const W: usize, const H: usize>(
+    rows: &mut [[core::arch::x86_64::__m512i; 2]; 4],
+    src: &[u8],
+) {
+    assert!(src.len() >= W * H);
+    for (index, (ty, tx)) in tiles::<W, H>().enumerate() {
+        rows[index] = unsafe { widen_8x8_avx512(src.as_ptr().add(ty * W + tx), W) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn wide_cost<const W: usize, const H: usize>(
+    rows: &[[core::arch::x86_64::__m512i; 2]; 4],
+    reference: &[u8],
+    pitch: usize,
+) -> u32 {
+    assert!(reference.len() >= (H - 1) * pitch + W);
+    unsafe { satd_wide::<W, H>(rows, reference.as_ptr(), pitch) }
 }
 
 #[cfg(target_arch = "x86_64")]

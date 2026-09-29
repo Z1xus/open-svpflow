@@ -504,6 +504,8 @@ impl Field {
             active: 0,
             block_luma: 0,
             scratch: [0; MAX_BLOCK_AREA],
+            wide_src: Default::default(),
+            wide_ready: [false; 2],
             flat: [0; MAX_BLOCK_AREA],
             blurred: [0; MAX_BLOCK_AREA],
         };
@@ -721,6 +723,8 @@ struct BlockSearch<'a> {
     active: usize,
     block_luma: i32,
     scratch: [u8; MAX_BLOCK_AREA],
+    wide_src: [metric::WideSource; 2],
+    wide_ready: [bool; 2],
     flat: [u8; MAX_BLOCK_AREA],
     blurred: [u8; MAX_BLOCK_AREA],
 }
@@ -772,6 +776,7 @@ impl BlockSearch<'_> {
     fn set_half(&mut self, half: bool, full: Kernels, half_kernels: Kernels, layout: BlockLayout) {
         let shape = Shape::new(layout.width as usize, layout.height as usize);
         self.half = half;
+        self.wide_ready = [false; 2];
         (self.kernels, self.shape) = if half {
             (half_kernels, shape.half())
         } else {
@@ -791,6 +796,16 @@ impl BlockSearch<'_> {
         self.src
             .y
             .copy_block(offset, self.shape, &mut self.buffers[set].y);
+        self.wide_ready[set] = false;
+    }
+
+    fn wide_source(&mut self, wide: metric::Wide) -> &metric::WideSource {
+        let set = self.active;
+        if !self.wide_ready[set] {
+            self.wide_src[set].prepare(wide, &self.buffers[set].y);
+            self.wide_ready[set] = true;
+        }
+        &self.wide_src[set]
     }
 
     fn copy_chroma(&mut self, set: usize) {
@@ -861,8 +876,14 @@ impl BlockSearch<'_> {
             self.state.pos[0] * self.pel + vx,
             self.state.pos_y[0] * self.pel + vy,
         );
+        if let Some(wide) = self.kernels.wide {
+            self.wide_source(wide);
+        }
         let (block, pitch) = plane.block(offset, self.shape, &mut self.scratch);
-        (self.kernels.luma)(&self.buffers[self.active].y, block, pitch) as i32
+        match self.kernels.wide {
+            Some(wide) => self.wide_src[self.active].cost(wide, block, pitch) as i32,
+            None => (self.kernels.luma)(&self.buffers[self.active].y, block, pitch) as i32,
+        }
     }
 
     fn chroma_sad(&mut self, vx: i32, vy: i32) -> i32 {
@@ -996,18 +1017,19 @@ impl BlockSearch<'_> {
         let spans = (luma_span, chroma_span);
         #[cfg(target_arch = "x86_64")]
         if let Some(wide) = self.kernels.wide {
+            use metric::Wide::{S8x8, S16x8, S16x16};
             let ranges = ((min_x, max_x), (min_y, max_y));
             unsafe {
                 match (pel, wide) {
-                    (1, metric::Wide::S8x8) => self.exhaustive_wide::<0, 8, 8>(ranges, spans),
-                    (1, metric::Wide::S16x8) => self.exhaustive_wide::<0, 16, 8>(ranges, spans),
-                    (1, metric::Wide::S16x16) => self.exhaustive_wide::<0, 16, 16>(ranges, spans),
-                    (2, metric::Wide::S8x8) => self.exhaustive_wide::<1, 8, 8>(ranges, spans),
-                    (2, metric::Wide::S16x8) => self.exhaustive_wide::<1, 16, 8>(ranges, spans),
-                    (2, metric::Wide::S16x16) => self.exhaustive_wide::<1, 16, 16>(ranges, spans),
-                    (_, metric::Wide::S8x8) => self.exhaustive_wide::<2, 8, 8>(ranges, spans),
-                    (_, metric::Wide::S16x8) => self.exhaustive_wide::<2, 16, 8>(ranges, spans),
-                    (_, metric::Wide::S16x16) => self.exhaustive_wide::<2, 16, 16>(ranges, spans),
+                    (1, S8x8) => self.exhaustive_wide::<0, 8, 8>(wide, ranges, spans),
+                    (1, S16x8) => self.exhaustive_wide::<0, 16, 8>(wide, ranges, spans),
+                    (1, S16x16) => self.exhaustive_wide::<0, 16, 16>(wide, ranges, spans),
+                    (2, S8x8) => self.exhaustive_wide::<1, 8, 8>(wide, ranges, spans),
+                    (2, S16x8) => self.exhaustive_wide::<1, 16, 8>(wide, ranges, spans),
+                    (2, S16x16) => self.exhaustive_wide::<1, 16, 16>(wide, ranges, spans),
+                    (_, S8x8) => self.exhaustive_wide::<2, 8, 8>(wide, ranges, spans),
+                    (_, S16x8) => self.exhaustive_wide::<2, 16, 8>(wide, ranges, spans),
+                    (_, S16x16) => self.exhaustive_wide::<2, 16, 16>(wide, ranges, spans),
                 }
             }
             return true;
@@ -1043,11 +1065,12 @@ impl BlockSearch<'_> {
     #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
     unsafe fn exhaustive_wide<const BITS: u32, const W: usize, const H: usize>(
         &mut self,
+        wide: metric::Wide,
         ranges: ((i32, i32), (i32, i32)),
         spans: (usize, usize),
     ) {
+        let luma = unsafe { metric::WideLuma::<W, H>::from_source(self.wide_source(wide)) };
         let buffer = &self.buffers[self.active];
-        let luma = unsafe { metric::WideLuma::<W, H>::new(&buffer.y) };
         #[cfg(target_feature = "avx2")]
         if self.kernels.pair.is_some() && (W, H) == (8, 8) {
             let chroma = metric::Pair4x4 {
