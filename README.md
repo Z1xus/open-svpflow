@@ -1,8 +1,8 @@
 # open-svpflow
 
-open-svpflow is a drop-in open-source replacement for SVPFlow's VapourSynth plugins in Rust.
+open-svpflow is a drop-in open-source replacement for SVPFlow's VapourSynth plugins in Rust. It produces the same frames as SVPFlow (matched to version 4.3.0.168) and runs faster on both CPU and GPU.
 
-I made it as a side project, mostly to see if I could get couler's [smoothie-rs](https://github.com/couleur-tweak-tips/smoothie-rs) running in a browser. The [demo](https://smoothie.z1x.us) is the result:
+It started as a side project, mostly to see if I could get couler's [smoothie-rs](https://github.com/couleur-tweak-tips/smoothie-rs) running in a browser. The [demo](https://smoothie.z1x.us) is the result:
 
 [![open-svpflow running in the browser](docs/assets/demo.png)](https://smoothie.z1x.us)
 
@@ -13,15 +13,18 @@ This proof of concept runs open-svpflow's analysis pipeline as WASM and renders 
 - `svpflow1`: `Super` and `Analyse`, including super-frame pyramids, multi-level predictors, SAD/SATD and chroma costs, and hex2, UMH, and exhaustive motion search.
 - `svpflow2`: `SmoothFps` rendering for algorithms 1, 2, 11, 13, 21, 22, and 23, with scene handling, masks, CPU rendering, and the GPU path.
 - Native I444 input and output, which the original SVPFlow doesn't support.
+- Part of the motion search runs on the GPU too when GPU rendering is on, which takes a lot of load off the CPU.
 
-Output is close, but not byte-exact (yet)
+Output matches the original byte for byte in everything I've tested, on both CPU and GPU. But GPU algorithms 1 and 2 are the exception, since the original reads uninitialized memory there and doesn't even match its own previous run (±1 on about 0.01% of pixels, same as ours). So it should work anywhere SVPFlow already does, whether that's smoothie, SVP itself, mpv or your own scripts.
 
-Benchmarked on a 7,992 frame video with [smoothie's](https://github.com/couleur-tweak-tips/smoothie-rs) `faster` preset:
+Benchmarked on a 1080p 200 fps Counter-Strike 2 clip interpolated to 1920 fps through [smoothie's](https://github.com/couleur-tweak-tips/smoothie-rs) VapourSynth script (Ryzen 5 7600X, RTX 4060, Linux):
 
-| Path | Original | open-svpflow | Speed vs original | SSIM parity | PSNR |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| CPU | 61.50 fps | 61.45 fps | 0.999x (0.1% slower) | 98.75% | 45.24 dB |
-| GPU | 83.58 fps | 82.19 fps | 0.983x (1.7% slower) | 98.77% | 43.57 dB |
+| Preset | Path | Original | open-svpflow | Speed vs original | Output |
+| --- | --- | ---: | ---: | ---: | --- |
+| `faster` | CPU | 307.1 fps | 563.0 fps | 1.83x | identical |
+| `faster` | GPU | 1180.1 fps | 1472.0 fps | 1.25x | identical |
+| `medium` (default) | CPU | 224.8 fps | 401.1 fps | 1.78x | identical |
+| `medium` (default) | GPU | 312.7 fps | 432.9 fps | 1.38x | identical |
 
 ## Releases
 
