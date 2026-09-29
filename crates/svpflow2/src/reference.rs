@@ -125,9 +125,9 @@ impl Merged {
 
 impl FilterState {
     pub(crate) fn reference_enabled(&self) -> bool {
-        matches!(self.mode, Mode::SmoothFps)
+        (matches!(self.mode, Mode::SmoothFps) || self.nvof.is_some())
             && (self.render_mode == 1 || (self.render_mode == 2 && self.gpu.is_some()))
-            && !self.source_8bit_mode
+            && (!self.source_8bit_mode || self.nvof.is_some())
             && !(self.render_mode == 2 && self.options.block_enabled())
             && self.options.reference_supported()
             && matches!(self.vector_data(), metadata::VectorRecord::Ready(_))
@@ -355,9 +355,59 @@ impl FilterState {
             }
         }
         let reach = if params.level >= 2 { 2 } else { 1 };
+        if self.nvof.is_some() {
+            for k in n..=n + 1 + nvof_extra(&params) {
+                request_node(request_frame, self.clips.vec_src, k, frame_ctx);
+            }
+            return;
+        }
         for k in (n - reach).max(0)..=n + reach {
             request_node(request_frame, self.clips.vectors, k, frame_ctx);
         }
+    }
+
+    fn with_vectors<R>(
+        &self,
+        fetch: &Fetch,
+        api: &frame::PlaneApi,
+        (k, n): (i32, i32),
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
+        if let Some(nvof) = self.nvof.as_ref() {
+            let payload = match nvof.cached(k) {
+                Some(payload) => payload,
+                None if k < n || k > n + nvof_extra(&self.options.reference()) => return None,
+                None => {
+                    let metadata::VectorRecord::Ready(data) = self.vector_data() else {
+                        return None;
+                    };
+                    let (w, h) = nvof.dimensions();
+                    let current = fetch.get(self.clips.vec_src, k);
+                    let next = fetch.get(self.clips.vec_src, k + 1);
+                    let packed = unsafe {
+                        (
+                            crate::core::pack_nv12_frame(api, current, w, h),
+                            crate::core::pack_nv12_frame(api, next, w, h),
+                        )
+                    };
+                    fetch.drop(current);
+                    fetch.drop(next);
+                    let (Some(current), Some(next)) = packed else {
+                        return None;
+                    };
+                    nvof.generate(k, &current, &next, data).ok()?
+                }
+            };
+            return Some(f(&payload));
+        }
+        let vectors = fetch.get(self.clips.vectors, k);
+        if vectors.is_null() {
+            return None;
+        }
+        let result = unsafe { api.read_plane(vectors, 0, 1) }
+            .map(|(ptr, stride, len)| f(unsafe { slice::from_raw_parts(ptr, len.max(stride)) }));
+        fetch.drop(vectors);
+        result
     }
 
     #[allow(clippy::too_many_lines)]
@@ -404,16 +454,8 @@ impl FilterState {
             scene: params.scene,
         };
         let load = |field: &mut VectorField, k: i32| {
-            let vectors = fetch.get(self.clips.vectors, k);
-            if vectors.is_null() {
-                return false;
-            }
-            if let Some((ptr, stride, len)) = unsafe { api.read_plane(vectors, 0, 1) } {
-                let payload = unsafe { slice::from_raw_parts(ptr, len.max(stride)) };
-                field.update(payload);
-            }
-            fetch.drop(vectors);
-            true
+            self.with_vectors(&fetch, &api, (k, n), |payload| field.update(payload))
+                .is_some()
         };
         let mut quality = |field: &mut VectorField, k: i32| -> i32 {
             if let Some(class) = self.cached_quality(k, &mut luma) {
@@ -655,12 +697,7 @@ impl FilterState {
         let mut extended = false;
         if neighbors_ok && algo == 23 && !neither {
             let load = |field: &mut VectorField, k: i32| {
-                let vectors = fetch.get(self.clips.vectors, k);
-                if let Some((ptr, stride, len)) = unsafe { api.read_plane(vectors, 0, 1) } {
-                    let payload = unsafe { slice::from_raw_parts(ptr, len.max(stride)) };
-                    field.update(payload);
-                }
-                fetch.drop(vectors);
+                self.with_vectors(fetch, api, (k, n), |payload| field.update(payload));
             };
             load(field, n - 1);
             field.pack(true, &mut prev_x, &mut prev_y, width, height);
@@ -1116,4 +1153,8 @@ fn draw_vectors(
             }
         }
     }
+}
+
+fn nvof_extra(params: &ReferenceParams) -> i32 {
+    i32::from(params.level != 0 || params.algo == 23 || params.algo > 89)
 }

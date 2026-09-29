@@ -321,7 +321,7 @@ unsafe fn collect_state(
         metadata::scene_luma_lut(3, options.scene_luma()),
     ];
 
-    let gpu = if mode == 0 && render_mode == 2 && !options.cpu_render() {
+    let gpu = if mode <= 1 && render_mode == 2 && !options.cpu_render() {
         crate::gpu::GpuContext::new(
             i32::try_from(options.gpu_id()).unwrap_or(0),
             options.gpu_qn(),

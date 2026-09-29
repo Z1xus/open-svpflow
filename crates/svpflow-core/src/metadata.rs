@@ -521,8 +521,9 @@ fn encode_region(payload: &mut [u8], offset: usize, count: usize, vectors: &[Dec
         let cursor = offset
             .saturating_add(4)
             .saturating_add(index.saturating_mul(8));
-        let raw0 = u32::from(u16::from_ne_bytes(vector.dy.to_ne_bytes()))
-            | (u32::from(u16::from_ne_bytes(vector.dx.to_ne_bytes())) << 16);
+        let raw0 = (i32::from(vector.dx) << 16)
+            .wrapping_add(i32::from(vector.dy))
+            .cast_unsigned();
         let raw1 = (u32::from(vector.luma) << 24) | (vector.score & 0x00FF_FFFF);
         write_u32_slice(payload, cursor, raw0);
         write_u32_slice(payload, cursor.saturating_add(4), raw1);

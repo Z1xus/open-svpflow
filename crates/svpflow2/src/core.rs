@@ -3291,7 +3291,7 @@ unsafe fn decode_frame_vectors(
     )
 }
 
-unsafe fn pack_nv12_frame(
+pub(crate) unsafe fn pack_nv12_frame(
     api: &frame::PlaneApi,
     frame: vs::ConstRaw,
     width: usize,
