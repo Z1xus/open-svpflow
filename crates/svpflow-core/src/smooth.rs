@@ -634,6 +634,7 @@ pub enum Algo {
     NoMaskSad { median: bool },
     NormalSad { simple: bool },
     Extended,
+    ExtendedSad,
     Fill,
 }
 
@@ -984,6 +985,36 @@ impl Renderer {
                     aux,
                     planes,
                     |out, p, base, n, l| row::extended(out, p, base, n, l, &weights),
+                );
+            }
+            Algo::ExtendedSad => {
+                let (bx, by) = vec2(v.bwd_x, v.bwd_y, fwd);
+                let (fx, fy) = vec2(v.fwd_x, v.fwd_y, rev);
+                let (px, py) = vec2(v.prev_bwd_x, v.prev_bwd_y, fwd);
+                let (nx, ny) = vec2(v.next_fwd_x, v.next_fwd_y, rev);
+                let (m9, m8) = (mask(v.cover_fwd), mask(v.cover_bwd));
+                let sad = mask(v.sad);
+                self.walk(
+                    pass,
+                    interp,
+                    [&bx, &by, &fx, &fy, &px, &py, &nx, &ny, &m9, &m8, &sad],
+                    [
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(v.cover_fwd),
+                        Some(v.cover_bwd),
+                        Some(v.sad),
+                    ],
+                    false,
+                    aux,
+                    planes,
+                    |out, p, base, n, l| row::extended_sad(out, p, base, n, l, &weights),
                 );
             }
             Algo::Fill => {}
@@ -1675,6 +1706,43 @@ mod row {
                 shr8(add(add(mul(sub(full, s), value), mul(s, mid)), full))
             });
         }
+
+        pub(in super::super) fn extended_sad(
+            out: &mut [u8],
+            p: &Prepared<'_>,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 11],
+            w: &Weights,
+        ) {
+            let (t, rt, tb, rtb, full) = (
+                splat(w.t),
+                splat(w.rt),
+                splat(w.tb),
+                splat(w.rtb),
+                splat(255),
+            );
+            p.run(out, base, n, |c, chunk, start| {
+                let c0 = p.b.fetch(p.at(chunk, l[0], l[1], c));
+                let n0 = p.a.fetch(p.at(chunk, l[2], l[3], c));
+                let c1 = p.b.fetch(p.at(chunk, l[4], l[5], c));
+                let n1 = p.a.fetch(p.at(chunk, l[6], l[7], c));
+                let m9 = p.lane(l[8], c);
+                let m8 = p.lane(l[9], c);
+                let s = p.lane(l[10], c);
+                let lo = min(c0, n0);
+                let hi = max(c0, n0);
+                let cn = max(lo, min(n1, hi));
+                let cc = max(lo, min(c1, hi));
+                let first = shr8(add(add(mul(m9, cn), mul(c0, sub(full, m9))), full));
+                let second = shr8(add(add(mul(m8, cc), mul(n0, sub(full, m8))), full));
+                let value = shr8(add(mul(rt, first), mul(t, second)));
+                let b0 = p.b.still(start, chunk);
+                let a0 = p.a.still(start, chunk);
+                let mid = shr8(add(mul(rtb, b0), mul(tb, a0)));
+                shr8(add(add(mul(sub(full, s), value), mul(s, mid)), full))
+            });
+        }
     }
 
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
@@ -1925,10 +1993,39 @@ mod row {
                 *o = (((255 - s) * value + s * mid + 255) >> 8) as u8;
             }
         }
+
+        pub(in super::super) fn extended_sad(
+            out: &mut [u8],
+            p: &Prepared<'_>,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 11],
+            w: &Weights,
+        ) {
+            for (c, o) in out.iter_mut().enumerate().take(n) {
+                let c0 = p.at(p.b, base, l[0], l[1], c);
+                let n0 = p.at(p.a, base, l[2], l[3], c);
+                let c1 = p.at(p.b, base, l[4], l[5], c);
+                let n1 = p.at(p.a, base, l[6], l[7], c);
+                let (m9, m8, s) = (p.lane(l[8], c), p.lane(l[9], c), p.lane(l[10], c));
+                let lo = c0.min(n0);
+                let hi = c0.max(n0);
+                let cn = lo.max(n1.min(hi));
+                let cc = lo.max(c1.min(hi));
+                let first = (m9 * cn + c0 * (255 - m9) + 255) >> 8;
+                let second = (m8 * cc + n0 * (255 - m8) + 255) >> 8;
+                let value = (w.rt * first + w.t * second) >> 8;
+                let b0 = p.still(p.b, base, c);
+                let a0 = p.still(p.a, base, c);
+                let mid = (w.rtb * b0 + w.tb * a0) >> 8;
+                *o = (((255 - s) * value + s * mid + 255) >> 8) as u8;
+            }
+        }
     }
 
     pub(super) use imp::{
-        Prepared, extended, fast, fast_sad, fill, no_mask, no_mask_sad, normal, normal_sad,
+        Prepared, extended, extended_sad, fast, fast_sad, fill, no_mask, no_mask_sad, normal,
+        normal_sad,
     };
 
     const _: () = assert!(MAX_STEP.is_multiple_of(8));

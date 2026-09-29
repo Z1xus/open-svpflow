@@ -783,6 +783,7 @@ impl FilterState {
             13 if sad_on => Algo::NoMaskSad { median: true },
             21 if sad_on => Algo::NormalSad { simple: true },
             22 if sad_on => Algo::NormalSad { simple: false },
+            23 if sad_on => Algo::ExtendedSad,
             1 => Algo::Fast { next: true },
             2 => Algo::Fast { next: false },
             11 => Algo::NoMask { median: false },
