@@ -567,56 +567,16 @@ impl FilterState {
         if self.render_mode == 2
             && let Some(gpu) = self.gpu.as_ref()
         {
-            let area_blend = params.area_blend;
-            let gpu_time = if selected == 1 { 256 - time } else { time };
-            let fraction = (f64::from(gpu_time) * 0.003_906_25) as f32;
-            let blend = area_blend as f32;
-            let sad_blend = if gpu_time > 126 {
-                (1.0 - f64::from(blend * (1.0 - f64::from(fraction)) as f32)) as f32
-            } else {
-                fraction * blend
-            };
-            let cubic = params.cubic & 1 != 0;
-            let cubic_ref = params.cubic & 2 != 0;
-            let linear = params.linear && self.video_info.width < 3001;
-            let block = vector_data.effective_block();
-            let make = |chroma: bool, offset_x: i32, offset_y: i32| crate::gpu::KernelParams {
-                algorithm: selected,
-                width: if chroma {
-                    self.video_info.width / 2
-                } else {
-                    self.video_info.width
-                },
-                height: if chroma {
-                    self.video_info.height / 2
-                } else {
-                    self.video_info.height
-                },
-                x_ratio: if chroma { 2 } else { 1 },
-                y_ratio: if chroma { 2 } else { 1 },
-                pel: shape.pel,
-                block_w: if cubic {
-                    block.width
-                } else {
-                    block.width * width
-                },
-                block_h: if cubic {
-                    block.height
-                } else {
-                    block.height * height
-                },
-                origin_x: shape.overlap_x / 2,
-                origin_y: shape.overlap_y / 2,
-                phase: gpu_time,
-                has_sad: i32::from(sad_masks.is_some()),
-                linear_luma: i32::from(!chroma && linear),
-                cubic: i32::from(cubic),
-                cubic_ref: i32::from(cubic_ref),
-                offset_x,
-                offset_y,
-                sad_blend,
-                dither: i32::from(self.options.dither()),
-            };
+            let linear = engine::gpu_linear(params, self.video_info.width);
+            let kernel_params = engine::gpu_params(
+                params,
+                vector_data,
+                (self.video_info.width, self.video_info.height),
+                selected,
+                time,
+                sad_masks.is_some(),
+                self.options.dither(),
+            );
             let output = unsafe {
                 self.reference_gpu(
                     api,
@@ -625,11 +585,7 @@ impl FilterState {
                     next_source,
                     n,
                     frame,
-                    [
-                        make(false, 0, 0),
-                        make(true, 0, self.video_info.height),
-                        make(true, self.video_info.width / 2, self.video_info.height),
-                    ],
+                    kernel_params,
                     linear,
                     width,
                     height,

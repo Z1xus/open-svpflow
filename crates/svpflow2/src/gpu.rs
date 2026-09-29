@@ -610,29 +610,7 @@ impl GpuContext {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct KernelParams {
-    pub algorithm: i32,
-    pub width: i32,
-    pub height: i32,
-    pub x_ratio: i32,
-    pub y_ratio: i32,
-    pub pel: i32,
-    pub block_w: i32,
-    pub block_h: i32,
-    pub origin_x: i32,
-    pub origin_y: i32,
-    pub phase: i32,
-    pub has_sad: i32,
-    pub linear_luma: i32,
-    pub cubic: i32,
-    pub cubic_ref: i32,
-    pub offset_x: i32,
-    pub offset_y: i32,
-    pub sad_blend: f32,
-    pub dither: i32,
-}
+pub use svpflow_core::smooth_engine::GpuParams as KernelParams;
 
 struct Buf<'a> {
     ctx: &'a GpuContext,

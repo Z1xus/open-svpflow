@@ -412,6 +412,93 @@ pub fn render_shape(data: &VectorData, width: i32, height: i32, blend: f64) -> R
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuParams {
+    pub algorithm: i32,
+    pub width: i32,
+    pub height: i32,
+    pub x_ratio: i32,
+    pub y_ratio: i32,
+    pub pel: i32,
+    pub block_w: i32,
+    pub block_h: i32,
+    pub origin_x: i32,
+    pub origin_y: i32,
+    pub phase: i32,
+    pub has_sad: i32,
+    pub linear_luma: i32,
+    pub cubic: i32,
+    pub cubic_ref: i32,
+    pub offset_x: i32,
+    pub offset_y: i32,
+    pub sad_blend: f32,
+    pub dither: i32,
+}
+
+pub const fn gpu_linear(params: &ReferenceParams, width: i32) -> bool {
+    params.linear && width < 3001
+}
+
+pub fn gpu_params(
+    params: &ReferenceParams,
+    data: &VectorData,
+    (width, height): (i32, i32),
+    selected: i32,
+    time: i32,
+    has_sad: bool,
+    dither: bool,
+) -> [GpuParams; 3] {
+    let shape = FieldShape::from_data(data);
+    let (grid_w, grid_h) = (shape.packed_width(), shape.packed_height());
+    let gpu_time = if selected == 1 { 256 - time } else { time };
+    let fraction = (f64::from(gpu_time) * 0.003_906_25) as f32;
+    let blend = params.area_blend as f32;
+    let sad_blend = if gpu_time > 126 {
+        (1.0 - f64::from(blend * (1.0 - f64::from(fraction)) as f32)) as f32
+    } else {
+        fraction * blend
+    };
+    let cubic = params.cubic & 1 != 0;
+    let cubic_ref = params.cubic & 2 != 0;
+    let linear = gpu_linear(params, width);
+    let block = data.effective_block();
+    let make = |chroma: bool, offset_x: i32, offset_y: i32| GpuParams {
+        algorithm: selected,
+        width: if chroma { width / 2 } else { width },
+        height: if chroma { height / 2 } else { height },
+        x_ratio: if chroma { 2 } else { 1 },
+        y_ratio: if chroma { 2 } else { 1 },
+        pel: shape.pel,
+        block_w: if cubic {
+            block.width
+        } else {
+            block.width * grid_w
+        },
+        block_h: if cubic {
+            block.height
+        } else {
+            block.height * grid_h
+        },
+        origin_x: shape.overlap_x / 2,
+        origin_y: shape.overlap_y / 2,
+        phase: gpu_time,
+        has_sad: i32::from(has_sad),
+        linear_luma: i32::from(!chroma && linear),
+        cubic: i32::from(cubic),
+        cubic_ref: i32::from(cubic_ref),
+        offset_x,
+        offset_y,
+        sad_blend,
+        dither: i32::from(dither),
+    };
+    [
+        make(false, 0, 0),
+        make(true, 0, height),
+        make(true, width / 2, height),
+    ]
+}
+
 pub fn interleave_pel(
     subplanes: &[u8],
     width: usize,
