@@ -897,11 +897,11 @@ impl Renderer {
         } else {
             (0, 0)
         };
+        let count = s.grid_w.wrapping_mul(s.grid_h);
         let at = |cx: i32, cy: i32| {
-            let index = cy
-                .wrapping_mul(s.grid_w)
-                .wrapping_add(cx)
-                .wrapping_add(skip);
+            let direct = cy.wrapping_mul(s.grid_w).wrapping_add(cx);
+            let skipped = direct.wrapping_add(skip);
+            let index = if skipped < count { skipped } else { direct };
             usize::try_from(index)
                 .ok()
                 .and_then(|index| buf.get(index))
