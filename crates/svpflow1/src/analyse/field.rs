@@ -1,6 +1,6 @@
 use super::metric::{self, Kernel, Shape};
 
-use super::planes::{LevelFrame, MAX_BLOCK_AREA};
+use super::planes::{LevelFrame, MAX_BLOCK_AREA, PlaneView};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Mv {
@@ -499,6 +499,7 @@ impl Field {
             shape: Shape::new(self.layout.width as usize, self.layout.height as usize),
             state: BlockState::default(),
             buffers: Default::default(),
+            planes_fit: planes_fit(reference, self.pel),
             active: 0,
             block_luma: 0,
             scratch: [0; MAX_BLOCK_AREA],
@@ -619,6 +620,19 @@ impl Field {
     }
 }
 
+fn planes_fit(frame: &LevelFrame<'_>, pel: i32) -> bool {
+    let fits = |plane: &PlaneView<'_>| {
+        plane.width > 0
+            && plane.height > 0
+            && plane.subpel_extent(
+                (0, pel * (plane.width - 1)),
+                (0, pel * (plane.height - 1)),
+                1,
+            )
+    };
+    frame.u.pitch == frame.v.pitch && fits(&frame.y) && fits(&frame.u) && fits(&frame.v)
+}
+
 fn packed_score(best: Mv, diagonal: i32, block_luma: i32) -> u32 {
     let mut sad = best.sad;
     let relative = (i32::from(best.x).abs() + i32::from(best.y).abs()) * 100 / diagonal;
@@ -702,6 +716,7 @@ struct BlockSearch<'a> {
     shape: Shape,
     state: BlockState,
     buffers: [SourceBlock; 2],
+    planes_fit: bool,
     active: usize,
     block_luma: i32,
     scratch: [u8; MAX_BLOCK_AREA],
@@ -941,11 +956,13 @@ impl BlockSearch<'_> {
         let (y, u, v) = (self.reference.y, self.reference.u, self.reference.v);
         let luma_span = self.shape.span(y.pitch);
         let (lx, ly) = (s.pos[0] * pel, s.pos_y[0] * pel);
-        if !y.subpel_extent(
-            (lx + min_x, lx + max_x),
-            (ly + min_y, ly + max_y),
-            luma_span,
-        ) {
+        if !self.planes_fit
+            && !y.subpel_extent(
+                (lx + min_x, lx + max_x),
+                (ly + min_y, ly + max_y),
+                luma_span,
+            )
+        {
             return false;
         }
         let (sx, sy) = self.chroma_shift;
@@ -953,7 +970,7 @@ impl BlockSearch<'_> {
         let chroma_shape = self.chroma_shape();
         let chroma_span = chroma_shape.span(u.pitch);
         let (cx, cy) = (s.pos[1] * pel, s.pos_y[1] * pel);
-        if chroma {
+        if chroma && !self.planes_fit {
             let xs = (cx + (min_x >> sx), cx + (max_x >> sx));
             let ys = (cy + (min_y >> sy), cy + (max_y >> sy));
             if u.pitch != v.pitch
