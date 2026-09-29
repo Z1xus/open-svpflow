@@ -268,67 +268,59 @@ impl VectorField {
         let stride = (width + 2) as usize;
         let len = stride * (height + 2) as usize;
         self.cover.clear();
-        self.cover.resize(len * 2, 0);
+        self.cover.resize(len + 1, 0);
         let area = s.block_w * s.block_h;
         let step_x = s.block_w - s.overlap_x;
         let step_y = s.block_h - s.overlap_y;
         let denom = s.pel << 8;
+        let pow2 = denom > 0 && denom.count_ones() == 1;
+        let shift = denom.trailing_zeros();
+        let scale = |value: i32| {
+            if pow2 {
+                (value + ((value >> 31) & (denom - 1))) >> shift
+            } else {
+                value / denom
+            }
+        };
+        let (floor_x, floor_y) = (FloorDiv::new(step_x), FloorDiv::new(step_y));
         let set = if forward {
             &self.forward
         } else {
             &self.backward
         };
-        let (points, rows) = self.cover.split_at_mut(len);
-        let mut add = |cx: i32, cy: i32, value: i32| {
-            let cell = &mut points[(cy as usize + 1) * stride + cx as usize + 1];
-            *cell = cell.wrapping_add(value);
+        let points = &mut self.cover[..];
+        let geometry = Scatter {
+            width,
+            height,
+            stride,
+            trash: len,
+            step_x,
+            step_y,
+            block_w: s.block_w,
+            block_h: s.block_h,
+            time,
         };
-        for by in 0..s.grid_h {
-            for bx in 0..s.grid_w {
-                let vector = set[(bx + by * s.grid_w) as usize];
-                let x = time * i32::from(vector.x) / denom + bx * step_x;
-                let y = time * i32::from(vector.y) / denom + by * step_y;
-                let cx = floor_div(x, step_x);
-                let cy = floor_div(y, step_y);
-                let rx = step_x * (cx + 1) - x;
-                let ry = step_y * (cy + 1) - y;
-                let cx1 = cx + 1;
-                let cy1 = cy + 1;
-                let col_in = |c: i32| c >= 0 && c < width;
-                let row_in = |r: i32| r >= 0 && r < height;
-                let row_ok = row_in(cy);
-                if col_in(cx) && row_ok {
-                    add(cx, cy, ry * rx);
-                }
-                if row_ok && cx1 >= 0 {
-                    if cx1 < width {
-                        add(cx1, cy, ry * (s.block_w - rx));
-                        if row_in(cy1) {
-                            add(cx1, cy1, (s.block_h - ry) * (s.block_w - rx));
-                            if col_in(cx) {
-                                add(cx, cy1, rx * (s.block_h - ry));
-                            }
-                        }
-                    } else if row_in(cy1) && col_in(cx) {
-                        add(cx, cy1, rx * (s.block_h - ry));
-                    }
-                } else {
-                    let below = row_in(cy1);
-                    if cx1 >= 0 && below && cx1 < width {
-                        add(cx1, cy1, (s.block_h - ry) * (s.block_w - rx));
-                    }
-                    if col_in(cx) && below {
-                        add(cx, cy1, rx * (s.block_h - ry));
-                    }
-                }
+        let grid_w = s.grid_w.max(0) as usize;
+        let rows = set
+            .chunks_exact(grid_w.max(1))
+            .take(s.grid_h.max(0) as usize);
+        if pow2 && floor_x.magic != 0 && floor_y.magic != 0 && time.unsigned_abs() <= 256 {
+            for (by, row) in rows.enumerate() {
+                geometry.fast_row(points, row, by as i32, shift, floor_x, floor_y);
             }
-        }
-        for (row, point) in rows
-            .chunks_exact_mut(stride)
-            .zip(points.chunks_exact(stride))
-        {
-            for ((cell, window), _) in row[1..].iter_mut().zip(point.windows(3)).zip(0..width) {
-                *cell = window[0].wrapping_add(window[1]).wrapping_add(window[2]);
+        } else {
+            for (by, row) in rows.enumerate() {
+                for (bx, vector) in row.iter().enumerate() {
+                    let tx = scale(time * i32::from(vector.x));
+                    let ty = scale(time * i32::from(vector.y));
+                    geometry.add(
+                        points,
+                        bx as i32,
+                        by as i32,
+                        (tx, ty),
+                        (floor_div(tx, step_x), floor_div(ty, step_y)),
+                    );
+                }
             }
         }
         let scale = f64::from(cover) / 100.0;
@@ -339,16 +331,21 @@ impl VectorField {
         let table: Vec<u8> = (0..=area.max(0)).map(level).collect();
         let top = table.len() as i32 - 1;
         let width = width as usize;
+        let mut column = vec![0i32; stride];
         for (y, out) in out
             .chunks_exact_mut(width)
             .take(height as usize)
             .enumerate()
         {
-            let above = &rows[y * stride + 1..y * stride + 1 + width];
-            let middle = &rows[(y + 1) * stride + 1..(y + 1) * stride + 1 + width];
-            let below = &rows[(y + 2) * stride + 1..(y + 2) * stride + 1 + width];
-            for (((out, &a), &m), &b) in out.iter_mut().zip(above).zip(middle).zip(below) {
-                let covered = (a.wrapping_add(m).wrapping_add(b) >> 3).min(area);
+            let above = &points[y * stride..(y + 1) * stride];
+            let middle = &points[(y + 1) * stride..(y + 2) * stride];
+            let below = &points[(y + 2) * stride..(y + 3) * stride];
+            for (((sum, &a), &m), &b) in column.iter_mut().zip(above).zip(middle).zip(below) {
+                *sum = a.wrapping_add(m).wrapping_add(b);
+            }
+            for (out, window) in out.iter_mut().zip(column.windows(3)) {
+                let total = window[0].wrapping_add(window[1]).wrapping_add(window[2]);
+                let covered = (total >> 3).min(area);
                 *out = if covered < 0 {
                     level(covered)
                 } else {
@@ -418,6 +415,130 @@ const fn clamp_pack(value: i32, pos: i32, block: i32, limit: i32) -> i32 {
         if clamped < 0 { 0 } else { clamped }
     } else {
         value
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FloorDiv {
+    magic: u64,
+    bias: i32,
+    offset: i32,
+}
+
+impl FloorDiv {
+    const LIMIT: i32 = 1 << 17;
+
+    const fn new(divisor: i32) -> Self {
+        if divisor <= 0 || divisor > 128 {
+            return Self {
+                magic: 0,
+                bias: 0,
+                offset: 0,
+            };
+        }
+        let bias = (Self::LIMIT + divisor - 1) / divisor;
+        Self {
+            magic: (1u64 << 32).div_ceil(divisor as u64),
+            bias,
+            offset: bias * divisor,
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[inline]
+    const fn apply(self, value: i32) -> i32 {
+        ((((value + self.offset) as u32) as u64 * self.magic) >> 32) as i32 - self.bias
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Scatter {
+    width: i32,
+    height: i32,
+    stride: usize,
+    trash: usize,
+    step_x: i32,
+    step_y: i32,
+    block_w: i32,
+    block_h: i32,
+    time: i32,
+}
+
+impl Scatter {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[inline]
+    fn cells(
+        self,
+        bx: i32,
+        by: i32,
+        (tx, ty): (i32, i32),
+        (qx, qy): (i32, i32),
+    ) -> [(u32, i32); 4] {
+        let cx = bx + qx;
+        let cy = by + qy;
+        let rx = self.step_x * (qx + 1) - tx;
+        let ry = self.step_y * (qy + 1) - ty;
+        let (lx, ly) = (self.block_w - rx, self.block_h - ry);
+        let targets = [(cx, cy), (cx + 1, cy), (cx + 1, cy + 1), (cx, cy + 1)];
+        let values = [ry * rx, ry * lx, ly * lx, rx * ly];
+        let mut cells = [(0u32, 0i32); 4];
+        for ((cell, (x, y)), value) in cells.iter_mut().zip(targets).zip(values) {
+            let inside = (x as u32) < self.width as u32 && (y as u32) < self.height as u32;
+            let index = ((y + 1) as u32)
+                .wrapping_mul(self.stride as u32)
+                .wrapping_add((x + 1) as u32);
+            *cell = (if inside { index } else { self.trash as u32 }, value);
+        }
+        cells
+    }
+
+    #[inline]
+    fn add(self, points: &mut [i32], bx: i32, by: i32, t: (i32, i32), q: (i32, i32)) {
+        for (index, value) in self.cells(bx, by, t, q) {
+            let cell = &mut points[index as usize];
+            *cell = cell.wrapping_add(value);
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn fast_row(
+        self,
+        points: &mut [i32],
+        row: &[BlockVector],
+        by: i32,
+        shift: u32,
+        floor_x: FloorDiv,
+        floor_y: FloorDiv,
+    ) {
+        const LANES: usize = 16;
+        let round = (1i32 << shift) - 1;
+        let scale = |value: i32| (value + ((value >> 31) & round)) >> shift;
+        for (chunk_index, chunk) in row.chunks(LANES).enumerate() {
+            let base = (chunk_index * LANES) as i32;
+            let mut vx = [0i32; LANES];
+            let mut vy = [0i32; LANES];
+            for ((x, y), vector) in vx.iter_mut().zip(vy.iter_mut()).zip(chunk) {
+                *x = i32::from(vector.x);
+                *y = i32::from(vector.y);
+            }
+            let mut cells = [[(0u32, 0i32); 4]; LANES];
+            for (lane, cell) in cells.iter_mut().enumerate() {
+                let tx = scale(self.time * vx[lane]);
+                let ty = scale(self.time * vy[lane]);
+                *cell = self.cells(
+                    base + lane as i32,
+                    by,
+                    (tx, ty),
+                    (floor_x.apply(tx), floor_y.apply(ty)),
+                );
+            }
+            for cell in &cells[..chunk.len()] {
+                for &(index, value) in cell {
+                    let target = &mut points[index as usize];
+                    *target = target.wrapping_add(value);
+                }
+            }
+        }
     }
 }
 
