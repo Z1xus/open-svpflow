@@ -5,44 +5,53 @@
     clippy::too_many_lines
 )]
 
+mod smoother;
+
 use rayon::prelude::*;
+pub use smoother::Smoother;
 use svpflow_core::metadata::{self, DecodedVector, DecodedVectors, VectorData, VectorRecord};
 use svpflow_core::renderer::{
     self, CpuConfig, CpuRenderer, FramePlanes, MaskPlanes, MotionPlanes, Plane, PlaneMut,
     PlaneRenderInput, Vector, VectorContext,
 };
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use svpflow1_vs::{Analyser, SuperBuilder, SuperFrame};
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use wasm_bindgen::prelude::*;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub use wasm_bindgen_rayon::init_thread_pool;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[wasm_bindgen]
 pub struct WasmSuper {
     builder: SuperBuilder,
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[wasm_bindgen]
 pub struct WasmSuperFrame {
     frame: SuperFrame,
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[wasm_bindgen]
 pub struct WasmAnalyser {
     analyser: Analyser,
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[wasm_bindgen]
 impl WasmSuper {
     #[wasm_bindgen(constructor)]
     pub fn new(width: i32, height: i32, pel: i32) -> Result<Self, String> {
         Ok(Self {
             builder: SuperBuilder::new(width, height, pel)?,
+        })
+    }
+
+    pub fn with_options(width: i32, height: i32, options: &str) -> Result<WasmSuper, String> {
+        Ok(Self {
+            builder: SuperBuilder::with_options(width, height, options)?,
         })
     }
 
@@ -83,7 +92,7 @@ impl WasmSuper {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[wasm_bindgen]
 impl WasmSuperFrame {
     #[must_use]
@@ -102,7 +111,7 @@ impl WasmSuperFrame {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[wasm_bindgen]
 impl WasmAnalyser {
     #[wasm_bindgen(constructor)]
@@ -124,6 +133,12 @@ impl WasmAnalyser {
         })
     }
 
+    pub fn with_options(super_builder: &WasmSuper, options: &str) -> Result<WasmAnalyser, String> {
+        Ok(Self {
+            analyser: Analyser::with_options(&super_builder.builder, options)?,
+        })
+    }
+
     #[must_use]
     pub fn vector_header(&self) -> Vec<i32> {
         self.analyser.vector_header()
@@ -138,7 +153,93 @@ impl WasmAnalyser {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub struct WasmSmoother {
+    smoother: Smoother,
+    output: Vec<u8>,
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+impl WasmSmoother {
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        analyser: &WasmAnalyser,
+        width: i32,
+        height: i32,
+        fps_num: i32,
+        fps_den: i32,
+        source_frames: i32,
+        options: &str,
+    ) -> Result<Self, String> {
+        let smoother = Smoother::new(
+            width,
+            height,
+            fps_num,
+            fps_den,
+            source_frames,
+            options,
+            &analyser.analyser.vector_header(),
+        )?;
+        Ok(Self {
+            output: vec![0; smoother.frame_len()],
+            smoother,
+        })
+    }
+
+    #[must_use]
+    pub fn output_frames(&self) -> i32 {
+        self.smoother.output_frames()
+    }
+
+    #[must_use]
+    pub fn uses_super(&self) -> bool {
+        self.smoother.uses_super()
+    }
+
+    #[must_use]
+    pub fn frame_len(&self) -> usize {
+        self.smoother.frame_len()
+    }
+
+    #[must_use]
+    pub fn plan(&self, frame: i32) -> Vec<i32> {
+        self.smoother.plan(frame).to_vec()
+    }
+
+    pub fn set_vectors(&mut self, k: i32, payload: &[u8]) {
+        self.smoother.set_vectors(k, payload);
+    }
+
+    pub fn set_super(&mut self, k: i32, frame: &WasmSuperFrame) -> Result<(), String> {
+        self.smoother.set_super(k, &frame.frame)
+    }
+
+    pub fn set_source(&mut self, k: i32, frame: &[u8]) -> Result<(), String> {
+        self.smoother.set_source(k, frame)
+    }
+
+    pub fn forget_before(&mut self, k: i32) {
+        self.smoother.forget_before(k);
+    }
+
+    pub fn render(&mut self, frame: i32) -> Result<(), String> {
+        self.smoother.render_into(frame, &mut self.output)
+    }
+
+    #[must_use]
+    pub fn output_ptr(&self) -> usize {
+        self.output.as_ptr() as usize
+    }
+
+    #[must_use]
+    pub fn output(&self) -> Vec<u8> {
+        self.output.clone()
+    }
+}
+
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen)]
 pub struct WasmVectorPrep {
     data: VectorData,
     frame_w: i32,
@@ -147,15 +248,18 @@ pub struct WasmVectorPrep {
     motion_h: usize,
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen)]
 pub struct WasmFrameBlender {
     frame_len: usize,
     luma_len: usize,
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen)]
 impl WasmFrameBlender {
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(constructor))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_os = "unknown"),
+        wasm_bindgen(constructor)
+    )]
     pub fn new(width: usize, height: usize) -> Result<Self, String> {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err("dimensions must be positive and even".into());
@@ -222,9 +326,12 @@ impl WasmFrameBlender {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen)]
 impl WasmVectorPrep {
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(constructor))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_os = "unknown"),
+        wasm_bindgen(constructor)
+    )]
     pub fn new(header: &[i32], frame_width: i32, frame_height: i32) -> Result<Self, String> {
         if frame_width <= 0 || frame_height <= 0 {
             return Err("invalid frame dimensions".into());
@@ -417,13 +524,13 @@ struct Layout {
     grid_len: usize,
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen)]
 pub struct WasmRenderer {
     renderer: CpuRenderer,
     layout: Layout,
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen)]
 pub struct WasmRenderBuffers {
     source0: Vec<u8>,
     source1: Vec<u8>,
@@ -432,9 +539,12 @@ pub struct WasmRenderBuffers {
     output: Vec<u8>,
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen)]
 impl WasmRenderBuffers {
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(constructor))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_os = "unknown"),
+        wasm_bindgen(constructor)
+    )]
     #[must_use]
     pub fn new(renderer: &WasmRenderer) -> Self {
         Self {
@@ -499,9 +609,12 @@ impl WasmRenderBuffers {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen)]
 impl WasmRenderer {
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(constructor))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_os = "unknown"),
+        wasm_bindgen(constructor)
+    )]
     pub fn new(
         width: i32,
         height: i32,

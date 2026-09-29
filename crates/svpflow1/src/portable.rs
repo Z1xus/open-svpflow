@@ -168,6 +168,11 @@ impl SuperFrame {
     }
 
     #[must_use]
+    pub fn planes(&self) -> [&[u8]; 3] {
+        [&self.y, &self.u, &self.v]
+    }
+
+    #[must_use]
     pub fn bytes(&self) -> Vec<u8> {
         let mut output = Vec::with_capacity(self.len());
         output.extend_from_slice(&self.y);
