@@ -114,29 +114,8 @@ type FnEnqueueNDRangeKernel = unsafe extern "C" fn(
 ) -> ClInt;
 type FnFinish = unsafe extern "C" fn(ClCommandQueue) -> ClInt;
 type ClEvent = *mut c_void;
-type FnEventCallback = unsafe extern "C" fn(ClEvent, ClInt, *mut c_void);
-type FnSetEventCallback =
-    unsafe extern "C" fn(ClEvent, ClInt, FnEventCallback, *mut c_void) -> ClInt;
 type FnWaitForEvents = unsafe extern "C" fn(ClUint, *const ClEvent) -> ClInt;
 type FnRelease = unsafe extern "C" fn(*mut c_void) -> ClInt;
-
-const CL_COMPLETE: ClInt = 0;
-
-#[derive(Default)]
-struct Signal {
-    state: std::sync::Mutex<Option<ClInt>>,
-    ready: std::sync::Condvar,
-}
-
-unsafe extern "C" fn signal_event(_event: ClEvent, status: ClInt, data: *mut c_void) {
-    let signal = unsafe { std::sync::Arc::from_raw(data.cast_const().cast::<Signal>()) };
-    let mut guard = signal
-        .state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some(status);
-    signal.ready.notify_all();
-}
 
 #[allow(non_snake_case)]
 struct OpenCl {
@@ -158,7 +137,6 @@ struct OpenCl {
     EnqueueNDRangeKernel: FnEnqueueNDRangeKernel,
     Finish: FnFinish,
     Flush: FnFinish,
-    SetEventCallback: FnSetEventCallback,
     WaitForEvents: FnWaitForEvents,
     ReleaseEvent: FnRelease,
     ReleaseMemObject: FnRelease,
@@ -206,7 +184,6 @@ impl OpenCl {
                 EnqueueNDRangeKernel: sym!("clEnqueueNDRangeKernel"),
                 Finish: sym!("clFinish"),
                 Flush: sym!("clFlush"),
-                SetEventCallback: sym!("clSetEventCallback"),
                 WaitForEvents: sym!("clWaitForEvents"),
                 ReleaseEvent: sym!("clReleaseEvent"),
                 ReleaseMemObject: sym!("clReleaseMemObject"),
@@ -963,40 +940,12 @@ impl GpuContext {
     }
 
     unsafe fn wait_event(&self, queue: ClCommandQueue, event: ClEvent) -> bool {
-        let signal = std::sync::Arc::new(Signal::default());
-        let data = std::sync::Arc::into_raw(std::sync::Arc::clone(&signal));
-        let ok = unsafe {
-            (self.cl.Flush)(queue) == CL_SUCCESS
-                && (self.cl.SetEventCallback)(
-                    event,
-                    CL_COMPLETE,
-                    signal_event,
-                    data.cast_mut().cast(),
-                ) == CL_SUCCESS
-        };
-        if !ok {
-            unsafe {
-                drop(std::sync::Arc::from_raw(data));
-                let done = (self.cl.WaitForEvents)(1, &raw const event) == CL_SUCCESS;
-                (self.cl.ReleaseEvent)(event);
-                return done;
-            }
+        unsafe {
+            (self.cl.Flush)(queue);
+            let done = (self.cl.WaitForEvents)(1, &raw const event) == CL_SUCCESS;
+            (self.cl.ReleaseEvent)(event);
+            done
         }
-        let status = {
-            let mut guard = signal
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            while guard.is_none() {
-                guard = signal
-                    .ready
-                    .wait(guard)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-            guard.unwrap_or(-1)
-        };
-        unsafe { (self.cl.ReleaseEvent)(event) };
-        status >= 0
     }
 
     unsafe fn set_i32(&self, k: ClKernel, i: u32, v: i32) -> bool {
