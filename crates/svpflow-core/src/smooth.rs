@@ -671,10 +671,6 @@ fn weights(count: i32, scale: f64) -> Vec<i16> {
         .collect()
 }
 
-fn sra16(value: i16, shift: u32) -> i16 {
-    value >> shift.min(15)
-}
-
 impl Renderer {
     pub fn new(shape: RenderShape) -> Self {
         let chroma_div = 2;
@@ -1052,7 +1048,7 @@ impl Renderer {
         planes: &mut [(&mut PlaneMut<'_>, Plane<'_>, Plane<'_>)],
         kernel: K,
     ) where
-        K: Fn(&mut [u8], &row::Prepared<'_>, i32, usize, &[i32; N]),
+        K: Fn(&mut [u8], &row::Prepared<'_>, i32, usize, &[&[i32]; N]),
     {
         let grid_w = self.shape.grid_w;
         let grid_h = self.shape.grid_h;
@@ -1083,8 +1079,12 @@ impl Renderer {
             .enumerate()
             .map(|(index, (a, b))| row::Prepared::new(&setup, a, b, aux, index))
             .collect();
-        let mut top = [[0i16; 2]; N];
-        let mut bottom = [[0i16; 2]; N];
+        const { assert!(N <= 16) };
+        let width = usize::try_from(pass.width).unwrap_or(0);
+        let span = width + MAX_STEP + 8;
+        let mut lanes = vec![0i32; N * span];
+        let mut blocks: Vec<(i32, usize, [i16; 32], [i16; 32])> =
+            Vec::with_capacity(usize::try_from(grid_w).unwrap_or(0) + 1);
         let mut pairs = [0i32; N];
         for by in -1..grid_h {
             let py0 = if by < 0 {
@@ -1109,6 +1109,7 @@ impl Renderer {
             } else {
                 upper + 1
             };
+            blocks.clear();
             for bx in -1..grid_w {
                 let px0 = if bx < 0 {
                     0
@@ -1136,64 +1137,62 @@ impl Renderer {
                 let tr = (upper * grid_w + right) as usize;
                 let bl = (lower * grid_w + left) as usize;
                 let br = (lower * grid_w + right) as usize;
+                let mut top = [0i16; 32];
+                let mut bottom = [0i16; 32];
                 for k in 0..N {
                     if !interp && let Some(buf) = samplers[k] {
                         let skip = if skip_rows { upper * grid_w } else { 0 };
                         let corner =
                             |x: i32, y: i32| i16::from(self.bilinear(buf, skip, x, y, pass));
-                        top[k] = [corner(px0, py0), corner(px0 + cols, py0)];
-                        bottom[k] = [corner(px0, py0 + rows), corner(px0 + cols, py0 + rows)];
+                        top[2 * k] = corner(px0, py0);
+                        top[2 * k + 1] = corner(px0 + cols, py0);
+                        bottom[2 * k] = corner(px0, py0 + rows);
+                        bottom[2 * k + 1] = corner(px0 + cols, py0 + rows);
                         continue;
                     }
                     let ch = channels[k];
-                    top[k] = [ch[tl], ch[tr]];
-                    bottom[k] = [ch[bl], ch[br]];
+                    top[2 * k] = ch[tl];
+                    top[2 * k + 1] = ch[tr];
+                    bottom[2 * k] = ch[bl];
+                    bottom[2 * k + 1] = ch[br];
                 }
-                let cols = cols as usize;
-                for r in 0..rows {
-                    let py = py0 + r;
-                    if interp {
-                        let wt = pass.y_weights[(pass.step_y - r) as usize];
-                        let wb = pass.y_weights[r as usize];
-                        let mix = |a: i16, b: i16| {
-                            sra16(
-                                wt.wrapping_mul(a).wrapping_add(wb.wrapping_mul(b)),
-                                pass.shift_y,
-                            )
+                blocks.push((px0, cols as usize, top, bottom));
+            }
+            for r in 0..rows {
+                let py = py0 + r;
+                let wt = pass.y_weights[(pass.step_y - r) as usize];
+                let wb = pass.y_weights[r as usize];
+                let shift_y = pass.shift_y.min(15);
+                for (px0, cols, top, bottom) in &blocks {
+                    let mut mixed = [0i16; 32];
+                    for ((m, &t), &b) in mixed.iter_mut().zip(top).zip(bottom) {
+                        *m = wt.wrapping_mul(t).wrapping_add(wb.wrapping_mul(b)) >> shift_y;
+                    }
+                    for (k, pair) in pairs.iter_mut().enumerate() {
+                        *pair = if interp || samplers[k].is_some() {
+                            i32::from(mixed[2 * k] as u16)
+                                | (i32::from(mixed[2 * k + 1] as u16) << 16)
+                        } else {
+                            i32::from(top[2 * k] as u16)
                         };
-                        for ((pair, t), b) in pairs.iter_mut().zip(&top).zip(&bottom) {
-                            *pair = i32::from(mix(t[0], b[0]) as u16)
-                                | (i32::from(mix(t[1], b[1]) as u16) << 16);
-                        }
-                    } else {
-                        let wt = pass.y_weights[(pass.step_y - r) as usize];
-                        let wb = pass.y_weights[r as usize];
-                        for (k, ((pair, t), b)) in
-                            pairs.iter_mut().zip(&top).zip(&bottom).enumerate()
-                        {
-                            *pair = if samplers[k].is_some() {
-                                let mix = |a: i16, b: i16| {
-                                    sra16(
-                                        wt.wrapping_mul(a).wrapping_add(wb.wrapping_mul(b)),
-                                        pass.shift_y,
-                                    )
-                                };
-                                i32::from(mix(t[0], b[0]) as u16)
-                                    | (i32::from(mix(t[1], b[1]) as u16) << 16)
-                            } else {
-                                i32::from(t[0] as u16)
-                            };
-                        }
                     }
-                    let base = pel * (px0 + py * pitch);
-                    for ((dst, _, _), prepared) in planes.iter_mut().zip(&prepared) {
-                        let row_start = py as usize * dst.pitch;
-                        let start = row_start + px0 as usize;
-                        let end = (start + cols.next_multiple_of(8))
-                            .min(row_start + pass.width as usize)
-                            .min(dst.data.len());
-                        kernel(&mut dst.data[start..end], prepared, base, cols, &pairs);
+                    let at = *px0 as usize;
+                    for (k, lane) in lanes.chunks_exact_mut(span).enumerate() {
+                        row::fill(
+                            &setup,
+                            &mut lane[at..],
+                            pairs[k],
+                            *cols,
+                            samplers[k].is_none(),
+                        );
                     }
+                }
+                let view: [&[i32]; N] = std::array::from_fn(|k| &lanes[k * span..(k + 1) * span]);
+                let base = pel * py * pitch;
+                for ((dst, _, _), prepared) in planes.iter_mut().zip(&prepared) {
+                    let row_start = py as usize * dst.pitch;
+                    let end = (row_start + width).min(dst.data.len());
+                    kernel(&mut dst.data[row_start..end], prepared, base, width, &view);
                 }
             }
         }
@@ -1236,7 +1235,7 @@ mod row {
             _mm256_extracti128_si256, _mm256_i32gather_epi32, _mm256_loadu_si256,
             _mm256_madd_epi16, _mm256_max_epi32, _mm256_min_epi32, _mm256_mullo_epi32,
             _mm256_set1_epi32, _mm256_setr_epi32, _mm256_slli_epi32, _mm256_sra_epi32,
-            _mm256_srai_epi32, _mm256_srlv_epi32, _mm256_sub_epi32,
+            _mm256_srai_epi32, _mm256_srlv_epi32, _mm256_storeu_si256, _mm256_sub_epi32,
         };
         use std::marker::PhantomData;
 
@@ -1327,10 +1326,6 @@ mod row {
             step: __m256i,
             pel: i32,
             pitch: __m256i,
-            shift: __m128i,
-            weights: *const i32,
-            vector_shift: __m128i,
-            vector_weights: *const i32,
             aux_a: Source,
             aux_b: Source,
             pub(in super::super) index: usize,
@@ -1354,8 +1349,6 @@ mod row {
                         aux_a: Source::new(&aux_a, pel),
                         aux_b: Source::new(&aux_b, pel),
                         index,
-                        vector_shift: _mm_cvtsi32_si128(setup.vector_shift as i32),
-                        vector_weights: setup.vector_weights.as_ptr(),
                         offsets: _mm256_setr_epi32(
                             0,
                             pel,
@@ -1369,42 +1362,23 @@ mod row {
                         step: _mm256_set1_epi32(8 * pel),
                         pel,
                         pitch: _mm256_set1_epi32(setup.pitch),
-                        shift: _mm_cvtsi32_si128(setup.shift as i32),
-                        weights: setup.weights.as_ptr(),
                         _life: PhantomData,
                     }
                 }
             }
 
+            #[allow(clippy::unused_self)]
             #[inline(always)]
-            fn lane(&self, pair: i32, c: usize) -> __m256i {
-                debug_assert!(c + 8 <= MAX_STEP);
-                unsafe {
-                    let w = _mm256_loadu_si256(self.weights.add(c).cast::<__m256i>());
-                    let sum =
-                        _mm256_sra_epi32(_mm256_madd_epi16(_mm256_set1_epi32(pair), w), self.shift);
-                    _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(sum))
-                }
+            fn lane(&self, values: &[i32], c: usize) -> __m256i {
+                assert!(c + 8 <= values.len());
+                unsafe { _mm256_loadu_si256(values.as_ptr().add(c).cast::<__m256i>()) }
             }
 
             #[inline(always)]
-            fn vector_lane(&self, pair: i32, c: usize) -> __m256i {
-                debug_assert!(c + 8 <= MAX_STEP);
+            fn at(&self, chunk: __m256i, x: &[i32], y: &[i32], c: usize) -> __m256i {
                 unsafe {
-                    let w = _mm256_loadu_si256(self.vector_weights.add(c).cast::<__m256i>());
-                    let sum = _mm256_sra_epi32(
-                        _mm256_madd_epi16(_mm256_set1_epi32(pair), w),
-                        self.vector_shift,
-                    );
-                    _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(sum))
-                }
-            }
-
-            #[inline(always)]
-            fn at(&self, chunk: __m256i, x: i32, y: i32, c: usize) -> __m256i {
-                unsafe {
-                    let x = self.vector_lane(x, c);
-                    let y = self.vector_lane(y, c);
+                    let x = self.lane(x, c);
+                    let y = self.lane(y, c);
                     _mm256_add_epi32(
                         _mm256_add_epi32(chunk, x),
                         _mm256_mullo_epi32(y, self.pitch),
@@ -1452,6 +1426,35 @@ mod row {
         }
 
         #[inline(always)]
+        pub(in super::super) fn fill(
+            setup: &Setup<'_>,
+            out: &mut [i32],
+            pair: i32,
+            cols: usize,
+            vector: bool,
+        ) {
+            let (weights, shift) = if vector {
+                (setup.vector_weights, setup.vector_shift)
+            } else {
+                (setup.weights, setup.shift)
+            };
+            let count = cols.next_multiple_of(8);
+            assert!(count <= MAX_STEP && count <= out.len());
+            unsafe {
+                let shift = _mm_cvtsi32_si128(shift as i32);
+                let pair = _mm256_set1_epi32(pair);
+                let mut c = 0;
+                while c < count {
+                    let w = _mm256_loadu_si256(weights.as_ptr().add(c).cast::<__m256i>());
+                    let sum = _mm256_sra_epi32(_mm256_madd_epi16(pair, w), shift);
+                    let value = _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(sum));
+                    _mm256_storeu_si256(out.as_mut_ptr().add(c).cast::<__m256i>(), value);
+                    c += 8;
+                }
+            }
+        }
+
+        #[inline(always)]
         fn mul(a: __m256i, b: __m256i) -> __m256i {
             unsafe { _mm256_mullo_epi32(a, b) }
         }
@@ -1487,7 +1490,7 @@ mod row {
             next: bool,
             base: i32,
             n: usize,
-            l: &[i32; 2],
+            l: &[&[i32]; 2],
         ) {
             let src = if next { p.a } else { p.b };
             p.run(out, base, n, |c, chunk, _| {
@@ -1500,7 +1503,7 @@ mod row {
             p: &Prepared<'_>,
             base: i32,
             n: usize,
-            l: &[i32; 4],
+            l: &[&[i32]; 4],
             w: &Weights,
             median: bool,
         ) {
@@ -1524,7 +1527,7 @@ mod row {
             p: &Prepared<'_>,
             base: i32,
             n: usize,
-            l: &[i32; 6],
+            l: &[&[i32]; 6],
             w: &Weights,
             simple: bool,
         ) {
@@ -1558,7 +1561,7 @@ mod row {
             p: &Prepared<'_>,
             base: i32,
             n: usize,
-            l: &[i32; 10],
+            l: &[&[i32]; 10],
             w: &Weights,
         ) {
             let (t, rt, full) = (splat(w.t), splat(w.rt), splat(255));
@@ -1585,7 +1588,7 @@ mod row {
             next: bool,
             base: i32,
             n: usize,
-            l: &[i32; 3],
+            l: &[&[i32]; 3],
         ) {
             let src = if next { p.a } else { p.b };
             let full = splat(255);
@@ -1602,7 +1605,7 @@ mod row {
             p: &Prepared<'_>,
             base: i32,
             n: usize,
-            l: &[i32; 5],
+            l: &[&[i32]; 5],
             w: &Weights,
             median: bool,
         ) {
@@ -1634,7 +1637,7 @@ mod row {
             p: &Prepared<'_>,
             base: i32,
             n: usize,
-            l: &[i32; 7],
+            l: &[&[i32]; 7],
             w: &Weights,
             simple: bool,
         ) {
@@ -1682,17 +1685,13 @@ mod row {
     )]
     mod imp {
         use super::super::Plane;
-        use super::{MAX_STEP, Setup, Weights};
+        use super::{Setup, Weights};
 
         pub(in super::super) struct Prepared<'a> {
             a: &'a [u8],
             b: &'a [u8],
             pel: i32,
             pitch: i32,
-            weights: &'a [i32; MAX_STEP],
-            shift: u32,
-            vector_weights: &'a [i32; MAX_STEP],
-            vector_shift: u32,
             aux_a: &'a [u8],
             aux_b: &'a [u8],
             pub(in super::super) index: usize,
@@ -1711,44 +1710,45 @@ mod row {
                     aux_a: aux_a.data,
                     aux_b: aux_b.data,
                     index,
-                    vector_weights: setup.vector_weights,
-                    vector_shift: setup.vector_shift,
                     a: a.data,
                     b: b.data,
                     pel: setup.pel,
                     pitch: setup.pitch,
-                    weights: setup.weights,
-                    shift: setup.shift,
                 }
             }
 
             #[inline(always)]
-            fn lane(&self, pair: i32, c: usize) -> i32 {
-                let w = self.weights[c];
-                let sum = i32::from(pair as i16) * i32::from(w as i16) + (pair >> 16) * (w >> 16);
-                i32::from((sum >> self.shift.min(31)) as i16)
+            fn lane(&self, values: &[i32], c: usize) -> i32 {
+                values[c]
             }
 
             #[inline(always)]
-            fn vector_lane(&self, pair: i32, c: usize) -> i32 {
-                let w = self.vector_weights[c];
-                let sum = i32::from(pair as i16) * i32::from(w as i16) + (pair >> 16) * (w >> 16);
-                i32::from((sum >> self.vector_shift.min(31)) as i16)
-            }
-
-            #[inline(always)]
-            fn at(&self, plane: &[u8], base: i32, x: i32, y: i32, c: usize) -> i32 {
-                px(
-                    plane,
-                    base + self.pel * c as i32
-                        + self.vector_lane(x, c)
-                        + self.pitch * self.vector_lane(y, c),
-                )
+            fn at(&self, plane: &[u8], base: i32, x: &[i32], y: &[i32], c: usize) -> i32 {
+                px(plane, base + self.pel * c as i32 + x[c] + self.pitch * y[c])
             }
 
             #[inline(always)]
             fn still(&self, plane: &[u8], base: i32, c: usize) -> i32 {
                 px(plane, base + self.pel * c as i32)
+            }
+        }
+
+        pub(in super::super) fn fill(
+            setup: &Setup<'_>,
+            out: &mut [i32],
+            pair: i32,
+            cols: usize,
+            vector: bool,
+        ) {
+            let (weights, shift) = if vector {
+                (setup.vector_weights, setup.vector_shift)
+            } else {
+                (setup.weights, setup.shift)
+            };
+            for (c, value) in out.iter_mut().enumerate().take(cols.next_multiple_of(8)) {
+                let w = weights[c];
+                let sum = i32::from(pair as i16) * i32::from(w as i16) + (pair >> 16) * (w >> 16);
+                *value = i32::from((sum >> shift.min(31)) as i16);
             }
         }
 
@@ -1766,7 +1766,7 @@ mod row {
             next: bool,
             base: i32,
             n: usize,
-            l: &[i32; 2],
+            l: &[&[i32]; 2],
         ) {
             let src = if next { p.a } else { p.b };
             for (c, o) in out.iter_mut().enumerate().take(n) {
@@ -1779,7 +1779,7 @@ mod row {
             p: &Prepared<'_>,
             base: i32,
             n: usize,
-            l: &[i32; 4],
+            l: &[&[i32]; 4],
             w: &Weights,
             median: bool,
         ) {
@@ -1800,7 +1800,7 @@ mod row {
             p: &Prepared<'_>,
             base: i32,
             n: usize,
-            l: &[i32; 6],
+            l: &[&[i32]; 6],
             w: &Weights,
             simple: bool,
         ) {
@@ -1832,7 +1832,7 @@ mod row {
             p: &Prepared<'_>,
             base: i32,
             n: usize,
-            l: &[i32; 10],
+            l: &[&[i32]; 10],
             w: &Weights,
         ) {
             for (c, o) in out.iter_mut().enumerate().take(n) {
@@ -1857,7 +1857,7 @@ mod row {
             next: bool,
             base: i32,
             n: usize,
-            l: &[i32; 3],
+            l: &[&[i32]; 3],
         ) {
             let src = if next { p.a } else { p.b };
             for (c, o) in out.iter_mut().enumerate().take(n) {
@@ -1873,7 +1873,7 @@ mod row {
             p: &Prepared<'_>,
             base: i32,
             n: usize,
-            l: &[i32; 5],
+            l: &[&[i32]; 5],
             w: &Weights,
             median: bool,
         ) {
@@ -1896,7 +1896,7 @@ mod row {
             p: &Prepared<'_>,
             base: i32,
             n: usize,
-            l: &[i32; 7],
+            l: &[&[i32]; 7],
             w: &Weights,
             simple: bool,
         ) {
@@ -1928,7 +1928,7 @@ mod row {
     }
 
     pub(super) use imp::{
-        Prepared, extended, fast, fast_sad, no_mask, no_mask_sad, normal, normal_sad,
+        Prepared, extended, fast, fast_sad, fill, no_mask, no_mask_sad, normal, normal_sad,
     };
 
     const _: () = assert!(MAX_STEP.is_multiple_of(8));
