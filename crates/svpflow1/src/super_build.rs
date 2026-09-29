@@ -380,11 +380,16 @@ fn reduce_row(filter: ReduceFilter, src: &[u8], out: &mut [u8], split: &mut Dein
     }
     let first = ((u16::from(src[0]) + u16::from(src[1]) + 1) >> 1) as u8;
     let pairs = src.len() / 2;
-    split.even.clear();
-    split.odd.clear();
-    for pair in src.as_chunks::<2>().0 {
-        split.even.push(u16::from(pair[0]));
-        split.odd.push(u16::from(pair[1]));
+    split.even.resize(pairs, 0);
+    split.odd.resize(pairs, 0);
+    for ((even, odd), pair) in split
+        .even
+        .iter_mut()
+        .zip(split.odd.iter_mut())
+        .zip(src.as_chunks::<2>().0)
+    {
+        *even = u16::from(pair[0]);
+        *odd = u16::from(pair[1]);
     }
     split.even[0] = u16::from(first);
     let (e, o) = (&split.even[..pairs], &split.odd[..pairs]);
