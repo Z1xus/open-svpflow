@@ -397,52 +397,45 @@ fn wide_satd<const W: usize, const H: usize>() -> Option<Kernel> {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn satd_8x8_avx512(
-    src: *const u8,
-    src_pitch: usize,
-    reference: *const u8,
-    pitch: usize,
-) -> core::arch::x86_64::__m512i {
+unsafe fn widen_8x8_avx512(base: *const u8, stride: usize) -> [core::arch::x86_64::__m512i; 2] {
     use core::arch::x86_64::{
-        _mm256_mask_set1_epi64, _mm256_set1_epi64x, _mm256_setr_epi8, _mm512_abs_epi16,
-        _mm512_add_epi16, _mm512_broadcast_i64x4, _mm512_bsrli_epi128, _mm512_maddubs_epi16,
-        _mm512_mask_set1_epi64, _mm512_max_epi16, _mm512_srli_epi32, _mm512_sub_epi16,
-        _mm512_unpackhi_epi64, _mm512_unpacklo_epi64, _mm512_zextsi256_si512,
+        _mm256_mask_set1_epi64, _mm256_set1_epi64x, _mm256_setr_epi8, _mm512_broadcast_i64x4,
+        _mm512_maddubs_epi16, _mm512_mask_set1_epi64, _mm512_zextsi256_si512,
     };
     macro_rules! row {
-        ($base:expr, $stride:expr, $y:expr) => {
-            unsafe { $base.add($y * $stride).cast::<i64>().read_unaligned() }
+        ($y:expr) => {
+            unsafe { base.add($y * stride).cast::<i64>().read_unaligned() }
         };
     }
     macro_rules! gather {
-        ($base:expr, $stride:expr, $a:expr, $b:expr, $c:expr, $d:expr) => {{
-            let low = _mm256_mask_set1_epi64(
-                _mm256_set1_epi64x(row!($base, $stride, $a)),
-                0b0101,
-                row!($base, $stride, $b),
-            );
-            let wide = _mm512_mask_set1_epi64(
-                _mm512_zextsi256_si512(low),
-                0b1010_0000,
-                row!($base, $stride, $c),
-            );
-            _mm512_mask_set1_epi64(wide, 0b0101_0000, row!($base, $stride, $d))
+        ($a:expr, $b:expr, $c:expr, $d:expr) => {{
+            let low = _mm256_mask_set1_epi64(_mm256_set1_epi64x(row!($a)), 0b0101, row!($b));
+            let wide = _mm512_mask_set1_epi64(_mm512_zextsi256_si512(low), 0b1010_0000, row!($c));
+            _mm512_mask_set1_epi64(wide, 0b0101_0000, row!($d))
         }};
     }
     let hmul = _mm512_broadcast_i64x4(_mm256_setr_epi8(
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1,
         1, -1, 1, -1,
     ));
-    macro_rules! widen {
-        ($a:expr, $b:expr, $c:expr, $d:expr) => {
-            _mm512_sub_epi16(
-                _mm512_maddubs_epi16(gather!(src, src_pitch, $a, $b, $c, $d), hmul),
-                _mm512_maddubs_epi16(gather!(reference, pitch, $a, $b, $c, $d), hmul),
-            )
-        };
-    }
-    let even = widen!(0, 2, 4, 6);
-    let odd = widen!(1, 3, 5, 7);
+    [
+        _mm512_maddubs_epi16(gather!(0, 2, 4, 6), hmul),
+        _mm512_maddubs_epi16(gather!(1, 3, 5, 7), hmul),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+fn satd_8x8_from_avx512(
+    src: [core::arch::x86_64::__m512i; 2],
+    reference: [core::arch::x86_64::__m512i; 2],
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::{
+        _mm512_abs_epi16, _mm512_add_epi16, _mm512_bsrli_epi128, _mm512_max_epi16,
+        _mm512_srli_epi32, _mm512_sub_epi16, _mm512_unpackhi_epi64, _mm512_unpacklo_epi64,
+    };
+    let even = _mm512_sub_epi16(src[0], reference[0]);
+    let odd = _mm512_sub_epi16(src[1], reference[1]);
     let sums = _mm512_add_epi16(even, odd);
     let diffs = _mm512_sub_epi16(odd, even);
     let high = _mm512_unpackhi_epi64(sums, diffs);
@@ -452,6 +445,71 @@ unsafe fn satd_8x8_avx512(
     let first = _mm512_max_epi16(first, _mm512_bsrli_epi128::<2>(first));
     let second = _mm512_max_epi16(second, _mm512_srli_epi32::<16>(second));
     _mm512_add_epi16(first, second)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn satd_8x8_avx512(
+    src: *const u8,
+    src_pitch: usize,
+    reference: *const u8,
+    pitch: usize,
+) -> core::arch::x86_64::__m512i {
+    unsafe {
+        satd_8x8_from_avx512(
+            widen_8x8_avx512(src, src_pitch),
+            widen_8x8_avx512(reference, pitch),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Prepared8 {
+    #[cfg(target_arch = "x86_64")]
+    rows: [core::arch::x86_64::__m512i; 2],
+}
+
+pub(crate) type PrepareFn = fn(&[u8]) -> Prepared8;
+pub(crate) type PreparedKernel = fn(&Prepared8, &[u8], usize) -> u32;
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn prepared_satd(shape: Shape, satd: bool) -> Option<(PrepareFn, PreparedKernel)> {
+    if !satd
+        || (shape.width, shape.height) != (8, 8)
+        || !std::arch::is_x86_feature_detected!("avx512bw")
+        || !std::arch::is_x86_feature_detected!("avx512vl")
+    {
+        return None;
+    }
+    Some((
+        |src: &[u8]| {
+            assert!(src.len() >= 64);
+            Prepared8 {
+                rows: unsafe { widen_8x8_avx512(src.as_ptr(), 8) },
+            }
+        },
+        |prepared: &Prepared8, reference: &[u8], pitch: usize| {
+            assert!(reference.len() >= 7 * pitch + 8);
+            unsafe { satd_prepared_avx512(prepared.rows, reference.as_ptr(), pitch) }
+        },
+    ))
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn prepared_satd(_: Shape, _: bool) -> Option<(PrepareFn, PreparedKernel)> {
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn satd_prepared_avx512(
+    src: [core::arch::x86_64::__m512i; 2],
+    reference: *const u8,
+    pitch: usize,
+) -> u32 {
+    use core::arch::x86_64::{_mm512_madd_epi16, _mm512_reduce_add_epi32, _mm512_set1_epi32};
+    let block = satd_8x8_from_avx512(src, unsafe { widen_8x8_avx512(reference, pitch) });
+    _mm512_reduce_add_epi32(_mm512_madd_epi16(block, _mm512_set1_epi32(1))) as u32
 }
 
 #[cfg(target_arch = "x86_64")]

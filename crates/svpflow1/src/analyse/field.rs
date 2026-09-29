@@ -1,4 +1,5 @@
 use super::metric::{self, Kernel, Shape};
+
 use super::planes::{LevelFrame, MAX_BLOCK_AREA};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,6 +91,7 @@ struct Kernels {
     luma: Kernel,
     chroma: Kernel,
     pair: Option<metric::PairKernel>,
+    prepared: Option<(metric::PrepareFn, metric::PreparedKernel)>,
 }
 
 pub(crate) struct Field {
@@ -145,11 +147,13 @@ impl Field {
                 pair: (chroma_shift == (1, 1))
                     .then(|| metric::chroma420_pair(shape, satd))
                     .flatten(),
+                prepared: metric::prepared_satd(shape, satd),
             },
             half: Kernels {
                 luma: metric::chroma420_kernel(shape, satd),
                 chroma: metric::null_kernel,
                 pair: None,
+                prepared: None,
             },
             vectors: vec![Mv::default(); count],
             reverse: vec![Mv::default(); count],
@@ -991,6 +995,10 @@ impl BlockSearch<'_> {
         let (ud, vd) = (u.data().as_ptr(), self.reference.v.data().as_ptr());
         let (luma_pitch, chroma_pitch) = (y.pitch, u.pitch);
         let buffer = &self.buffers[self.active];
+        let prepared = self
+            .kernels
+            .prepared
+            .map(|(prepare, run)| (prepare(&buffer.y), run));
         let mut min_cost = s.min_cost;
         let mut best = s.best;
         for vy in min_y..=max_y {
@@ -1011,7 +1019,10 @@ impl BlockSearch<'_> {
                 }
                 let offset = (luma_row + y.column_offset::<BITS>(lx + at)) as usize;
                 let block = unsafe { std::slice::from_raw_parts(yd.add(offset), luma_span) };
-                let sad = luma(&buffer.y, block, luma_pitch) as i32;
+                let sad = match &prepared {
+                    Some((source, run)) => run(source, block, luma_pitch),
+                    None => luma(&buffer.y, block, luma_pitch),
+                } as i32;
                 cost = cost.wrapping_add(penalty(sad));
                 if cost >= min_cost {
                     continue;
