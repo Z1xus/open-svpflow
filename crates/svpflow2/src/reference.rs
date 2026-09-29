@@ -10,6 +10,8 @@ use svpflow_core::smooth::{
 use crate::core::{FilterState, Mode, drop_frame, get_node, request_node, super_frame_planes};
 use crate::{frame, metadata, options::ReferenceParams, vs};
 
+pub(crate) type MotionSet = std::sync::Arc<[Vec<u16>; 8]>;
+
 struct Rates {
     num: u64,
     den: u64,
@@ -131,6 +133,26 @@ impl FilterState {
             && !(self.render_mode == 2 && self.options.block_enabled())
             && self.options.reference_supported()
             && matches!(self.vector_data(), metadata::VectorRecord::Ready(_))
+    }
+
+    fn cached_motions(&self, key: i64) -> Option<MotionSet> {
+        let cache = self.motion_cache.lock().ok()?;
+        cache
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, motions)| std::sync::Arc::clone(motions))
+    }
+
+    fn store_motions(&self, key: i64, motions: MotionSet) {
+        if let Ok(mut cache) = self.motion_cache.lock() {
+            if cache.iter().any(|(k, _)| *k == key) {
+                return;
+            }
+            if cache.len() >= 8 {
+                cache.remove(0);
+            }
+            cache.push((key, motions));
+        }
     }
 
     fn cached_quality(&self, frame: i32, luma: &mut [u8]) -> Option<i32> {
@@ -653,17 +675,8 @@ impl FilterState {
         };
         let neither = !use_fwd && !use_bwd;
         let algo = params.algo;
-        let unset = u16::from(self.render_mode != 2) * 1024;
-        let neutral = || vec![unset; count];
-        let (mut fwd_x, mut fwd_y, mut bwd_x, mut bwd_y) =
-            (neutral(), neutral(), neutral(), neutral());
-        let (mut next_x, mut next_y, mut prev_x, mut prev_y) =
-            (neutral(), neutral(), neutral(), neutral());
         let mut cover_bwd = vec![0u8; count];
         let mut cover_fwd = vec![0u8; count];
-        if use_fwd {
-            field.pack(false, &mut fwd_x, &mut fwd_y, width, height);
-        }
         if algo > 20 && !neither {
             field.cover_mask(
                 false,
@@ -673,17 +686,7 @@ impl FilterState {
                 width,
                 height,
             );
-        }
-        if use_bwd {
-            field.pack(true, &mut bwd_x, &mut bwd_y, width, height);
-        }
-        if algo > 20 && !neither {
             field.cover_mask(true, &mut cover_fwd, params.cover, time, width, height);
-        }
-        if neither {
-            for buf in [&mut fwd_x, &mut fwd_y, &mut bwd_x, &mut bwd_y] {
-                buf.fill(1024);
-            }
         }
         let sad_masks = match params.sad {
             Some((scale, sharp)) if !neither => {
@@ -695,27 +698,61 @@ impl FilterState {
             }
             _ => None,
         };
-        let mut extended = false;
-        if neighbors_ok && algo == 23 && !neither {
-            let load = |field: &mut VectorField, k: i32| {
-                self.with_vectors(fetch, api, (k, n), |payload| field.update(payload));
-            };
-            load(field, n - 1);
-            field.pack(true, &mut prev_x, &mut prev_y, width, height);
-            load(field, n + 1);
-            field.pack(false, &mut next_x, &mut next_y, width, height);
-            extended = true;
-        }
-        if self.options.debug_zerox() {
-            for buf in [&mut fwd_x, &mut bwd_x, &mut next_x, &mut prev_x] {
-                buf.fill(1024);
+        let want_extended = neighbors_ok && algo == 23 && !neither;
+        let (zerox, zeroy) = (self.options.debug_zerox(), self.options.debug_zeroy());
+        let motion_key = (i64::from(n) << 8)
+            | i64::from(use_fwd)
+            | i64::from(use_bwd) << 1
+            | i64::from(want_extended) << 2
+            | i64::from(zerox) << 3
+            | i64::from(zeroy) << 4;
+        let reuse = !(self.options.debug_qmap() || self.options.debug_vectors());
+        let cached = reuse.then(|| self.cached_motions(motion_key)).flatten();
+        let motions = if let Some(motions) = cached {
+            motions
+        } else {
+            let unset = u16::from(self.render_mode != 2) * 1024;
+            let mut arrays: [Vec<u16>; 8] = std::array::from_fn(|_| vec![unset; count]);
+            let [fwd_x, fwd_y, bwd_x, bwd_y, next_x, next_y, prev_x, prev_y] = &mut arrays;
+            if use_fwd {
+                field.pack(false, fwd_x, fwd_y, width, height);
             }
-        }
-        if self.options.debug_zeroy() {
-            for buf in [&mut fwd_y, &mut bwd_y, &mut next_y, &mut prev_y] {
-                buf.fill(1024);
+            if use_bwd {
+                field.pack(true, bwd_x, bwd_y, width, height);
             }
-        }
+            if neither {
+                for buf in [&mut *fwd_x, &mut *fwd_y, &mut *bwd_x, &mut *bwd_y] {
+                    buf.fill(1024);
+                }
+            }
+            if want_extended {
+                let load = |field: &mut VectorField, k: i32| {
+                    self.with_vectors(fetch, api, (k, n), |payload| field.update(payload));
+                };
+                load(field, n - 1);
+                field.pack(true, prev_x, prev_y, width, height);
+                load(field, n + 1);
+                field.pack(false, next_x, next_y, width, height);
+            }
+            if zerox {
+                for buf in [&mut *fwd_x, &mut *bwd_x, &mut *next_x, &mut *prev_x] {
+                    buf.fill(1024);
+                }
+            }
+            if zeroy {
+                for buf in [&mut *fwd_y, &mut *bwd_y, &mut *next_y, &mut *prev_y] {
+                    buf.fill(1024);
+                }
+            }
+            let motions = std::sync::Arc::new(arrays);
+            if reuse {
+                self.store_motions(motion_key, std::sync::Arc::clone(&motions));
+            }
+            motions
+        };
+        let extended = want_extended;
+        let [fwd_x, fwd_y, bwd_x, bwd_y, next_x, next_y, prev_x, prev_y] =
+            motions.each_ref().map(Vec::as_slice);
         let mut selected = algo;
         if selected == 2 {
             if use_fwd && !use_bwd {
@@ -839,21 +876,16 @@ impl FilterState {
                     width,
                     height,
                     [
-                        (&bwd_x, &bwd_y),
-                        (&fwd_x, &fwd_y),
-                        (&prev_x, &prev_y),
-                        (&next_x, &next_y),
+                        (bwd_x, bwd_y),
+                        (fwd_x, fwd_y),
+                        (prev_x, prev_y),
+                        (next_x, next_y),
                     ],
                     (&cover_fwd, &cover_bwd),
                     sad_masks
                         .as_ref()
                         .map(|(first, second)| (&second[..], &first[..])),
-                    (i64::from(n) << 8)
-                        | i64::from(use_fwd)
-                        | i64::from(use_bwd) << 1
-                        | i64::from(extended) << 2
-                        | i64::from(self.options.debug_zerox()) << 3
-                        | i64::from(self.options.debug_zeroy()) << 4,
+                    motion_key,
                     core,
                 )
             };
@@ -965,14 +997,14 @@ impl FilterState {
         };
         let mut dst = FrameMut { y, u, v };
         let vectors = PackedVectors {
-            fwd_x: &fwd_x,
-            fwd_y: &fwd_y,
-            bwd_x: &bwd_x,
-            bwd_y: &bwd_y,
-            next_fwd_x: &next_x,
-            next_fwd_y: &next_y,
-            prev_bwd_x: &prev_x,
-            prev_bwd_y: &prev_y,
+            fwd_x,
+            fwd_y,
+            bwd_x,
+            bwd_y,
+            next_fwd_x: next_x,
+            next_fwd_y: next_y,
+            prev_bwd_x: prev_x,
+            prev_bwd_y: prev_y,
             cover_bwd: &cover_bwd,
             cover_fwd: &cover_fwd,
             sad: sad.as_deref().unwrap_or(&[]),
