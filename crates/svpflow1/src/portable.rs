@@ -30,11 +30,18 @@ impl SuperBuilder {
         if !matches!(pel, 1 | 2 | 4) {
             return Err("pel must be 1, 2 or 4".into());
         }
+        Self::with_options(width, height, &format!("{{pel:{pel}}}"))
+    }
+
+    pub fn with_options(width: i32, height: i32, options: &str) -> Result<Self, String> {
         if width <= 0 || height <= 0 || width % 2 != 0 || height % 2 != 0 {
             return Err("dimensions must be positive and even".into());
         }
-        let mut opts = SuperOpts::from_opt(None, width, height)?;
-        opts.pel = pel;
+        let options = params::parse(options.as_bytes())?;
+        let opts = SuperOpts::from_opt(Some(&options), width, height)?;
+        if !opts.full {
+            return Err("full:false is not supported here".into());
+        }
         let width = usize::try_from(width).map_err(|_| "invalid width")?;
         let height = usize::try_from(height).map_err(|_| "invalid height")?;
         let chroma_width = width / 2;
@@ -203,9 +210,15 @@ impl Analyser {
         overlap_mode: i32,
         vectors: i32,
     ) -> Result<Self, String> {
-        let options = format!(
-            "{{block:{{w:{block_width},h:{block_height},overlap:{overlap_mode}}},vectors:{vectors}}}"
-        );
+        Self::with_options(
+            super_builder,
+            &format!(
+                "{{block:{{w:{block_width},h:{block_height},overlap:{overlap_mode}}},vectors:{vectors}}}"
+            ),
+        )
+    }
+
+    pub fn with_options(super_builder: &SuperBuilder, options: &str) -> Result<Self, String> {
         let options = params::parse(options.as_bytes())?;
         let super_params = SuperParams::unpack(super_builder.opts.pack_data())?;
         Ok(Self {
