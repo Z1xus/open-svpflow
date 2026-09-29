@@ -96,6 +96,8 @@ struct Kernels {
     pair: Option<metric::PairKernel>,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     wide: Option<metric::Wide>,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    stacked: bool,
 }
 
 pub(crate) struct Field {
@@ -153,12 +155,14 @@ impl Field {
                     .then(|| metric::chroma420_pair(shape, satd))
                     .flatten(),
                 wide: metric::wide_shape(shape, satd),
+                stacked: chroma_shift == (1, 1) && metric::stacked_pair(shape, satd),
             },
             half: Kernels {
                 luma: metric::chroma420_kernel(shape, satd),
                 chroma: metric::null_kernel,
                 pair: None,
                 wide: None,
+                stacked: false,
             },
             satd,
             vectors: vec![Mv::default(); count],
@@ -511,6 +515,8 @@ impl Field {
             scratch: [0; MAX_BLOCK_AREA],
             wide_src: Default::default(),
             wide_ready: [false; 2],
+            #[cfg(target_arch = "x86_64")]
+            stacked_src: [None; 2],
             flat: [0; MAX_BLOCK_AREA],
             blurred: [0; MAX_BLOCK_AREA],
         };
@@ -730,6 +736,8 @@ struct BlockSearch<'a> {
     scratch: [u8; MAX_BLOCK_AREA],
     wide_src: [metric::WideSource; 2],
     wide_ready: [bool; 2],
+    #[cfg(target_arch = "x86_64")]
+    stacked_src: [Option<metric::WidePair8x4>; 2],
     flat: [u8; MAX_BLOCK_AREA],
     blurred: [u8; MAX_BLOCK_AREA],
 }
@@ -782,6 +790,10 @@ impl BlockSearch<'_> {
         let shape = Shape::new(layout.width as usize, layout.height as usize);
         self.half = half;
         self.wide_ready = [false; 2];
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.stacked_src = [None; 2];
+        }
         (self.kernels, self.shape) = if half {
             (half_kernels, shape.half())
         } else {
@@ -816,6 +828,10 @@ impl BlockSearch<'_> {
     fn copy_chroma(&mut self, set: usize) {
         if self.half {
             return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.stacked_src[set] = None;
         }
         let shape = self.chroma_shape();
         let (s, buffer) = (self.state, &mut self.buffers[set]);
@@ -891,6 +907,15 @@ impl BlockSearch<'_> {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn stacked_source(&mut self) -> metric::WidePair8x4 {
+        let set = self.active;
+        *self.stacked_src[set].get_or_insert_with(|| {
+            let buffer = &self.buffers[set];
+            unsafe { metric::WidePair8x4::new([&buffer.u, &buffer.v]) }
+        })
+    }
+
     fn chroma_sad(&mut self, vx: i32, vy: i32) -> i32 {
         if self.half {
             return 0;
@@ -902,6 +927,15 @@ impl BlockSearch<'_> {
         let offset = u.subpel(cx, cy);
         let buffer = &self.buffers[self.active];
         let span = shape.span(u.pitch);
+        #[cfg(target_arch = "x86_64")]
+        if self.kernels.stacked
+            && u.pitch == v.pitch
+            && let (Some(ur), Some(vr)) = (u.slice(offset, span), v.slice(offset, span))
+        {
+            use metric::ChromaCost;
+            let sum = self.stacked_source().cost(ur, vr, u.pitch);
+            return (sum as i32) << (self.chroma_shift.0 + self.chroma_shift.1);
+        }
         let sum = match (
             self.kernels.pair,
             u.slice(offset, span),
@@ -1085,11 +1119,8 @@ impl BlockSearch<'_> {
                 self.exhaustive_loop::<BITS, _, _>(ranges, spans, &luma, &chroma);
             return;
         }
-        #[cfg(target_feature = "avx2")]
-        if self.kernels.pair.is_some() && (W, H) == (16, 8) {
-            let chroma = metric::Pair8x4 {
-                src: [&buffer.u, &buffer.v],
-            };
+        if self.kernels.stacked {
+            let chroma = self.stacked_source();
             (self.state.best, self.state.min_cost) =
                 self.exhaustive_loop::<BITS, _, _>(ranges, spans, &luma, &chroma);
             return;
@@ -1120,6 +1151,7 @@ impl BlockSearch<'_> {
         let chroma = !self.half;
         let pnew = self.settings.pnew;
         let penalty = |sad: i32| sad.wrapping_add(pnew.wrapping_mul(sad) >> 8);
+        let bounded = pnew > -256;
         let (px, py, lambda) = (i32::from(s.predictor.x), i32::from(s.predictor.y), s.lambda);
         let shift = sx + sy;
         let yd = y.data().as_ptr();
@@ -1145,7 +1177,13 @@ impl BlockSearch<'_> {
                 }
                 let offset = (luma_row + y.column_offset::<BITS>(lx + at)) as usize;
                 let block = unsafe { std::slice::from_raw_parts(yd.add(offset), luma_span) };
-                let sad = luma.cost(block, luma_pitch) as i32;
+                let sad = if bounded {
+                    luma.cost_until(block, luma_pitch, |partial| {
+                        cost.wrapping_add(penalty(partial as i32)) >= min_cost
+                    }) as i32
+                } else {
+                    luma.cost(block, luma_pitch) as i32
+                };
                 cost = cost.wrapping_add(penalty(sad));
                 if cost >= min_cost {
                     continue;
