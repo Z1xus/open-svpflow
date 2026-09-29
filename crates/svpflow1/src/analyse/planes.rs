@@ -59,10 +59,7 @@ impl<'a> PlaneView<'a> {
 
     pub(crate) fn copy_block(&self, offset: isize, shape: Shape, out: &mut [u8]) {
         let Some(block) = self.slice(offset, shape.span(self.pitch)) else {
-            for row in 0..shape.height {
-                let start = offset + (row * self.pitch) as isize;
-                self.copy_clamped(start, &mut out[row * shape.width..][..shape.width]);
-            }
+            self.copy_block_clamped(offset, shape, out);
             return;
         };
         let p = self.pitch;
@@ -82,6 +79,15 @@ impl<'a> PlaneView<'a> {
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn copy_block_clamped(&self, offset: isize, shape: Shape, out: &mut [u8]) {
+        for row in 0..shape.height {
+            let start = offset + (row * self.pitch) as isize;
+            self.copy_clamped(start, &mut out[row * shape.width..][..shape.width]);
+        }
+    }
+
     pub(crate) fn block<'s>(
         &'s self,
         offset: isize,
@@ -98,7 +104,7 @@ impl<'a> PlaneView<'a> {
         (&scratch[..], shape.width)
     }
 
-    fn slice(&self, offset: isize, len: usize) -> Option<&'a [u8]> {
+    pub(crate) fn slice(&self, offset: isize, len: usize) -> Option<&'a [u8]> {
         let start = usize::try_from(offset).ok()?;
         self.data.get(start..start.checked_add(len)?)
     }

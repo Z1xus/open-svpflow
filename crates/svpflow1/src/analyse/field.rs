@@ -875,10 +875,22 @@ impl BlockSearch<'_> {
         let (u, v) = (self.reference.u, self.reference.v);
         let offset = u.subpel(cx, cy);
         let buffer = &self.buffers[self.active];
-        let (block, pitch) = u.block(offset, shape, &mut self.scratch);
-        let mut sum = (self.kernels.chroma)(&buffer.u, block, pitch);
-        let (block, pitch) = v.block(offset, shape, &mut self.scratch);
-        sum += (self.kernels.chroma)(&buffer.v, block, pitch);
+        let span = shape.span(u.pitch);
+        let sum = match (
+            self.kernels.pair,
+            u.slice(offset, span),
+            v.slice(offset, span),
+        ) {
+            (Some(pair), Some(ur), Some(vr)) if u.pitch == v.pitch => {
+                pair([&buffer.u, &buffer.v], [ur, vr], u.pitch)
+            }
+            _ => {
+                let (block, pitch) = u.block(offset, shape, &mut self.scratch);
+                let sum = (self.kernels.chroma)(&buffer.u, block, pitch);
+                let (block, pitch) = v.block(offset, shape, &mut self.scratch);
+                sum + (self.kernels.chroma)(&buffer.v, block, pitch)
+            }
+        };
         (sum as i32) << (self.chroma_shift.0 + self.chroma_shift.1)
     }
 
