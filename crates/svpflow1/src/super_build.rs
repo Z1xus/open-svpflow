@@ -527,6 +527,16 @@ impl Interp {
         let (mut a, mut b) = (vec![0u8; span], vec![0u8; span]);
         for y in 0..self.height {
             let row = y * self.pitch;
+            let (target, left, right) = (dst + row, first + row, second + row);
+            if left.max(right) + span <= target && target + span <= canvas.frame.len() {
+                let (sources, rest) = canvas.frame.split_at_mut(target);
+                let lhs = &sources[left..left + span];
+                let rhs = &sources[right..right + span];
+                for ((out, &l), &r) in rest[..span].iter_mut().zip(lhs).zip(rhs) {
+                    *out = ((u16::from(l) + u16::from(r) + 1) >> 1) as u8;
+                }
+                continue;
+            }
             canvas.fetch((first + row) as isize, &mut a);
             canvas.fetch((second + row) as isize, &mut b);
             for (x, y) in a.iter_mut().zip(&b) {
