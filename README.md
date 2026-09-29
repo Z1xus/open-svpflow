@@ -6,9 +6,7 @@ It started as a side project, mostly to see if I could get couler's [smoothie-rs
 
 [![open-svpflow running in the browser](docs/assets/demo.png)](https://smoothie.z1x.us)
 
-This proof of concept runs open-svpflow's analysis pipeline as WASM and renders with WebGPU, using [WebCodecs](https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API) for video decoding and encoding.
-
-In the browser it runs about 2-3x slower than native, since WASM can't use AVX2 or AVX-512. If it's a lot slower than that for you, check `chrome://gpu` (or `about:support` for Firefox) and make sure hardware acceleration and WebGPU are enabled, otherwise it falls back to rendering on the CPU.
+This proof of concept runs open-svpflow client-side in the browser as WASM and renders with WebGPU, using [WebCodecs](https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API). It runs about 2-3x slower than native, since WASM can't use AVX2 or AVX-512. If it's a lot slower than that for you, check `chrome://gpu` (or `about:support` for Firefox) and make sure hardware acceleration and WebGPU are enabled, otherwise it falls back to rendering on the CPU.
 
 ## What's implemented
 
@@ -16,7 +14,6 @@ In the browser it runs about 2-3x slower than native, since WASM can't use AVX2 
 - `svpflow2`: `SmoothFps` rendering for algorithms 1, 2, 11, 13, 21, 22, and 23, with scene handling, masks, CPU rendering, and the GPU path.
 - Native I444 input and output, which the original SVPFlow doesn't support.
 - VapourSynth API 4 support, so it works on current VapourSynth (R80 and newer can't load the original at all, since it only has API 3).
-- Part of the motion search runs on the GPU too when GPU rendering is on, which takes a lot of load off the CPU.
 
 Output matches the original byte for byte in everything I've tested, on both CPU and GPU. But GPU algorithms 1 and 2 are the exception, since the original reads uninitialized memory there and doesn't even match its own previous run (±1 on about 0.01% of pixels, same as ours). So it should work anywhere SVPFlow already does, whether that's smoothie, SVP itself, mpv or your own scripts.
 
@@ -28,6 +25,8 @@ Benchmarked on a 1080p 200 fps Counter-Strike 2 clip interpolated to 1920 fps th
 | `faster` | GPU | 1180.1 fps | 1472.0 fps | 1.25x | identical |
 | `medium` (default) | CPU | 224.8 fps | 401.1 fps | 1.78x | identical |
 | `medium` (default) | GPU | 312.7 fps | 432.9 fps | 1.38x | identical |
+
+The speedup mainly comes from AVX2/AVX-512 motion search, running part of that search on the GPU (when using GPU mode), and caching work the original redoes for every frame.
 
 ## Releases
 
