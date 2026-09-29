@@ -463,53 +463,140 @@ unsafe fn satd_8x8_avx512(
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct Prepared8 {
-    #[cfg(target_arch = "x86_64")]
-    rows: [core::arch::x86_64::__m512i; 2],
+pub(crate) trait LumaCost {
+    fn cost(&self, reference: &[u8], pitch: usize) -> u32;
 }
 
-pub(crate) type PrepareFn = fn(&[u8]) -> Prepared8;
-pub(crate) type PreparedKernel = fn(&Prepared8, &[u8], usize) -> u32;
+pub(crate) trait ChromaCost {
+    fn cost(&self, u: &[u8], v: &[u8], pitch: usize) -> u32;
+}
+
+pub(crate) struct IndirectLuma<'a> {
+    pub(crate) kernel: Kernel,
+    pub(crate) src: &'a [u8],
+}
+
+impl LumaCost for IndirectLuma<'_> {
+    #[inline]
+    fn cost(&self, reference: &[u8], pitch: usize) -> u32 {
+        (self.kernel)(self.src, reference, pitch)
+    }
+}
+
+pub(crate) struct IndirectChroma<'a> {
+    pub(crate) kernel: Kernel,
+    pub(crate) pair: Option<PairKernel>,
+    pub(crate) src: [&'a [u8]; 2],
+}
+
+impl ChromaCost for IndirectChroma<'_> {
+    #[inline]
+    fn cost(&self, u: &[u8], v: &[u8], pitch: usize) -> u32 {
+        match self.pair {
+            Some(pair) => pair(self.src, [u, v], pitch),
+            None => (self.kernel)(self.src[0], u, pitch) + (self.kernel)(self.src[1], v, pitch),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) enum Wide {
+    S8x8,
+    S16x8,
+    S16x16,
+}
 
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn prepared_satd(shape: Shape, satd: bool) -> Option<(PrepareFn, PreparedKernel)> {
+pub(crate) fn wide_shape(shape: Shape, satd: bool) -> Option<Wide> {
     if !satd
-        || (shape.width, shape.height) != (8, 8)
         || !std::arch::is_x86_feature_detected!("avx512bw")
         || !std::arch::is_x86_feature_detected!("avx512vl")
     {
         return None;
     }
-    Some((
-        |src: &[u8]| {
-            assert!(src.len() >= 64);
-            Prepared8 {
-                rows: unsafe { widen_8x8_avx512(src.as_ptr(), 8) },
-            }
-        },
-        |prepared: &Prepared8, reference: &[u8], pitch: usize| {
-            assert!(reference.len() >= 7 * pitch + 8);
-            unsafe { satd_prepared_avx512(prepared.rows, reference.as_ptr(), pitch) }
-        },
-    ))
+    match (shape.width, shape.height) {
+        (8, 8) => Some(Wide::S8x8),
+        (16, 8) => Some(Wide::S16x8),
+        (16, 16) => Some(Wide::S16x16),
+        _ => None,
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-pub(crate) fn prepared_satd(_: Shape, _: bool) -> Option<(PrepareFn, PreparedKernel)> {
+pub(crate) fn wide_shape(_: Shape, _: bool) -> Option<Wide> {
     None
 }
 
 #[cfg(target_arch = "x86_64")]
+pub(crate) struct WideLuma<const W: usize, const H: usize> {
+    rows: [[core::arch::x86_64::__m512i; 2]; 4],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl<const W: usize, const H: usize> WideLuma<W, H> {
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+    pub(crate) unsafe fn new(src: &[u8]) -> Self {
+        assert!(src.len() >= W * H);
+        let mut rows = [[core::arch::x86_64::_mm512_setzero_si512(); 2]; 4];
+        for (index, (ty, tx)) in tiles::<W, H>().enumerate() {
+            rows[index] = unsafe { widen_8x8_avx512(src.as_ptr().add(ty * W + tx), W) };
+        }
+        Self { rows }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl<const W: usize, const H: usize> LumaCost for WideLuma<W, H> {
+    #[inline]
+    fn cost(&self, reference: &[u8], pitch: usize) -> u32 {
+        assert!(reference.len() >= (H - 1) * pitch + W);
+        unsafe { satd_wide::<W, H>(&self.rows, reference.as_ptr(), pitch) }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub(crate) struct Pair4x4<'a> {
+    pub(crate) src: [&'a [u8]; 2],
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+impl ChromaCost for Pair4x4<'_> {
+    #[inline]
+    fn cost(&self, u: &[u8], v: &[u8], pitch: usize) -> u32 {
+        assert!(self.src.iter().all(|s| s.len() >= 16));
+        assert!(u.len() >= 3 * pitch + 4 && v.len() >= 3 * pitch + 4);
+        unsafe { satd_4x4_pair_avx2(self.src, [u, v], pitch) }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn tiles<const W: usize, const H: usize>() -> impl Iterator<Item = (usize, usize)> {
+    (0..H)
+        .step_by(8)
+        .flat_map(|ty| (0..W).step_by(8).map(move |tx| (ty, tx)))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn satd_prepared_avx512(
-    src: [core::arch::x86_64::__m512i; 2],
+unsafe fn satd_wide<const W: usize, const H: usize>(
+    src: &[[core::arch::x86_64::__m512i; 2]; 4],
     reference: *const u8,
     pitch: usize,
 ) -> u32 {
-    use core::arch::x86_64::{_mm512_madd_epi16, _mm512_reduce_add_epi32, _mm512_set1_epi32};
-    let block = satd_8x8_from_avx512(src, unsafe { widen_8x8_avx512(reference, pitch) });
-    _mm512_reduce_add_epi32(_mm512_madd_epi16(block, _mm512_set1_epi32(1))) as u32
+    use core::arch::x86_64::{
+        _mm512_add_epi32, _mm512_madd_epi16, _mm512_reduce_add_epi32, _mm512_set1_epi32,
+        _mm512_setzero_si512,
+    };
+    let mut acc = _mm512_setzero_si512();
+    for (index, (ty, tx)) in tiles::<W, H>().enumerate() {
+        let widened = unsafe { widen_8x8_avx512(reference.add(ty * pitch + tx), pitch) };
+        let block = satd_8x8_from_avx512(src[index], widened);
+        acc = _mm512_add_epi32(acc, _mm512_madd_epi16(block, _mm512_set1_epi32(1)));
+    }
+    _mm512_reduce_add_epi32(acc) as u32
 }
 
 #[cfg(target_arch = "x86_64")]

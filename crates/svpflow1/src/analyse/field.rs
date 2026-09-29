@@ -1,4 +1,4 @@
-use super::metric::{self, Kernel, Shape};
+use super::metric::{self, ChromaCost, Kernel, LumaCost, Shape};
 
 use super::planes::{LevelFrame, MAX_BLOCK_AREA, PlaneView};
 
@@ -91,7 +91,8 @@ struct Kernels {
     luma: Kernel,
     chroma: Kernel,
     pair: Option<metric::PairKernel>,
-    prepared: Option<(metric::PrepareFn, metric::PreparedKernel)>,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    wide: Option<metric::Wide>,
 }
 
 pub(crate) struct Field {
@@ -147,13 +148,13 @@ impl Field {
                 pair: (chroma_shift == (1, 1))
                     .then(|| metric::chroma420_pair(shape, satd))
                     .flatten(),
-                prepared: metric::prepared_satd(shape, satd),
+                wide: metric::wide_shape(shape, satd),
             },
             half: Kernels {
                 luma: metric::chroma420_kernel(shape, satd),
                 chroma: metric::null_kernel,
                 pair: None,
-                prepared: None,
+                wide: None,
             },
             vectors: vec![Mv::default(); count],
             reverse: vec![Mv::default(); count],
@@ -981,20 +982,86 @@ impl BlockSearch<'_> {
             }
         }
         let spans = (luma_span, chroma_span);
+        #[cfg(target_arch = "x86_64")]
+        if let Some(wide) = self.kernels.wide {
+            let ranges = ((min_x, max_x), (min_y, max_y));
+            unsafe {
+                match (pel, wide) {
+                    (1, metric::Wide::S8x8) => self.exhaustive_wide::<0, 8, 8>(ranges, spans),
+                    (1, metric::Wide::S16x8) => self.exhaustive_wide::<0, 16, 8>(ranges, spans),
+                    (1, metric::Wide::S16x16) => self.exhaustive_wide::<0, 16, 16>(ranges, spans),
+                    (2, metric::Wide::S8x8) => self.exhaustive_wide::<1, 8, 8>(ranges, spans),
+                    (2, metric::Wide::S16x8) => self.exhaustive_wide::<1, 16, 8>(ranges, spans),
+                    (2, metric::Wide::S16x16) => self.exhaustive_wide::<1, 16, 16>(ranges, spans),
+                    (_, metric::Wide::S8x8) => self.exhaustive_wide::<2, 8, 8>(ranges, spans),
+                    (_, metric::Wide::S16x8) => self.exhaustive_wide::<2, 16, 8>(ranges, spans),
+                    (_, metric::Wide::S16x16) => self.exhaustive_wide::<2, 16, 16>(ranges, spans),
+                }
+            }
+            return true;
+        }
         match pel {
-            1 => self.exhaustive_run::<0>((min_x, max_x), (min_y, max_y), spans),
-            2 => self.exhaustive_run::<1>((min_x, max_x), (min_y, max_y), spans),
-            _ => self.exhaustive_run::<2>((min_x, max_x), (min_y, max_y), spans),
+            1 => self.exhaustive_run::<0>(((min_x, max_x), (min_y, max_y)), spans),
+            2 => self.exhaustive_run::<1>(((min_x, max_x), (min_y, max_y)), spans),
+            _ => self.exhaustive_run::<2>(((min_x, max_x), (min_y, max_y)), spans),
         }
         true
     }
 
     fn exhaustive_run<const BITS: u32>(
         &mut self,
-        (min_x, max_x): (i32, i32),
-        (min_y, max_y): (i32, i32),
-        (luma_span, chroma_span): (usize, usize),
+        ranges: ((i32, i32), (i32, i32)),
+        spans: (usize, usize),
     ) {
+        let buffer = &self.buffers[self.active];
+        let luma = metric::IndirectLuma {
+            kernel: self.kernels.luma,
+            src: &buffer.y,
+        };
+        let chroma = metric::IndirectChroma {
+            kernel: self.kernels.chroma,
+            pair: self.kernels.pair,
+            src: [&buffer.u, &buffer.v],
+        };
+        (self.state.best, self.state.min_cost) =
+            self.exhaustive_loop::<BITS, _, _>(ranges, spans, &luma, &chroma);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+    unsafe fn exhaustive_wide<const BITS: u32, const W: usize, const H: usize>(
+        &mut self,
+        ranges: ((i32, i32), (i32, i32)),
+        spans: (usize, usize),
+    ) {
+        let buffer = &self.buffers[self.active];
+        let luma = unsafe { metric::WideLuma::<W, H>::new(&buffer.y) };
+        #[cfg(target_feature = "avx2")]
+        if self.kernels.pair.is_some() && (W, H) == (8, 8) {
+            let chroma = metric::Pair4x4 {
+                src: [&buffer.u, &buffer.v],
+            };
+            (self.state.best, self.state.min_cost) =
+                self.exhaustive_loop::<BITS, _, _>(ranges, spans, &luma, &chroma);
+            return;
+        }
+        let chroma = metric::IndirectChroma {
+            kernel: self.kernels.chroma,
+            pair: self.kernels.pair,
+            src: [&buffer.u, &buffer.v],
+        };
+        (self.state.best, self.state.min_cost) =
+            self.exhaustive_loop::<BITS, _, _>(ranges, spans, &luma, &chroma);
+    }
+
+    #[inline]
+    fn exhaustive_loop<const BITS: u32, L: LumaCost, C: ChromaCost>(
+        &self,
+        ((min_x, max_x), (min_y, max_y)): ((i32, i32), (i32, i32)),
+        (luma_span, chroma_span): (usize, usize),
+        luma: &L,
+        chroma_cost: &C,
+    ) -> (Mv, i32) {
         let s = self.state;
         let pel = 1 << BITS;
         let (y, u) = (self.reference.y, self.reference.u);
@@ -1002,8 +1069,6 @@ impl BlockSearch<'_> {
         let (cx, cy) = (s.pos[1] * pel, s.pos_y[1] * pel);
         let (sx, sy) = self.chroma_shift;
         let chroma = !self.half;
-        let (luma, chroma_kernel, pair) =
-            (self.kernels.luma, self.kernels.chroma, self.kernels.pair);
         let pnew = self.settings.pnew;
         let penalty = |sad: i32| sad.wrapping_add(pnew.wrapping_mul(sad) >> 8);
         let (px, py, lambda) = (i32::from(s.predictor.x), i32::from(s.predictor.y), s.lambda);
@@ -1011,11 +1076,6 @@ impl BlockSearch<'_> {
         let yd = y.data().as_ptr();
         let (ud, vd) = (u.data().as_ptr(), self.reference.v.data().as_ptr());
         let (luma_pitch, chroma_pitch) = (y.pitch, u.pitch);
-        let buffer = &self.buffers[self.active];
-        let prepared = self
-            .kernels
-            .prepared
-            .map(|(prepare, run)| (prepare(&buffer.y), run));
         let mut min_cost = s.min_cost;
         let mut best = s.best;
         for vy in min_y..=max_y {
@@ -1036,10 +1096,7 @@ impl BlockSearch<'_> {
                 }
                 let offset = (luma_row + y.column_offset::<BITS>(lx + at)) as usize;
                 let block = unsafe { std::slice::from_raw_parts(yd.add(offset), luma_span) };
-                let sad = match &prepared {
-                    Some((source, run)) => run(source, block, luma_pitch),
-                    None => luma(&buffer.y, block, luma_pitch),
-                } as i32;
+                let sad = luma.cost(block, luma_pitch) as i32;
                 cost = cost.wrapping_add(penalty(sad));
                 if cost >= min_cost {
                     continue;
@@ -1052,14 +1109,7 @@ impl BlockSearch<'_> {
                             std::slice::from_raw_parts(vd.add(offset), chroma_span),
                         )
                     };
-                    let sum = match pair {
-                        Some(pair) => pair([&buffer.u, &buffer.v], [ur, vr], chroma_pitch),
-                        None => {
-                            chroma_kernel(&buffer.u, ur, chroma_pitch)
-                                + chroma_kernel(&buffer.v, vr, chroma_pitch)
-                        }
-                    };
-                    (sum as i32) << shift
+                    (chroma_cost.cost(ur, vr, chroma_pitch) as i32) << shift
                 } else {
                     0
                 };
@@ -1071,8 +1121,7 @@ impl BlockSearch<'_> {
                 min_cost = cost;
             }
         }
-        self.state.best = best;
-        self.state.min_cost = min_cost;
+        (best, min_cost)
     }
 
     fn hex2(&mut self, range: i32) {
