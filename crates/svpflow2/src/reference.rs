@@ -3,79 +3,14 @@
 use std::slice;
 
 use svpflow_core::smooth::{
-    Algo, FieldShape, Frame, FrameMut, PackedVectors, Plane, PlaneMut, RenderShape, Renderer,
-    SceneLimits, VectorField,
+    FieldShape, Frame, FrameMut, PackedVectors, Plane, PlaneMut, Renderer, SceneLimits, VectorField,
 };
+use svpflow_core::smooth_engine::{self as engine, Rates};
 
 use crate::core::{FilterState, Mode, drop_frame, get_node, request_node, super_frame_planes};
 use crate::{frame, metadata, options::ReferenceParams, vs};
 
 pub(crate) type MotionSet = std::sync::Arc<[Vec<u16>; 8]>;
-
-struct Rates {
-    num: u64,
-    den: u64,
-}
-
-impl Rates {
-    fn source_frame(&self, frame: i32) -> i32 {
-        let frame = u64::try_from(frame.max(0)).unwrap_or(0);
-        i32::try_from(frame * self.den / self.num).unwrap_or(i32::MAX)
-    }
-
-    fn raw_phase(&self, frame: i32, source: i32) -> f64 {
-        256.0
-            * (f64::from(frame) * f64::from(self.den as i32) / self.num as f64 - f64::from(source))
-    }
-
-    fn ratio(&self) -> f64 {
-        self.num as f64 / self.den as f64
-    }
-
-    fn time_to_fixed(&self, raw: f64, mode: i32) -> i32 {
-        let step = f64::from(self.den as i32) * 256.0 / self.num as f64;
-        let mut left = (raw / step).floor() as i32;
-        let rem = raw - f64::from(left) * step;
-        let mut right = ((256.0 - raw - 0.001) / step).floor() as i32;
-        let whole = if mode <= 1 {
-            left += i32::from(rem as i32 >= (rem - step).abs() as i32);
-            let tail = 256.0 - (f64::from(right) * step + raw);
-            if tail as i32 > (tail - step).abs() as i32 {
-                right += 1;
-            }
-            left << 8
-        } else {
-            let mut shifted = left << 8;
-            if rem as i32 <= 0 {
-                if left <= 0 {
-                    shifted = 0;
-                    left = 0;
-                } else {
-                    left -= 1;
-                    shifted = left << 8;
-                }
-            }
-            if (256.0 - (f64::from(right) * step + raw) - step).abs() < 0.1 {
-                right += 1;
-            }
-            shifted
-        };
-        let total = left + right;
-        if total == 0 {
-            return 0;
-        }
-        let result = whole / total;
-        if mode & !2 != 0 {
-            if right >= left {
-                result / 2
-            } else {
-                256 - (right << 7) / total
-            }
-        } else {
-            result
-        }
-    }
-}
 
 struct Fetch {
     get_frame: vs::GetFrameFilter,
@@ -350,17 +285,7 @@ impl FilterState {
     }
 
     fn rates(&self, params: &ReferenceParams) -> Rates {
-        let src_num = u64::try_from(self.video_info.fps_num.max(1)).unwrap_or(1);
-        let src_den = u64::try_from(self.video_info.fps_den.max(1)).unwrap_or(1);
-        let (out_num, out_den) = if params.absolute {
-            (params.rate_num, params.rate_den)
-        } else {
-            (src_num * params.rate_num, src_den * params.rate_den)
-        };
-        Rates {
-            num: out_num * src_den,
-            den: out_den * src_num,
-        }
+        Rates::new(params, &self.video_info.source())
     }
 
     pub(crate) fn reference_request(
@@ -371,13 +296,8 @@ impl FilterState {
     ) {
         let params = self.options.reference();
         let rates = self.rates(&params);
-        let n = rates.source_frame(frame);
-        let raw = rates.raw_phase(frame, n);
-        let mut phase = (raw + 0.5) as i32;
-        if matches!(params.scene_mode, 1 | 2) {
-            phase = rates.time_to_fixed(raw, if params.scene_mode == 1 { 0 } else { 2 });
-        }
-        if phase & !0x100 == 0 {
+        let engine::Step { n, phase, .. } = rates.step(&params, frame);
+        if !engine::needs_vectors(phase) {
             for k in [n, n + 1] {
                 request_node(request_frame, self.clips.source, k, frame_ctx);
             }
@@ -389,7 +309,7 @@ impl FilterState {
                 request_node(request_frame, self.clips.super_clip, k, frame_ctx);
             }
         }
-        let reach = if params.level >= 2 { 2 } else { 1 };
+        let reach = engine::vector_reach(&params);
         if self.nvof.is_some() {
             for k in n..=n + 1 + nvof_extra(&params) {
                 request_node(request_frame, self.clips.vec_src, k, frame_ctx);
@@ -471,23 +391,12 @@ impl FilterState {
         };
         let params = self.options.reference();
         let rates = self.rates(&params);
-        let n = rates.source_frame(frame);
-        let raw = rates.raw_phase(frame, n);
-        let mut phase = (raw + 0.5) as i32;
-        if matches!(params.scene_mode, 1 | 2) {
-            phase = rates.time_to_fixed(raw, if params.scene_mode == 1 { 0 } else { 2 });
-        }
+        let engine::Step { n, raw, mut phase } = rates.step(&params, frame);
         let shape = FieldShape::from_data(&vector_data);
         let mut field = VectorField::new(shape);
         let mut luma = vec![0u8; shape.blocks()];
         let mut luma_table = None;
-        let limits = SceneLimits {
-            blocks: params.blocks,
-            zero: params.zero,
-            m1: params.m1,
-            m2: params.m2,
-            scene: params.scene,
-        };
+        let limits = engine::limits(&params);
         let load = |field: &mut VectorField, k: i32| {
             self.with_vectors(&fetch, &api, (k, n), |payload| field.update(payload))
                 .is_some()
@@ -499,68 +408,13 @@ impl FilterState {
             if !load(field, k) {
                 return 3;
             }
-            let table = luma_table.get_or_insert_with(|| field.luma_table(params.luma));
-            field.avg_luma(&mut luma, table);
-            let class = field.quality(false, &limits, &luma);
-            let mut cached = luma.clone();
-            if let Some(tail) = cached.len().checked_sub(4) {
-                let mean = (field.luma_geomean() * 1_000_000.0) as i32;
-                cached[tail..].copy_from_slice(&mean.to_le_bytes());
-            }
+            let (class, cached) =
+                engine::quality(field, &params, &limits, &mut luma_table, &mut luma);
             self.store_quality(k, class, &cached);
             class
         };
-        let algo = params.algo;
-        let mut class = 3;
-        let mut neighbors_ok = false;
-        if phase & !0x100 != 0 {
-            let level = params.level;
-            let (prev, next, prev2, next2) = if (level == 0 && algo != 23 && algo <= 89) || n <= 1 {
-                (3, 3, -1, -1)
-            } else {
-                let prev = quality(&mut field, n - 1);
-                let next = quality(&mut field, n + 1);
-                if level <= 1 || n == 2 {
-                    (prev, next, -1, -1)
-                } else {
-                    let prev2 = quality(&mut field, n - 2);
-                    let next2 = if level > 2 {
-                        quality(&mut field, n + 2)
-                    } else {
-                        -1
-                    };
-                    if prev2 == 3 || next2 == 3 {
-                        (prev, next, -1, -1)
-                    } else {
-                        (prev, next, prev2, next2)
-                    }
-                }
-            };
-            let current = quality(&mut field, n);
-            class = current;
-            if level != 0 && prev != 3 && next != 3 && current != 3 {
-                let sum = next + prev + current;
-                let average = if prev2 < 0 {
-                    f64::from(sum as f32) / 3.0
-                } else if next2 < 0 {
-                    f64::from((sum + prev2) as f32) * 0.25
-                } else {
-                    f64::from((sum + prev2 + next2) as f32) / 5.0
-                };
-                class = (f64::from(average as f32) + 0.5).floor() as i32;
-            }
-            neighbors_ok = prev <= 2 && next <= 2;
-        }
-        if params.scene_mode == 3 && (0..=2).contains(&class) {
-            let adaptive = params.adaptive[class as usize];
-            if adaptive >= 0 {
-                phase = if rates.ratio() >= 2.0 {
-                    rates.time_to_fixed(raw, adaptive)
-                } else {
-                    0
-                };
-            }
-        }
+        let (class, neighbors_ok) = engine::classify(&params, n, phase, |k| quality(&mut field, k));
+        phase = engine::adapt_phase(&params, &rates, raw, class, phase);
         let source = fetch.get(self.clips.source, n);
         let next_source = fetch.get(self.clips.source, n + 1);
         if source.is_null() || next_source.is_null() {
@@ -568,15 +422,7 @@ impl FilterState {
             fetch.drop(next_source);
             return std::ptr::null();
         }
-        let copy = if phase == 0 {
-            Some(false)
-        } else if phase == 256 {
-            Some(true)
-        } else if (class == 3 && !params.blend) || self.options.debug_vectors() {
-            Some(phase > 127)
-        } else {
-            None
-        };
+        let copy = engine::copy_choice(&params, phase, class, self.options.debug_vectors());
         if let Some(use_next) = copy {
             let (selected, other) = if use_next {
                 (next_source, source)
@@ -596,7 +442,7 @@ impl FilterState {
                 )
             };
             fetch.drop(other);
-            if !output.is_null() && phase & !0x100 != 0 {
+            if !output.is_null() && engine::needs_vectors(phase) {
                 load(&mut field, n);
                 unsafe {
                     self.reference_overlays(
@@ -614,16 +460,7 @@ impl FilterState {
             }
             return output;
         }
-        let (mut use_fwd, mut use_bwd) = if algo == 2 {
-            (phase > 127, phase <= 127)
-        } else {
-            (true, algo > 10)
-        };
-        if class == 3 {
-            use_fwd = false;
-            use_bwd = false;
-        }
-        let force13 = class > 0 && params.force13;
+        let (use_fwd, use_bwd, force13) = engine::directions(&params, phase, class);
         load(&mut field, n);
         let output = unsafe {
             self.reference_calculate(
@@ -679,83 +516,34 @@ impl FilterState {
         let shape = *field.shape();
         let width = shape.packed_width();
         let height = shape.packed_height();
-        let count = usize::try_from(width * height).unwrap_or(0);
-        let time = if use_fwd && !use_bwd {
-            256 - phase
-        } else {
-            phase
-        };
+        let time = engine::render_time(phase, use_fwd, use_bwd);
         let neither = !use_fwd && !use_bwd;
         let algo = params.algo;
-        let mut cover_bwd = vec![0u8; count];
-        let mut cover_fwd = vec![0u8; count];
-        if algo > 20 && !neither {
-            field.cover_mask(
-                false,
-                &mut cover_bwd,
-                params.cover,
-                256 - time,
-                width,
-                height,
-            );
-            field.cover_mask(true, &mut cover_fwd, params.cover, time, width, height);
-        }
-        let sad_masks = match params.sad {
-            Some((scale, sharp)) if !neither => {
-                let mut first = vec![0u8; count];
-                let mut second = vec![0u8; count];
-                field.sad_mask(false, &mut first, scale, sharp, width, height);
-                field.sad_mask(true, &mut second, scale, sharp, width, height);
-                Some((first, second))
-            }
-            _ => None,
-        };
+        let engine::Masks {
+            cover_bwd,
+            cover_fwd,
+            sad: sad_masks,
+        } = engine::masks(field, params, time, neither);
         let want_extended = neighbors_ok && algo == 23 && !neither;
         let (zerox, zeroy) = (self.options.debug_zerox(), self.options.debug_zeroy());
-        let motion_key = (i64::from(n) << 8)
-            | i64::from(use_fwd)
-            | i64::from(use_bwd) << 1
-            | i64::from(want_extended) << 2
-            | i64::from(zerox) << 3
-            | i64::from(zeroy) << 4;
+        let motion_key = engine::motion_key(n, use_fwd, use_bwd, want_extended, (zerox, zeroy));
         let reuse = !(self.options.debug_qmap() || self.options.debug_vectors());
         let cached = reuse.then(|| self.cached_motions(motion_key)).flatten();
         let motions = if let Some(motions) = cached {
             motions
         } else {
-            let unset = u16::from(self.render_mode != 2) * 1024;
-            let mut arrays: [Vec<u16>; 8] = std::array::from_fn(|_| vec![unset; count]);
-            let [fwd_x, fwd_y, bwd_x, bwd_y, next_x, next_y, prev_x, prev_y] = &mut arrays;
-            if use_fwd {
-                field.pack(false, fwd_x, fwd_y, width, height);
-            }
-            if use_bwd {
-                field.pack(true, bwd_x, bwd_y, width, height);
-            }
-            if neither {
-                for buf in [&mut *fwd_x, &mut *fwd_y, &mut *bwd_x, &mut *bwd_y] {
-                    buf.fill(1024);
-                }
-            }
-            if want_extended {
-                let load = |field: &mut VectorField, k: i32| {
+            let arrays = engine::motions(
+                field,
+                self.render_mode == 2,
+                use_fwd,
+                use_bwd,
+                want_extended,
+                (zerox, zeroy),
+                |field, k| {
                     self.with_vectors(fetch, api, (k, n), |payload| field.update(payload));
-                };
-                load(field, n - 1);
-                field.pack(true, prev_x, prev_y, width, height);
-                load(field, n + 1);
-                field.pack(false, next_x, next_y, width, height);
-            }
-            if zerox {
-                for buf in [&mut *fwd_x, &mut *bwd_x, &mut *next_x, &mut *prev_x] {
-                    buf.fill(1024);
-                }
-            }
-            if zeroy {
-                for buf in [&mut *fwd_y, &mut *bwd_y, &mut *next_y, &mut *prev_y] {
-                    buf.fill(1024);
-                }
-            }
+                },
+                n,
+            );
             let motions = std::sync::Arc::new(arrays);
             if reuse {
                 self.store_motions(motion_key, std::sync::Arc::clone(&motions));
@@ -765,59 +553,16 @@ impl FilterState {
         let extended = want_extended;
         let [fwd_x, fwd_y, bwd_x, bwd_y, next_x, next_y, prev_x, prev_y] =
             motions.each_ref().map(Vec::as_slice);
-        let mut selected = algo;
-        if selected == 2 {
-            if use_fwd && !use_bwd {
-                selected = 1;
-            }
-        } else if selected == 23 || selected > 10 {
-            if selected == 23 && !extended {
-                selected = 21;
-            }
-            if force13 {
-                selected = 13;
-            }
-        }
+        let selected = engine::select(algo, use_fwd, use_bwd, extended, force13);
         let interp = !neither && !params.block;
-        if neither {
-            selected = 11;
-        }
-        let sad = sad_masks.as_ref().map(|(first, second)| match selected {
-            1 => first.clone(),
-            2 => second.clone(),
-            _ => first.iter().zip(second).map(|(a, b)| *a.max(b)).collect(),
-        });
-        let sad_on = sad.is_some();
-        let kind = match selected {
-            1 if sad_on => Algo::FastSad { next: true },
-            2 if sad_on => Algo::FastSad { next: false },
-            11 if sad_on => Algo::NoMaskSad { median: false },
-            13 if sad_on => Algo::NoMaskSad { median: true },
-            21 if sad_on => Algo::NormalSad { simple: true },
-            22 if sad_on => Algo::NormalSad { simple: false },
-            23 if sad_on => Algo::ExtendedSad,
-            1 => Algo::Fast { next: true },
-            2 => Algo::Fast { next: false },
-            11 => Algo::NoMask { median: false },
-            13 => Algo::NoMask { median: true },
-            21 => Algo::Normal { simple: true },
-            22 => Algo::Normal { simple: false },
-            23 => Algo::Extended,
-            _ => Algo::Fill,
-        };
-        let block = vector_data.effective_block();
-        let mut renderer = Renderer::new(RenderShape {
-            width: self.video_info.width,
-            height: self.video_info.height,
-            step_x: block.width,
-            step_y: block.height,
-            grid_w: width,
-            grid_h: height,
-            origin_x: shape.block_w / 2,
-            origin_y: shape.block_h / 2,
-            pel: shape.pel,
-            blend: params.area_blend,
-        });
+        let sad = engine::merged_sad(selected, sad_masks.as_ref());
+        let kind = engine::kind(selected, sad.is_some());
+        let mut renderer = Renderer::new(engine::render_shape(
+            vector_data,
+            self.video_info.width,
+            self.video_info.height,
+            params.area_blend,
+        ));
         renderer.set_time(time);
         if self.render_mode == 2
             && let Some(gpu) = self.gpu.as_ref()

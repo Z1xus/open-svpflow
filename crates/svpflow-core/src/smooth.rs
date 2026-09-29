@@ -652,6 +652,41 @@ struct Pass<'a> {
     x_weights: &'a [[i16; 2]],
     y_weights: &'a [i16],
     pitch: usize,
+    blocks: std::ops::Range<i32>,
+    row_base: i32,
+}
+
+impl Pass<'_> {
+    fn block_rows(&self, interp: bool, grid_h: i32, by: i32) -> (i32, i32) {
+        let py0 = if by < 0 {
+            0
+        } else {
+            self.origin_y + by * self.step_y
+        };
+        let mut rows = if py0 + self.step_y < self.height {
+            if by == -1 { self.origin_y } else { self.step_y }
+        } else {
+            self.height - py0
+        };
+        if !interp && by == grid_h - 1 {
+            rows = self.height - py0;
+        }
+        (py0, rows)
+    }
+
+    fn rows_of(&self, interp: bool, grid_h: i32) -> std::ops::Range<i32> {
+        let edge = |by: i32| {
+            if by >= grid_h {
+                self.height
+            } else {
+                self.block_rows(interp, grid_h, by.max(-1))
+                    .0
+                    .min(self.height)
+            }
+        };
+        let start = edge(self.blocks.start);
+        start..edge(self.blocks.end).max(start)
+    }
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -714,6 +749,10 @@ impl Renderer {
         renderer
     }
 
+    pub const fn grid_h(&self) -> i32 {
+        self.shape.grid_h
+    }
+
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn set_time(&mut self, time: i32) {
         if self.time == time {
@@ -734,10 +773,16 @@ impl Renderer {
     }
 
     #[allow(clippy::cast_sign_loss)]
-    fn pass(&self, chroma: bool, interp: bool, pitch: usize) -> Pass<'_> {
+    fn pass(
+        &self,
+        chroma: bool,
+        interp: bool,
+        pitch: usize,
+        blocks: std::ops::Range<i32>,
+    ) -> Pass<'_> {
         let s = &self.shape;
         let shift = |i: usize| self.shifts[i].clamp(0, 31) as u32;
-        if chroma {
+        let mut pass = if chroma {
             let d = self.chroma_div;
             Pass {
                 width: s.width / 2,
@@ -753,6 +798,8 @@ impl Renderer {
                 x_weights: &self.x_chroma,
                 y_weights: if d == 2 { &self.y_chroma } else { &self.y_luma },
                 pitch,
+                blocks,
+                row_base: 0,
             }
         } else {
             Pass {
@@ -769,18 +816,39 @@ impl Renderer {
                 x_weights: &self.x_luma,
                 y_weights: &self.y_luma,
                 pitch,
+                blocks,
+                row_base: 0,
             }
-        }
+        };
+        pass.row_base = pass.rows_of(interp, s.grid_h).start;
+        pass
+    }
+
+    pub fn band_rows(
+        &self,
+        interp: bool,
+        blocks: std::ops::Range<i32>,
+    ) -> [std::ops::Range<usize>; 2] {
+        [false, true].map(|chroma| {
+            let rows = self
+                .pass(chroma, interp, 0, blocks.clone())
+                .rows_of(interp, self.shape.grid_h);
+            usize::try_from(rows.start).unwrap_or(0)..usize::try_from(rows.end).unwrap_or(0)
+        })
     }
 
     pub fn fill(&self, dst: &mut FrameMut<'_>) {
-        let s = &self.shape;
-        let w = s.width as usize;
-        let h = s.height as usize;
+        let h = self.shape.height as usize;
+        self.fill_rows(dst, [0..h, 0..h / 2]);
+    }
+
+    fn fill_rows(&self, dst: &mut FrameMut<'_>, rows: [std::ops::Range<usize>; 2]) {
+        let w = self.shape.width as usize;
+        let [luma, chroma] = rows;
         for (plane, pw, ph, value) in [
-            (&mut dst.y, w, h, 0x7F),
-            (&mut dst.u, w / 2, h / 2, 0x80),
-            (&mut dst.v, w / 2, h / 2, 0x80),
+            (&mut dst.y, w, luma.len(), 0x7F),
+            (&mut dst.u, w / 2, chroma.len(), 0x80),
+            (&mut dst.v, w / 2, chroma.len(), 0x80),
         ] {
             for row in 0..ph {
                 plane.data[row * plane.pitch..row * plane.pitch + pw].fill(value);
@@ -797,13 +865,35 @@ impl Renderer {
         current: Frame<'_>,
         vectors: &PackedVectors<'_>,
     ) {
+        self.render_band(
+            algo,
+            interp,
+            dst,
+            next,
+            current,
+            vectors,
+            -1..self.shape.grid_h,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_band(
+        &self,
+        algo: Algo,
+        interp: bool,
+        dst: &mut FrameMut<'_>,
+        next: Frame<'_>,
+        current: Frame<'_>,
+        vectors: &PackedVectors<'_>,
+        blocks: std::ops::Range<i32>,
+    ) {
         if algo == Algo::Fill {
-            self.fill(dst);
+            self.fill_rows(dst, self.band_rows(interp, blocks));
             return;
         }
         for chroma in [false, true] {
             let pitch = if chroma { next.u.pitch } else { next.y.pitch };
-            let pass = self.pass(chroma, interp, pitch);
+            let pass = self.pass(chroma, interp, pitch, blocks.clone());
             let mut planes: Vec<(&mut PlaneMut<'_>, Plane<'_>, Plane<'_>)> = if chroma {
                 vec![
                     (&mut dst.u, next.u, current.u),
@@ -1117,20 +1207,8 @@ impl Renderer {
         let mut blocks: Vec<(i32, usize, [i16; 32], [i16; 32])> =
             Vec::with_capacity(usize::try_from(grid_w).unwrap_or(0) + 1);
         let mut pairs = [0i32; N];
-        for by in -1..grid_h {
-            let py0 = if by < 0 {
-                0
-            } else {
-                pass.origin_y + by * pass.step_y
-            };
-            let mut rows = if py0 + pass.step_y < pass.height {
-                if by == -1 { pass.origin_y } else { pass.step_y }
-            } else {
-                pass.height - py0
-            };
-            if !interp && by == grid_h - 1 {
-                rows = pass.height - py0;
-            }
+        for by in pass.blocks.start.max(-1)..pass.blocks.end.min(grid_h) {
+            let (py0, rows) = pass.block_rows(interp, grid_h, by);
             if rows <= 0 {
                 continue;
             }
@@ -1221,7 +1299,7 @@ impl Renderer {
                 let view: [&[i32]; N] = std::array::from_fn(|k| &lanes[k * span..(k + 1) * span]);
                 let base = pel * py * pitch;
                 for ((dst, _, _), prepared) in planes.iter_mut().zip(&prepared) {
-                    let row_start = py as usize * dst.pitch;
+                    let row_start = (py - pass.row_base) as usize * dst.pitch;
                     let end = (row_start + width).min(dst.data.len());
                     kernel(&mut dst.data[row_start..end], prepared, base, width, &view);
                 }
