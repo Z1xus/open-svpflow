@@ -536,6 +536,9 @@ pub struct Engine {
     shape: FieldShape,
     render: RenderShape,
     zero: (bool, bool),
+    dither: bool,
+    width: i32,
+    height: i32,
     table: Option<[u8; 511]>,
     quality: Vec<(i32, i32, Vec<u8>)>,
 }
@@ -543,6 +546,26 @@ pub struct Engine {
 pub enum Output {
     Copy(i32),
     Render(Box<Job>),
+    Gpu(Box<GpuJob>),
+}
+
+pub struct GpuJob {
+    pub n: i32,
+    pub params: [GpuParams; 3],
+    pub linear: bool,
+    pub grid: (usize, usize),
+    pub base: Vec<u16>,
+    pub ext: Option<Vec<u16>>,
+    pub mask: Option<Vec<u8>>,
+}
+
+struct Planned {
+    n: i32,
+    time: i32,
+    neither: bool,
+    selected: i32,
+    motions: MotionSet,
+    masks: Masks,
 }
 
 pub struct Job {
@@ -596,6 +619,9 @@ impl Engine {
             limits: limits(&params),
             shape: FieldShape::from_data(&data),
             zero: (options.debug_zerox(), options.debug_zeroy()),
+            dither: options.dither(),
+            width: source.width,
+            height: source.height,
             params,
             data,
             render,
@@ -627,6 +653,89 @@ impl Engine {
     }
 
     pub fn prepare<'a>(&mut self, frame: i32, vectors: impl Fn(i32) -> Option<&'a [u8]>) -> Output {
+        let planned = match self.plan_frame(frame, vectors, false) {
+            Ok(planned) => planned,
+            Err(k) => return Output::Copy(k),
+        };
+        let sad = merged_sad(planned.selected, planned.masks.sad.as_ref());
+        let mut renderer = Renderer::new(self.render);
+        renderer.set_time(planned.time);
+        Output::Render(Box::new(Job {
+            renderer,
+            algo: kind(planned.selected, sad.is_some()),
+            interp: !planned.neither && !self.params.block,
+            motions: planned.motions,
+            masks: planned.masks,
+            sad,
+            n: planned.n,
+        }))
+    }
+
+    pub fn prepare_gpu<'a>(
+        &mut self,
+        frame: i32,
+        vectors: impl Fn(i32) -> Option<&'a [u8]>,
+    ) -> Output {
+        let planned = match self.plan_frame(frame, vectors, true) {
+            Ok(planned) => planned,
+            Err(k) => return Output::Copy(k),
+        };
+        let (grid_w, grid_h) = (self.shape.packed_width(), self.shape.packed_height());
+        let count = usize::try_from(grid_w * grid_h).unwrap_or(0);
+        let [fwd_x, fwd_y, bwd_x, bwd_y, next_x, next_y, prev_x, prev_y] = &planned.motions;
+        let pack = |a: &[u16], b: &[u16], c: &[u16], d: &[u16]| {
+            (0..count)
+                .flat_map(|i| [a[i], b[i], c[i], d[i]])
+                .collect::<Vec<u16>>()
+        };
+        let base = pack(bwd_x, fwd_y, fwd_x, bwd_y);
+        let ext = (planned.selected == 23).then(|| pack(prev_x, next_y, next_x, prev_y));
+        let masks = &planned.masks;
+        let coverage = planned.selected >= 21;
+        let mask = (coverage || masks.sad.is_some()).then(|| {
+            (0..count)
+                .flat_map(|i| {
+                    let (first, second) = masks
+                        .sad
+                        .as_ref()
+                        .map_or((0, 0), |(first, second)| (first[i], second[i]));
+                    let (fwd, bwd) = if coverage {
+                        (masks.cover_fwd[i], masks.cover_bwd[i])
+                    } else {
+                        (0, 0)
+                    };
+                    [first, fwd, bwd, second]
+                })
+                .collect()
+        });
+        Output::Gpu(Box::new(GpuJob {
+            n: planned.n,
+            params: gpu_params(
+                &self.params,
+                &self.data,
+                (self.width, self.height),
+                planned.selected,
+                planned.time,
+                masks.sad.is_some(),
+                self.dither,
+            ),
+            linear: gpu_linear(&self.params, self.width),
+            grid: (
+                usize::try_from(grid_w).unwrap_or(0),
+                usize::try_from(grid_h).unwrap_or(0),
+            ),
+            base,
+            ext,
+            mask,
+        }))
+    }
+
+    fn plan_frame<'a>(
+        &mut self,
+        frame: i32,
+        vectors: impl Fn(i32) -> Option<&'a [u8]>,
+        gpu: bool,
+    ) -> Result<Planned, i32> {
         let params = self.params;
         let step = self.rates.step(&params, frame);
         let (n, raw) = (step.n, step.raw);
@@ -651,7 +760,7 @@ impl Engine {
         });
         phase = adapt_phase(&params, &self.rates, raw, class, phase);
         if let Some(next) = copy_choice(&params, phase, class, false) {
-            return Output::Copy(n + i32::from(next));
+            return Err(n + i32::from(next));
         }
         let (use_fwd, use_bwd, force13) = directions(&params, phase, class);
         load(&mut field, n);
@@ -661,7 +770,7 @@ impl Engine {
         let extended = neighbors_ok && params.algo == 23 && !neither;
         let motions = motions(
             &mut field,
-            false,
+            gpu,
             use_fwd,
             use_bwd,
             extended,
@@ -671,19 +780,14 @@ impl Engine {
             },
             n,
         );
-        let selected = select(params.algo, use_fwd, use_bwd, extended, force13);
-        let sad = merged_sad(selected, masks.sad.as_ref());
-        let mut renderer = Renderer::new(self.render);
-        renderer.set_time(time);
-        Output::Render(Box::new(Job {
-            renderer,
-            algo: kind(selected, sad.is_some()),
-            interp: !neither && !params.block,
+        Ok(Planned {
+            n,
+            time,
+            neither,
+            selected: select(params.algo, use_fwd, use_bwd, extended, force13),
             motions,
             masks,
-            sad,
-            n,
-        }))
+        })
     }
 }
 

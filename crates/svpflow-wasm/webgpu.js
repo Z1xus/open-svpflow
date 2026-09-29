@@ -375,6 +375,11 @@ export class WebGpuRenderer {
     this.device.queue.submit([encoder.finish()]);
   }
 
+  renderSmoothToSlot(smooth, smoother, frame, slot) {
+    if (slot < 0 || slot >= this.batchCount) throw new Error("invalid batch slot");
+    smooth.renderToBuffer(smoother, frame, this.batchFrames, slot * this.outputBytes);
+  }
+
   async finishBatch(weights, bright, grading) {
     if (!(weights instanceof Float32Array) || weights.length !== this.batchCount) throw new Error("invalid blend weights");
     const hue = (grading.hue * Math.PI) / 180;
@@ -444,5 +449,175 @@ export class WebGpuRenderer {
     const result = new Uint8Array(this.readback.getMappedRange()).slice(0, this.outputLength);
     this.readback.unmap();
     return result;
+  }
+}
+
+const unfilterable = binding => ({binding, visibility: GPUShaderStage.COMPUTE, texture: {sampleType: "unfilterable-float"}});
+
+export class SmoothGpu {
+  static async create(device, {width, height}) {
+    const code = await (await fetch(new URL("./smooth.wgsl", import.meta.url))).text();
+    return new SmoothGpu(device, code, {width, height});
+  }
+
+  constructor(device, code, {width, height}) {
+    if (![width, height].every(Number.isInteger) || width <= 0 || height <= 0 || width % 2 || height % 2) throw new Error("invalid smoother size");
+    this.device = device;
+    this.width = width;
+    this.height = height;
+    this.frameLength = width * height * 3 / 2;
+    this.outputBytes = words(this.frameLength) * 4;
+    this.module = device.createShaderModule({code});
+    this.layout = device.createBindGroupLayout({entries: [
+      {binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: {type: "uniform"}},
+      unfilterable(1), unfilterable(2), unfilterable(3), unfilterable(4), unfilterable(5),
+      {binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: {type: "storage"}},
+    ]});
+    this.pipelineLayout = device.createPipelineLayout({bindGroupLayouts: [this.layout]});
+    this.prepassLayout = device.createBindGroupLayout({entries: [
+      unfilterable(0),
+      {binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: {access: "write-only", format: "r32float"}},
+    ]});
+    this.prepass = device.createComputePipeline({
+      layout: device.createPipelineLayout({bindGroupLayouts: [device.createBindGroupLayout({entries: []}), this.prepassLayout]}),
+      compute: {module: this.module, entryPoint: "linear_luma"},
+    });
+    this.pipelines = new Map();
+    this.sources = new Map();
+    this.params = [0, 1, 2].map(() => device.createBuffer({size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST}));
+    this.output = device.createBuffer({size: this.outputBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST});
+    this.readback = device.createBuffer({size: this.outputBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
+    this.planes = [
+      [0, width],
+      [width * height, width / 2],
+      [width * height * 5 / 4, width / 2],
+    ];
+  }
+
+  #texture(width, height, format, usage) {
+    return this.device.createTexture({size: [width, height], format, usage});
+  }
+
+  uploadSource(k, frame) {
+    if (!(frame instanceof Uint8Array) || frame.length !== this.frameLength) throw new Error("invalid source buffer length");
+    if (this.sources.has(k)) return;
+    const {width, height} = this;
+    const luma = width * height, chroma = luma / 4;
+    const texture = this.#texture(width, height * 3 / 2, "r8unorm", GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST);
+    const queue = this.device.queue;
+    queue.writeTexture({texture}, frame, {bytesPerRow: width}, [width, height]);
+    queue.writeTexture({texture, origin: [0, height]}, frame.subarray(luma, luma + chroma), {bytesPerRow: width / 2}, [width / 2, height / 2]);
+    queue.writeTexture({texture, origin: [width / 2, height]}, frame.subarray(luma + chroma), {bytesPerRow: width / 2}, [width / 2, height / 2]);
+    const linear = this.#texture(width, height, "r32float", GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING);
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.prepass);
+    pass.setBindGroup(1, this.device.createBindGroup({layout: this.prepassLayout, entries: [
+      {binding: 0, resource: texture.createView()},
+      {binding: 1, resource: linear.createView()},
+    ]}));
+    pass.dispatchWorkgroups(Math.ceil(width / 16), Math.ceil(height / 16));
+    pass.end();
+    queue.submit([encoder.finish()]);
+    this.sources.set(k, {texture, linear, frame});
+  }
+
+  forgetBefore(k) {
+    for (const [key, source] of this.sources) {
+      if (key >= k) continue;
+      source.texture.destroy();
+      source.linear.destroy();
+      this.sources.delete(key);
+    }
+  }
+
+  #pipeline(ints) {
+    const [algorithm, , , , , , , , , , , hasSad, linearLuma, cubic, cubicRef, , , , dither] = ints;
+    const key = [algorithm, cubic, cubicRef, hasSad, linearLuma, dither].join();
+    let pipeline = this.pipelines.get(key);
+    if (!pipeline) {
+      pipeline = this.device.createComputePipeline({
+        layout: this.pipelineLayout,
+        compute: {module: this.module, entryPoint: "render", constants: {
+          ALGO: algorithm, CUBIC: cubic, CUBIC_REF: cubicRef, HAS_SAD: hasSad, LINEAR_LUMA: linearLuma, DITHER: dither,
+        }},
+      });
+      this.pipelines.set(key, pipeline);
+    }
+    return pipeline;
+  }
+
+  #field(data, [width, height]) {
+    const texture = this.#texture(width, height, "rgba32float", GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST);
+    this.device.queue.writeTexture({texture}, Float32Array.from(data), {bytesPerRow: width * 16}, [width, height]);
+    return texture;
+  }
+
+  encode(smoother, frame, encoder) {
+    const k = smoother.prepare_gpu(frame);
+    if (k === -2) throw new Error("smoother is not in GPU mode");
+    if (k >= 0) {
+      const source = this.sources.get(k);
+      if (!source) throw new Error(`source frame ${k} is missing`);
+      this.device.queue.writeBuffer(this.output, 0, packed(source.frame));
+      return [];
+    }
+    const [n0, n1] = smoother.plan(frame);
+    const current = this.sources.get(n0), next = this.sources.get(n1);
+    if (!current || !next) throw new Error(`source frame ${current ? n1 : n0} is missing`);
+    const grid = smoother.gpu_grid();
+    const base = this.#field(smoother.gpu_base(), grid);
+    const extData = smoother.gpu_ext();
+    const ext = extData.length ? this.#field(extData, grid) : base;
+    const maskData = smoother.gpu_mask();
+    const mask = this.#texture(grid[0], grid[1], "rgba8unorm", GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST);
+    this.device.queue.writeTexture({texture: mask}, maskData.length ? maskData : new Uint8Array(grid[0] * grid[1] * 4), {bytesPerRow: grid[0] * 4}, grid);
+    const params = smoother.gpu_params();
+    const linear = smoother.gpu_linear();
+    encoder.clearBuffer(this.output);
+    const pass = encoder.beginComputePass();
+    for (let plane = 0; plane < 3; plane++) {
+      const bytes = new Uint8Array(96);
+      bytes.set(params.subarray(plane * 88, plane * 88 + 88));
+      const view = new DataView(bytes.buffer);
+      view.setUint32(76, this.planes[plane][0], true);
+      view.setUint32(80, this.planes[plane][1], true);
+      this.device.queue.writeBuffer(this.params[plane], 0, bytes);
+      const ints = new Int32Array(bytes.buffer, 0, 19);
+      const source = s => plane === 0 && linear ? s.linear : s.texture;
+      pass.setPipeline(this.#pipeline(ints));
+      pass.setBindGroup(0, this.device.createBindGroup({layout: this.layout, entries: [
+        {binding: 0, resource: {buffer: this.params[plane]}},
+        {binding: 1, resource: source(current).createView()},
+        {binding: 2, resource: source(next).createView()},
+        {binding: 3, resource: base.createView()},
+        {binding: 4, resource: ext.createView()},
+        {binding: 5, resource: mask.createView()},
+        {binding: 6, resource: {buffer: this.output}},
+      ]}));
+      pass.dispatchWorkgroups(Math.ceil(ints[1] / 16), Math.ceil(ints[2] / 16));
+    }
+    pass.end();
+    return ext === base ? [base, mask] : [base, ext, mask];
+  }
+
+  async render(smoother, frame) {
+    const encoder = this.device.createCommandEncoder();
+    const temporary = this.encode(smoother, frame, encoder);
+    encoder.copyBufferToBuffer(this.output, 0, this.readback, 0, this.outputBytes);
+    this.device.queue.submit([encoder.finish()]);
+    for (const texture of temporary) texture.destroy();
+    await this.readback.mapAsync(GPUMapMode.READ);
+    const result = new Uint8Array(this.readback.getMappedRange()).slice(0, this.frameLength);
+    this.readback.unmap();
+    return result;
+  }
+
+  renderToBuffer(smoother, frame, buffer, offset) {
+    const encoder = this.device.createCommandEncoder();
+    const temporary = this.encode(smoother, frame, encoder);
+    encoder.copyBufferToBuffer(this.output, 0, buffer, offset, this.outputBytes);
+    this.device.queue.submit([encoder.finish()]);
+    for (const texture of temporary) texture.destroy();
   }
 }

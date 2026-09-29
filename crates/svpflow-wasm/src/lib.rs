@@ -15,6 +15,8 @@ use svpflow_core::renderer::{
     PlaneRenderInput, Vector, VectorContext,
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use svpflow_core::smooth_engine::{GpuJob, Output};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use svpflow1_vs::{Analyser, SuperBuilder, SuperFrame};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use wasm_bindgen::prelude::*;
@@ -158,6 +160,7 @@ impl WasmAnalyser {
 pub struct WasmSmoother {
     smoother: Smoother,
     output: Vec<u8>,
+    job: Option<Box<GpuJob>>,
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -185,6 +188,7 @@ impl WasmSmoother {
         Ok(Self {
             output: vec![0; smoother.frame_len()],
             smoother,
+            job: None,
         })
     }
 
@@ -236,6 +240,96 @@ impl WasmSmoother {
     #[must_use]
     pub fn output(&self) -> Vec<u8> {
         self.output.clone()
+    }
+    pub fn prepare_gpu(&mut self, frame: i32) -> i32 {
+        match self.smoother.prepare_gpu(frame) {
+            Output::Copy(k) => {
+                self.job = None;
+                k
+            }
+            Output::Gpu(job) => {
+                self.job = Some(job);
+                -1
+            }
+            Output::Render(_) => {
+                self.job = None;
+                -2
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn gpu_params(&self) -> Vec<u8> {
+        self.job.as_ref().map_or_else(Vec::new, |job| {
+            job.params
+                .iter()
+                .flat_map(|p| {
+                    let ints = [
+                        p.algorithm,
+                        p.width,
+                        p.height,
+                        p.x_ratio,
+                        p.y_ratio,
+                        p.pel,
+                        p.block_w,
+                        p.block_h,
+                        p.origin_x,
+                        p.origin_y,
+                        p.phase,
+                        p.has_sad,
+                        p.linear_luma,
+                        p.cubic,
+                        p.cubic_ref,
+                        p.offset_x,
+                        p.offset_y,
+                    ];
+                    ints.into_iter()
+                        .flat_map(i32::to_le_bytes)
+                        .chain(p.sad_blend.to_le_bytes())
+                        .chain(p.dither.to_le_bytes())
+                        .chain([0; 12])
+                        .collect::<Vec<u8>>()
+                })
+                .collect()
+        })
+    }
+
+    #[must_use]
+    pub fn gpu_linear(&self) -> bool {
+        self.job.as_ref().is_some_and(|job| job.linear)
+    }
+
+    #[must_use]
+    pub fn gpu_grid(&self) -> Vec<u32> {
+        self.job.as_ref().map_or_else(Vec::new, |job| {
+            vec![
+                u32::try_from(job.grid.0).unwrap_or(0),
+                u32::try_from(job.grid.1).unwrap_or(0),
+            ]
+        })
+    }
+
+    #[must_use]
+    pub fn gpu_base(&self) -> Vec<u16> {
+        self.job
+            .as_ref()
+            .map_or_else(Vec::new, |job| job.base.clone())
+    }
+
+    #[must_use]
+    pub fn gpu_ext(&self) -> Vec<u16> {
+        self.job
+            .as_ref()
+            .and_then(|job| job.ext.clone())
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn gpu_mask(&self) -> Vec<u8> {
+        self.job
+            .as_ref()
+            .and_then(|job| job.mask.clone())
+            .unwrap_or_default()
     }
 }
 

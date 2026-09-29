@@ -10,3 +10,4 @@ export RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals,+simd
 
 wasm-pack build "$crate" --target web --release --out-dir "$out"
 cp "$crate/webgpu.js" "$out/webgpu.js"
+cp "$crate/smooth.wgsl" "$out/smooth.wgsl"

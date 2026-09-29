@@ -168,6 +168,19 @@ impl Smoother {
                 self.render_job(&job, current, next, out);
                 Ok(())
             }
+            Output::Gpu(_) => Err("unexpected GPU job".into()),
+        }
+    }
+
+    pub fn prepare_gpu(&mut self, frame: i32) -> Output {
+        let last = self.last;
+        let vectors = &self.vectors;
+        match self
+            .engine
+            .prepare_gpu(frame, |k| vectors.get(&k.clamp(0, last)).map(Vec::as_slice))
+        {
+            Output::Copy(k) => Output::Copy(k.clamp(0, last)),
+            output => output,
         }
     }
 
