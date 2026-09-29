@@ -2,6 +2,9 @@ use super::metric::{self, ChromaCost, Kernel, LumaCost, Shape};
 
 use super::planes::{LevelFrame, MAX_BLOCK_AREA, PlaneView};
 
+#[path = "recalc.rs"]
+pub(crate) mod recalc;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Mv {
     pub(crate) x: i16,
@@ -106,6 +109,7 @@ pub(crate) struct Field {
     chroma_shift: (u32, u32),
     full: Kernels,
     half: Kernels,
+    satd: bool,
     pub(crate) vectors: Vec<Mv>,
     pub(crate) reverse: Vec<Mv>,
     border: Vec<Mv>,
@@ -156,6 +160,7 @@ impl Field {
                 pair: None,
                 wide: None,
             },
+            satd,
             vectors: vec![Mv::default(); count],
             reverse: vec![Mv::default(); count],
             border: vec![Mv::default(); (blk_x + blk_y + 1) as usize],
@@ -636,7 +641,7 @@ fn planes_fit(frame: &LevelFrame<'_>, pel: i32) -> bool {
     frame.u.pitch == frame.v.pitch && fits(&frame.y) && fits(&frame.u) && fits(&frame.v)
 }
 
-fn packed_score(best: Mv, diagonal: i32, block_luma: i32) -> u32 {
+pub(crate) fn packed_score(best: Mv, diagonal: i32, block_luma: i32) -> u32 {
     let mut sad = best.sad;
     let relative = (i32::from(best.x).abs() + i32::from(best.y).abs()) * 100 / diagonal;
     if relative > 50 {

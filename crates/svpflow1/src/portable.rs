@@ -231,6 +231,7 @@ impl Analyser {
             &self.params,
             &current.view(),
             &reference.view(),
+            None,
         ))
     }
 }

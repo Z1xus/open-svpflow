@@ -315,7 +315,17 @@ unsafe extern "system" fn get_frame_analyse(
         pel: sp.pel,
         chroma_shift: params.chroma_shift,
     };
-    let payload = analyse::analyse(params, &view(0), &view(1));
+    let level0 = if full {
+        state.super_node
+    } else {
+        state.src_node
+    } as usize;
+    let payload = analyse::analyse(
+        params,
+        &view(0),
+        &view(1),
+        Some([(level0, n), (level0, next)]),
+    );
     release(&sources);
 
     let out = unsafe { new_frame(state.gray_format, payload.len() as i32, 1, supers[0], core) };

@@ -40,6 +40,14 @@ impl<'a> PlaneView<'a> {
         (x >> BITS) as isize + subplane
     }
 
+    pub(crate) fn base(&self) -> usize {
+        self.base
+    }
+
+    pub(crate) fn pel(&self) -> i32 {
+        self.pel
+    }
+
     pub(crate) fn data(&self) -> &'a [u8] {
         self.data
     }

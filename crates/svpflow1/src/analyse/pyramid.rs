@@ -1,5 +1,8 @@
+use super::field::recalc::RecalcPlan;
 use super::field::{Field, Mv, VectorOutput};
+use super::gpu::Session;
 use super::params::{AnalyseParams, Stage};
+use super::planes::LevelFrame;
 use super::planes::SuperFrameView;
 
 pub(crate) struct Pyramid {
@@ -44,6 +47,7 @@ impl Pyramid {
         second: &SuperFrameView<'_>,
         lambda_out: &mut i32,
         outputs: [Option<VectorOutput<'_>>; 2],
+        mut on_finest: impl FnMut(usize, &Field, i32),
     ) {
         let [mut out_forward, mut out_backward] = outputs;
         let top = stage.levels - 1;
@@ -115,9 +119,15 @@ impl Pyramid {
                 lambda,
                 if finest { out_forward.take() } else { None },
             );
+            if finest {
+                on_finest(0, f, *lambda_out);
+            }
             if let Some(b) = b {
                 let out = if finest { out_backward.take() } else { None };
                 b.search(&reference, &src, &settings, global_backward, None, out);
+                if finest {
+                    on_finest(1, b, *lambda_out);
+                }
             }
         }
     }
@@ -131,8 +141,9 @@ impl Pyramid {
         second: &SuperFrameView<'_>,
         lambda_out: &mut i32,
         outputs: [Option<VectorOutput<'_>>; 2],
+        session: Option<&mut Session<'_>>,
     ) {
-        let [out_forward, out_backward] = outputs;
+        let [mut out_forward, mut out_backward] = outputs;
         let mut settings = stage.settings(params, 0, true);
         settings.lambda = *lambda_out;
         let seeds = [&previous.forward[0], &previous.backward[0]];
@@ -147,9 +158,146 @@ impl Pyramid {
         }
         let (src, reference) = (first.level(0), second.level(0));
         let (f, b) = self.pair(0);
-        f.recalculate(&src, &reference, &settings, Some(lambda_out), out_forward);
-        if let Some(b) = b {
-            b.recalculate(&reference, &src, &settings, None, out_backward);
+        if session.is_none() {
+            f.recalculate(&src, &reference, &settings, Some(lambda_out), out_forward);
+            if let Some(b) = b {
+                b.recalculate(&reference, &src, &settings, None, out_backward);
+            }
+            return;
+        }
+        let mut plans = [RecalcPlan::default(), RecalcPlan::default()];
+        let planned_f = f.plan_recalculate(&src, &settings, out_forward.is_some(), &mut plans[0]);
+        if planned_f {
+            *lambda_out = settings.lambda >> 2;
+        } else {
+            f.recalculate(
+                &src,
+                &reference,
+                &settings,
+                Some(lambda_out),
+                out_forward.as_deref_mut(),
+            );
+        }
+        let mut b = b;
+        let planned_b = b.as_deref_mut().is_some_and(|b| {
+            let planned =
+                b.plan_recalculate(&reference, &settings, out_backward.is_some(), &mut plans[1]);
+            if !planned {
+                b.recalculate(
+                    &reference,
+                    &src,
+                    &settings,
+                    None,
+                    out_backward.as_deref_mut(),
+                );
+            }
+            planned
+        });
+        let mut session = session;
+        let mut tickets = [None, None];
+        if let Some(session) = session.as_deref_mut() {
+            if planned_f {
+                tickets[0] = session.submit(&plans[0], 0, 1);
+            }
+            if planned_b {
+                tickets[1] = session.submit(&plans[1], 1, 0);
+            }
+            if tickets.iter().any(Option::is_some) && !session.wait() {
+                tickets = [None, None];
+            }
+        }
+        let mut results = |index: usize, src: &LevelFrame<'_>, reference: &LevelFrame<'_>| {
+            tickets[index]
+                .and_then(|ticket| session.as_deref_mut().map(|s| s.take(ticket)))
+                .filter(|r| r.len() == plans[index].blocks())
+                .unwrap_or_else(|| Field::evaluate_recalc_cpu(&plans[index], src, reference))
+        };
+        if planned_f {
+            let r = results(0, &src, &reference);
+            f.finish_recalculate(&plans[0], &r, out_forward);
+        }
+        if planned_b && let Some(b) = b {
+            let r = results(1, &reference, &src);
+            b.finish_recalculate(&plans[1], &r, out_backward);
+        }
+    }
+}
+
+pub(crate) struct RefineStart {
+    plan: RecalcPlan,
+    ticket: Option<usize>,
+}
+
+impl Pyramid {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn refine_start(
+        &mut self,
+        direction: usize,
+        seed: &Field,
+        settings: &super::field::SearchSettings,
+        frames: [&SuperFrameView<'_>; 2],
+        session: &mut Session<'_>,
+        output: Option<VectorOutput<'_>>,
+        lambda_out: Option<&mut i32>,
+    ) -> Option<RefineStart> {
+        let field = if direction == 0 {
+            self.forward[0].as_mut()?
+        } else if self.both {
+            self.backward[0].as_mut()?
+        } else {
+            return None;
+        };
+        field.interpolate_prediction(seed, true);
+        field.set_order(None);
+        let (src, reference) = if direction == 0 {
+            (frames[0].level(0), frames[1].level(0))
+        } else {
+            (frames[1].level(0), frames[0].level(0))
+        };
+        let mut plan = RecalcPlan::default();
+        if !field.plan_recalculate(&src, settings, output.is_some(), &mut plan) {
+            field.recalculate(&src, &reference, settings, lambda_out, output);
+            return None;
+        }
+        if let Some(lambda) = lambda_out {
+            *lambda = settings.lambda >> 2;
+        }
+        let ticket = session.submit(&plan, direction, 1 - direction);
+        Some(RefineStart { plan, ticket })
+    }
+
+    pub(crate) fn refine_finish(
+        &mut self,
+        starts: [Option<RefineStart>; 2],
+        frames: [&SuperFrameView<'_>; 2],
+        session: &mut Session<'_>,
+        outputs: [Option<VectorOutput<'_>>; 2],
+    ) {
+        let waited = starts.iter().flatten().any(|s| s.ticket.is_some()) && session.wait();
+        for (direction, (start, output)) in starts.into_iter().zip(outputs).enumerate() {
+            let Some(start) = start else {
+                continue;
+            };
+            let field = if direction == 0 {
+                self.forward[0].as_mut()
+            } else {
+                self.backward[0].as_mut()
+            };
+            let Some(field) = field else {
+                continue;
+            };
+            let (src, reference) = if direction == 0 {
+                (frames[0].level(0), frames[1].level(0))
+            } else {
+                (frames[1].level(0), frames[0].level(0))
+            };
+            let bests = start
+                .ticket
+                .filter(|_| waited)
+                .map(|ticket| session.take(ticket))
+                .filter(|r| r.len() == start.plan.blocks())
+                .unwrap_or_else(|| Field::evaluate_recalc_cpu(&start.plan, &src, &reference));
+            field.finish_recalculate(&start.plan, &bests, output);
         }
     }
 }
