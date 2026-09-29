@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/svpflow-core",
+    "crates/svpflow-vs4",
     "crates/svpflow-wasm",
     "crates/svpflow1",
     "crates/svpflow2",

@@ -1,0 +1,14 @@
+[package]
+name = "svpflow-vs4"
+version = "0.1.0"
+authors = ["z1xus"]
+license = "Apache-2.0"
+edition = "2024"
+rust-version = "1.89"
+
+[lib]
+crate-type = ["rlib"]
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

@@ -46,3 +46,28 @@ pub unsafe extern "system" fn VapourSynthPluginInit(
         );
     }
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn VapourSynthPluginInit2(plugin: vs::Raw, api: vs::ConstRaw) {
+    let config = svpflow_vs4::Plugin {
+        identifier: c"com.svp-team.flow1",
+        namespace: c"svp1",
+        name: c"SVPFlow1",
+        version: 0x30002,
+    };
+    let functions = [
+        svpflow_vs4::Function {
+            name: c"Super",
+            args: c"clip:clip;opt:data",
+            returns: c"clip:vnode;data:int;",
+            create: super_filter::create_super,
+        },
+        svpflow_vs4::Function {
+            name: c"Analyse",
+            args: c"clip:clip;sdata:int;src:clip;opt:data",
+            returns: c"clip:vnode;data:int;",
+            create: analyse_filter::create_analyse,
+        },
+    ];
+    unsafe { svpflow_vs4::init(plugin, api, &config, &functions) };
+}

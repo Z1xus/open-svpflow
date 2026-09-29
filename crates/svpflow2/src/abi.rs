@@ -49,3 +49,35 @@ pub unsafe extern "system" fn VapourSynthPluginInit(
         );
     }
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn VapourSynthPluginInit2(plugin: vs::Raw, api: vs::ConstRaw) {
+    let text = |bytes: &'static [u8]| std::ffi::CStr::from_bytes_with_nul(bytes).unwrap_or(c"");
+    let config = svpflow_vs4::Plugin {
+        identifier: text(strings::PLUGIN_ID),
+        namespace: text(strings::PLUGIN_NS),
+        name: text(strings::PLUGIN_NAME),
+        version: 0x30002,
+    };
+    let functions = [
+        svpflow_vs4::Function {
+            name: text(strings::SMOOTH_FPS),
+            args: text(strings::ARGS_SMOOTH_FPS),
+            returns: c"clip:vnode;",
+            create: filter::create_smooth_fps,
+        },
+        svpflow_vs4::Function {
+            name: text(strings::SMOOTH_FPS_NVOF),
+            args: text(strings::ARGS_NVOF),
+            returns: c"clip:vnode;",
+            create: filter::create_smooth_fps_nvof,
+        },
+        svpflow_vs4::Function {
+            name: text(strings::SMOOTH_FPS_RIFE),
+            args: text(strings::ARGS_RIFE),
+            returns: c"clip:vnode;",
+            create: filter::create_smooth_fps_rife,
+        },
+    ];
+    unsafe { svpflow_vs4::init(plugin, api, &config, &functions) };
+}

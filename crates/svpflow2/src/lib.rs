@@ -27,4 +27,4 @@ mod vs;
 
 pub(crate) use svpflow_core::{params, renderer};
 
-pub use abi::{VapourSynthPluginInit, svpGetVersion};
+pub use abi::{VapourSynthPluginInit, VapourSynthPluginInit2, svpGetVersion};

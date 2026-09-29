@@ -168,6 +168,10 @@ name = "svpflow-core"
 version = "0.1.0"
 
 [[package]]
+name = "svpflow-vs4"
+version = "0.1.0"
+
+[[package]]
 name = "svpflow-wasm"
 version = "0.1.0"
 dependencies = [
@@ -185,6 +189,7 @@ dependencies = [
  "libloading",
  "rayon",
  "svpflow-core",
+ "svpflow-vs4",
 ]
 
 [[package]]
@@ -193,6 +198,7 @@ version = "0.1.0"
 dependencies = [
  "libloading",
  "svpflow-core",
+ "svpflow-vs4",
 ]
 
 [[package]]

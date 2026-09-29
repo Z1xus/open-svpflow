@@ -14,6 +14,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 libloading = "0.9.0"
 svpflow-core = { path = "../svpflow-core" }
+svpflow-vs4 = { path = "../svpflow-vs4" }
 
 [lints.rust]
 unsafe_code = "warn"
