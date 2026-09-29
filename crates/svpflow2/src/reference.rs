@@ -133,20 +133,19 @@ impl FilterState {
             && matches!(self.vector_data(), metadata::VectorRecord::Ready(_))
     }
 
-    fn cached_quality(&self, frame: i32) -> Option<i32> {
+    fn cached_quality(&self, frame: i32, luma: &mut [u8]) -> Option<i32> {
         let cache = self.quality_cache.lock().ok()?;
-        cache
-            .iter()
-            .find(|(k, _)| *k == frame)
-            .map(|&(_, class)| class)
+        let (_, class, cached) = cache.iter().find(|(k, _, _)| *k == frame)?;
+        luma.copy_from_slice(cached);
+        Some(*class)
     }
 
-    fn store_quality(&self, frame: i32, class: i32) {
+    fn store_quality(&self, frame: i32, class: i32, luma: &[u8]) {
         if let Ok(mut cache) = self.quality_cache.lock() {
             if cache.len() >= 64 {
                 cache.remove(0);
             }
-            cache.push((frame, class));
+            cache.push((frame, class, luma.to_vec()));
         }
     }
 
@@ -261,12 +260,70 @@ impl FilterState {
             unsafe { api.free(output.cast_const()) };
             return std::ptr::null();
         }
-        unsafe { self.apply_light_border(api, output, frame) };
         let timing = self.options.timing(&self.video_info);
         let ratio = crate::core::f64_i64(timing.frame_num) / crate::core::f64_i64(timing.frame_den);
         let raw_phase = timing.raw_phase_256(frame, n);
         unsafe { api.copy_interpolated_timing(source, next_source, output, raw_phase, ratio) };
         output.cast_const()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn reference_overlays(
+        &self,
+        api: &frame::PlaneApi,
+        output: vs::Raw,
+        frame: i32,
+        class: i32,
+        field: &VectorField,
+        (luma, limits): (&[u8], &SceneLimits),
+    ) {
+        let phase = self
+            .options
+            .timing(&self.video_info)
+            .output_phase_256(frame);
+        let backward = phase > 127;
+        let shape = *field.shape();
+        let (pw, ph) = (shape.packed_width(), shape.packed_height());
+        let count = usize::try_from(pw * ph).unwrap_or(0);
+        let w = self.video_info.width;
+        let h = self.video_info.height;
+        let planes = || -> Option<[(&'static mut [u8], usize); 3]> {
+            let hu = usize::try_from(h).ok()?;
+            let plane = |p: i32, rows: usize| -> Option<(&'static mut [u8], usize)> {
+                let (ptr, pitch, len) = unsafe { api.write_plane(output, p, rows) }?;
+                Some((unsafe { slice::from_raw_parts_mut(ptr, len) }, pitch))
+            };
+            Some([plane(0, hu)?, plane(1, hu / 2)?, plane(2, hu / 2)?])
+        };
+        let step_x = shape.block_w - shape.overlap_x;
+        let step_y = shape.block_h - shape.overlap_y;
+        if self.options.debug_qmap()
+            && let Some([(y, yp), (u, up), (v, _)]) = planes()
+        {
+            let mut map = vec![3u8; shape.blocks()];
+            field.quality_map(backward, limits, luma, &mut map);
+            draw_quality_map(&map, &shape, (step_x, step_y), (w, h), (y, yp), (u, v, up));
+        }
+        if self.options.debug_vectors()
+            && let Some([(y, yp), (u, up), (v, _)]) = planes()
+        {
+            let (mut xs, mut ys, mut sad) =
+                (vec![0u16; count], vec![0u16; count], vec![0u8; count]);
+            field.pack(backward, &mut xs, &mut ys, pw, ph);
+            field.sad_mask(
+                backward,
+                &mut sad,
+                self.options.mask_area_scale(),
+                self.options.mask_area_sharp(),
+                pw,
+                ph,
+            );
+            let zero = (self.options.debug_zerox(), self.options.debug_zeroy());
+            draw_vectors((&xs, &ys, &sad), &shape, (w, h), zero, (y, yp), (u, v, up));
+        }
+        if self.options.debug_qmode() {
+            unsafe { self.apply_qmode_overlay(api, output, class) };
+        }
     }
 
     fn rates(&self, params: &ReferenceParams) -> Rates {
@@ -359,7 +416,7 @@ impl FilterState {
             true
         };
         let mut quality = |field: &mut VectorField, k: i32| -> i32 {
-            if let Some(class) = self.cached_quality(k) {
+            if let Some(class) = self.cached_quality(k, &mut luma) {
                 return class;
             }
             if !load(field, k) {
@@ -368,7 +425,12 @@ impl FilterState {
             let table = luma_table.get_or_insert_with(|| field.luma_table(params.luma));
             field.avg_luma(&mut luma, table);
             let class = field.quality(false, &limits, &luma);
-            self.store_quality(k, class);
+            let mut cached = luma.clone();
+            if let Some(tail) = cached.len().checked_sub(4) {
+                let mean = (field.luma_geomean() * 1_000_000.0) as i32;
+                cached[tail..].copy_from_slice(&mean.to_le_bytes());
+            }
+            self.store_quality(k, class, &cached);
             class
         };
         let algo = params.algo;
@@ -433,7 +495,7 @@ impl FilterState {
             Some(false)
         } else if phase == 256 {
             Some(true)
-        } else if class == 3 && !params.blend {
+        } else if (class == 3 && !params.blend) || self.options.debug_vectors() {
             Some(phase > 127)
         } else {
             None
@@ -457,6 +519,22 @@ impl FilterState {
                 )
             };
             fetch.drop(other);
+            if !output.is_null() && phase & !0x100 != 0 {
+                load(&mut field, n);
+                unsafe {
+                    self.reference_overlays(
+                        &api,
+                        output.cast_mut(),
+                        frame,
+                        class,
+                        &field,
+                        (&luma, &limits),
+                    );
+                };
+                if self.options.debug_tt() {
+                    unsafe { self.apply_timing_bar(&api, output.cast_mut(), frame) };
+                }
+            }
             return output;
         }
         let (mut use_fwd, mut use_bwd) = if algo == 2 {
@@ -484,6 +562,8 @@ impl FilterState {
                 use_bwd,
                 neighbors_ok,
                 force13,
+                class,
+                (&luma, &limits),
                 &params,
                 &vector_data,
                 core,
@@ -513,6 +593,8 @@ impl FilterState {
         use_bwd: bool,
         neighbors_ok: bool,
         force13: bool,
+        class: i32,
+        (luma, limits): (&[u8], &SceneLimits),
         params: &ReferenceParams,
         vector_data: &metadata::VectorData,
         core: vs::Raw,
@@ -585,6 +667,16 @@ impl FilterState {
             load(field, n + 1);
             field.pack(false, &mut next_x, &mut next_y, width, height);
             extended = true;
+        }
+        if self.options.debug_zerox() {
+            for buf in [&mut fwd_x, &mut bwd_x, &mut next_x, &mut prev_x] {
+                buf.fill(1024);
+            }
+        }
+        if self.options.debug_zeroy() {
+            for buf in [&mut fwd_y, &mut bwd_y, &mut next_y, &mut prev_y] {
+                buf.fill(1024);
+            }
         }
         let mut selected = algo;
         if selected == 2 {
@@ -702,7 +794,7 @@ impl FilterState {
                 sad_blend,
                 dither: i32::from(self.options.dither()),
             };
-            return unsafe {
+            let output = unsafe {
                 self.reference_gpu(
                     api,
                     gpu,
@@ -731,6 +823,23 @@ impl FilterState {
                     core,
                 )
             };
+            if !output.is_null() {
+                unsafe {
+                    self.reference_overlays(
+                        api,
+                        output.cast_mut(),
+                        frame,
+                        class,
+                        field,
+                        (luma, limits),
+                    );
+                };
+                unsafe { self.apply_light_border(api, output.cast_mut(), frame) };
+                if self.options.debug_tt() {
+                    unsafe { self.apply_timing_bar(api, output.cast_mut(), frame) };
+                }
+            }
+            return output;
         }
         let merged = |k: i32, raw: vs::ConstRaw| -> Option<Merged> {
             if shape.pel <= 1 || !self.request_super {
@@ -835,11 +944,176 @@ impl FilterState {
             sad: sad.as_deref().unwrap_or(&[]),
         };
         renderer.render(kind, interp, &mut dst, nxt.frame(), cur.frame(), &vectors);
+        unsafe { self.reference_overlays(api, output, frame, class, field, (luma, limits)) };
         unsafe { self.apply_light_border(api, output, frame) };
+        if self.options.debug_tt() {
+            unsafe { self.apply_timing_bar(api, output, frame) };
+        }
         let timing = self.options.timing(&self.video_info);
         let ratio = crate::core::f64_i64(timing.frame_num) / crate::core::f64_i64(timing.frame_den);
         let raw_phase = timing.raw_phase_256(frame, n);
         unsafe { api.copy_interpolated_timing(source, next_source, output, raw_phase, ratio) };
         output.cast_const()
+    }
+}
+
+fn draw_quality_map(
+    map: &[u8],
+    shape: &FieldShape,
+    (step_x, step_y): (i32, i32),
+    (w, h): (i32, i32),
+    (y, yp): (&mut [u8], usize),
+    (u, v, up): (&mut [u8], &mut [u8], usize),
+) {
+    let mut color = [0u8; 3];
+    for by in 0..shape.grid_h {
+        for bx in 0..shape.grid_w {
+            color = match map[(bx + shape.grid_w * by) as usize] {
+                0 => [29, 255, 107],
+                1 => [149, 43, 21],
+                2 => [255, 0, 148],
+                3 => [76, 84, 255],
+                0xFF => continue,
+                _ => color,
+            };
+            for py in by * step_y..(by + 1) * step_y {
+                if py < 0 || py >= h {
+                    continue;
+                }
+                for px in bx * step_x..(bx + 1) * step_x {
+                    if px < 0 || px >= w {
+                        continue;
+                    }
+                    let (py, px) = (py as usize, px as usize);
+                    let blend = |dst: &mut u8, c: u8| {
+                        *dst = ((20 * u16::from(c) + 235 * u16::from(*dst)) >> 8) as u8;
+                    };
+                    blend(&mut y[py * yp + px], color[0]);
+                    let c = (py >> 1) * up + (px >> 1);
+                    blend(&mut u[c], color[1]);
+                    blend(&mut v[c], color[2]);
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn draw_vectors(
+    (xs, ys, sad): (&[u16], &[u16], &[u8]),
+    shape: &FieldShape,
+    (w, h): (i32, i32),
+    (zero_x, zero_y): (bool, bool),
+    (y, yp): (&mut [u8], usize),
+    (u, v, up): (&mut [u8], &mut [u8], usize),
+) {
+    let step_x = shape.block_w - shape.overlap_x;
+    let step_y = shape.block_h - shape.overlap_y;
+    let packed = shape.packed_width();
+    let mut put = |px: i32, py: i32, c: [i32; 3], blend: bool| {
+        let (x, yy) = (px as usize, py as usize);
+        let mix = |dst: &mut u8, c: i32| {
+            *dst = if blend {
+                ((140 * u16::from(c as u8) + 115 * u16::from(*dst)) >> 8) as u8
+            } else {
+                c as u8
+            };
+        };
+        mix(&mut y[yy * yp + x], c[0]);
+        let ci = (yy >> 1) * up + (x >> 1);
+        mix(&mut u[ci], c[1]);
+        mix(&mut v[ci], c[2]);
+    };
+    for by in 0..shape.grid_h {
+        for bx in 0..shape.grid_w {
+            let cx = bx * step_x + shape.block_w / 2;
+            let cy = by * step_y + shape.block_h / 2;
+            let index = (bx + packed * by) as usize;
+            let m = i32::from(sad[index]);
+            let color = [
+                (76 * m + 255 * (255 - m)) >> 8,
+                (((255 - m) << 7) + 84 * m) >> 8,
+                (255 * m + ((255 - m) << 7)) >> 8,
+            ];
+            let (mut x0, mut y0) = (cx - 1, cy - 1);
+            let inside = |x: i32, yv: i32| x >= 0 && x < w && yv >= 0 && yv < h;
+            if y0 < h && y0 >= 0 {
+                for px in [x0, cx - 2, cx] {
+                    if px < w && px >= 0 {
+                        put(px, y0, color, true);
+                    }
+                }
+            }
+            if inside(x0, cy - 2) {
+                put(x0, cy - 2, color, true);
+            }
+            if inside(x0, cy) {
+                put(x0, cy, color, true);
+            }
+            let (vy, ay) = if zero_y {
+                if zero_x {
+                    continue;
+                }
+                (0, 0)
+            } else {
+                let vy = i32::from(ys[index]) - 1024;
+                (vy, vy.abs())
+            };
+            let (x1, ax, sx) = if zero_x {
+                if ay <= 1 {
+                    continue;
+                }
+                (x0, 0, -1)
+            } else {
+                let vx = i32::from(xs[index]) - 1024;
+                let (x1, ax) = (x0 + vx, vx.abs());
+                if ay <= 1 && ax <= 1 {
+                    continue;
+                }
+                (x1, ax, if x0 < x1 { 1 } else { -1 })
+            };
+            let y1 = y0 + vy;
+            let sy = if y0 < y1 { 1 } else { -1 };
+            let mut err = ax - ay;
+            let mut state = 0;
+            loop {
+                match state {
+                    0 => {
+                        if y0 >= 0 && inside(x0, y0) {
+                            put(x0, y0, color, false);
+                        }
+                        state = 1;
+                    }
+                    1 => state = if y0 == y1 { 2 } else { 3 },
+                    2 => {
+                        if x0 == x1 {
+                            break;
+                        }
+                        state = 3;
+                    }
+                    _ => {
+                        let e2 = 2 * err;
+                        if e2 > -ay {
+                            x0 += sx;
+                            err -= ay;
+                        }
+                        if ax <= e2 {
+                            state = 0;
+                            continue;
+                        }
+                        y0 += sy;
+                        err += ax;
+                        if y0 >= 0 {
+                            if inside(x0, y0) {
+                                put(x0, y0, color, false);
+                            }
+                            state = 1;
+                        } else {
+                            state = if y0 == y1 { 2 } else { 3 };
+                        }
+                    }
+                }
+            }
+        }
     }
 }

@@ -345,12 +345,6 @@ impl Options {
     pub(crate) fn reference_supported(&self) -> bool {
         let debug = self.debug;
         !self.hdr_enabled()
-            && !debug.vectors
-            && !debug.qmap
-            && !debug.qmode
-            && !debug.zerox
-            && !debug.zeroy
-            && !debug.tt
             && debug.flags.trailing_zeros() >= 3
             && matches!(self.algo_for_mode(0), 1 | 2 | 11 | 13 | 21 | 22 | 23)
     }

@@ -159,6 +159,37 @@ impl VectorField {
         }
     }
 
+    pub fn luma_geomean(&self) -> f64 {
+        let denom = if self.shape.flags == 3 { 510.0 } else { 255.0 };
+        let count = self.shape.blocks();
+        let sum =
+            self.backward
+                .iter()
+                .zip(&self.forward)
+                .take(count)
+                .fold(0.0, |sum, (back, fwd)| {
+                    sum + (f64::from(u16::from(back.luma) + u16::from(fwd.luma)) / denom).ln()
+                });
+        (sum / count as f64).exp()
+    }
+
+    pub fn quality_map(&self, backward: bool, limits: &SceneLimits, luma: &[u8], out: &mut [u8]) {
+        let count = self.shape.blocks();
+        out[..count].fill(3);
+        for ((out, vector), &luma) in out.iter_mut().zip(self.set(backward)).zip(luma).take(count) {
+            let score = vector.sad.wrapping_mul(255) / i32::from(luma.max(1));
+            if score < limits.zero {
+                *out = 0xFF;
+            } else if score < limits.m1 {
+                *out = 0;
+            } else if score < limits.m2 {
+                *out = 1;
+            } else if score < limits.scene {
+                *out = 2;
+            }
+        }
+    }
+
     pub fn quality(&self, backward: bool, limits: &SceneLimits, luma: &[u8]) -> i32 {
         let count = self.shape.blocks();
         if count == 0 {

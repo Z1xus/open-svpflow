@@ -82,7 +82,7 @@ pub(crate) struct FilterState {
     pub(crate) prep_cache: PrepCache,
     pub(crate) decode_cache: DecodeCache,
     pub(crate) expand_cache: ExpandCache,
-    pub(crate) quality_cache: std::sync::Mutex<Vec<(i32, i32)>>,
+    pub(crate) quality_cache: std::sync::Mutex<Vec<(i32, i32, Vec<u8>)>>,
 }
 
 pub(crate) struct SuperExpand {
@@ -1970,7 +1970,7 @@ impl FilterState {
     }
 
     #[allow(clippy::similar_names)]
-    unsafe fn apply_timing_bar(
+    pub(crate) unsafe fn apply_timing_bar(
         &self,
         api: &frame::PlaneApi,
         output: vs::Raw,
@@ -2000,6 +2000,30 @@ impl FilterState {
     }
 
     #[allow(clippy::similar_names)]
+    pub(crate) unsafe fn apply_qmode_overlay(
+        &self,
+        api: &frame::PlaneApi,
+        output: vs::Raw,
+        scene_class: i32,
+    ) -> Option<()> {
+        let output_info = self.output_info();
+        let chroma_h =
+            usize_height(output_info.height / video_format::chroma_divisors(&output_info).1);
+        let (dst_y, dst_y_stride, dst_y_len) =
+            unsafe { api.write_plane(output, 0, usize_height(output_info.height)) }?;
+        let (dst_u, dst_u_stride, dst_u_len) = unsafe { api.write_plane(output, 1, chroma_h) }?;
+        let (dst_v, dst_v_stride, dst_v_len) = unsafe { api.write_plane(output, 2, chroma_h) }?;
+        let dst = unsafe {
+            renderer::FramePlanesMut {
+                y: plane_mut(dst_y, dst_y_stride, dst_y_len),
+                u: plane_mut(dst_u, dst_u_stride, dst_u_len),
+                v: plane_mut(dst_v, dst_v_stride, dst_v_len),
+            }
+        };
+        qmode_overlay(scene_class, &output_info, dst);
+        Some(())
+    }
+
     pub(crate) unsafe fn apply_light_border(
         &self,
         api: &frame::PlaneApi,
@@ -2035,7 +2059,7 @@ impl FilterState {
     }
 
     #[allow(clippy::similar_names)]
-    unsafe fn apply_qmap_overlay(
+    pub(crate) unsafe fn apply_qmap_overlay(
         &self,
         api: &frame::PlaneApi,
         output: vs::Raw,
@@ -2098,7 +2122,7 @@ impl FilterState {
     }
 
     #[allow(clippy::similar_names)]
-    unsafe fn apply_vector_overlay(
+    pub(crate) unsafe fn apply_vector_overlay(
         &self,
         api: &frame::PlaneApi,
         output: vs::Raw,
@@ -2743,7 +2767,7 @@ fn bytes_per_sample(info: &vs::VideoInfo) -> usize {
     }
 }
 
-fn timing_bar(frame: i32, info: &vs::VideoInfo, depth: i32, dst: renderer::FramePlanesMut<'_>) {
+fn timing_bar(frame: i32, info: &vs::VideoInfo, depth: i32, mut dst: renderer::FramePlanesMut<'_>) {
     let (width, height) = (info.width, info.height);
     let period = width.saturating_mul(2).saturating_sub(20);
     if period <= 0 {
@@ -2754,16 +2778,12 @@ fn timing_bar(frame: i32, info: &vs::VideoInfo, depth: i32, dst: renderer::Frame
         .saturating_sub(10)
         .abs()
         .saturating_add(2);
-    fill_yuv_rect(
-        dst,
-        x,
-        0,
-        6,
-        height,
-        video_format::chroma_divisors(info),
-        depth,
-        [80, 39, 198],
-    );
+    let (x_div, y_div) = video_format::chroma_divisors(info);
+    let luma_x = if depth == 0 { x & !1 } else { x };
+    fill_plane(&mut dst.y, luma_x, 0, 6, height, depth, 156);
+    for (plane, value) in [(&mut dst.u, 39), (&mut dst.v, 198)] {
+        fill_plane(plane, x / x_div, 0, 6 / x_div, height / y_div, depth, value);
+    }
 }
 
 fn qmode_overlay(scene_class: i32, info: &vs::VideoInfo, mut dst: renderer::FramePlanesMut<'_>) {
@@ -3144,37 +3164,6 @@ fn blend_qmap_plane(
 
 fn blend_qmap_byte(dst: u8, value: u8) -> u8 {
     ((u16::from(value) * 20 + u16::from(dst) * 235) >> 8) as u8
-}
-
-fn fill_yuv_rect(
-    mut dst: renderer::FramePlanesMut<'_>,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    divisors: (i32, i32),
-    depth: i32,
-    color: [u16; 3],
-) {
-    fill_plane(&mut dst.y, x, y, width, height, depth, color[0]);
-    fill_plane(
-        &mut dst.u,
-        x / divisors.0,
-        y / divisors.1,
-        width / divisors.0,
-        height / divisors.1,
-        depth,
-        color[1],
-    );
-    fill_plane(
-        &mut dst.v,
-        x / divisors.0,
-        y / divisors.1,
-        width / divisors.0,
-        height / divisors.1,
-        depth,
-        color[2],
-    );
 }
 
 fn fill_byte_plane(
