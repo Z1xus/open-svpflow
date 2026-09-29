@@ -1,4 +1,8 @@
 mod field;
+#[cfg(not(target_arch = "wasm32"))]
+mod gpu;
+#[cfg(target_arch = "wasm32")]
+#[path = "gpu_stub.rs"]
 mod gpu;
 mod metric;
 mod params;
