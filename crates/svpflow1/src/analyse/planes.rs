@@ -65,12 +65,20 @@ impl<'a> PlaneView<'a> {
             }
             return;
         };
-        match shape.width {
-            2 => copy_rows::<2>(block, self.pitch, out, shape.height),
-            4 => copy_rows::<4>(block, self.pitch, out, shape.height),
-            8 => copy_rows::<8>(block, self.pitch, out, shape.height),
-            16 => copy_rows::<16>(block, self.pitch, out, shape.height),
-            _ => copy_rows::<32>(block, self.pitch, out, shape.height),
+        let p = self.pitch;
+        match (shape.width, shape.height) {
+            (4, 4) => copy_fixed::<4, 4>(block, p, out),
+            (8, 8) => copy_fixed::<8, 8>(block, p, out),
+            (8, 4) => copy_fixed::<8, 4>(block, p, out),
+            (4, 2) => copy_fixed::<4, 2>(block, p, out),
+            (2, 2) => copy_fixed::<2, 2>(block, p, out),
+            (16, 16) => copy_fixed::<16, 16>(block, p, out),
+            (16, 8) => copy_fixed::<16, 8>(block, p, out),
+            (2, _) => copy_rows::<2>(block, p, out, shape.height),
+            (4, _) => copy_rows::<4>(block, p, out, shape.height),
+            (8, _) => copy_rows::<8>(block, p, out, shape.height),
+            (16, _) => copy_rows::<16>(block, p, out, shape.height),
+            _ => copy_rows::<32>(block, p, out, shape.height),
         }
     }
 
@@ -180,6 +188,18 @@ impl<'a> SuperFrameView<'a> {
 
 pub(crate) fn plane_size(size: i32, level: i32) -> i32 {
     (0..level).fold(size, |size, _| 2 * (size / 4))
+}
+
+#[inline]
+fn copy_fixed<const W: usize, const H: usize>(block: &[u8], pitch: usize, out: &mut [u8]) {
+    assert!(out.len() >= H * W && block.len() >= (H - 1) * pitch + W);
+    let (src, dst) = (block.as_ptr(), out.as_mut_ptr());
+    for row in 0..H {
+        unsafe {
+            let value = src.add(row * pitch).cast::<[u8; W]>().read_unaligned();
+            dst.add(row * W).cast::<[u8; W]>().write_unaligned(value);
+        }
+    }
 }
 
 fn copy_rows<const W: usize>(block: &[u8], pitch: usize, out: &mut [u8], rows: usize) {
