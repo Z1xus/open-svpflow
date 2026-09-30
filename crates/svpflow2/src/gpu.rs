@@ -24,6 +24,8 @@ const CL_EVENT_COMMAND_EXECUTION_STATUS: ClUint = 0x11D3;
 const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
 const CL_DEVICE_NAME: ClUint = 0x102B;
 const CL_MEM_READ_WRITE: u64 = 1 << 0;
+const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
+const CL_MAP_READ: u64 = 1;
 const CL_FALSE: ClUint = 0;
 const CL_TRUE: ClUint = 1;
 const CL_PROGRAM_BUILD_LOG: ClUint = 0x1183;
@@ -101,6 +103,18 @@ type FnEnqueueWriteImage = unsafe extern "C" fn(
     *const c_void,
     *mut c_void,
 ) -> ClInt;
+type FnEnqueueMapBuffer = unsafe extern "C" fn(
+    ClCommandQueue,
+    ClMem,
+    ClUint,
+    u64,
+    usize,
+    usize,
+    ClUint,
+    *const ClEvent,
+    *mut ClEvent,
+    *mut ClInt,
+) -> *mut c_void;
 type FnSetKernelArg = unsafe extern "C" fn(ClKernel, ClUint, usize, *const c_void) -> ClInt;
 type FnEnqueueNDRangeKernel = unsafe extern "C" fn(
     ClCommandQueue,
@@ -136,6 +150,7 @@ struct OpenCl {
     CreateImage2D: FnCreateImage2D,
     EnqueueReadBuffer: FnEnqueueReadBuffer,
     EnqueueWriteImage: FnEnqueueWriteImage,
+    EnqueueMapBuffer: FnEnqueueMapBuffer,
     SetKernelArg: FnSetKernelArg,
     EnqueueNDRangeKernel: FnEnqueueNDRangeKernel,
     Finish: FnFinish,
@@ -184,6 +199,7 @@ impl OpenCl {
                 CreateImage2D: sym!("clCreateImage2D"),
                 EnqueueReadBuffer: sym!("clEnqueueReadBuffer"),
                 EnqueueWriteImage: sym!("clEnqueueWriteImage"),
+                EnqueueMapBuffer: sym!("clEnqueueMapBuffer"),
                 SetKernelArg: sym!("clSetKernelArg"),
                 EnqueueNDRangeKernel: sym!("clEnqueueNDRangeKernel"),
                 Finish: sym!("clFinish"),
@@ -219,7 +235,16 @@ pub struct GpuContext {
 
     super_cache: std::sync::Mutex<Vec<(i64, SuperCell)>>,
     image_pool: std::sync::Arc<ImagePool>,
+    staging: std::sync::Mutex<Vec<Staging>>,
 }
+
+struct Staging {
+    mem: ClMem,
+    len: usize,
+    host: *mut u8,
+}
+
+unsafe impl Send for Staging {}
 
 type SuperCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<SuperEntry>>>>;
 
@@ -409,6 +434,11 @@ impl Drop for GpuContext {
             if let Ok(mut cache) = self.super_cache.lock() {
                 cache.clear();
             }
+            if let Ok(mut pool) = self.staging.lock() {
+                for staging in pool.drain(..) {
+                    (self.cl.ReleaseMemObject)(staging.mem);
+                }
+            }
             if let Ok(mut pool) = self.image_pool.lock() {
                 for images in pool.drain(..) {
                     (self.cl.ReleaseMemObject)(images.linear);
@@ -583,6 +613,7 @@ impl GpuContext {
                 next_upload: std::sync::atomic::AtomicUsize::new(0),
                 super_cache: std::sync::Mutex::new(Vec::new()),
                 image_pool: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                staging: std::sync::Mutex::new(Vec::new()),
             });
         }
         Err("no usable GPU device".into())
@@ -873,6 +904,61 @@ impl GpuContext {
         Some(slot.0)
     }
 
+    unsafe fn take_staging(&self, queue: ClCommandQueue, bytes: usize) -> Option<Staging> {
+        let reused = self.staging.lock().ok().and_then(|mut pool| {
+            let index = pool.iter().position(|staging| staging.len >= bytes)?;
+            Some(pool.swap_remove(index))
+        });
+        if reused.is_some() {
+            return reused;
+        }
+        let mut err = 0;
+        let mem = unsafe {
+            (self.cl.CreateBuffer)(
+                self.context,
+                CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
+                bytes,
+                std::ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        if err != CL_SUCCESS || mem.is_null() {
+            return None;
+        }
+        let host = unsafe {
+            (self.cl.EnqueueMapBuffer)(
+                queue,
+                mem,
+                CL_TRUE,
+                CL_MAP_READ,
+                0,
+                bytes,
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        if err != CL_SUCCESS || host.is_null() {
+            unsafe { (self.cl.ReleaseMemObject)(mem) };
+            return None;
+        }
+        Some(Staging {
+            mem,
+            len: bytes,
+            host: host.cast(),
+        })
+    }
+
+    fn put_staging(&self, staging: Staging) {
+        match self.staging.lock() {
+            Ok(mut pool) => pool.push(staging),
+            Err(_) => unsafe {
+                (self.cl.ReleaseMemObject)(staging.mem);
+            },
+        }
+    }
+
     fn upload_resources(&self) -> Option<std::sync::MutexGuard<'_, CacheResources>> {
         let count = self.cache_resources.len();
         let start = self
@@ -1153,7 +1239,11 @@ impl GpuContext {
             let u_mem = run(&mut dst[1], dst_u, su, pu, src0[1], src1[1], &[])?;
             let v_mem = run(&mut dst[2], dst_v, sv, pv, src0[2], src1[2], &[])?;
             let mut done: ClEvent = std::ptr::null_mut();
-            for (index, (dmem, output)) in [(y_mem, dst_y), (u_mem, dst_u), (v_mem, dst_v)]
+            let total = dst_y.len() + dst_u.len() + dst_v.len();
+            let staging = self.take_staging(q, total)?;
+            let host = staging.host;
+            let mut offset = 0;
+            for (index, (dmem, output)) in [(y_mem, &*dst_y), (u_mem, &*dst_u), (v_mem, &*dst_v)]
                 .into_iter()
                 .enumerate()
             {
@@ -1163,7 +1253,7 @@ impl GpuContext {
                     CL_FALSE,
                     0,
                     output.len(),
-                    output.as_mut_ptr().cast(),
+                    host.add(offset).cast(),
                     0,
                     std::ptr::null(),
                     if index == 2 {
@@ -1177,12 +1267,23 @@ impl GpuContext {
                         (self.cl.ReleaseEvent)(done);
                     }
                     (self.cl.Finish)(q);
+                    self.put_staging(staging);
                     return None;
                 }
+                offset += output.len();
             }
-            if !self.wait_event(q, done) {
+            let ok = self.wait_event(q, done);
+            drop(unit);
+            if !ok {
+                (self.cl.ReleaseMemObject)(staging.mem);
                 return None;
             }
+            let mut offset = 0;
+            for output in [dst_y, dst_u, dst_v] {
+                output.copy_from_slice(std::slice::from_raw_parts(host.add(offset), output.len()));
+                offset += output.len();
+            }
+            self.put_staging(staging);
         }
         Some(())
     }
