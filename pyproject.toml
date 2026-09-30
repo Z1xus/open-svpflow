@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "open-svpflow"
+dynamic = ["version"]
+description = "Open-source drop-in replacement for SVPFlow's VapourSynth plugins"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "z1xus" }]
+keywords = ["vapoursynth", "svpflow", "interpolation", "motion", "video"]
+classifiers = [
+    "Environment :: Plugins",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+    "Topic :: Multimedia :: Video",
+]
+
+[project.urls]
+Homepage = "https://smoothie.z1x.us"
+Repository = "https://github.com/Z1xus/open-svpflow"
+Issues = "https://github.com/Z1xus/open-svpflow/issues"
+
+[tool.hatch.version]
+path = "Cargo.toml"
+pattern = '(?m)^\[workspace\.package\]\nversion = "(?P<version>[^"]+)"'
+
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[tool.hatch.build.targets.wheel.hooks.custom]

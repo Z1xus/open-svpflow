@@ -28,22 +28,30 @@ Benchmarked on a 1080p 200 fps Counter-Strike 2 clip interpolated to 1920 fps th
 
 The speedup mainly comes from AVX2/AVX-512 motion search, running part of that search on the GPU (when using GPU mode), and caching work the original redoes for every frame.
 
+## Install
+
+```sh
+pip install open-svpflow
+```
+
+It install with an assumption that you already have VapourSynth installed in the same Python environment (we deliberately not include it as a dependency). Wheels are available for Windows x64, Linux x64 and arm64, and macOS x64 and arm64.
+
 ## Releases
 
-Download builds for Windows, Linux, and macOS from [Releases](https://github.com/Z1xus/open-svpflow/releases).
+Download latest nightly builds for Windows, Linux, and macOS from [Releases](https://github.com/Z1xus/open-svpflow/releases). Versioned releases follow semver and are published to [PyPI](https://pypi.org/project/open-svpflow/).
 
 New releases are reproducible and immutable once published.
 
-To reproduce the binaries, check out the release commit in a clean directory and use the matching build environment from the [release workflow](.github/workflows/nightly-release.yml). Run `bash .github/build.sh <target>` with the target from the release's `BUILD.txt`, then compare the files in `dist/` with the extracted release.
+To reproduce the binaries, check out the release commit in a clean directory and use the matching build environment from the [build workflow](.github/workflows/build.yml). Run `bash .github/build.sh <target>` with the target from the release's `BUILD.txt`, then compare the files in `dist/` with the extracted release.
 
 ## Build
 
 Rust 1.88 or newer:
 
-```powershell
+```sh
 cargo build --release -p svpflow1 -p svpflow2
 ```
 
-The plugins are written to `target/release/svpflow1_vs.dll` and `target/release/svpflow2_vs.dll`.
+The plugins end up in `target/release/`: `svpflow1_vs.dll` and `svpflow2_vs.dll` on Windows, `libsvpflow1_vs.so` and `libsvpflow2_vs.so` on Linux, `.dylib` on macOS.
 
 Licensed under Apache-2.0.

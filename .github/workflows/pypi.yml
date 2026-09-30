@@ -1,0 +1,78 @@
+name: PyPI
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check tag
+        if: github.ref_type == 'tag'
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+  build:
+    needs: version
+    uses: ./.github/workflows/build.yml
+
+  wheels:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          path: bin
+      - name: Build wheels
+        run: |
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
+          for dir in bin/*/; do
+            SVPFLOW_BIN="$dir" pipx run build --wheel --outdir wheels
+          done
+          wheels=(wheels/*.whl)
+          test "${#wheels[@]}" -eq 5
+          pipx run twine check --strict "${wheels[@]}"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: wheels
+          path: wheels/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: wheels
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://${{ github.ref_type != 'tag' && 'test.' || '' }}pypi.org/p/open-svpflow
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: wheels
+          path: wheels
+      - uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          packages-dir: wheels/
+          repository-url: ${{ github.ref_type != 'tag' && 'https://test.pypi.org/legacy/' || '' }}
