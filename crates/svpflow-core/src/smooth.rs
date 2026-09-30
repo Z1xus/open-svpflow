@@ -332,6 +332,7 @@ impl VectorField {
         let top = table.len() as i32 - 1;
         let width = width as usize;
         let mut column = vec![0i32; stride];
+        let mut covered = vec![0i32; width];
         for (y, out) in out
             .chunks_exact_mut(width)
             .take(height as usize)
@@ -343,9 +344,15 @@ impl VectorField {
             for (((sum, &a), &m), &b) in column.iter_mut().zip(above).zip(middle).zip(below) {
                 *sum = a.wrapping_add(m).wrapping_add(b);
             }
-            for (out, window) in out.iter_mut().zip(column.windows(3)) {
-                let total = window[0].wrapping_add(window[1]).wrapping_add(window[2]);
-                let covered = (total >> 3).min(area);
+            for (((covered, &l), &c), &r) in covered
+                .iter_mut()
+                .zip(&column[..width])
+                .zip(&column[1..=width])
+                .zip(&column[2..width + 2])
+            {
+                *covered = (l.wrapping_add(c).wrapping_add(r) >> 3).min(area);
+            }
+            for (out, &covered) in out.iter_mut().zip(&covered) {
                 *out = if covered < 0 {
                     level(covered)
                 } else {
@@ -513,32 +520,70 @@ impl Scatter {
         const LANES: usize = 16;
         let round = (1i32 << shift) - 1;
         let scale = |value: i32| (value + ((value >> 31) & round)) >> shift;
-        for (chunk_index, chunk) in row.chunks(LANES).enumerate() {
+        let stride = self.stride as i32;
+        let (last_x, last_y) = (
+            (self.width.max(1) - 1) as u32,
+            (self.height.max(1) - 1) as u32,
+        );
+        let add = |points: &mut [i32], (at, top, bottom): (usize, i32, i32)| {
+            points[at] = points[at].wrapping_add(top);
+            points[at + self.stride] = points[at + self.stride].wrapping_add(bottom);
+        };
+        let mut pending = (0, 0, 0);
+        let lanes = row.len().div_ceil(LANES) * LANES;
+        let mut vx = vec![0i32; lanes];
+        let mut vy = vec![0i32; lanes];
+        for ((x, y), vector) in vx.iter_mut().zip(vy.iter_mut()).zip(row) {
+            *x = i32::from(vector.x);
+            *y = i32::from(vector.y);
+        }
+        for (chunk_index, ((chunk, vx), vy)) in row
+            .chunks(LANES)
+            .zip(vx.as_chunks::<LANES>().0)
+            .zip(vy.as_chunks::<LANES>().0)
+            .enumerate()
+        {
             let base = (chunk_index * LANES) as i32;
-            let mut vx = [0i32; LANES];
-            let mut vy = [0i32; LANES];
-            for ((x, y), vector) in vx.iter_mut().zip(vy.iter_mut()).zip(chunk) {
-                *x = i32::from(vector.x);
-                *y = i32::from(vector.y);
-            }
-            let mut cells = [[(0u32, 0i32); 4]; LANES];
-            for (lane, cell) in cells.iter_mut().enumerate() {
+            let mut index = [0i32; LANES];
+            let mut inside = [false; LANES];
+            let mut values = [[0i32; LANES]; 4];
+            for lane in 0..LANES {
                 let tx = scale(self.time * vx[lane]);
                 let ty = scale(self.time * vy[lane]);
-                *cell = self.cells(
-                    base + lane as i32,
-                    by,
-                    (tx, ty),
-                    (floor_x.apply(tx), floor_y.apply(ty)),
-                );
+                let (qx, qy) = (floor_x.apply(tx), floor_y.apply(ty));
+                let cx = base + lane as i32 + qx;
+                let cy = by + qy;
+                let rx = self.step_x * (qx + 1) - tx;
+                let ry = self.step_y * (qy + 1) - ty;
+                let (lx, ly) = (self.block_w - rx, self.block_h - ry);
+                values[0][lane] = ry * rx;
+                values[1][lane] = ry * lx;
+                values[2][lane] = ly * lx;
+                values[3][lane] = rx * ly;
+                inside[lane] = (cx as u32) < last_x && (cy as u32) < last_y;
+                index[lane] = (cy + 1) * stride + cx + 1;
             }
-            for cell in &cells[..chunk.len()] {
-                for &(index, value) in cell {
-                    let target = &mut points[index as usize];
-                    *target = target.wrapping_add(value);
+            for lane in 0..chunk.len() {
+                if inside[lane] {
+                    let at = index[lane] as usize;
+                    let (mut top, mut bottom) = (values[0][lane], values[3][lane]);
+                    if at == pending.0 {
+                        top = top.wrapping_add(pending.1);
+                        bottom = bottom.wrapping_add(pending.2);
+                    } else {
+                        add(points, pending);
+                    }
+                    add(points, (at, top, bottom));
+                    pending = (at + 1, values[1][lane], values[2][lane]);
+                } else {
+                    let tx = scale(self.time * vx[lane]);
+                    let ty = scale(self.time * vy[lane]);
+                    let q = (floor_x.apply(tx), floor_y.apply(ty));
+                    self.add(points, base + lane as i32, by, (tx, ty), q);
                 }
             }
         }
+        add(points, pending);
     }
 }
 
