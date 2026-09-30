@@ -405,6 +405,24 @@ impl FilterState {
         let limits = engine::limits(&params);
         let load = |k: i32| self.cached_field(&fetch, &api, (k, n), shape);
         let mut quality = |k: i32| -> i32 {
+            if self.nvof.is_none()
+                && let Some(cell) = crate::core::cache_cell(&self.quality_cells, i64::from(k), 64)
+            {
+                let mut fresh = false;
+                let value = cell.get_or_init(|| {
+                    let field = load(k)?;
+                    fresh = true;
+                    let (class, cached) =
+                        engine::quality(&field, &params, &limits, &mut luma_table, &mut luma);
+                    Some(std::sync::Arc::new((class, cached)))
+                });
+                return value.as_ref().map_or(3, |value| {
+                    if !fresh {
+                        luma.copy_from_slice(&value.1);
+                    }
+                    value.0
+                });
+            }
             if let Some(class) = self.cached_quality(k, &mut luma) {
                 return class;
             }

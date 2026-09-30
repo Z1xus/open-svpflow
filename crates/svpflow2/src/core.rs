@@ -84,6 +84,7 @@ pub(crate) struct FilterState {
     pub(crate) expand_cache: ExpandCache,
     pub(crate) field_cache: Cache<svpflow_core::smooth::VectorField>,
     pub(crate) quality_cache: std::sync::Mutex<Vec<(i32, i32, Vec<u8>)>>,
+    pub(crate) quality_cells: Cache<(i32, Vec<u8>)>,
     pub(crate) motion_cache: Cache<[Vec<u16>; 8]>,
 }
 

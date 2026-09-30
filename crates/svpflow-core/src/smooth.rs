@@ -160,14 +160,15 @@ impl VectorField {
     pub fn luma_geomean(&self) -> f64 {
         let denom = if self.shape.flags == 3 { 510.0 } else { 255.0 };
         let count = self.shape.blocks();
-        let sum =
-            self.backward
-                .iter()
-                .zip(&self.forward)
-                .take(count)
-                .fold(0.0, |sum, (back, fwd)| {
-                    sum + (f64::from(u16::from(back.luma) + u16::from(fwd.luma)) / denom).ln()
-                });
+        let ln: [f64; 511] = std::array::from_fn(|sum| (sum as f64 / denom).ln());
+        let sum = self
+            .backward
+            .iter()
+            .zip(&self.forward)
+            .take(count)
+            .fold(0.0, |sum, (back, fwd)| {
+                sum + ln[usize::from(back.luma) + usize::from(fwd.luma)]
+            });
         (sum / count as f64).exp()
     }
 
