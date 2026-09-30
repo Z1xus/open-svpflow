@@ -7,7 +7,8 @@
     clippy::too_many_arguments
 )]
 
-use std::ops::Range;
+use std::ops::{Deref, Range};
+use std::sync::Arc;
 
 use crate::frame_math::Timing;
 use crate::metadata::{self, VectorData, VectorRecord};
@@ -258,14 +259,16 @@ pub struct Masks {
     pub sad: Option<(Vec<u8>, Vec<u8>)>,
 }
 
-pub fn masks(field: &mut VectorField, params: &ReferenceParams, time: i32, neither: bool) -> Masks {
+pub fn masks(field: &VectorField, params: &ReferenceParams, time: i32, neither: bool) -> Masks {
     let shape = *field.shape();
     let (width, height) = (shape.packed_width(), shape.packed_height());
     let count = usize::try_from(width * height).unwrap_or(0);
     let mut cover_bwd = vec![0u8; count];
     let mut cover_fwd = vec![0u8; count];
     if params.algo > 20 && !neither {
+        let mut scratch = Vec::new();
         field.cover_mask(
+            &mut scratch,
             false,
             &mut cover_bwd,
             params.cover,
@@ -273,7 +276,15 @@ pub fn masks(field: &mut VectorField, params: &ReferenceParams, time: i32, neith
             width,
             height,
         );
-        field.cover_mask(true, &mut cover_fwd, params.cover, time, width, height);
+        field.cover_mask(
+            &mut scratch,
+            true,
+            &mut cover_fwd,
+            params.cover,
+            time,
+            width,
+            height,
+        );
     }
     let sad = match params.sad {
         Some((scale, sharp)) if !neither => {
@@ -301,14 +312,14 @@ pub fn motion_key(n: i32, use_fwd: bool, use_bwd: bool, extended: bool, zero: (b
         | i64::from(zero.1) << 4
 }
 
-pub fn motions(
-    field: &mut VectorField,
+pub fn motions<F: Deref<Target = VectorField>>(
+    field: &VectorField,
     gpu: bool,
     use_fwd: bool,
     use_bwd: bool,
     extended: bool,
     (zerox, zeroy): (bool, bool),
-    mut load: impl FnMut(&mut VectorField, i32),
+    mut load: impl FnMut(i32) -> Option<F>,
     n: i32,
 ) -> MotionSet {
     let shape = *field.shape();
@@ -329,10 +340,13 @@ pub fn motions(
         }
     }
     if extended {
-        load(field, n - 1);
-        field.pack(true, prev_x, prev_y, width, height);
-        load(field, n + 1);
-        field.pack(false, next_x, next_y, width, height);
+        let prev = load(n - 1);
+        let last = prev.as_deref().unwrap_or(field);
+        last.pack(true, prev_x, prev_y, width, height);
+        let next = load(n + 1);
+        next.as_deref()
+            .unwrap_or(last)
+            .pack(false, next_x, next_y, width, height);
     }
     if zerox {
         for buf in [&mut *fwd_x, &mut *bwd_x, &mut *next_x, &mut *prev_x] {
@@ -541,6 +555,7 @@ pub struct Engine {
     height: i32,
     table: Option<[u8; 511]>,
     quality: Vec<(i32, i32, Vec<u8>)>,
+    fields: Vec<(i32, Arc<VectorField>)>,
 }
 
 pub enum Output {
@@ -624,6 +639,7 @@ impl Engine {
             render,
             table: None,
             quality: Vec::new(),
+            fields: Vec::new(),
         })
     }
 
@@ -731,6 +747,26 @@ impl Engine {
         }))
     }
 
+    fn field<'a>(
+        &mut self,
+        k: i32,
+        vectors: &impl Fn(i32) -> Option<&'a [u8]>,
+    ) -> Option<Arc<VectorField>> {
+        if let Some((_, field)) = self.fields.iter().find(|(key, _)| *key == k) {
+            return Some(Arc::clone(field));
+        }
+        let mut field = VectorField::new(self.shape);
+        if !vectors(k).is_some_and(|p| field.update(p)) {
+            return None;
+        }
+        let field = Arc::new(field);
+        if self.fields.len() >= 8 {
+            self.fields.remove(0);
+        }
+        self.fields.push((k, Arc::clone(&field)));
+        Some(field)
+    }
+
     fn plan_frame<'a>(
         &mut self,
         frame: i32,
@@ -741,16 +777,14 @@ impl Engine {
         let step = self.rates.step(&params, frame);
         let (n, raw) = (step.n, step.raw);
         let mut phase = step.phase;
-        let mut field = VectorField::new(self.shape);
-        let load = |field: &mut VectorField, k: i32| vectors(k).is_some_and(|p| field.update(p));
         let mut luma = vec![0u8; self.shape.blocks()];
         let (class, neighbors_ok) = classify(&params, n, phase, |k| {
             if let Some((_, class, _)) = self.quality.iter().find(|(key, _, _)| *key == k) {
                 return *class;
             }
-            if !load(&mut field, k) {
+            let Some(field) = self.field(k, &vectors) else {
                 return 3;
-            }
+            };
             let (class, cached) =
                 quality(&field, &params, &self.limits, &mut self.table, &mut luma);
             if self.quality.len() >= 64 {
@@ -764,21 +798,21 @@ impl Engine {
             return Err(n + i32::from(next));
         }
         let (use_fwd, use_bwd, force13) = directions(&params, phase, class);
-        load(&mut field, n);
+        let field = self
+            .field(n, &vectors)
+            .unwrap_or_else(|| Arc::new(VectorField::new(self.shape)));
         let neither = !use_fwd && !use_bwd;
         let time = render_time(phase, use_fwd, use_bwd);
-        let masks = masks(&mut field, &params, time, neither);
+        let masks = masks(&field, &params, time, neither);
         let extended = neighbors_ok && params.algo == 23 && !neither;
         let motions = motions(
-            &mut field,
+            &field,
             gpu,
             use_fwd,
             use_bwd,
             extended,
             self.zero,
-            |field, k| {
-                load(field, k);
-            },
+            |k| self.field(k, &vectors),
             n,
         );
         Ok(Planned {

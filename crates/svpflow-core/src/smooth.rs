@@ -77,7 +77,6 @@ pub struct VectorField {
     shape: FieldShape,
     forward: Vec<BlockVector>,
     backward: Vec<BlockVector>,
-    cover: Vec<i32>,
 }
 
 pub struct SceneLimits {
@@ -95,7 +94,6 @@ impl VectorField {
             shape,
             forward: vec![BlockVector::default(); count],
             backward: vec![BlockVector::default(); count],
-            cover: Vec::new(),
         }
     }
 
@@ -253,10 +251,12 @@ impl VectorField {
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
+        clippy::too_many_arguments,
         clippy::too_many_lines
     )]
     pub fn cover_mask(
-        &mut self,
+        &self,
+        scratch: &mut Vec<i32>,
         forward: bool,
         out: &mut [u8],
         cover: i32,
@@ -267,8 +267,8 @@ impl VectorField {
         let s = self.shape;
         let stride = (width + 2) as usize;
         let len = stride * (height + 2) as usize;
-        self.cover.clear();
-        self.cover.resize(len + 1, 0);
+        scratch.clear();
+        scratch.resize(len + 1, 0);
         let area = s.block_w * s.block_h;
         let step_x = s.block_w - s.overlap_x;
         let step_y = s.block_h - s.overlap_y;
@@ -288,7 +288,7 @@ impl VectorField {
         } else {
             &self.backward
         };
-        let points = &mut self.cover[..];
+        let points = &mut scratch[..];
         let geometry = Scatter {
             width,
             height,

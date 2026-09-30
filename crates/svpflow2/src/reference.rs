@@ -3,14 +3,17 @@
 use std::slice;
 
 use svpflow_core::smooth::{
-    FieldShape, Frame, FrameMut, PackedVectors, Plane, PlaneMut, Renderer, SceneLimits, VectorField,
+    BlockVector, FieldShape, Frame, FrameMut, PackedVectors, Plane, PlaneMut, Renderer,
+    SceneLimits, VectorField,
 };
 use svpflow_core::smooth_engine::{self as engine, Rates};
 
 use crate::core::{FilterState, Mode, drop_frame, get_node, request_node, super_frame_planes};
 use crate::{frame, metadata, options::ReferenceParams, vs};
 
-pub(crate) type MotionSet = std::sync::Arc<[Vec<u16>; 8]>;
+fn cache_cap(bytes: usize) -> usize {
+    ((96 << 20) / bytes.max(1)).clamp(4, 48)
+}
 
 struct Fetch {
     get_frame: vs::GetFrameFilter,
@@ -70,24 +73,25 @@ impl FilterState {
             && matches!(self.vector_data(), metadata::VectorRecord::Ready(_))
     }
 
-    fn cached_motions(&self, key: i64) -> Option<MotionSet> {
-        let cache = self.motion_cache.lock().ok()?;
-        cache
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, motions)| std::sync::Arc::clone(motions))
-    }
-
-    fn store_motions(&self, key: i64, motions: MotionSet) {
-        if let Ok(mut cache) = self.motion_cache.lock() {
-            if cache.iter().any(|(k, _)| *k == key) {
-                return;
-            }
-            if cache.len() >= 8 {
-                cache.remove(0);
-            }
-            cache.push((key, motions));
+    fn cached_field(
+        &self,
+        fetch: &Fetch,
+        api: &frame::PlaneApi,
+        (k, n): (i32, i32),
+        shape: FieldShape,
+    ) -> Option<std::sync::Arc<VectorField>> {
+        let decode = || {
+            let mut field = VectorField::new(shape);
+            self.with_vectors(fetch, api, (k, n), |payload| field.update(payload))
+                .map(|_| std::sync::Arc::new(field))
+        };
+        if self.nvof.is_some() {
+            return decode();
         }
+        let cap = cache_cap(shape.blocks() * std::mem::size_of::<BlockVector>() * 2);
+        crate::core::cache_cell(&self.field_cache, i64::from(k), cap)?
+            .get_or_init(decode)
+            .clone()
     }
 
     fn cached_quality(&self, frame: i32, luma: &mut [u8]) -> Option<i32> {
@@ -99,6 +103,9 @@ impl FilterState {
 
     fn store_quality(&self, frame: i32, class: i32, luma: &[u8]) {
         if let Ok(mut cache) = self.quality_cache.lock() {
+            if cache.iter().any(|(k, _, _)| *k == frame) {
+                return;
+            }
             if cache.len() >= 64 {
                 cache.remove(0);
             }
@@ -393,27 +400,24 @@ impl FilterState {
         let rates = self.rates(&params);
         let engine::Step { n, raw, mut phase } = rates.step(&params, frame);
         let shape = FieldShape::from_data(&vector_data);
-        let mut field = VectorField::new(shape);
         let mut luma = vec![0u8; shape.blocks()];
         let mut luma_table = None;
         let limits = engine::limits(&params);
-        let load = |field: &mut VectorField, k: i32| {
-            self.with_vectors(&fetch, &api, (k, n), |payload| field.update(payload))
-                .is_some()
-        };
-        let mut quality = |field: &mut VectorField, k: i32| -> i32 {
+        let load = |k: i32| self.cached_field(&fetch, &api, (k, n), shape);
+        let mut quality = |k: i32| -> i32 {
             if let Some(class) = self.cached_quality(k, &mut luma) {
                 return class;
             }
-            if !load(field, k) {
+            let Some(field) = load(k) else {
                 return 3;
-            }
+            };
             let (class, cached) =
-                engine::quality(field, &params, &limits, &mut luma_table, &mut luma);
+                engine::quality(&field, &params, &limits, &mut luma_table, &mut luma);
             self.store_quality(k, class, &cached);
             class
         };
-        let (class, neighbors_ok) = engine::classify(&params, n, phase, |k| quality(&mut field, k));
+        let (class, neighbors_ok) = engine::classify(&params, n, phase, &mut quality);
+        let field = || load(n).unwrap_or_else(|| std::sync::Arc::new(VectorField::new(shape)));
         phase = engine::adapt_phase(&params, &rates, raw, class, phase);
         let source = fetch.get(self.clips.source, n);
         let next_source = fetch.get(self.clips.source, n + 1);
@@ -443,7 +447,7 @@ impl FilterState {
             };
             fetch.drop(other);
             if !output.is_null() && engine::needs_vectors(phase) {
-                load(&mut field, n);
+                let field = field();
                 unsafe {
                     self.reference_overlays(
                         &api,
@@ -461,12 +465,12 @@ impl FilterState {
             return output;
         }
         let (use_fwd, use_bwd, force13) = engine::directions(&params, phase, class);
-        load(&mut field, n);
+        let field = field();
         let output = unsafe {
             self.reference_calculate(
                 &api,
                 &fetch,
-                &mut field,
+                &field,
                 source,
                 next_source,
                 n,
@@ -497,7 +501,7 @@ impl FilterState {
         &self,
         api: &frame::PlaneApi,
         fetch: &Fetch,
-        field: &mut VectorField,
+        field: &VectorField,
         source: vs::ConstRaw,
         next_source: vs::ConstRaw,
         n: i32,
@@ -527,30 +531,36 @@ impl FilterState {
         let want_extended = neighbors_ok && algo == 23 && !neither;
         let (zerox, zeroy) = (self.options.debug_zerox(), self.options.debug_zeroy());
         let motion_key = engine::motion_key(n, use_fwd, use_bwd, want_extended, (zerox, zeroy));
-        let reuse = !(self.options.debug_qmap() || self.options.debug_vectors());
-        let cached = reuse.then(|| self.cached_motions(motion_key)).flatten();
-        let motions = if let Some(motions) = cached {
-            motions
-        } else {
-            let arrays = engine::motions(
+        let compute = || {
+            std::sync::Arc::new(engine::motions(
                 field,
                 self.render_mode == 2,
                 use_fwd,
                 use_bwd,
                 want_extended,
                 (zerox, zeroy),
-                |field, k| {
-                    self.with_vectors(fetch, api, (k, n), |payload| field.update(payload));
-                },
+                |k| self.cached_field(fetch, api, (k, n), shape),
                 n,
-            );
-            let motions = std::sync::Arc::new(arrays);
-            if reuse {
-                self.store_motions(motion_key, std::sync::Arc::clone(&motions));
-            }
-            motions
+            ))
+        };
+        let cap = cache_cap(usize::try_from(width * height).unwrap_or(0) * 16);
+        let motions = if self.options.debug_qmap() || self.options.debug_vectors() {
+            compute()
+        } else if let Some(cell) = crate::core::cache_cell(&self.motion_cache, motion_key, cap) {
+            cell.get_or_init(|| Some(compute()))
+                .clone()
+                .unwrap_or_else(compute)
+        } else {
+            compute()
         };
         let extended = want_extended;
+        let overlay = (extended && self.options.debug_qmap())
+            .then(|| {
+                let load = |k| self.cached_field(fetch, api, (k, n), shape);
+                load(n + 1).or_else(|| load(n - 1))
+            })
+            .flatten();
+        let field = overlay.as_deref().unwrap_or(field);
         let [fwd_x, fwd_y, bwd_x, bwd_y, next_x, next_y, prev_x, prev_y] =
             motions.each_ref().map(Vec::as_slice);
         let selected = engine::select(algo, use_fwd, use_bwd, extended, force13);

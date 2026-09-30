@@ -82,8 +82,28 @@ pub(crate) struct FilterState {
     pub(crate) prep_cache: PrepCache,
     pub(crate) decode_cache: DecodeCache,
     pub(crate) expand_cache: ExpandCache,
+    pub(crate) field_cache: Cache<svpflow_core::smooth::VectorField>,
     pub(crate) quality_cache: std::sync::Mutex<Vec<(i32, i32, Vec<u8>)>>,
-    pub(crate) motion_cache: std::sync::Mutex<Vec<(i64, crate::reference::MotionSet)>>,
+    pub(crate) motion_cache: Cache<[Vec<u16>; 8]>,
+}
+
+pub(crate) type Cell<T> = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<T>>>>;
+pub(crate) type Cache<T> = std::sync::Mutex<Vec<(i64, Cell<T>)>>;
+
+pub(crate) fn cache_cell<T>(cache: &Cache<T>, key: i64, cap: usize) -> Option<Cell<T>> {
+    let mut cache = cache.lock().ok()?;
+    if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
+        let entry = cache.remove(pos);
+        let cell = std::sync::Arc::clone(&entry.1);
+        cache.push(entry);
+        return Some(cell);
+    }
+    let cell = Cell::default();
+    if cache.len() >= cap {
+        cache.remove(0);
+    }
+    cache.push((key, std::sync::Arc::clone(&cell)));
+    Some(cell)
 }
 
 pub(crate) struct SuperExpand {
@@ -129,14 +149,12 @@ impl SuperExpand {
     }
 }
 
-type ExpandCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<SuperExpand>>>>;
-pub(crate) type ExpandCache = std::sync::Mutex<Vec<(i64, ExpandCell)>>;
+pub(crate) type ExpandCache = Cache<SuperExpand>;
 
 const EXPAND_CACHE_CAP: usize = 32;
 pub(crate) const EXPAND_SLACK: usize = 32;
 
-type PrepCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<FramePrep>>>>;
-type PrepCache = std::sync::Mutex<Vec<(i64, PrepCell)>>;
+type PrepCache = Cache<FramePrep>;
 
 pub(crate) struct DecodedEntry {
     decoded: metadata::DecodedVectors,
@@ -149,8 +167,7 @@ pub(crate) struct DecodedEntry {
     mvy1: Vec<u16>,
 }
 
-type DecodeCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<DecodedEntry>>>>;
-pub(crate) type DecodeCache = std::sync::Mutex<Vec<(i64, DecodeCell)>>;
+pub(crate) type DecodeCache = Cache<DecodedEntry>;
 
 const PREP_CACHE_CAP: usize = 24;
 const DECODE_CACHE_CAP: usize = 16;
@@ -1074,22 +1091,7 @@ impl FilterState {
                 }
             }
         }
-        let cell: PrepCell = {
-            let mut cache = self.prep_cache.lock().ok()?;
-            if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
-                let entry = cache.remove(pos);
-                let cell = std::sync::Arc::clone(&entry.1);
-                cache.push(entry);
-                cell
-            } else {
-                let cell: PrepCell = std::sync::Arc::new(std::sync::OnceLock::new());
-                if cache.len() >= PREP_CACHE_CAP {
-                    cache.remove(0);
-                }
-                cache.push((key, std::sync::Arc::clone(&cell)));
-                cell
-            }
-        };
+        let cell = cache_cell(&self.prep_cache, key, PREP_CACHE_CAP)?;
 
         cell.get_or_init(|| {
             unsafe {
@@ -1185,22 +1187,7 @@ impl FilterState {
         if std::env::var_os("SVP_NO_PREP").is_some() {
             return decode();
         }
-        let cell: DecodeCell = {
-            let mut cache = self.decode_cache.lock().ok()?;
-            if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
-                let entry = cache.remove(pos);
-                let cell = std::sync::Arc::clone(&entry.1);
-                cache.push(entry);
-                cell
-            } else {
-                let cell: DecodeCell = std::sync::Arc::new(std::sync::OnceLock::new());
-                if cache.len() >= DECODE_CACHE_CAP {
-                    cache.remove(0);
-                }
-                cache.push((key, std::sync::Arc::clone(&cell)));
-                cell
-            }
-        };
+        let cell = cache_cell(&self.decode_cache, key, DECODE_CACHE_CAP)?;
         cell.get_or_init(decode).clone()
     }
 
@@ -1217,22 +1204,7 @@ impl FilterState {
         let (chroma_x_div, chroma_y_div) = video_format::chroma_divisors(&self.video_info);
         let chroma_x_div = usize::try_from(chroma_x_div).ok()?;
         let chroma_y_div = usize::try_from(chroma_y_div).ok()?;
-        let cell: ExpandCell = {
-            let mut cache = self.expand_cache.lock().ok()?;
-            if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
-                let entry = cache.remove(pos);
-                let cell = std::sync::Arc::clone(&entry.1);
-                cache.push(entry);
-                cell
-            } else {
-                let cell: ExpandCell = std::sync::Arc::new(std::sync::OnceLock::new());
-                if cache.len() >= EXPAND_CACHE_CAP {
-                    cache.remove(0);
-                }
-                cache.push((key, std::sync::Arc::clone(&cell)));
-                cell
-            }
-        };
+        let cell = cache_cell(&self.expand_cache, key, EXPAND_CACHE_CAP)?;
         cell.get_or_init(|| {
             let (y, y_stride) = expand_plane(planes.y, width, height)?;
             let (u, uv_stride) =
