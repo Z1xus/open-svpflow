@@ -4,7 +4,7 @@ open-svpflow is a drop-in open-source replacement for SVPFlow's VapourSynth plug
 
 It started as a side project, mostly to see if I could get couler's [smoothie-rs](https://github.com/couleur-tweak-tips/smoothie-rs) running in a browser. The [demo](https://smoothie.z1x.us) is the result:
 
-[![open-svpflow running in the browser](docs/assets/demo.png)](https://smoothie.z1x.us)
+[![open-svpflow running in the browser](https://smoothie.z1x.us/demo.webp)](https://smoothie.z1x.us)
 
 This proof of concept runs open-svpflow client-side in the browser as WASM and renders with WebGPU, using [WebCodecs](https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API). The browser version runs about 2-3x slower than the native plugins, since WASM can't use AVX2 or AVX-512. If it's a lot slower than that for you, check `chrome://gpu` (or `about:support` for Firefox) and make sure hardware acceleration and WebGPU are enabled, otherwise it falls back to rendering on the CPU.
 
