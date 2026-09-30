@@ -1319,6 +1319,16 @@ impl Renderer {
                 let wb = pass.y_weights[r as usize];
                 let shift_y = pass.shift_y.min(15);
                 for (px0, cols, top, bottom) in &blocks {
+                    if interp {
+                        row::fill_block::<N>(
+                            &setup,
+                            &mut lanes,
+                            (span, *px0 as usize, *cols),
+                            (top, bottom),
+                            (wt, wb, shift_y),
+                        );
+                        continue;
+                    }
                     let mut mixed = [0i16; 32];
                     for ((m, &t), &b) in mixed.iter_mut().zip(top).zip(bottom) {
                         *m = wt.wrapping_mul(t).wrapping_add(wb.wrapping_mul(b)) >> shift_y;
@@ -1385,11 +1395,13 @@ mod row {
     mod imp {
         use std::arch::x86_64::{
             __m128i, __m256i, _mm_cvtsi32_si128, _mm_loadl_epi64, _mm_loadu_si128, _mm_packs_epi32,
-            _mm_packus_epi16, _mm_storel_epi64, _mm256_add_epi32, _mm256_and_si256,
-            _mm256_castsi256_si128, _mm256_cvtepu8_epi32, _mm256_cvtepu16_epi32,
-            _mm256_extracti128_si256, _mm256_i32gather_epi32, _mm256_loadu_si256,
-            _mm256_madd_epi16, _mm256_max_epi32, _mm256_min_epi32, _mm256_mullo_epi32,
-            _mm256_set1_epi32, _mm256_setr_epi32, _mm256_slli_epi32, _mm256_sra_epi32,
+            _mm_packus_epi16, _mm_storel_epi64, _mm256_add_epi16, _mm256_add_epi32,
+            _mm256_and_si256, _mm256_castsi256_si128, _mm256_cmpeq_epi32, _mm256_cvtepu8_epi32,
+            _mm256_cvtepu16_epi32, _mm256_cvtsi256_si32, _mm256_extracti128_si256,
+            _mm256_i32gather_epi32, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_max_epi32,
+            _mm256_min_epi32, _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_mullo_epi32,
+            _mm256_permutevar8x32_epi32, _mm256_set1_epi16, _mm256_set1_epi32, _mm256_setr_epi32,
+            _mm256_sll_epi32, _mm256_slli_epi32, _mm256_sra_epi16, _mm256_sra_epi32,
             _mm256_srai_epi32, _mm256_srlv_epi32, _mm256_storeu_si256, _mm256_sub_epi32,
         };
         use std::marker::PhantomData;
@@ -1403,6 +1415,7 @@ mod row {
             bytes: *const u8,
             last: __m256i,
             safe: __m256i,
+            offsets: __m256i,
             valid: bool,
             padded: bool,
             readable: usize,
@@ -1419,6 +1432,10 @@ mod row {
                         bytes: plane.data.as_ptr(),
                         last: _mm256_set1_epi32(len - 1),
                         safe: _mm256_set1_epi32(len - 4),
+                        offsets: _mm256_mullo_epi32(
+                            _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+                            _mm256_set1_epi32(pel),
+                        ),
                         valid: len >= 4,
                         padded: plane.slack >= 3,
                         readable: plane.data.len() + plane.slack,
@@ -1434,6 +1451,14 @@ mod row {
                     if !self.valid {
                         return zero;
                     }
+                    let first = _mm256_cvtsi256_si32(index);
+                    let run = _mm256_add_epi32(_mm256_set1_epi32(first), self.offsets);
+                    if first >= 0
+                        && _mm256_movemask_epi8(_mm256_cmpeq_epi32(index, run)) == -1
+                        && let Some(value) = self.load(first)
+                    {
+                        return value;
+                    }
                     let index = _mm256_min_epi32(_mm256_max_epi32(index, zero), self.last);
                     if self.padded {
                         let words = _mm256_i32gather_epi32::<1>(self.ptr, index);
@@ -1447,30 +1472,33 @@ mod row {
             }
 
             #[inline(always)]
-            fn still(&self, start: i32, chunk: __m256i) -> __m256i {
+            fn load(&self, start: i32) -> Option<__m256i> {
                 unsafe {
                     let start = start as usize;
                     let span = 8 * self.pel as usize;
-                    if start + span.max(16) <= self.readable {
-                        let at = self.bytes.add(start);
-                        match self.pel {
-                            1 => {
-                                return _mm256_cvtepu8_epi32(_mm_loadl_epi64(at.cast::<__m128i>()));
-                            }
-                            2 => {
-                                let words =
-                                    _mm256_cvtepu16_epi32(_mm_loadu_si128(at.cast::<__m128i>()));
-                                return _mm256_and_si256(words, _mm256_set1_epi32(0xFF));
-                            }
-                            4 => {
-                                let words = _mm256_loadu_si256(at.cast::<__m256i>());
-                                return _mm256_and_si256(words, _mm256_set1_epi32(0xFF));
-                            }
-                            _ => {}
-                        }
+                    if start + span.max(16) > self.readable {
+                        return None;
                     }
-                    self.fetch(chunk)
+                    let at = self.bytes.add(start);
+                    match self.pel {
+                        1 => Some(_mm256_cvtepu8_epi32(_mm_loadl_epi64(at.cast::<__m128i>()))),
+                        2 => {
+                            let words =
+                                _mm256_cvtepu16_epi32(_mm_loadu_si128(at.cast::<__m128i>()));
+                            Some(_mm256_and_si256(words, _mm256_set1_epi32(0xFF)))
+                        }
+                        4 => {
+                            let words = _mm256_loadu_si256(at.cast::<__m256i>());
+                            Some(_mm256_and_si256(words, _mm256_set1_epi32(0xFF)))
+                        }
+                        _ => None,
+                    }
                 }
+            }
+
+            #[inline(always)]
+            fn still(&self, start: i32, chunk: __m256i) -> __m256i {
+                self.load(start).unwrap_or_else(|| self.fetch(chunk))
             }
         }
 
@@ -1604,6 +1632,52 @@ mod row {
                     let sum = _mm256_sra_epi32(_mm256_madd_epi16(pair, w), shift);
                     let value = _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(sum));
                     _mm256_storeu_si256(out.as_mut_ptr().add(c).cast::<__m256i>(), value);
+                    c += 8;
+                }
+            }
+        }
+
+        #[inline(always)]
+        pub(in super::super) fn fill_block<const N: usize>(
+            setup: &Setup<'_>,
+            lanes: &mut [i32],
+            (span, at, cols): (usize, usize, usize),
+            (top, bottom): (&[i16; 32], &[i16; 32]),
+            (wt, wb, shift_y): (i16, i16, u32),
+        ) {
+            let count = cols.next_multiple_of(8);
+            assert!(count <= MAX_STEP && at + count <= span && N * span <= lanes.len());
+            unsafe {
+                let (wt, wb) = (_mm256_set1_epi16(wt), _mm256_set1_epi16(wb));
+                let shift_y = _mm_cvtsi32_si128(shift_y as i32);
+                let mix = |half: usize| {
+                    let t = _mm256_loadu_si256(top.as_ptr().add(16 * half).cast::<__m256i>());
+                    let b = _mm256_loadu_si256(bottom.as_ptr().add(16 * half).cast::<__m256i>());
+                    let sum =
+                        _mm256_add_epi16(_mm256_mullo_epi16(wt, t), _mm256_mullo_epi16(wb, b));
+                    _mm256_sra_epi16(sum, shift_y)
+                };
+                let halves = [mix(0), if N > 8 { mix(1) } else { mix(0) }];
+                let pairs: [__m256i; N] = std::array::from_fn(|k| {
+                    _mm256_permutevar8x32_epi32(halves[k / 8], _mm256_set1_epi32((k % 8) as i32))
+                });
+                let near = setup.shift <= 16;
+                let shift = _mm_cvtsi32_si128(setup.shift as i32);
+                let up = _mm_cvtsi32_si128(16 - setup.shift.min(16) as i32);
+                let out = lanes.as_mut_ptr().add(at);
+                let mut c = 0;
+                while c < count {
+                    let w = _mm256_loadu_si256(setup.weights.as_ptr().add(c).cast::<__m256i>());
+                    for (k, &pair) in pairs.iter().enumerate() {
+                        let sum = _mm256_madd_epi16(pair, w);
+                        let value = if near {
+                            _mm256_srai_epi32::<16>(_mm256_sll_epi32(sum, up))
+                        } else {
+                            let sum = _mm256_sra_epi32(sum, shift);
+                            _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(sum))
+                        };
+                        _mm256_storeu_si256(out.add(k * span + c).cast::<__m256i>(), value);
+                    }
                     c += 8;
                 }
             }
@@ -1944,6 +2018,24 @@ mod row {
             }
         }
 
+        pub(in super::super) fn fill_block<const N: usize>(
+            setup: &Setup<'_>,
+            lanes: &mut [i32],
+            (span, at, cols): (usize, usize, usize),
+            (top, bottom): (&[i16; 32], &[i16; 32]),
+            (wt, wb, shift_y): (i16, i16, u32),
+        ) {
+            let mix = |i: usize| {
+                wt.wrapping_mul(top[i])
+                    .wrapping_add(wb.wrapping_mul(bottom[i]))
+                    >> shift_y
+            };
+            for (k, lane) in lanes.chunks_exact_mut(span).take(N).enumerate() {
+                let pair = i32::from(mix(2 * k) as u16) | (i32::from(mix(2 * k + 1) as u16) << 16);
+                fill(setup, &mut lane[at..], pair, cols, false);
+            }
+        }
+
         #[inline(always)]
         fn px(plane: &[u8], index: i32) -> i32 {
             let last = plane.len().saturating_sub(1);
@@ -2148,8 +2240,8 @@ mod row {
     }
 
     pub(super) use imp::{
-        Prepared, extended, extended_sad, fast, fast_sad, fill, no_mask, no_mask_sad, normal,
-        normal_sad,
+        Prepared, extended, extended_sad, fast, fast_sad, fill, fill_block, no_mask, no_mask_sad,
+        normal, normal_sad,
     };
 
     const _: () = assert!(MAX_STEP.is_multiple_of(8));
