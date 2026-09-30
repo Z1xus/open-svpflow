@@ -1,0 +1,79 @@
+name: Build
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            container: rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            container: rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922
+          - runner: macos-26
+            target: aarch64-apple-darwin
+          - runner: macos-26-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Windows tools
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64 -property installationPath`) do set "VS_INSTALL=%%i"
+          if not defined VS_INSTALL exit /b 1
+          call "%VS_INSTALL%\VC\Auxiliary\Build\vcvarsall.bat" x64 10.0.26100.0 -vcvars_ver=14.44.35207
+          if errorlevel 1 exit /b 1
+          if not "%VCToolsVersion%"=="14.44.35207" exit /b 1
+          echo PATH=%PATH%>> "%GITHUB_ENV%"
+          echo LIB=%LIB%>> "%GITHUB_ENV%"
+          echo INCLUDE=%INCLUDE%>> "%GITHUB_ENV%"
+          echo VCINSTALLDIR=%VCINSTALLDIR%>> "%GITHUB_ENV%"
+          echo VCToolsVersion=%VCToolsVersion%>> "%GITHUB_ENV%"
+          echo VCToolsInstallDir=%VCToolsInstallDir%>> "%GITHUB_ENV%"
+          echo WindowsSdkDir=%WindowsSdkDir%>> "%GITHUB_ENV%"
+          echo WindowsSDKVersion=%WindowsSDKVersion%>> "%GITHUB_ENV%"
+      - name: Apple tools
+        if: runner.os == 'macOS'
+        run: |
+          export DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer
+          test "$(xcodebuild -version | tail -1)" = 'Build version 17F113'
+          test "$(xcrun --sdk macosx --show-sdk-version)" = '26.5'
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash .github/build.sh "$TARGET"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: dist/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
