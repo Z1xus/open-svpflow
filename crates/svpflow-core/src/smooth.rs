@@ -1322,8 +1322,9 @@ impl Renderer {
             }
             for r in 0..rows {
                 let py = py0 + r;
-                let wt = pass.y_weights[(pass.step_y - r) as usize];
-                let wb = pass.y_weights[r as usize];
+                let ry = r.min(pass.step_y);
+                let wt = pass.y_weights[(pass.step_y - ry) as usize];
+                let wb = pass.y_weights[ry as usize];
                 let shift_y = pass.shift_y.min(15);
                 for (px0, cols, top, bottom) in &blocks {
                     if interp {
