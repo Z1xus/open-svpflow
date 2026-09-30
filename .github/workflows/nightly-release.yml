@@ -110,7 +110,7 @@ jobs:
         run: |
           cd dist
           sha256sum ./*.zip > SHA256SUMS
-          tag="nightly-$(date -u +%Y%m%d)-${GITHUB_SHA:0:7}"
+          tag="nightly-$(date -u +%Y%m%d)-${GITHUB_SHA:0:12}"
           gh release create "$tag" ./*.zip SHA256SUMS \
             --target "$GITHUB_SHA" --title "$tag" \
             --notes "Built from $GITHUB_SHA." \
