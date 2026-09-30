@@ -142,6 +142,9 @@ impl Smoother {
         if out.len() != self.frame_len() {
             return Err("invalid output buffer length".into());
         }
+        if !self.engine.cpu_supported() {
+            return Err("overlap must be even with CPU rendering".into());
+        }
         let last = self.last;
         let vectors = &self.vectors;
         let output = self

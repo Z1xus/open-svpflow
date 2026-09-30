@@ -597,9 +597,6 @@ impl Engine {
         let VectorRecord::Ready(data) = metadata::vector_data(header) else {
             return Err("invalid vector header".into());
         };
-        if data.has_odd_overlap() {
-            return Err("odd overlap is not supported".into());
-        }
         options.scale_scene_limits(data.block);
         options.apply_mask_area_scale(false);
         options.apply_debug_mask_scale();
@@ -632,6 +629,10 @@ impl Engine {
 
     pub fn output_frames(&self, source_frames: i32) -> i32 {
         self.timing.scale_frame_count(source_frames)
+    }
+
+    pub const fn cpu_supported(&self) -> bool {
+        !self.data.has_odd_overlap()
     }
 
     pub fn uses_super(&self) -> bool {
