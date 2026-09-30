@@ -954,9 +954,16 @@ impl Renderer {
     }
 
     fn channel(raw: &[u16], lut: &[i16], div: i32) -> Vec<i16> {
-        raw.iter()
-            .map(|&value| (i32::from(lut[usize::from(value)]) / div) as i16)
-            .collect()
+        let map = |div: i32| {
+            raw.iter()
+                .map(|&value| (i32::from(lut[usize::from(value)]) / div) as i16)
+                .collect()
+        };
+        match div {
+            1 => map(1),
+            2 => map(2),
+            _ => map(div),
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2011,10 +2018,11 @@ mod row {
             } else {
                 (setup.weights, setup.shift)
             };
-            for (c, value) in out.iter_mut().enumerate().take(cols.next_multiple_of(8)) {
-                let w = weights[c];
-                let sum = i32::from(pair as i16) * i32::from(w as i16) + (pair >> 16) * (w >> 16);
-                *value = i32::from((sum >> shift.min(31)) as i16);
+            let count = cols.next_multiple_of(8);
+            let (lo, hi, shift) = (i32::from(pair as i16), pair >> 16, shift.min(31));
+            for (value, &w) in out[..count].iter_mut().zip(&weights[..count]) {
+                let sum = lo * i32::from(w as i16) + hi * (w >> 16);
+                *value = i32::from((sum >> shift) as i16);
             }
         }
 
