@@ -21,10 +21,10 @@ Benchmarked on a 1080p 200 fps Counter-Strike 2 clip interpolated to 1920 fps th
 
 | Preset | Path | Original | open-svpflow | Speed vs original | Output |
 | --- | --- | ---: | ---: | ---: | --- |
-| `faster` | CPU | 307.1 fps | 563.0 fps | 1.83x | identical |
-| `faster` | GPU | 1180.1 fps | 1472.0 fps | 1.25x | identical |
-| `medium` (default) | CPU | 224.8 fps | 401.1 fps | 1.78x | identical |
-| `medium` (default) | GPU | 312.7 fps | 432.9 fps | 1.38x | identical |
+| `faster` | CPU | 305.2 fps | 819.2 fps | 2.68x | identical |
+| `faster` | GPU | 1110.8 fps | 1660.5 fps | 1.49x | identical |
+| `medium` (default) | CPU | 225.1 fps | 535.7 fps | 2.38x | identical |
+| `medium` (default) | GPU | 310.2 fps | 602.8 fps | 1.94x | identical |
 
 The speedup mainly comes from AVX2/AVX-512 motion search, running part of that search on the GPU (when using GPU mode), and caching work the original redoes for every frame.
 
