@@ -170,8 +170,7 @@ impl Options {
 
     pub fn from_value(value: &Value, mode: i32) -> Self {
         let hdr = HdrOptions::from_value(value);
-        let mut render = RenderOptions::from_value(value);
-        render.linear &= hdr.mluminance <= 0.0;
+        let render = RenderOptions::from_value(value);
         Self {
             rate: Rate {
                 absolute: value.bool_at(&["rate", "abs"]).unwrap_or(false),
@@ -352,8 +351,7 @@ impl Options {
 
     pub fn reference_supported(&self) -> bool {
         let debug = self.debug;
-        !self.hdr_enabled()
-            && debug.flags.trailing_zeros() >= 3
+        debug.flags.trailing_zeros() >= 3
             && matches!(self.algo_for_mode(0), 1 | 2 | 11 | 13 | 21 | 22 | 23)
     }
 
