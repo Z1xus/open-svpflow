@@ -20,6 +20,7 @@ This proof of concept runs open-svpflow client-side in the browser as WASM and r
 - `svpflow2`: `SmoothFps` rendering for algorithms 1, 2, 11, 13, 21, 22, and 23, with scene handling, masks, CPU rendering, and the GPU path.
 - Native I444 input and output, which the original SVPFlow doesn't support.
 - VapourSynth API 4 support, so it works on current VapourSynth (R80 and newer can't load the original at all, since it only has API 3).
+- AviSynth+ support with the original function names.
 
 Output matches the original byte for byte in everything I've tested, on both CPU and GPU. But GPU algorithms 1 and 2 are the exception, since the original reads uninitialized memory there and doesn't even match its own previous run (±1 on about 0.01% of pixels, same as ours). So it should work anywhere SVPFlow already does, whether that's smoothie, SVP itself, mpv or your own scripts.
 
@@ -41,6 +42,18 @@ pip install open-svpflow
 ```
 
 It install with an assumption that you already have VapourSynth installed in the same Python environment (we deliberately not include it as a dependency). Wheels are available for Windows x64, Linux x64 and arm64, and macOS x64 and arm64.
+
+## AviSynth+
+
+The plugins also load in AviSynth+ 3.6 or newer:
+
+```avs
+LoadPlugin("svpflow1_vs.dll")
+LoadPlugin("svpflow2_vs.dll")
+super = SVSuper("{gpu:1}")
+vectors = SVAnalyse(super, "{}")
+SVSmoothFps(super, vectors, "{rate:{num:5,den:2}}", mt=8)
+```
 
 ## Releases
 
