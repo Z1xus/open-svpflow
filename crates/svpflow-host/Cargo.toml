@@ -9,6 +9,9 @@ rust-version = "1.89"
 [lib]
 crate-type = ["rlib"]
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libloading = "0.9.0"
+
 [lints.clippy]
 all = "warn"
 pedantic = "warn"

@@ -170,6 +170,9 @@ version = "0.1.0"
 [[package]]
 name = "svpflow-host"
 version = "0.1.0"
+dependencies = [
+ "libloading",
+]
 
 [[package]]
 name = "svpflow-wasm"
