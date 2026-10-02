@@ -55,6 +55,7 @@ pub(crate) const CLIP: &[u8] = b"clip\0";
 pub(crate) const FPS: &[u8] = b"fps\0";
 pub(crate) const OPT: &[u8] = b"opt\0";
 pub(crate) const RIFE_OUT: &[u8] = b"rife_out\0";
+pub(crate) const SAR: &[u8] = b"sar\0";
 pub(crate) const SDATA: &[u8] = b"sdata\0";
 pub(crate) const SRC: &[u8] = b"src\0";
 pub(crate) const SUPER: &[u8] = b"super\0";

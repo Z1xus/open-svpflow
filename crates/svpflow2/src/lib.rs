@@ -26,4 +26,6 @@ mod vs;
 
 pub(crate) use svpflow_core::{params, renderer, smooth_options as options};
 
-pub use abi::{VapourSynthPluginInit, VapourSynthPluginInit2, svpGetVersion};
+pub use abi::{
+    VapourSynthPluginInit, VapourSynthPluginInit2, avisynth_c_plugin_init, svpGetVersion,
+};

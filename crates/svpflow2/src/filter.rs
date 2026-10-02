@@ -56,6 +56,9 @@ unsafe fn create_filter(
         return 0;
     };
     options.apply_core_threads(unsafe { core_threads(core, vsapi) });
+    if let Some(sar) = unsafe { sar(input, vsapi) } {
+        options.apply_sar(sar);
+    }
     if mode != 0 && !unsafe { validate_options(&options, mode, output, vsapi) } {
         return 0;
     }
@@ -228,6 +231,13 @@ unsafe fn core_threads(core: vs::Raw, vsapi: vs::ConstRaw) -> i32 {
     } else {
         unsafe { (*info).num_threads }
     }
+}
+
+unsafe fn sar(input: vs::ConstRaw, vsapi: vs::ConstRaw) -> Option<f64> {
+    let get_float = unsafe { vs::table_fn::<vs::PropGetFloat>(vsapi, vs::PROP_GET_FLOAT) }?;
+    let mut error = 0;
+    let sar = unsafe { get_float(input, strings::SAR.as_ptr().cast(), 0, &raw mut error) };
+    (error == 0).then_some(sar)
 }
 
 unsafe fn source_info(

@@ -1,3 +1,7 @@
+use std::ffi::c_char;
+
+use svpflow_host::avs;
+
 use crate::{filter, strings, vs};
 
 #[unsafe(no_mangle)]
@@ -80,4 +84,53 @@ pub unsafe extern "system" fn VapourSynthPluginInit2(plugin: vs::Raw, api: vs::C
         },
     ];
     unsafe { svpflow_host::vs4::init(plugin, api, &config, &functions) };
+}
+
+static AVS_FUNCTIONS: [avs::Function; 3] = [
+    avs::Function {
+        name: c"SVSmoothFps",
+        params: c"cccs[mt]i[sar]f[src]c",
+        args: &[
+            avs::arg(c"clip"),
+            avs::data_clip(c"super", c"sdata"),
+            avs::data_clip(c"vectors", c"vdata"),
+            avs::arg(c"opt"),
+            avs::arg(c"mt"),
+            avs::arg(c"sar"),
+            avs::arg(c"src"),
+        ],
+        create: filter::create_smooth_fps,
+    },
+    avs::Function {
+        name: c"SVSmoothFps_NVOF",
+        params: c"cs[nvof_src]c[mt]i[sar]f[src]c",
+        args: &[
+            avs::arg(c"clip"),
+            avs::arg(c"opt"),
+            avs::arg(c"nvof_src"),
+            avs::arg(c"mt"),
+            avs::arg(c"sar"),
+            avs::arg(c"src"),
+        ],
+        create: filter::create_smooth_fps_nvof,
+    },
+    avs::Function {
+        name: c"SVSmoothFps_RIFE",
+        params: c"csc[vec_src]c[mt]i[sar]f[src]c",
+        args: &[
+            avs::arg(c"clip"),
+            avs::arg(c"opt"),
+            avs::arg(c"rife_out"),
+            avs::data_clip(c"vec_src", c"vdata"),
+            avs::arg(c"mt"),
+            avs::arg(c"sar"),
+            avs::arg(c"src"),
+        ],
+        create: filter::create_smooth_fps_rife,
+    },
+];
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn avisynth_c_plugin_init(env: vs::Raw) -> *const c_char {
+    unsafe { avs::init(env, &AVS_FUNCTIONS, c"SVPFlow2") }
 }
