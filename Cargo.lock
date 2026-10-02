@@ -168,7 +168,7 @@ name = "svpflow-core"
 version = "0.1.0"
 
 [[package]]
-name = "svpflow-vs4"
+name = "svpflow-host"
 version = "0.1.0"
 
 [[package]]
@@ -189,7 +189,7 @@ dependencies = [
  "libloading",
  "rayon",
  "svpflow-core",
- "svpflow-vs4",
+ "svpflow-host",
 ]
 
 [[package]]
@@ -198,7 +198,7 @@ version = "0.1.0"
 dependencies = [
  "libloading",
  "svpflow-core",
- "svpflow-vs4",
+ "svpflow-host",
 ]
 
 [[package]]

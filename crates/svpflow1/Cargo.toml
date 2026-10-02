@@ -14,7 +14,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 rayon = "1.12.0"
 svpflow-core = { path = "../svpflow-core" }
-svpflow-vs4 = { path = "../svpflow-vs4" }
+svpflow-host = { path = "../svpflow-host" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libloading = "0.9.0"

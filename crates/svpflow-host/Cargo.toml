@@ -1,5 +1,5 @@
 [package]
-name = "svpflow-vs4"
+name = "svpflow-host"
 version.workspace = true
 authors = ["z1xus"]
 license = "Apache-2.0"

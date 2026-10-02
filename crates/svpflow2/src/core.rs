@@ -1,5 +1,6 @@
 use std::{borrow::Cow, slice};
 
+use crate::vs::Source as _;
 use crate::{frame, hdr, light, metadata, options, renderer, video_format, vs};
 
 #[derive(Clone, Copy)]

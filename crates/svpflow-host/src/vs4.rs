@@ -1,18 +1,12 @@
-#![allow(unsafe_code, clippy::missing_safety_doc)]
-
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-type Raw = *mut c_void;
-type ConstRaw = *const c_void;
-
-pub type Create = unsafe extern "system" fn(ConstRaw, Raw, Raw, Raw, ConstRaw) -> isize;
-type Init = unsafe extern "system" fn(ConstRaw, Raw, *mut Raw, Raw, Raw, ConstRaw);
-type GetFrame3 =
-    unsafe extern "system" fn(i32, i32, *mut Raw, *mut Raw, Raw, Raw, ConstRaw) -> ConstRaw;
-type Free3 = unsafe extern "system" fn(Raw, Raw, ConstRaw);
+use crate::vs3::{
+    self, ConstRaw, CoreInfo, Create, Format as Format3, FreeFilter as Free3,
+    GetFrame as GetFrame3, InitFilter as Init, Raw, VideoInfo as VideoInfo3,
+};
 
 pub struct Function {
     pub name: &'static CStr,
@@ -74,45 +68,6 @@ struct VideoInfo4 {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
-struct Format3 {
-    name: [u8; 32],
-    id: i32,
-    color_family: i32,
-    sample_type: i32,
-    bits_per_sample: i32,
-    bytes_per_sample: i32,
-    sub_sampling_w: i32,
-    sub_sampling_h: i32,
-    num_planes: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VideoInfo3 {
-    format: *const Format3,
-    fps_num: i64,
-    fps_den: i64,
-    width: i32,
-    height: i32,
-    num_frames: i32,
-    flags: i32,
-}
-
-unsafe impl Send for VideoInfo3 {}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CoreInfo {
-    version: *const c_char,
-    core: i32,
-    api: i32,
-    threads: i32,
-    max_framebuffer: i64,
-    used_framebuffer: i64,
-}
-
-#[repr(C)]
 struct Dependency {
     source: Raw,
     pattern: i32,
@@ -147,8 +102,6 @@ const MAP_GET_NODE: usize = 584;
 const GET_CORE_INFO: usize = 808;
 
 const PT_VIDEO_NODE: i32 = 3;
-const TABLE_LEN: usize = 110;
-
 static API4: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 fn api() -> ConstRaw {
@@ -159,77 +112,64 @@ unsafe fn f<T: Copy>(offset: usize) -> T {
     unsafe { api().cast::<u8>().add(offset).cast::<T>().read_unaligned() }
 }
 
-extern "C" fn missing() {
-    std::process::abort();
-}
-
 fn table() -> ConstRaw {
-    static TABLE: OnceLock<Box<[usize; TABLE_LEN]>> = OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        let mut t = Box::new([missing as *const () as usize; TABLE_LEN]);
-        let entries: [(usize, usize); 24] = [
-            (16, get_core_info as *const () as usize),
-            (48, free_frame as *const () as usize),
-            (56, free_node as *const () as usize),
-            (72, new_video_frame as *const () as usize),
-            (80, copy_frame as *const () as usize),
-            (136, create_filter as *const () as usize),
-            (144, set_error as *const () as usize),
-            (160, set_filter_error as *const () as usize),
-            (176, get_format_preset as *const () as usize),
-            (208, get_frame_filter as *const () as usize),
-            (216, request_frame_filter as *const () as usize),
-            (240, get_stride as *const () as usize),
-            (248, get_read_ptr as *const () as usize),
-            (256, get_write_ptr as *const () as usize),
-            (304, get_video_info as *const () as usize),
-            (312, set_video_info as *const () as usize),
-            (344, get_frame_props_ro as *const () as usize),
-            (352, get_frame_props_rw as *const () as usize),
-            (392, prop_get_int as *const () as usize),
-            (400, prop_get_float as *const () as usize),
-            (408, prop_get_data as *const () as usize),
-            (416, prop_get_data_size as *const () as usize),
-            (424, prop_get_node as *const () as usize),
-            (456, prop_set_int as *const () as usize),
-        ];
-        for (offset, function) in entries {
-            t[offset / 8] = function;
-        }
-        t
-    });
-    table.as_ptr().cast()
+    static TABLE: OnceLock<Box<[usize]>> = OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            vs3::table(&[
+                (vs3::GET_CORE_INFO, get_core_info as *const () as usize),
+                (vs3::FREE_FRAME, free_frame as *const () as usize),
+                (vs3::FREE_NODE, free_node as *const () as usize),
+                (vs3::NEW_VIDEO_FRAME, new_video_frame as *const () as usize),
+                (vs3::COPY_FRAME, copy_frame as *const () as usize),
+                (vs3::CREATE_FILTER, create_filter as *const () as usize),
+                (vs3::SET_ERROR, set_error as *const () as usize),
+                (
+                    vs3::SET_FILTER_ERROR,
+                    set_filter_error as *const () as usize,
+                ),
+                (
+                    vs3::GET_FORMAT_PRESET,
+                    get_format_preset as *const () as usize,
+                ),
+                (
+                    vs3::GET_FRAME_FILTER,
+                    get_frame_filter as *const () as usize,
+                ),
+                (
+                    vs3::REQUEST_FRAME_FILTER,
+                    request_frame_filter as *const () as usize,
+                ),
+                (vs3::GET_STRIDE, get_stride as *const () as usize),
+                (vs3::GET_READ_PTR, get_read_ptr as *const () as usize),
+                (vs3::GET_WRITE_PTR, get_write_ptr as *const () as usize),
+                (vs3::GET_VIDEO_INFO, get_video_info as *const () as usize),
+                (vs3::SET_VIDEO_INFO, set_video_info as *const () as usize),
+                (
+                    vs3::GET_FRAME_PROPS_RO,
+                    get_frame_props_ro as *const () as usize,
+                ),
+                (
+                    vs3::GET_FRAME_PROPS_RW,
+                    get_frame_props_rw as *const () as usize,
+                ),
+                (vs3::PROP_GET_INT, prop_get_int as *const () as usize),
+                (vs3::PROP_GET_FLOAT, prop_get_float as *const () as usize),
+                (vs3::PROP_GET_DATA, prop_get_data as *const () as usize),
+                (
+                    vs3::PROP_GET_DATA_SIZE,
+                    prop_get_data_size as *const () as usize,
+                ),
+                (vs3::PROP_GET_NODE, prop_get_node as *const () as usize),
+                (vs3::PROP_SET_INT, prop_set_int as *const () as usize),
+            ])
+        })
+        .as_ptr()
+        .cast()
 }
-
-const CM_GRAY: i32 = 1_000_000;
-const CM_RGB: i32 = 2_000_000;
-const CM_YUV: i32 = 3_000_000;
-
-const PRESETS: [(i32, i32, i32, i32, i32, i32); 20] = [
-    (CM_GRAY + 10, 1, 0, 8, 0, 0),
-    (CM_GRAY + 11, 1, 0, 16, 0, 0),
-    (CM_GRAY + 12, 1, 1, 16, 0, 0),
-    (CM_GRAY + 13, 1, 1, 32, 0, 0),
-    (CM_YUV + 10, 3, 0, 8, 1, 1),
-    (CM_YUV + 11, 3, 0, 8, 1, 0),
-    (CM_YUV + 12, 3, 0, 8, 0, 0),
-    (CM_YUV + 13, 3, 0, 8, 2, 2),
-    (CM_YUV + 14, 3, 0, 8, 2, 0),
-    (CM_YUV + 15, 3, 0, 8, 0, 1),
-    (CM_YUV + 16, 3, 0, 9, 1, 1),
-    (CM_YUV + 17, 3, 0, 9, 1, 0),
-    (CM_YUV + 18, 3, 0, 9, 0, 0),
-    (CM_YUV + 19, 3, 0, 10, 1, 1),
-    (CM_YUV + 20, 3, 0, 10, 1, 0),
-    (CM_YUV + 21, 3, 0, 10, 0, 0),
-    (CM_YUV + 22, 3, 0, 16, 1, 1),
-    (CM_YUV + 23, 3, 0, 16, 1, 0),
-    (CM_YUV + 24, 3, 0, 16, 0, 0),
-    (CM_RGB + 10, 2, 0, 8, 0, 0),
-];
 
 fn format3(format: Format4) -> Format3 {
-    let id = PRESETS
+    let id = vs3::PRESETS
         .iter()
         .find(|p| {
             (p.1, p.2, p.3, p.4, p.5)
@@ -243,9 +183,9 @@ fn format3(format: Format4) -> Format3 {
         })
         .map_or(0, |p| p.0);
     let family = match format.color_family {
-        1 => CM_GRAY,
-        2 => CM_RGB,
-        3 => CM_YUV,
+        1 => vs3::CM_GRAY,
+        2 => vs3::CM_RGB,
+        3 => vs3::CM_YUV,
         _ => 0,
     };
     Format3 {
@@ -271,29 +211,6 @@ fn format4(format: &Format3) -> Format4 {
         sub_sampling_h: format.sub_sampling_h,
         num_planes: format.num_planes,
     }
-}
-
-#[allow(clippy::vec_box)]
-fn stable_format(format: Format3) -> *const Format3 {
-    static FORMATS: Mutex<Vec<Box<Format3>>> = Mutex::new(Vec::new());
-    let mut formats = FORMATS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let key = |f: &Format3| {
-        (
-            f.id,
-            f.color_family,
-            f.sample_type,
-            f.bits_per_sample,
-            f.sub_sampling_w,
-            f.sub_sampling_h,
-        )
-    };
-    if let Some(found) = formats.iter().find(|f| key(f) == key(&format)) {
-        return &raw const **found;
-    }
-    formats.push(Box::new(format));
-    &raw const **formats.last().expect("pushed")
 }
 
 struct Adapter {
@@ -447,7 +364,7 @@ unsafe extern "system" fn set_video_info(info: *const VideoInfo3, _count: i32, n
     let format = if info.format.is_null() {
         Format4::default()
     } else {
-        format4(unsafe { &*info.format })
+        format4(unsafe { &*info.format.cast::<Format3>() })
     };
     adapter.info = Some(VideoInfo4 {
         format,
@@ -464,7 +381,7 @@ unsafe extern "system" fn get_video_info(node: Raw) -> *const VideoInfo3 {
     let info =
         unsafe { &*f::<unsafe extern "system" fn(Raw) -> *const VideoInfo4>(GET_VIDEO_INFO)(node) };
     let converted = VideoInfo3 {
-        format: stable_format(format3(info.format)),
+        format: vs3::intern(format3(info.format)).cast(),
         fps_num: info.fps_num,
         fps_den: info.fps_den,
         width: info.width,
@@ -484,21 +401,7 @@ unsafe extern "system" fn get_video_info(node: Raw) -> *const VideoInfo3 {
 }
 
 unsafe extern "system" fn get_format_preset(id: i32, _core: Raw) -> *const Format3 {
-    let Some(&(id, family, sample, bits, sw, sh)) = PRESETS.iter().find(|p| p.0 == id) else {
-        return std::ptr::null();
-    };
-    let format = Format4 {
-        color_family: family,
-        sample_type: sample,
-        bits_per_sample: bits,
-        bytes_per_sample: (bits + 7) / 8,
-        sub_sampling_w: sw,
-        sub_sampling_h: sh,
-        num_planes: if family == 1 { 1 } else { 3 },
-    };
-    let mut converted = format3(format);
-    converted.id = id;
-    stable_format(converted)
+    vs3::preset(id).map_or(std::ptr::null(), vs3::intern)
 }
 
 unsafe extern "system" fn new_video_frame(
@@ -522,7 +425,7 @@ unsafe extern "system" fn get_core_info(core: Raw) -> *const CoreInfo {
             version: std::ptr::null(),
             core: 0,
             api: 0,
-            threads: 0,
+            num_threads: 0,
             max_framebuffer: 0,
             used_framebuffer: 0,
         }) };

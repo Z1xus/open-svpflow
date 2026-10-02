@@ -174,13 +174,12 @@ unsafe fn get_gray8_format(
     vsapi: vs::ConstRaw,
     fallback: vs::ConstRaw,
 ) -> vs::ConstRaw {
-    type GetFormatPreset = unsafe extern "system" fn(i32, vs::Raw) -> vs::ConstRaw;
-    const GET_FORMAT_PRESET: usize = 176;
-    const PF_GRAY8: i32 = 1_000_010;
-    if let Some(preset) = unsafe { vs::table_fn::<GetFormatPreset>(vsapi, GET_FORMAT_PRESET) } {
-        let format = unsafe { preset(PF_GRAY8, core) };
+    if let Some(preset) =
+        unsafe { vs::table_fn::<vs::GetFormatPreset>(vsapi, vs::GET_FORMAT_PRESET) }
+    {
+        let format = unsafe { preset(vs::PF_GRAY8, core) };
         if !format.is_null() {
-            return format;
+            return format.cast();
         }
     }
     fallback

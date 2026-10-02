@@ -1,6 +1,7 @@
 use std::ffi::c_char;
 use std::slice;
 
+use crate::vs::Source as _;
 use crate::{core, light, metadata, nvof, options, params, strings, video_format, vs};
 
 type FilterData = core::FilterState;

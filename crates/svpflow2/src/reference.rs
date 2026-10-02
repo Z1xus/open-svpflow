@@ -9,6 +9,7 @@ use svpflow_core::smooth::{
 use svpflow_core::smooth_engine::{self as engine, Rates};
 
 use crate::core::{FilterState, Mode, drop_frame, get_node, request_node, super_frame_planes};
+use crate::vs::Source as _;
 use crate::{frame, metadata, options::ReferenceParams, vs};
 
 fn cache_cap(bytes: usize) -> usize {
