@@ -254,6 +254,10 @@ impl Options {
         self.mt = i64::from(threads);
     }
 
+    pub fn apply_sar(&mut self, sar: f64) {
+        self.light.sar = Some(sar);
+    }
+
     pub fn apply_mask_area_scale(&mut self, source_8bit: bool) {
         if self.mask.area > 0 {
             let area = i32::try_from(self.mask.area).unwrap_or(i32::MAX);

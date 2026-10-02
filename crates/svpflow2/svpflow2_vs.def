@@ -2,3 +2,5 @@ LIBRARY svpflow2_vs
 EXPORTS
     VapourSynthPluginInit @1
     svpGetVersion @2
+    VapourSynthPluginInit2 @3
+    avisynth_c_plugin_init @4
