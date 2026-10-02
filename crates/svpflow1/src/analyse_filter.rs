@@ -48,7 +48,12 @@ unsafe fn create_analyse_inner(
     if super_node.is_null() {
         return Err("SVAnalyse: clip (super) required".into());
     }
-    let src_node = unsafe { get_node(input, c"src".as_ptr(), 0, &raw mut err) };
+    let given_src = unsafe { get_node(input, c"src".as_ptr(), 0, &raw mut err) };
+    let src_node = if given_src.is_null() {
+        unsafe { get_node(input, c"clip".as_ptr(), 0, &raw mut err) }
+    } else {
+        given_src
+    };
     let free_nodes = || unsafe {
         vs::free_node(super_node, vsapi);
         if !src_node.is_null() {
@@ -80,6 +85,9 @@ unsafe fn create_analyse_inner(
         let params = AnalyseParams::new(options.as_ref(), super_params, chroma_shift)?;
 
         let full = super_params.has_finest_level();
+        if !full && given_src.is_null() {
+            return Err("SVAnalyse: src required".into());
+        }
         let expected_width = if full {
             super_params.width
         } else {

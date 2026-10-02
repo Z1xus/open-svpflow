@@ -42,4 +42,6 @@ pub(crate) use svpflow_host::vs3 as vs;
 pub use portable::{Analyser, SuperBuilder, SuperFrame};
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use abi::{VapourSynthPluginInit, VapourSynthPluginInit2, svpGetVersion};
+pub use abi::{
+    VapourSynthPluginInit, VapourSynthPluginInit2, avisynth_c_plugin_init, svpGetVersion,
+};

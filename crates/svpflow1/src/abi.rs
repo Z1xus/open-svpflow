@@ -1,3 +1,7 @@
+use std::ffi::c_char;
+
+use svpflow_host::avs;
+
 use crate::{analyse_filter, super_filter, vs};
 
 pub const VERSION: i64 = 1_174_405_393;
@@ -70,4 +74,28 @@ pub unsafe extern "system" fn VapourSynthPluginInit2(plugin: vs::Raw, api: vs::C
         },
     ];
     unsafe { svpflow_host::vs4::init(plugin, api, &config, &functions) };
+}
+
+static AVS_FUNCTIONS: [avs::Function; 2] = [
+    avs::Function {
+        name: c"SVSuper",
+        params: c"cs",
+        args: &[avs::arg(c"clip"), avs::arg(c"opt")],
+        create: super_filter::create_super,
+    },
+    avs::Function {
+        name: c"SVAnalyse",
+        params: c"cs[src]c",
+        args: &[
+            avs::data_clip(c"clip", c"sdata"),
+            avs::arg(c"opt"),
+            avs::arg(c"src"),
+        ],
+        create: analyse_filter::create_analyse,
+    },
+];
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn avisynth_c_plugin_init(env: vs::Raw) -> *const c_char {
+    unsafe { avs::init(env, &AVS_FUNCTIONS, c"SVPFlow1") }
 }
