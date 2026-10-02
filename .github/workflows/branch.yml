@@ -1,0 +1,39 @@
+name: Branch
+
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: branch-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  links:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    steps:
+      - name: Links
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          latest="https://nightly.link/$GH_REPO/workflows/branch/$GITHUB_REF_NAME"
+          run="https://nightly.link/$GH_REPO/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "| Target | Latest on $GITHUB_REF_NAME | This build (${GITHUB_SHA:0:12}) |"
+            echo "| --- | --- | --- |"
+            gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts" \
+              --jq '.artifacts[].name' | sort | while read -r name; do
+              echo "| $name | [zip]($latest/$name.zip) | [zip]($run/$name.zip) |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
