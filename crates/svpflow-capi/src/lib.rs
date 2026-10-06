@@ -126,33 +126,68 @@ unsafe fn vectors(
     super_opt: *const c_char,
     analyse_opt: *const c_char,
     smooth_opt: *const c_char,
+    half: bool,
 ) -> Result<Map, CString> {
-    let mut input = Map::default();
-    input.set(c"clip", Value::Node(Arc::clone(source)));
-    input.set(c"opt", Value::Data(unsafe { text(super_opt) }));
-    let output = host.invoke(c"Super", &input)?;
     let missing = || c"the plugin returned no clip".to_owned();
-    let (super_clip, sdata) = (
-        output.node(c"clip").ok_or_else(missing)?,
-        output.int(c"data").ok_or_else(missing)?,
-    );
+    let call = |name: &CStr, values: Vec<(&CStr, Value)>| {
+        let mut input = Map::default();
+        for (key, value) in values {
+            input.set(key, value);
+        }
+        host.invoke(name, &input)
+    };
+    let clip = |node: &Arc<Node>| Value::Node(Arc::clone(node));
+    let analysed = if half {
+        call(c"Halve", vec![(c"clip", clip(source))])?
+            .node(c"clip")
+            .ok_or_else(missing)?
+    } else {
+        Arc::clone(source)
+    };
+    let options = Value::Data(unsafe { text(super_opt) });
+    let mut supers = call(
+        c"Super",
+        vec![(c"clip", clip(&analysed)), (c"opt", options)],
+    )?;
+    let sdata = supers.int(c"data").ok_or_else(missing)?;
+    let mut found = call(
+        c"Analyse",
+        vec![
+            (c"clip", clip(&supers.node(c"clip").ok_or_else(missing)?)),
+            (c"sdata", Value::Int(sdata)),
+            (c"src", clip(&analysed)),
+            (c"opt", Value::Data(unsafe { text(analyse_opt) })),
+        ],
+    )?;
+    if half {
+        found = call(
+            c"DoubleVectors",
+            vec![
+                (c"clip", clip(&found.node(c"clip").ok_or_else(missing)?)),
+                (
+                    c"vdata",
+                    Value::Int(found.int(c"data").ok_or_else(missing)?),
+                ),
+            ],
+        )?;
+        let gpu = (sdata >> 48) & 0xFF;
+        let options = CString::new(format!("{{pel:1,gpu:{gpu}}}")).unwrap_or_default();
+        supers = call(
+            c"Super",
+            vec![(c"clip", clip(source)), (c"opt", Value::Data(options))],
+        )?;
+    }
     let mut input = Map::default();
-    input.set(c"clip", Value::Node(Arc::clone(&super_clip)));
-    input.set(c"sdata", Value::Int(sdata));
-    input.set(c"src", Value::Node(Arc::clone(source)));
-    input.set(c"opt", Value::Data(unsafe { text(analyse_opt) }));
-    let output = host.invoke(c"Analyse", &input)?;
-    let mut input = Map::default();
-    input.set(c"clip", Value::Node(Arc::clone(source)));
-    input.set(c"super", Value::Node(super_clip));
-    input.set(c"sdata", Value::Int(sdata));
+    input.set(c"clip", clip(source));
+    input.set(c"super", clip(&supers.node(c"clip").ok_or_else(missing)?));
     input.set(
-        c"vectors",
-        Value::Node(output.node(c"clip").ok_or_else(missing)?),
+        c"sdata",
+        Value::Int(supers.int(c"data").ok_or_else(missing)?),
     );
+    input.set(c"vectors", clip(&found.node(c"clip").ok_or_else(missing)?));
     input.set(
         c"vdata",
-        Value::Int(output.int(c"data").ok_or_else(missing)?),
+        Value::Int(found.int(c"data").ok_or_else(missing)?),
     );
     input.set(c"opt", Value::Data(unsafe { text(smooth_opt) }));
     Ok(input)
@@ -174,9 +209,11 @@ pub unsafe extern "C" fn osvp_smooth_fps(
     super_opt: *const c_char,
     analyse_opt: *const c_char,
     smooth_opt: *const c_char,
+    half_analysis: i32,
 ) -> *mut Clip {
     let (host, source) = unsafe { (&(*context).0, &(*source).node) };
-    let input = unsafe { vectors(host, source, super_opt, analyse_opt, smooth_opt) };
+    let half = half_analysis != 0;
+    let input = unsafe { vectors(host, source, super_opt, analyse_opt, smooth_opt, half) };
     finish(host, c"SmoothFps", input)
 }
 
@@ -187,6 +224,7 @@ pub unsafe extern "C" fn osvp_smooth_fps_blend(
     super_opt: *const c_char,
     analyse_opt: *const c_char,
     smooth_opt: *const c_char,
+    half_analysis: i32,
     weights: *const f64,
     weight_count: i32,
     fps_num: i64,
@@ -195,15 +233,17 @@ pub unsafe extern "C" fn osvp_smooth_fps_blend(
     let (host, source) = unsafe { (&(*context).0, &(*source).node) };
     let weights =
         unsafe { std::slice::from_raw_parts(weights, usize::try_from(weight_count).unwrap_or(0)) };
-    let input =
-        unsafe { vectors(host, source, super_opt, analyse_opt, smooth_opt) }.map(|mut input| {
+    let half = half_analysis != 0;
+    let input = unsafe { vectors(host, source, super_opt, analyse_opt, smooth_opt, half) }.map(
+        |mut input| {
             for &weight in weights {
                 input.set(c"weights", Value::Float(weight));
             }
             input.set(c"fpsnum", Value::Int(fps_num));
             input.set(c"fpsden", Value::Int(fps_den));
             input
-        });
+        },
+    );
     finish(host, c"SmoothFpsBlend", input)
 }
 

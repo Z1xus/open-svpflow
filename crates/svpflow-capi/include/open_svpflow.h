@@ -41,12 +41,13 @@ osvp_clip *osvp_source(const osvp_context *context, const osvp_video_info *info,
 
 osvp_clip *osvp_smooth_fps(const osvp_context *context, const osvp_clip *source,
                            const char *super_opt, const char *analyse_opt,
-                           const char *smooth_opt);
+                           const char *smooth_opt, int32_t half_analysis);
 
 osvp_clip *osvp_smooth_fps_blend(const osvp_context *context, const osvp_clip *source,
                                  const char *super_opt, const char *analyse_opt,
-                                 const char *smooth_opt, const double *weights,
-                                 int32_t weight_count, int64_t fps_num, int64_t fps_den);
+                                 const char *smooth_opt, int32_t half_analysis,
+                                 const double *weights, int32_t weight_count, int64_t fps_num,
+                                 int64_t fps_den);
 
 void osvp_clip_info(const osvp_clip *clip, osvp_video_info *info);
 void osvp_clip_free(osvp_clip *clip);
