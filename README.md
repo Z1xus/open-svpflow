@@ -23,6 +23,7 @@ This proof of concept runs open-svpflow client-side in the browser as WASM and r
 - AviSynth+ support with the original function names.
 - `SmoothFpsBlend`, an extra function that interpolates and frame-blends on the GPU in one go, so it's about 2x faster than blending separately (build with `--no-default-features` if you don't want it).
 - `Halve` and `DoubleVectors`, two more extra functions that let the motion search run on a half-size frame, which is a lot faster for a small quality loss.
+- `mask:{still:true}` in the `SmoothFps` options, which finds text, logos and other things that stay in place and keeps them from smearing (GPU only, off by default). It can be tuned with `mask:{still:{limit:4.5,edge:5,tolerance:30}}`.
 - A C API for running it without VapourSynth or AviSynth (`open_svpflow.h`, build it with `cargo build --release -p svpflow-capi`).
 
 Output matches the original byte for byte in everything I've tested, on both CPU and GPU. But GPU algorithms 1 and 2 are the exception, since the original reads uninitialized memory there and doesn't even match its own previous run (±1 on about 0.01% of pixels, same as ours). So it should work anywhere SVPFlow already does, whether that's smoothie, SVP itself, mpv or your own scripts.
