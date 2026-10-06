@@ -131,6 +131,7 @@ impl FilterState {
         coverage: (&[u8], &[u8]),
         area: Option<(&[u8], &[u8])>,
         motion_key: i64,
+        blend: Option<&crate::gpu::BlendJob>,
         core: vs::Raw,
     ) -> vs::ConstRaw {
         let w = usize::try_from(self.video_info.width).unwrap_or(0);
@@ -161,6 +162,22 @@ impl FilterState {
         ) else {
             return std::ptr::null();
         };
+        if let Some(job) = blend {
+            gpu.blend_render(
+                job,
+                &current,
+                &next,
+                linear,
+                params,
+                motion_key,
+                usize::try_from(width).unwrap_or(0),
+                usize::try_from(height).unwrap_or(0),
+                motions,
+                coverage,
+                area,
+            );
+            return std::ptr::null();
+        }
         let output_info = self.output_info();
         let Some(output) = (unsafe {
             api.new_frame(
@@ -377,6 +394,7 @@ impl FilterState {
     pub(crate) unsafe fn reference_get(
         &self,
         frame: i32,
+        blend: Option<&crate::gpu::BlendJob>,
         frame_ctx: vs::Raw,
         core: vs::Raw,
         vsapi: vs::ConstRaw,
@@ -503,6 +521,7 @@ impl FilterState {
                 (&luma, &limits),
                 &params,
                 &vector_data,
+                blend,
                 core,
             )
         };
@@ -534,6 +553,7 @@ impl FilterState {
         (luma, limits): (&[u8], &SceneLimits),
         params: &ReferenceParams,
         vector_data: &metadata::VectorData,
+        blend: Option<&crate::gpu::BlendJob>,
         core: vs::Raw,
     ) -> vs::ConstRaw {
         let shape = *field.shape();
@@ -629,6 +649,7 @@ impl FilterState {
                         .as_ref()
                         .map(|(first, second)| (&second[..], &first[..])),
                     motion_key,
+                    blend,
                     core,
                 )
             };

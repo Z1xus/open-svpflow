@@ -6,8 +6,8 @@ use crate::{core, light, metadata, nvof, options, params, strings, video_format,
 
 type FilterData = core::FilterState;
 
-struct CreateApi {
-    create_filter: vs::CreateFilter,
+pub(crate) struct CreateApi {
+    pub(crate) create_filter: vs::CreateFilter,
     get_node: vs::PropGetNode,
     get_video_info: vs::GetVideoInfo,
 }
@@ -49,85 +49,9 @@ unsafe fn create_filter(
     core: vs::Raw,
     vsapi: vs::ConstRaw,
 ) -> isize {
-    let Some(api) = (unsafe { load_create_api(output, vsapi) }) else {
+    let Some((data, api)) = (unsafe { build_state(mode, input, output, core, vsapi) }) else {
         return 0;
     };
-    let Some(mut options) = (unsafe { parse_params(mode, input, output, vsapi) }) else {
-        return 0;
-    };
-    options.apply_core_threads(unsafe { core_threads(core, vsapi) });
-    if let Some(sar) = unsafe { sar(input, vsapi) } {
-        options.apply_sar(sar);
-    }
-    if mode != 0 && !unsafe { validate_options(&options, mode, output, vsapi) } {
-        return 0;
-    }
-
-    let Some((source, video_info)) = (unsafe { source_info(input, output, vsapi, &api) }) else {
-        return 0;
-    };
-    if mode != 0
-        && !unsafe { validate_timing_options(&options, mode, source, &video_info, output, vsapi) }
-    {
-        return 0;
-    }
-    options.normalize_scene_mode(mode, &video_info.source());
-    options.apply_source_depth(video_format::source_depth(&video_info));
-    let mut data = unsafe { collect_state(mode, input, vsapi, &api, source, video_info, options) };
-    if let metadata::VectorRecord::Ready(vectors) = data.vector_data() {
-        data.options.scale_scene_limits(vectors.block);
-    }
-    let source_8bit_scale = data.mask_area_uses_source_8bit_scale();
-    data.options.apply_mask_area_scale(source_8bit_scale);
-    data.options.apply_debug_mask_scale();
-    data.options.apply_mask_cover_algo(mode);
-    if !unsafe { validate_nvof_runtime(mode, &data, output, vsapi) } {
-        unsafe { data.free(vsapi) };
-        return 0;
-    }
-    if !unsafe { validate_vec_src(mode, &data, output, vsapi, &api) } {
-        unsafe { data.free(vsapi) };
-        return 0;
-    }
-    if !unsafe { init_nvof_runtime(mode, &mut data, output, vsapi, &api) } {
-        unsafe { data.free(vsapi) };
-        return 0;
-    }
-    if !unsafe { validate_vectors(mode, &data, output, vsapi) } {
-        unsafe { data.free(vsapi) };
-        return 0;
-    }
-    if mode == 0 && !unsafe { validate_mode0_options(&data, output, vsapi) } {
-        unsafe { data.free(vsapi) };
-        return 0;
-    }
-    unsafe { apply_vector_defaults(mode, &mut data) };
-    if !unsafe { validate_super(mode, &data, output, vsapi) } {
-        unsafe { data.free(vsapi) };
-        return 0;
-    }
-    unsafe { apply_request_flags(mode, &mut data) };
-    if !unsafe { validate_cubic(&data, output, vsapi) } {
-        unsafe { data.free(vsapi) };
-        return 0;
-    }
-    if data.render_mode == 2 && data.options.block_enabled() {
-        unsafe { set_error(output, vsapi, strings::ERR_BLOCK_GPU.as_ptr().cast()) };
-        unsafe { data.free(vsapi) };
-        return 0;
-    }
-    if !unsafe { validate_overlap(&data, output, vsapi) } {
-        unsafe { data.free(vsapi) };
-        return 0;
-    }
-    if !unsafe { validate_source_format(&data, output, vsapi) } {
-        unsafe { data.free(vsapi) };
-        return 0;
-    }
-    if !unsafe { validate_gpu_runtime(&data, output, vsapi) } {
-        unsafe { data.free(vsapi) };
-        return 0;
-    }
     let data = Box::into_raw(Box::new(data)).cast();
 
     unsafe {
@@ -145,6 +69,89 @@ unsafe fn create_filter(
         );
     }
     0
+}
+
+pub(crate) unsafe fn build_state(
+    mode: i32,
+    input: vs::ConstRaw,
+    output: vs::Raw,
+    core: vs::Raw,
+    vsapi: vs::ConstRaw,
+) -> Option<(FilterData, CreateApi)> {
+    let api = unsafe { load_create_api(output, vsapi) }?;
+    let mut options = unsafe { parse_params(mode, input, output, vsapi) }?;
+    options.apply_core_threads(unsafe { core_threads(core, vsapi) });
+    if let Some(sar) = unsafe { sar(input, vsapi) } {
+        options.apply_sar(sar);
+    }
+    if mode != 0 && !unsafe { validate_options(&options, mode, output, vsapi) } {
+        return None;
+    }
+
+    let (source, video_info) = unsafe { source_info(input, output, vsapi, &api) }?;
+    if mode != 0
+        && !unsafe { validate_timing_options(&options, mode, source, &video_info, output, vsapi) }
+    {
+        return None;
+    }
+    options.normalize_scene_mode(mode, &video_info.source());
+    options.apply_source_depth(video_format::source_depth(&video_info));
+    let mut data = unsafe { collect_state(mode, input, vsapi, &api, source, video_info, options) };
+    if let metadata::VectorRecord::Ready(vectors) = data.vector_data() {
+        data.options.scale_scene_limits(vectors.block);
+    }
+    let source_8bit_scale = data.mask_area_uses_source_8bit_scale();
+    data.options.apply_mask_area_scale(source_8bit_scale);
+    data.options.apply_debug_mask_scale();
+    data.options.apply_mask_cover_algo(mode);
+    if !unsafe { validate_nvof_runtime(mode, &data, output, vsapi) } {
+        unsafe { data.free(vsapi) };
+        return None;
+    }
+    if !unsafe { validate_vec_src(mode, &data, output, vsapi, &api) } {
+        unsafe { data.free(vsapi) };
+        return None;
+    }
+    if !unsafe { init_nvof_runtime(mode, &mut data, output, vsapi, &api) } {
+        unsafe { data.free(vsapi) };
+        return None;
+    }
+    if !unsafe { validate_vectors(mode, &data, output, vsapi) } {
+        unsafe { data.free(vsapi) };
+        return None;
+    }
+    if mode == 0 && !unsafe { validate_mode0_options(&data, output, vsapi) } {
+        unsafe { data.free(vsapi) };
+        return None;
+    }
+    unsafe { apply_vector_defaults(mode, &mut data) };
+    if !unsafe { validate_super(mode, &data, output, vsapi) } {
+        unsafe { data.free(vsapi) };
+        return None;
+    }
+    unsafe { apply_request_flags(mode, &mut data) };
+    if !unsafe { validate_cubic(&data, output, vsapi) } {
+        unsafe { data.free(vsapi) };
+        return None;
+    }
+    if data.render_mode == 2 && data.options.block_enabled() {
+        unsafe { set_error(output, vsapi, strings::ERR_BLOCK_GPU.as_ptr().cast()) };
+        unsafe { data.free(vsapi) };
+        return None;
+    }
+    if !unsafe { validate_overlap(&data, output, vsapi) } {
+        unsafe { data.free(vsapi) };
+        return None;
+    }
+    if !unsafe { validate_source_format(&data, output, vsapi) } {
+        unsafe { data.free(vsapi) };
+        return None;
+    }
+    if !unsafe { validate_gpu_runtime(&data, output, vsapi) } {
+        unsafe { data.free(vsapi) };
+        return None;
+    }
+    Some((data, api))
 }
 
 unsafe fn validate_options(
@@ -865,12 +872,12 @@ unsafe extern "system" fn get_frame(
             unsafe { state.request_frame(n, frame_ctx, vsapi) };
             std::ptr::null()
         }
-        2 => unsafe { state.get_frame(n, frame_ctx, core, vsapi) },
+        2 => unsafe { state.get_frame(n, None, frame_ctx, core, vsapi) },
         _ => std::ptr::null(),
     }
 }
 
-unsafe fn set_error(output: vs::Raw, vsapi: vs::ConstRaw, message: *const c_char) {
+pub(crate) unsafe fn set_error(output: vs::Raw, vsapi: vs::ConstRaw, message: *const c_char) {
     if let Some(set_error) = unsafe { vs::table_fn::<vs::SetError>(vsapi, vs::SET_ERROR) } {
         unsafe { set_error(output, message) };
     }

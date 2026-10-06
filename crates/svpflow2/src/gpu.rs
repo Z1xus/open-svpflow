@@ -3,6 +3,12 @@
 use core::ffi::{c_char, c_void};
 use std::ffi::CString;
 
+mod blend;
+
+pub use blend::BlendJob;
+#[cfg(feature = "blend")]
+pub use blend::OutputPlane;
+
 type ClInt = i32;
 type ClUint = u32;
 type ClPlatformId = *mut c_void;
@@ -148,6 +154,7 @@ struct OpenCl {
     CreateKernel: FnCreateKernel,
     CreateBuffer: FnCreateBuffer,
     CreateImage2D: FnCreateImage2D,
+    CreateImage: Option<blend::FnCreateImage>,
     EnqueueReadBuffer: FnEnqueueReadBuffer,
     EnqueueWriteImage: FnEnqueueWriteImage,
     EnqueueMapBuffer: FnEnqueueMapBuffer,
@@ -197,6 +204,7 @@ impl OpenCl {
                 CreateKernel: sym!("clCreateKernel"),
                 CreateBuffer: sym!("clCreateBuffer"),
                 CreateImage2D: sym!("clCreateImage2D"),
+                CreateImage: unsafe { lib.get(b"clCreateImage\0") }.ok().map(|f| *f),
                 EnqueueReadBuffer: sym!("clEnqueueReadBuffer"),
                 EnqueueWriteImage: sym!("clEnqueueWriteImage"),
                 EnqueueMapBuffer: sym!("clEnqueueMapBuffer"),
@@ -236,6 +244,8 @@ pub struct GpuContext {
     super_cache: std::sync::Mutex<Vec<(i64, SuperCell)>>,
     image_pool: std::sync::Arc<ImagePool>,
     staging: std::sync::Mutex<Vec<Staging>>,
+    blend_pool: std::sync::Mutex<Vec<blend::Buffers>>,
+    blend_units: std::sync::Mutex<Vec<Unit>>,
 }
 
 struct Staging {
@@ -340,6 +350,7 @@ struct Unit {
     packed_ext: Vec<u16>,
     packed_mask: Vec<u8>,
     variant_kernels: Vec<(u32, ClKernel)>,
+    blend: blend::UnitState,
 }
 
 #[derive(Clone, Copy)]
@@ -375,6 +386,7 @@ impl Unit {
             packed_ext: Vec::new(),
             packed_mask: Vec::new(),
             variant_kernels: Vec::new(),
+            blend: blend::UnitState::default(),
         }
     }
 }
@@ -408,21 +420,12 @@ impl Drop for GpuContext {
             }
             for unit in &self.units {
                 if let Ok(u) = unit.lock() {
-                    for b in &u.dst {
-                        if !b.0.is_null() {
-                            (self.cl.ReleaseMemObject)(b.0);
-                        }
-                    }
-                    for image in u.motion.iter().chain(std::iter::once(&u.mask)) {
-                        if !image.mem.is_null() {
-                            (self.cl.ReleaseMemObject)(image.mem);
-                        }
-                    }
-                    (self.cl.ReleaseKernel)(u.kernel);
-                    for &(_, kernel) in &u.variant_kernels {
-                        (self.cl.ReleaseKernel)(kernel);
-                    }
-                    (self.cl.ReleaseCommandQueue)(u.queue);
+                    self.release_unit(&u);
+                }
+            }
+            if let Ok(mut pool) = self.blend_units.lock() {
+                for unit in pool.drain(..) {
+                    self.release_unit(&unit);
                 }
             }
             for resources in &self.cache_resources {
@@ -437,6 +440,12 @@ impl Drop for GpuContext {
             if let Ok(mut pool) = self.staging.lock() {
                 for staging in pool.drain(..) {
                     (self.cl.ReleaseMemObject)(staging.mem);
+                }
+            }
+            if let Ok(mut pool) = self.blend_pool.lock() {
+                for buffers in pool.drain(..) {
+                    (self.cl.ReleaseMemObject)(buffers.sums);
+                    (self.cl.ReleaseMemObject)(buffers.bytes);
                 }
             }
             if let Ok(mut pool) = self.image_pool.lock() {
@@ -457,6 +466,32 @@ impl Drop for GpuContext {
 }
 
 impl GpuContext {
+    unsafe fn release_unit(&self, u: &Unit) {
+        unsafe {
+            for b in &u.dst {
+                if !b.0.is_null() {
+                    (self.cl.ReleaseMemObject)(b.0);
+                }
+            }
+            for image in u.motion.iter().chain(std::iter::once(&u.mask)) {
+                if !image.mem.is_null() {
+                    (self.cl.ReleaseMemObject)(image.mem);
+                }
+            }
+            (self.cl.ReleaseKernel)(u.kernel);
+            for &(_, kernel) in &u.variant_kernels {
+                (self.cl.ReleaseKernel)(kernel);
+            }
+            for kernel in u.blend.kernels.into_iter().flatten() {
+                (self.cl.ReleaseKernel)(kernel);
+            }
+            if !u.blend.masks.0.is_null() {
+                (self.cl.ReleaseMemObject)(u.blend.masks.0);
+            }
+            (self.cl.ReleaseCommandQueue)(u.queue);
+        }
+    }
+
     pub fn new(gpuid: i32, qn: i64, hi10: bool) -> Option<Self> {
         let units = usize::try_from(qn)
             .unwrap_or(DEFAULT_UNITS)
@@ -614,6 +649,8 @@ impl GpuContext {
                 super_cache: std::sync::Mutex::new(Vec::new()),
                 image_pool: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 staging: std::sync::Mutex::new(Vec::new()),
+                blend_pool: std::sync::Mutex::new(Vec::new()),
+                blend_units: std::sync::Mutex::new(Vec::new()),
             });
         }
         Err("no usable GPU device".into())
@@ -982,13 +1019,14 @@ impl GpuContext {
                 program
             } else {
                 let source = format!(
-                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define HI10P {}\n{}",
+                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define HI10P {}\n{}",
                     variant & 0xFF,
                     (variant >> 8) & 1,
                     (variant >> 9) & 1,
                     (variant >> 10) & 1,
                     (variant >> 11) & 1,
                     (variant >> 12) & 1,
+                    (variant >> 13) & 1,
                     u8::from(self.hi10),
                     KERNEL_SRC
                 );
@@ -998,7 +1036,11 @@ impl GpuContext {
                 program
             }
         };
-        let name = CString::new("render_frame").ok()?;
+        let name = if variant & blend::BLEND_VARIANT == 0 {
+            c"render_frame"
+        } else {
+            c"blend_frame"
+        };
         let mut err = 0;
         let kernel = unsafe { (self.cl.CreateKernel)(program, name.as_ptr(), &raw mut err) };
         if err != CL_SUCCESS || kernel.is_null() {
@@ -1037,29 +1079,26 @@ impl GpuContext {
         unsafe { (self.cl.SetKernelArg)(k, i, 4, (&raw const v).cast()) == CL_SUCCESS }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_frame(
+    fn variant(p: &KernelParams, hi10: bool) -> u32 {
+        u32::try_from(p.algorithm & 0xFF).unwrap_or(23)
+            | u32::from(p.cubic != 0) << 8
+            | u32::from(p.cubic_ref != 0) << 9
+            | u32::from(p.has_sad != 0) << 10
+            | u32::from(p.linear_luma != 0) << 11
+            | u32::from(p.dither != 0 && !hi10) << 12
+    }
+
+    unsafe fn upload_motion(
         &self,
-        src0: [GpuBuf; 3],
-        src1: [GpuBuf; 3],
-        dst_y: &mut [u8],
-        sy: i32,
-        py: KernelParams,
-        dst_u: &mut [u8],
-        su: i32,
-        pu: KernelParams,
-        dst_v: &mut [u8],
-        sv: i32,
-        pv: KernelParams,
+        unit: &mut Unit,
+        algorithm: i32,
         motion_key: i64,
         motion_width: usize,
         motion_height: usize,
         motions: [(&[u16], &[u16]); 4],
-        coverage: (&[u8], &[u8]),
-        area: Option<(&[u8], &[u8])>,
-    ) -> Option<()> {
+    ) -> Option<(ClMem, ClMem)> {
         let count = motion_width.checked_mul(motion_height)?;
-        let motion_count = if py.algorithm == 23 { 4 } else { 2 };
+        let motion_count = if algorithm == 23 { 4 } else { 2 };
         if count == 0
             || motions[..motion_count]
                 .iter()
@@ -1067,31 +1106,17 @@ impl GpuContext {
         {
             return None;
         }
-        let mut unit = self.acquire();
         let Unit {
-            kernel,
             queue,
-            dst,
             motion,
             motion_key: cached_motion_key,
-            mask,
             packed_base,
             packed_ext,
-            packed_mask,
-            variant_kernels,
-        } = &mut *unit;
-        let _ = kernel;
-        let variant = u32::try_from(py.algorithm & 0xFF).unwrap_or(23)
-            | u32::from(py.cubic != 0) << 8
-            | u32::from(py.cubic_ref != 0) << 9
-            | u32::from(py.has_sad != 0) << 10
-            | u32::from(py.linear_luma != 0) << 11
-            | u32::from(py.dither != 0 && !self.hi10) << 12;
-        let k = self.variant_kernel(variant_kernels, variant)?;
+            ..
+        } = unit;
         let q = *queue;
         packed_base.clear();
         packed_ext.clear();
-        packed_mask.clear();
         unsafe {
             let base_mem =
                 self.ensure_image(&mut motion[0], motion_width, motion_height, CL_UNORM_INT16)?;
@@ -1115,7 +1140,7 @@ impl GpuContext {
                 )?;
                 cached_motion_key[0] = motion_key;
             }
-            let ext_mem = if py.algorithm == 23 {
+            let ext_mem = if algorithm == 23 {
                 let mem =
                     self.ensure_image(&mut motion[1], motion_width, motion_height, CL_UNORM_INT16)?;
                 if cached_motion_key[1] != motion_key {
@@ -1142,29 +1167,73 @@ impl GpuContext {
             } else {
                 base_mem
             };
+            Some((base_mem, ext_mem))
+        }
+    }
+
+    fn pack_masks(
+        packed: &mut Vec<u8>,
+        count: usize,
+        needs_coverage: bool,
+        coverage: (&[u8], &[u8]),
+        area: Option<(&[u8], &[u8])>,
+    ) -> Option<()> {
+        if needs_coverage && (coverage.0.len() < count || coverage.1.len() < count) {
+            return None;
+        }
+        if let Some((a, b)) = area
+            && (a.len() < count || b.len() < count)
+        {
+            return None;
+        }
+        packed.reserve(count * 4);
+        for i in 0..count {
+            let sad_f = area.map_or(0, |(a, _)| a[i]);
+            let sad_b = area.map_or(0, |(_, b)| b[i]);
+            packed.extend_from_slice(&[
+                sad_b,
+                if needs_coverage { coverage.0[i] } else { 0 },
+                if needs_coverage { coverage.1[i] } else { 0 },
+                sad_f,
+            ]);
+        }
+        Some(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bind_fields(
+        &self,
+        unit: &mut Unit,
+        variant: u32,
+        py: &KernelParams,
+        motion_key: i64,
+        motion_width: usize,
+        motion_height: usize,
+        motions: [(&[u16], &[u16]); 4],
+        coverage: (&[u8], &[u8]),
+        area: Option<(&[u8], &[u8])>,
+    ) -> Option<ClKernel> {
+        let count = motion_width.checked_mul(motion_height)?;
+        let k = self.variant_kernel(&mut unit.variant_kernels, variant)?;
+        let q = unit.queue;
+        unsafe {
+            let (base_mem, ext_mem) = self.upload_motion(
+                unit,
+                py.algorithm,
+                motion_key,
+                motion_width,
+                motion_height,
+                motions,
+            )?;
+            let Unit {
+                mask, packed_mask, ..
+            } = unit;
+            packed_mask.clear();
 
             let needs_coverage = py.algorithm >= 21;
             let needs_mask = needs_coverage || py.has_sad != 0;
             let mask_mem = if needs_mask {
-                if needs_coverage && (coverage.0.len() < count || coverage.1.len() < count) {
-                    return None;
-                }
-                if let Some((a, b)) = area
-                    && (a.len() < count || b.len() < count)
-                {
-                    return None;
-                }
-                packed_mask.reserve(count * 4);
-                for i in 0..count {
-                    let sad_f = area.map_or(0, |(a, _)| a[i]);
-                    let sad_b = area.map_or(0, |(_, b)| b[i]);
-                    packed_mask.extend_from_slice(&[
-                        sad_b,
-                        if needs_coverage { coverage.0[i] } else { 0 },
-                        if needs_coverage { coverage.1[i] } else { 0 },
-                        sad_f,
-                    ]);
-                }
+                Self::pack_masks(packed_mask, count, needs_coverage, coverage, area)?;
                 let mem = self.ensure_image(mask, motion_width, motion_height, CL_UNORM_INT8)?;
                 self.enqueue_image_raw(
                     q,
@@ -1185,59 +1254,111 @@ impl GpuContext {
                     return None;
                 }
             }
+        }
+        Some(k)
+    }
 
-            let run = |dslot: &mut (ClMem, usize),
-                       dst: &[u8],
-                       stride: i32,
-                       p: KernelParams,
-                       s0: GpuBuf,
-                       s1: GpuBuf,
-                       waits: &[ClEvent]|
-             -> Option<ClMem> {
-                let dmem = self.ensure_buffer(dslot, dst.len())?;
-                (self.cl.SetKernelArg)(k, 0, size_of::<ClMem>(), (&raw const dmem).cast());
-                let stride = if self.hi10 { stride / 2 } else { stride };
-                self.set_i32(k, 1, stride).then_some(())?;
-                (self.cl.SetKernelArg)(k, 2, size_of::<ClMem>(), (&raw const s0.0).cast());
-                (self.cl.SetKernelArg)(k, 3, size_of::<ClMem>(), (&raw const s1.0).cast());
-                if (self.cl.SetKernelArg)(k, 7, size_of::<KernelParams>(), (&raw const p).cast())
-                    != CL_SUCCESS
-                {
-                    return None;
-                }
-                let global = [
-                    usize::try_from(p.width).ok()?,
-                    usize::try_from(p.height).ok()?,
-                ];
-                if (self.cl.EnqueueNDRangeKernel)(
-                    q,
-                    k,
-                    2,
-                    std::ptr::null(),
-                    global.as_ptr(),
-                    std::ptr::null(),
-                    ClUint::try_from(waits.len()).ok()?,
-                    if waits.is_empty() {
-                        std::ptr::null()
-                    } else {
-                        waits.as_ptr().cast()
-                    },
-                    std::ptr::null_mut(),
-                ) != CL_SUCCESS
-                {
-                    return None;
-                }
-                Some(dmem)
-            };
-            let mut waits = Vec::with_capacity(2);
-            for event in [src0[0].1, src1[0].1] {
-                if !event.is_null() && !waits.contains(&event) {
-                    waits.push(event);
-                }
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn enqueue_plane(
+        &self,
+        q: ClCommandQueue,
+        k: ClKernel,
+        dmem: ClMem,
+        stride: i32,
+        p: KernelParams,
+        s0: GpuBuf,
+        s1: GpuBuf,
+        waits: &[ClEvent],
+    ) -> Option<()> {
+        unsafe {
+            (self.cl.SetKernelArg)(k, 0, size_of::<ClMem>(), (&raw const dmem).cast());
+            self.set_i32(k, 1, stride).then_some(())?;
+            (self.cl.SetKernelArg)(k, 2, size_of::<ClMem>(), (&raw const s0.0).cast());
+            (self.cl.SetKernelArg)(k, 3, size_of::<ClMem>(), (&raw const s1.0).cast());
+            if (self.cl.SetKernelArg)(k, 7, size_of::<KernelParams>(), (&raw const p).cast())
+                != CL_SUCCESS
+            {
+                return None;
             }
-            let y_mem = run(&mut dst[0], dst_y, sy, py, src0[0], src1[0], &waits)?;
-            let u_mem = run(&mut dst[1], dst_u, su, pu, src0[1], src1[1], &[])?;
-            let v_mem = run(&mut dst[2], dst_v, sv, pv, src0[2], src1[2], &[])?;
+            let global = [
+                usize::try_from(p.width).ok()?,
+                usize::try_from(p.height).ok()?,
+            ];
+            if (self.cl.EnqueueNDRangeKernel)(
+                q,
+                k,
+                2,
+                std::ptr::null(),
+                global.as_ptr(),
+                std::ptr::null(),
+                ClUint::try_from(waits.len()).ok()?,
+                if waits.is_empty() {
+                    std::ptr::null()
+                } else {
+                    waits.as_ptr().cast()
+                },
+                std::ptr::null_mut(),
+            ) != CL_SUCCESS
+            {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    fn source_waits(src0: GpuBuf, src1: GpuBuf) -> Vec<ClEvent> {
+        let mut waits = Vec::with_capacity(2);
+        for event in [src0.1, src1.1] {
+            if !event.is_null() && !waits.contains(&event) {
+                waits.push(event);
+            }
+        }
+        waits
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_frame(
+        &self,
+        src0: [GpuBuf; 3],
+        src1: [GpuBuf; 3],
+        dst_y: &mut [u8],
+        sy: i32,
+        py: KernelParams,
+        dst_u: &mut [u8],
+        su: i32,
+        pu: KernelParams,
+        dst_v: &mut [u8],
+        sv: i32,
+        pv: KernelParams,
+        motion_key: i64,
+        motion_width: usize,
+        motion_height: usize,
+        motions: [(&[u16], &[u16]); 4],
+        coverage: (&[u8], &[u8]),
+        area: Option<(&[u8], &[u8])>,
+    ) -> Option<()> {
+        let mut unit = self.acquire();
+        unsafe {
+            let k = self.bind_fields(
+                &mut unit,
+                Self::variant(&py, self.hi10),
+                &py,
+                motion_key,
+                motion_width,
+                motion_height,
+                motions,
+                coverage,
+                area,
+            )?;
+            let q = unit.queue;
+            let depth = if self.hi10 { 2 } else { 1 };
+            let waits = Self::source_waits(src0[0], src1[0]);
+            let y_mem = self.ensure_buffer(&mut unit.dst[0], dst_y.len())?;
+            self.enqueue_plane(q, k, y_mem, sy / depth, py, src0[0], src1[0], &waits)?;
+            let u_mem = self.ensure_buffer(&mut unit.dst[1], dst_u.len())?;
+            self.enqueue_plane(q, k, u_mem, su / depth, pu, src0[1], src1[1], &[])?;
+            let v_mem = self.ensure_buffer(&mut unit.dst[2], dst_v.len())?;
+            self.enqueue_plane(q, k, v_mem, sv / depth, pv, src0[2], src1[2], &[])?;
             let mut done: ClEvent = std::ptr::null_mut();
             let total = dst_y.len() + dst_u.len() + dst_v.len();
             let staging = self.take_staging(q, total)?;
@@ -1392,6 +1513,9 @@ pub(crate) const KERNEL_SRC: &str = r"
 #endif
 #ifndef HI10P
 #define HI10P 0
+#endif
+#ifndef BLEND
+#define BLEND 0
 #endif
 #if HI10P
 #define REF_SCALE(p) ((p)->linear_luma ? 256.0f : 16384.0f)
@@ -1597,5 +1721,152 @@ kernel void render_frame(
 # endif
     destination[y*destination_stride+x] = (uchar)clamp(round(result), 0.0f, 255.0f);
 #endif
+}
+
+#if BLEND && !HI10P
+#define MAX_STEPS 16
+typedef struct {
+    int count;
+    int phase[MAX_STEPS];
+    float sad_blend[MAX_STEPS];
+    float weight[MAX_STEPS];
+} Steps;
+
+inline float4 layer_sample(read_only image2d_array_t image, float2 position, int layer) {
+#if CUBIC
+    float2 grid = position - (float2)(0.5f, 0.5f);
+    float2 index = floor(grid);
+    float2 f = grid - index;
+    float2 r = 1.0f - f;
+    float2 r2 = r * r;
+    float2 f2 = f * f;
+    float2 w0 = 1.0f/6.0f * r2 * r;
+    float2 w1 = 2.0f/3.0f - 0.5f * f2 * (2.0f - f);
+    float2 w2 = 2.0f/3.0f - 0.5f * r2 * (2.0f - r);
+    float2 w3 = 1.0f/6.0f * f2 * f;
+    float2 g0 = w0 + w1;
+    float2 g1 = w2 + w3;
+    float2 h0 = (w1 / g0) - 0.5f + index;
+    float2 h1 = (w3 / g1) + 1.5f + index;
+    float4 a = read_imagef(image, linear_sampler, (float4)(h0, (float)layer, 0.0f));
+    float4 b = read_imagef(image, linear_sampler, (float4)(h1.x, h0.y, (float)layer, 0.0f));
+    float4 c = read_imagef(image, linear_sampler, (float4)(h0.x, h1.y, (float)layer, 0.0f));
+    float4 d = read_imagef(image, linear_sampler, (float4)(h1, (float)layer, 0.0f));
+    a = mix(c, a, g0.y);
+    b = mix(d, b, g0.y);
+    return mix(b, a, g0.x);
+#else
+    return read_imagef(image, field_sampler, (float4)(position, (float)layer, 0.0f));
+#endif
+}
+
+kernel void blend_frame(
+    global float *sums, int stride,
+    read_only image2d_t source_f, read_only image2d_t source_b,
+    read_only image2d_t vectors, read_only image2d_t vectors_ext,
+    read_only image2d_array_t masks, Params p, Steps steps)
+{
+    int x = get_global_id(0), y = get_global_id(1);
+    if (x >= p.width || y >= p.height) return;
+
+    float2 field_position = native_divide(
+        (float2)(x*p.x_ratio-p.origin_x, y*p.y_ratio-p.origin_y),
+        (float2)(p.block_w, p.block_h));
+    float4 vector = field_sample(vectors, field_position, CUBIC);
+#if ALGO == 13 || ALGO == 22 || HAS_SAD
+    float ref_b0 = base_sample(source_b, &p);
+    float ref_f0 = base_sample(source_f, &p);
+#endif
+#if ALGO == 23
+    float4 ext = field_sample(vectors_ext, field_position, CUBIC);
+#endif
+    global float *sum = sums + (p.offset_y+y)*stride + p.offset_x + x;
+    float total = *sum;
+
+    for (int step = 0; step < steps.count; step++) {
+        p.phase = steps.phase[step];
+        p.sad_blend = steps.sad_blend[step];
+#if ALGO >= 21 || HAS_SAD
+        float4 mask = layer_sample(masks, field_position, step);
+#endif
+        float time = native_divide((float)p.phase, 256.0f);
+
+        float ref_b = source_sample(source_b, &p, vector.z, vector.y, 256-p.phase);
+        float ref_f = source_sample(source_f, &p, vector.x, vector.w, p.phase);
+#if ALGO == 23
+        float ref_bb = linear_source_sample(source_b, &p, ext.z, ext.y, 256-p.phase);
+        float ref_ff = linear_source_sample(source_f, &p, ext.x, ext.w, p.phase);
+#endif
+        float result;
+
+#if ALGO == 1
+        result = ref_b + ref_f*0.00001f;
+#elif ALGO == 2
+        result = ref_f + ref_b*0.00001f;
+#elif ALGO == 11
+        result = mix(ref_f, ref_b, time);
+#elif ALGO == 13
+        result = median3(ref_f, ref_b, mix(ref_f0, ref_b0, p.sad_blend));
+#elif ALGO == 21
+        result = mix(mix(ref_f, ref_b, mask.y), mix(ref_b, ref_f, mask.z), time);
+#elif ALGO == 22
+        result = median3(
+            mix(ref_f, ref_b, mask.y),
+            mix(ref_b, ref_f, mask.z),
+            mix(ref_f0, ref_b0, time));
+#else
+        result = mix(
+            mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y),
+            mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z),
+            time);
+#endif
+
+#if HAS_SAD
+# if ALGO == 1
+        result = mix(result, ref_b0, mask.x);
+# elif ALGO == 2
+        result = mix(result, ref_f0, mask.w);
+# else
+        result = mix(result, mix(ref_f0, ref_b0, p.sad_blend), fmax(mask.w, mask.x));
+# endif
+#endif
+
+#if LINEAR_LUMA
+        if (p.linear_luma) {
+            result = native_divide(result, 255.0f);
+            if (result < 0.018f) result *= 4.5f;
+            else result = 1.099f*native_powr(result, 0.45f)-0.099f;
+            result *= 255.0f;
+        }
+#endif
+#if DITHER
+        result += native_divide((float)(bayer[x%8][y%8]-32), 65.0f);
+#endif
+        {
+#pragma OPENCL FP_CONTRACT OFF
+            float term = steps.weight[step] * clamp(round(result), 0.0f, 255.0f);
+            total = term + total;
+        }
+    }
+    *sum = total;
+}
+#endif
+
+kernel void blend_source(
+    global float *sums, int stride, read_only image2d_t source, float weight)
+{
+#pragma OPENCL FP_CONTRACT OFF
+    int2 position = (int2)(get_global_id(0), get_global_id(1));
+    float value = round(255.0f * read_imagef(source, nearest_sampler, position).x);
+    float term = weight * value;
+    global float *sum = sums + position.y*stride + position.x;
+    *sum = term + *sum;
+}
+
+kernel void blend_resolve(global float *sums, global uchar *destination, float divisor)
+{
+    size_t i = get_global_id(0);
+    destination[i] = (uchar)clamp(rint(sums[i] / divisor), 0.0f, 255.0f);
+    sums[i] = 0.0f;
 }
 ";

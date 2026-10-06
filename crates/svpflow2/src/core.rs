@@ -275,6 +275,7 @@ impl FilterState {
     pub(crate) unsafe fn get_frame(
         &self,
         frame: i32,
+        blend: Option<&crate::gpu::BlendJob>,
         frame_ctx: vs::Raw,
         core: vs::Raw,
         vsapi: vs::ConstRaw,
@@ -291,7 +292,7 @@ impl FilterState {
                 get_node(get_frame, self.clips.src, source_frame, frame_ctx),
                 free_frame,
             );
-            return unsafe { self.reference_get(frame, frame_ctx, core, vsapi) };
+            return unsafe { self.reference_get(frame, blend, frame_ctx, core, vsapi) };
         }
 
         drop_frame(
@@ -2214,7 +2215,7 @@ impl FilterState {
         Some(())
     }
 
-    fn source_frame(&self, frame: i32) -> i32 {
+    pub(crate) fn source_frame(&self, frame: i32) -> i32 {
         let timing = self.options.timing(&self.video_info.source());
         timing.source_frame(frame, false)
     }

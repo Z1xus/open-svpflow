@@ -420,6 +420,14 @@ impl PlaneApi {
         }
     }
 
+    #[cfg(feature = "blend")]
+    pub(crate) unsafe fn set_duration(&self, frame: vs::Raw, num: i64, den: i64) {
+        let mut timing = unsafe { self.read_timing(frame.cast_const()) };
+        timing.duration_num = num;
+        timing.duration_den = den;
+        unsafe { self.write_timing(frame, timing) };
+    }
+
     unsafe fn write_timing(&self, frame: vs::Raw, timing: TimingProps) {
         let (Some(get_props), Some(set_int)) = (self.get_frame_props_rw, self.prop_set_int) else {
             return;

@@ -16,6 +16,10 @@ libloading = "0.9.0"
 svpflow-core = { path = "../svpflow-core" }
 svpflow-host = { path = "../svpflow-host" }
 
+[features]
+default = ["blend"]
+blend = []
+
 [lints.rust]
 unsafe_code = "warn"
 

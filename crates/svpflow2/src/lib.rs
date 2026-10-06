@@ -11,6 +11,8 @@
 )]
 
 mod abi;
+#[cfg(feature = "blend")]
+mod blend;
 mod core;
 mod filter;
 mod frame;

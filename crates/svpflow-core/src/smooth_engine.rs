@@ -427,7 +427,7 @@ pub fn render_shape(data: &VectorData, width: i32, height: i32, blend: f64) -> R
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GpuParams {
     pub algorithm: i32,
     pub width: i32,

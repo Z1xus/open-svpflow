@@ -8,6 +8,18 @@ pub(crate) const FILTER_NAME: &[u8] = b"SVSmoothFps\0";
 pub(crate) const SMOOTH_FPS: &[u8] = b"SmoothFps\0";
 pub(crate) const SMOOTH_FPS_NVOF: &[u8] = b"SmoothFps_NVOF\0";
 pub(crate) const SMOOTH_FPS_RIFE: &[u8] = b"SmoothFps_RIFE\0";
+#[cfg(feature = "blend")]
+pub(crate) const BLEND_FILTER_NAME: &[u8] = b"SVSmoothFpsBlend\0";
+#[cfg(feature = "blend")]
+pub(crate) const SMOOTH_FPS_BLEND: &[u8] = b"SmoothFpsBlend\0";
+#[cfg(feature = "blend")]
+pub(crate) const ARGS_BLEND: &[u8] = b"clip:clip;super:clip;sdata:int;vectors:clip;vdata:int;opt:data;weights:float[];fpsnum:int;fpsden:int:opt;src:clip:opt;fps:float:opt\0";
+#[cfg(feature = "blend")]
+pub(crate) const WEIGHTS: &[u8] = b"weights\0";
+#[cfg(feature = "blend")]
+pub(crate) const FPS_NUM: &[u8] = b"fpsnum\0";
+#[cfg(feature = "blend")]
+pub(crate) const FPS_DEN: &[u8] = b"fpsden\0";
 
 pub(crate) const ARGS_SMOOTH_FPS: &[u8] =
     b"clip:clip;super:clip;sdata:int;vectors:clip;vdata:int;opt:data;src:clip:opt;fps:float:opt\0";

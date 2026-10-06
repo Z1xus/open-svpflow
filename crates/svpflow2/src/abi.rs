@@ -51,6 +51,14 @@ pub unsafe extern "system" fn VapourSynthPluginInit(
             std::ptr::null_mut(),
             plugin,
         );
+        #[cfg(feature = "blend")]
+        register(
+            strings::SMOOTH_FPS_BLEND.as_ptr().cast(),
+            strings::ARGS_BLEND.as_ptr().cast(),
+            crate::blend::create_smooth_fps_blend,
+            std::ptr::null_mut(),
+            plugin,
+        );
     }
 }
 
@@ -81,6 +89,13 @@ pub unsafe extern "system" fn VapourSynthPluginInit2(plugin: vs::Raw, api: vs::C
             args: text(strings::ARGS_RIFE),
             returns: c"clip:vnode;",
             create: filter::create_smooth_fps_rife,
+        },
+        #[cfg(feature = "blend")]
+        svpflow_host::vs4::Function {
+            name: text(strings::SMOOTH_FPS_BLEND),
+            args: text(strings::ARGS_BLEND),
+            returns: c"clip:vnode;",
+            create: crate::blend::create_smooth_fps_blend,
         },
     ];
     unsafe { svpflow_host::vs4::init(plugin, api, &config, &functions) };
