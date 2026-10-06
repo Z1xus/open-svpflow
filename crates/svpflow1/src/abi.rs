@@ -48,6 +48,22 @@ pub unsafe extern "system" fn VapourSynthPluginInit(
             std::ptr::null_mut(),
             plugin,
         );
+        #[cfg(feature = "half")]
+        register(
+            c"Halve".as_ptr(),
+            c"clip:clip".as_ptr(),
+            crate::half::create_halve,
+            std::ptr::null_mut(),
+            plugin,
+        );
+        #[cfg(feature = "half")]
+        register(
+            c"DoubleVectors".as_ptr(),
+            c"clip:clip;vdata:int".as_ptr(),
+            crate::half::create_double_vectors,
+            std::ptr::null_mut(),
+            plugin,
+        );
     }
 }
 
@@ -71,6 +87,20 @@ pub unsafe extern "system" fn VapourSynthPluginInit2(plugin: vs::Raw, api: vs::C
             args: c"clip:clip;sdata:int;src:clip;opt:data",
             returns: c"clip:vnode;data:int;",
             create: analyse_filter::create_analyse,
+        },
+        #[cfg(feature = "half")]
+        svpflow_host::vs4::Function {
+            name: c"Halve",
+            args: c"clip:clip",
+            returns: c"clip:vnode;",
+            create: crate::half::create_halve,
+        },
+        #[cfg(feature = "half")]
+        svpflow_host::vs4::Function {
+            name: c"DoubleVectors",
+            args: c"clip:clip;vdata:int",
+            returns: c"clip:vnode;data:int;",
+            create: crate::half::create_double_vectors,
         },
     ];
     unsafe { svpflow_host::vs4::init(plugin, api, &config, &functions) };

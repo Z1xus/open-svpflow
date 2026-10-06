@@ -19,6 +19,10 @@ svpflow-host = { path = "../svpflow-host" }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libloading = "0.9.0"
 
+[features]
+default = ["half"]
+half = []
+
 [lints.rust]
 unsafe_code = "warn"
 

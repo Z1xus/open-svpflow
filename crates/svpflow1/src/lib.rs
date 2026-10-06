@@ -27,6 +27,8 @@ mod abi;
 mod analyse;
 #[cfg(not(target_arch = "wasm32"))]
 mod analyse_filter;
+#[cfg(all(feature = "half", not(target_arch = "wasm32")))]
+mod half;
 mod portable;
 mod super_build;
 #[cfg(not(target_arch = "wasm32"))]
