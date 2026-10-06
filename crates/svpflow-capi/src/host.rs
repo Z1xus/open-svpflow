@@ -223,6 +223,8 @@ struct Slot {
 
 type Cell = Arc<Slot>;
 
+pub struct Pending(#[allow(dead_code)] Cell);
+
 struct Entry {
     cell: Cell,
     bytes: usize,
@@ -290,8 +292,6 @@ pub struct Host {
     info: CoreInfo,
     functions: Vec<(CString, vs3::Create)>,
     cache: Mutex<Cache>,
-    produced: AtomicUsize,
-    pulled: AtomicUsize,
     queue: Arc<Queue>,
 }
 
@@ -315,8 +315,8 @@ impl Node {
         n.clamp(0, (self.info().num_frames - 1).max(0))
     }
 
-    pub fn prepare(self: &Arc<Self>, n: i32) {
-        drop(self.start(n, n));
+    pub fn prepare(self: &Arc<Self>, n: i32) -> Pending {
+        Pending(self.start(n, n))
     }
 
     fn start(self: &Arc<Self>, n: i32, priority: i32) -> Cell {
@@ -355,7 +355,11 @@ impl Node {
                 frames: Vec::new(),
             }),
         });
-        self.host.spawn(priority, move || task.begin());
+        if matches!(self.kind, Kind::Source(_)) {
+            self.host.spawn(priority, move || task.begin());
+        } else {
+            task.begin();
+        }
         cell
     }
 
@@ -461,7 +465,8 @@ impl Task {
             context.frames.push(((node.id(), n), cell));
         }
         if self.waiting.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.run();
+            let host = Arc::clone(&self.node.host);
+            host.spawn(self.priority, move || self.run());
         }
     }
 
@@ -496,7 +501,6 @@ impl Task {
             match &produced {
                 Ok(frame) if cached => {
                     let bytes = frame.bytes();
-                    host.produced.fetch_add(bytes, Ordering::Relaxed);
                     if let Some(entry) = cache.entries.get_mut(&key) {
                         entry.bytes = bytes;
                     }
@@ -621,8 +625,6 @@ impl Host {
             },
             functions,
             cache: Mutex::default(),
-            produced: AtomicUsize::new(0),
-            pulled: AtomicUsize::new(0),
             queue,
         }))
     }
@@ -631,11 +633,15 @@ impl Host {
         self.info.num_threads
     }
 
-    pub fn lookahead(&self) -> i32 {
-        let pulled = self.pulled.fetch_add(1, Ordering::Relaxed) + 1;
-        let each = self.produced.load(Ordering::Relaxed) / pulled;
-        let fit = i32::try_from(CACHE_BYTES / 2 / each.max(1)).unwrap_or(i32::MAX);
-        fit.clamp(2, 8 * self.threads())
+    pub fn busy(&self) -> bool {
+        let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        let used: usize = cache
+            .entries
+            .values()
+            .filter(|entry| Arc::strong_count(&entry.cell) > 1)
+            .map(|entry| entry.bytes)
+            .sum();
+        used > CACHE_BYTES / 2
     }
 
     fn spawn(&self, priority: i32, job: impl FnOnce() + Send + 'static) {

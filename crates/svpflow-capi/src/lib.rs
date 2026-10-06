@@ -3,10 +3,11 @@
 mod host;
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use host::{Frame, Host, Map, Node, Read, Value};
+use host::{Frame, Host, Map, Node, Pending, Read, Value};
 use svpflow_host::vs3;
 
 const FORMATS: [i32; 4] = [
@@ -30,7 +31,7 @@ pub struct Context(Arc<Host>);
 
 pub struct Clip {
     node: Arc<Node>,
-    scheduled: Mutex<i32>,
+    ahead: Mutex<(i32, VecDeque<(i32, Pending)>)>,
 }
 
 thread_local! {
@@ -46,7 +47,7 @@ fn fail<T>(message: impl Into<Vec<u8>>) -> *mut T {
 fn clip(node: Arc<Node>) -> *mut Clip {
     Box::into_raw(Box::new(Clip {
         node,
-        scheduled: Mutex::new(0),
+        ahead: Mutex::default(),
     }))
 }
 
@@ -235,20 +236,23 @@ pub unsafe extern "C" fn osvp_clip_free(clip: *mut Clip) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn osvp_get_frame(clip: *const Clip, n: i32) -> *const Frame {
     let clip = unsafe { &*clip };
+    let host = clip.node.host();
     let last = clip.node.info().num_frames - 1;
-    let lookahead = clip.node.host().lookahead();
     {
-        let mut scheduled = clip
-            .scheduled
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if !(n + 1..=n + 1 + lookahead).contains(&*scheduled) {
-            *scheduled = n + 1;
+        let mut ahead = clip.ahead.lock().unwrap_or_else(PoisonError::into_inner);
+        let (next, pending) = &mut *ahead;
+        let limit = n + 8 * host.threads();
+        if !(n + 1..=limit + 1).contains(next) {
+            *next = n + 1;
+            pending.clear();
         }
-        let ahead = (n + lookahead).min(*scheduled + 1).min(last);
-        while *scheduled <= ahead {
-            clip.node.prepare(*scheduled);
-            *scheduled += 1;
+        while pending.front().is_some_and(|(frame, _)| *frame < n) {
+            pending.pop_front();
+        }
+        let end = limit.min(*next + 1).min(last);
+        while *next <= end && !host.busy() {
+            pending.push_back((*next, clip.node.prepare(*next)));
+            *next += 1;
         }
     }
     match clip.node.get(n) {
