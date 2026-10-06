@@ -3467,6 +3467,7 @@ fn gpu_render_frame(
         motions,
         (coverage.a, coverage.b),
         area.map(|mask| (mask.a, mask.b)),
+        None,
     )
     .is_some()
 }

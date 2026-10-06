@@ -162,6 +162,10 @@ impl FilterState {
         ) else {
             return std::ptr::null();
         };
+        let still = self
+            .options
+            .mask_still()
+            .and_then(|limits| gpu.still_mask(&current, &next, limits));
         if let Some(job) = blend {
             gpu.blend_render(
                 job,
@@ -175,6 +179,7 @@ impl FilterState {
                 motions,
                 coverage,
                 area,
+                still,
             );
             return std::ptr::null();
         }
@@ -238,6 +243,7 @@ impl FilterState {
             motions,
             coverage,
             area,
+            still,
         );
         if done.is_none() {
             unsafe { api.free(output.cast_const()) };

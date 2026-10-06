@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use super::{
     CL_FALSE, CL_MEM_READ_WRITE, CL_RGBA, CL_SUCCESS, CL_UNORM_INT8, ClContext, ClEvent,
-    ClImageFormat, ClInt, ClKernel, ClMem, GpuBuf, GpuContext, KernelParams, SuperEntry,
+    ClImageFormat, ClInt, ClKernel, ClMem, GpuBuf, GpuContext, KernelParams, StillMask, SuperEntry,
     SuperHandle, Unit, UploadPlane,
 };
 
@@ -76,6 +76,7 @@ struct Group {
     frames: [Arc<SuperEntry>; 2],
     sources: [[GpuBuf; 3]; 2],
     fields: (ClMem, ClMem),
+    still: Option<StillMask>,
     key: (i64, bool, usize, usize),
     params: [KernelParams; 3],
     steps: Steps,
@@ -348,7 +349,8 @@ impl GpuContext {
         let (width, height) = (group.key.2, group.key.3);
         let layers = unsafe { self.mask_layers(&mut unit, width, height) }?;
         let stride = i32::try_from(job.width).ok()?;
-        let waits = Self::source_waits(group.sources[0][0], group.sources[1][0]);
+        let mut waits = Self::source_waits(group.sources[0][0], group.sources[1][0]);
+        waits.extend(group.still.map(|StillMask(_, ready)| ready));
         let masks = group.masks.as_ptr();
         let filled = !group.masks.is_empty();
         pending.masks.push(group.masks);
@@ -390,6 +392,11 @@ impl GpuContext {
             {
                 return None;
             }
+            if let Some(StillMask(still, _)) = group.still
+                && set(kernel, 9, size_of::<ClMem>(), (&raw const still).cast()) != CL_SUCCESS
+            {
+                return None;
+            }
             for (index, plane) in group.params.into_iter().enumerate() {
                 self.enqueue_plane(
                     unit.queue,
@@ -422,10 +429,12 @@ impl GpuContext {
         motions: [(&[u16], &[u16]); 4],
         coverage: (&[u8], &[u8]),
         area: Option<(&[u8], &[u8])>,
+        still: Option<StillMask>,
     ) -> Option<()> {
         let key = (motion_key, linear, motion_width, motion_height);
         let joins = job.pending.borrow().group.as_ref().is_some_and(|group| {
             group.key == key
+                && group.still == still
                 && (group.steps.count as usize) < MAX_STEPS
                 && shared(group.params) == shared(params)
                 && Arc::ptr_eq(&group.frames[0], &src0.entry)
@@ -435,7 +444,8 @@ impl GpuContext {
             self.flush(job)?;
             let mut unit = job.unit.borrow_mut();
             let unit = &mut *unit;
-            let variant = Self::variant(&params[0], false) | BLEND_VARIANT;
+            let variant =
+                Self::variant(&params[0], false) | BLEND_VARIANT | u32::from(still.is_some()) << 14;
             let kernel = self.variant_kernel(&mut unit.variant_kernels, variant);
             let fields = unsafe {
                 self.upload_motion(
@@ -458,6 +468,7 @@ impl GpuContext {
                 frames: [Arc::clone(&src0.entry), Arc::clone(&src1.entry)],
                 sources: [src0.sources(linear), src1.sources(linear)],
                 fields: fields?,
+                still,
                 key,
                 params: shared(params),
                 steps: Steps::default(),

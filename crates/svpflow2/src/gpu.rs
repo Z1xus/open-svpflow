@@ -244,6 +244,7 @@ pub struct GpuContext {
     super_cache: std::sync::Mutex<Vec<(i64, SuperCell)>>,
     image_pool: std::sync::Arc<ImagePool>,
     staging: std::sync::Mutex<Vec<Staging>>,
+    still: std::sync::Mutex<StillState>,
     blend_pool: std::sync::Mutex<Vec<blend::Buffers>>,
     blend_units: std::sync::Mutex<Vec<Unit>>,
 }
@@ -264,6 +265,7 @@ struct CacheResources {
 }
 
 struct SuperEntry {
+    still: std::sync::OnceLock<Option<(StillMask, std::sync::Arc<SuperEntry>)>>,
     mems: [ClMem; 4],
     ready: ClEvent,
     wait: FnWaitForEvents,
@@ -293,6 +295,13 @@ impl Drop for SuperEntry {
             unsafe {
                 (self.wait)(1, &raw const self.ready);
                 (self.release_event)(self.ready);
+            }
+        }
+        if let Some(Some((StillMask(still, done), _))) = self.still.get() {
+            unsafe {
+                (self.wait)(1, done);
+                (self.release_event)(*done);
+                (self.release)(*still);
             }
         }
         if let Ok(mut pool) = self.pool.lock()
@@ -406,6 +415,18 @@ const MAX_UNITS: usize = 8;
 #[derive(Clone, Copy)]
 pub struct GpuBuf(ClMem, ClEvent);
 
+#[derive(Clone, Copy, PartialEq)]
+pub struct StillMask(ClMem, ClEvent);
+
+struct StillState {
+    queue: ClCommandQueue,
+    kernels: [ClKernel; 2],
+    scratch: ClMem,
+    dims: (usize, usize),
+}
+
+unsafe impl Send for StillState {}
+
 const SUPER_CACHE_CAP: usize = 32;
 const UPLOAD_QUEUES: usize = 4;
 
@@ -440,6 +461,19 @@ impl Drop for GpuContext {
             if let Ok(mut pool) = self.staging.lock() {
                 for staging in pool.drain(..) {
                     (self.cl.ReleaseMemObject)(staging.mem);
+                }
+            }
+            if let Ok(still) = self.still.lock() {
+                for kernel in still.kernels {
+                    if !kernel.is_null() {
+                        (self.cl.ReleaseKernel)(kernel);
+                    }
+                }
+                if !still.scratch.is_null() {
+                    (self.cl.ReleaseMemObject)(still.scratch);
+                }
+                if !still.queue.is_null() {
+                    (self.cl.ReleaseCommandQueue)(still.queue);
                 }
             }
             if let Ok(mut pool) = self.blend_pool.lock() {
@@ -649,6 +683,12 @@ impl GpuContext {
                 super_cache: std::sync::Mutex::new(Vec::new()),
                 image_pool: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 staging: std::sync::Mutex::new(Vec::new()),
+                still: std::sync::Mutex::new(StillState {
+                    queue: std::ptr::null_mut(),
+                    kernels: [std::ptr::null_mut(); 2],
+                    scratch: std::ptr::null_mut(),
+                    dims: (0, 0),
+                }),
                 blend_pool: std::sync::Mutex::new(Vec::new()),
                 blend_units: std::sync::Mutex::new(Vec::new()),
             });
@@ -744,6 +784,7 @@ impl GpuContext {
             mems
         };
         let mut entry = SuperEntry {
+            still: std::sync::OnceLock::new(),
             mems: [linear, packed, packed, packed],
             ready: std::ptr::null_mut(),
             wait: self.cl.WaitForEvents,
@@ -1019,7 +1060,7 @@ impl GpuContext {
                 program
             } else {
                 let source = format!(
-                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define HI10P {}\n{}",
+                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define STILL {}\n#define HI10P {}\n{}",
                     variant & 0xFF,
                     (variant >> 8) & 1,
                     (variant >> 9) & 1,
@@ -1027,6 +1068,7 @@ impl GpuContext {
                     (variant >> 11) & 1,
                     (variant >> 12) & 1,
                     (variant >> 13) & 1,
+                    (variant >> 14) & 1,
                     u8::from(self.hi10),
                     KERNEL_SRC
                 );
@@ -1306,6 +1348,114 @@ impl GpuContext {
         Some(())
     }
 
+    pub fn still_mask(
+        &self,
+        first: &SuperHandle,
+        second: &SuperHandle,
+        limits: [f32; 3],
+    ) -> Option<StillMask> {
+        if self.hi10 || first.entry.dims != second.entry.dims {
+            return None;
+        }
+        let dims = (first.entry.dims.0, first.entry.dims.1 / 3 * 2);
+        let compute = || {
+            let image = unsafe { self.create_image(CL_R, CL_UNORM_INT8, dims.0, dims.1) }?;
+            let mut state = self.still.lock().ok()?;
+            for (kernel, name) in state
+                .kernels
+                .iter_mut()
+                .zip([c"still_pixels", c"still_mask"])
+            {
+                if kernel.is_null() {
+                    let mut err = 0;
+                    *kernel = unsafe {
+                        (self.cl.CreateKernel)(self.program, name.as_ptr(), &raw mut err)
+                    };
+                    if err != CL_SUCCESS || kernel.is_null() {
+                        return None;
+                    }
+                }
+            }
+            if state.dims != dims {
+                let scratch = unsafe { self.create_image(CL_R, CL_UNORM_INT8, dims.0, dims.1) }?;
+                if !state.scratch.is_null() {
+                    unsafe { (self.cl.ReleaseMemObject)(state.scratch) };
+                }
+                state.scratch = scratch.mem;
+                state.dims = dims;
+                std::mem::forget(scratch);
+            }
+            if state.queue.is_null() {
+                let mut err = 0;
+                state.queue = unsafe {
+                    (self.cl.CreateCommandQueue)(self.context, self.device, 0, &raw mut err)
+                };
+                if err != CL_SUCCESS || state.queue.is_null() {
+                    return None;
+                }
+            }
+            let [pixels, mask] = state.kernels;
+            let queue = state.queue;
+            let waits = Self::source_waits(first.bufs()[1], second.bufs()[1]);
+            let global = [dims.0, dims.1];
+            let mut done: ClEvent = std::ptr::null_mut();
+            unsafe {
+                let set = |kernel, index, mem: ClMem| {
+                    (self.cl.SetKernelArg)(
+                        kernel,
+                        index,
+                        size_of::<ClMem>(),
+                        (&raw const mem).cast(),
+                    ) == CL_SUCCESS
+                };
+                let run = |kernel, waits: &[ClEvent], done: *mut ClEvent| {
+                    (self.cl.EnqueueNDRangeKernel)(
+                        queue,
+                        kernel,
+                        2,
+                        std::ptr::null(),
+                        global.as_ptr(),
+                        std::ptr::null(),
+                        waits.len() as ClUint,
+                        if waits.is_empty() {
+                            std::ptr::null()
+                        } else {
+                            waits.as_ptr().cast()
+                        },
+                        done.cast(),
+                    ) == CL_SUCCESS
+                };
+                for (index, limit) in (3..).zip(limits) {
+                    (self.cl.SetKernelArg)(
+                        pixels,
+                        index,
+                        size_of::<f32>(),
+                        (&raw const limit).cast(),
+                    );
+                }
+                let ready = set(pixels, 0, first.entry.mems[1])
+                    && set(pixels, 1, second.entry.mems[1])
+                    && set(pixels, 2, state.scratch)
+                    && set(mask, 0, state.scratch)
+                    && set(mask, 1, image.mem)
+                    && run(pixels, &waits, std::ptr::null_mut())
+                    && run(mask, &[], &raw mut done);
+                if !ready || (self.cl.Flush)(queue) != CL_SUCCESS {
+                    return None;
+                }
+            }
+            let mem = image.mem;
+            std::mem::forget(image);
+            Some((StillMask(mem, done), std::sync::Arc::clone(&second.entry)))
+        };
+        first
+            .entry
+            .still
+            .get_or_init(compute)
+            .as_ref()
+            .map(|(still, _)| *still)
+    }
+
     fn source_waits(src0: GpuBuf, src1: GpuBuf) -> Vec<ClEvent> {
         let mut waits = Vec::with_capacity(2);
         for event in [src0.1, src1.1] {
@@ -1336,12 +1486,13 @@ impl GpuContext {
         motions: [(&[u16], &[u16]); 4],
         coverage: (&[u8], &[u8]),
         area: Option<(&[u8], &[u8])>,
+        still: Option<StillMask>,
     ) -> Option<()> {
         let mut unit = self.acquire();
         unsafe {
             let k = self.bind_fields(
                 &mut unit,
-                Self::variant(&py, self.hi10),
+                Self::variant(&py, self.hi10) | u32::from(still.is_some()) << 14,
                 &py,
                 motion_key,
                 motion_width,
@@ -1350,9 +1501,17 @@ impl GpuContext {
                 coverage,
                 area,
             )?;
+            let mut waits = Self::source_waits(src0[0], src1[0]);
+            if let Some(StillMask(still, ready)) = still {
+                if (self.cl.SetKernelArg)(k, 8, size_of::<ClMem>(), (&raw const still).cast())
+                    != CL_SUCCESS
+                {
+                    return None;
+                }
+                waits.push(ready);
+            }
             let q = unit.queue;
             let depth = if self.hi10 { 2 } else { 1 };
-            let waits = Self::source_waits(src0[0], src1[0]);
             let y_mem = self.ensure_buffer(&mut unit.dst[0], dst_y.len())?;
             self.enqueue_plane(q, k, y_mem, sy / depth, py, src0[0], src1[0], &waits)?;
             let u_mem = self.ensure_buffer(&mut unit.dst[1], dst_u.len())?;
@@ -1517,6 +1676,11 @@ pub(crate) const KERNEL_SRC: &str = r"
 #ifndef BLEND
 #define BLEND 0
 #endif
+#ifndef STILL
+#define STILL 0
+#endif
+#define STILL_AT(still, p, x, y) (read_imagef(still, linear_sampler, \
+    ((float2)(x, y) + 0.5f) * (float2)(p.x_ratio, p.y_ratio)).x > 0.4f)
 #if HI10P
 #define REF_SCALE(p) ((p)->linear_luma ? 256.0f : 16384.0f)
 #else
@@ -1637,7 +1801,11 @@ kernel void render_frame(
     global uchar *destination, int destination_stride,
     read_only image2d_t source_f, read_only image2d_t source_b,
     read_only image2d_t vectors, read_only image2d_t vectors_ext,
-    read_only image2d_t masks, Params p)
+    read_only image2d_t masks, Params p
+#if STILL
+    , read_only image2d_t still
+#endif
+    )
 {
     int x = get_global_id(0), y = get_global_id(1);
     if (x >= p.width || y >= p.height) return;
@@ -1694,6 +1862,11 @@ kernel void render_frame(
 # else
     result = mix(result, mix(ref_f0, ref_b0, p.sad_blend), fmax(mask.w, mask.x));
 # endif
+#endif
+
+#if STILL
+    if (STILL_AT(still, p, x, y))
+        result = mix(base_sample(source_f, &p), base_sample(source_b, &p), time);
 #endif
 
 #if LINEAR_LUMA
@@ -1764,7 +1937,11 @@ kernel void blend_frame(
     global float *sums, int stride,
     read_only image2d_t source_f, read_only image2d_t source_b,
     read_only image2d_t vectors, read_only image2d_t vectors_ext,
-    read_only image2d_array_t masks, Params p, Steps steps)
+    read_only image2d_array_t masks, Params p, Steps steps
+#if STILL
+    , read_only image2d_t still
+#endif
+    )
 {
     int x = get_global_id(0), y = get_global_id(1);
     if (x >= p.width || y >= p.height) return;
@@ -1782,14 +1959,29 @@ kernel void blend_frame(
 #endif
     global float *sum = sums + (p.offset_y+y)*stride + p.offset_x + x;
     float total = *sum;
+#if STILL
+    int kept = STILL_AT(still, p, x, y);
+    float kept_f = 0.0f, kept_b = 0.0f;
+    if (kept) {
+        kept_f = base_sample(source_f, &p);
+        kept_b = base_sample(source_b, &p);
+    }
+#endif
 
     for (int step = 0; step < steps.count; step++) {
         p.phase = steps.phase[step];
         p.sad_blend = steps.sad_blend[step];
+        float time = native_divide((float)p.phase, 256.0f);
+        float result;
+#if STILL
+        if (kept) {
+            result = mix(kept_f, kept_b, time);
+        } else
+#endif
+        {
 #if ALGO >= 21 || HAS_SAD
         float4 mask = layer_sample(masks, field_position, step);
 #endif
-        float time = native_divide((float)p.phase, 256.0f);
 
         float ref_b = source_sample(source_b, &p, vector.z, vector.y, 256-p.phase);
         float ref_f = source_sample(source_f, &p, vector.x, vector.w, p.phase);
@@ -1797,7 +1989,6 @@ kernel void blend_frame(
         float ref_bb = linear_source_sample(source_b, &p, ext.z, ext.y, 256-p.phase);
         float ref_ff = linear_source_sample(source_f, &p, ext.x, ext.w, p.phase);
 #endif
-        float result;
 
 #if ALGO == 1
         result = ref_b + ref_f*0.00001f;
@@ -1830,6 +2021,7 @@ kernel void blend_frame(
         result = mix(result, mix(ref_f0, ref_b0, p.sad_blend), fmax(mask.w, mask.x));
 # endif
 #endif
+        }
 
 #if LINEAR_LUMA
         if (p.linear_luma) {
@@ -1851,6 +2043,36 @@ kernel void blend_frame(
     *sum = total;
 }
 #endif
+
+inline float detail(read_only image2d_t image, int2 at, float value) {
+    return value - read_imagef(image, linear_sampler, (float2)(at.x + 1, at.y + 1)).x;
+}
+
+kernel void still_pixels(
+    read_only image2d_t first, read_only image2d_t second, write_only image2d_t same,
+    float limit, float strength, float tolerance)
+{
+    int2 at = (int2)(get_global_id(0), get_global_id(1));
+    float a = read_imagef(first, nearest_sampler, at).x;
+    float b = read_imagef(second, nearest_sampler, at).x;
+    float edge_a = detail(first, at, a), edge_b = detail(second, at, b);
+    float edge = fmax(fabs(edge_a), fabs(edge_b));
+    int still = fabs(a - b) <= limit
+        || (edge > strength && fabs(edge_a - edge_b) <= tolerance*edge);
+    write_imagef(same, at, (float4)(still, 0.0f, 0.0f, 0.0f));
+}
+
+kernel void still_mask(read_only image2d_t same, write_only image2d_t still)
+{
+    int2 at = (int2)(get_global_id(0), get_global_id(1));
+    float2 corner = (float2)(at.x, at.y);
+    float full = fmax(
+        fmax(read_imagef(same, linear_sampler, corner).x,
+            read_imagef(same, linear_sampler, corner + (float2)(1.0f, 0.0f)).x),
+        fmax(read_imagef(same, linear_sampler, corner + (float2)(0.0f, 1.0f)).x,
+            read_imagef(same, linear_sampler, corner + (float2)(1.0f, 1.0f)).x));
+    write_imagef(still, at, (float4)(full > 0.99f, 0.0f, 0.0f, 0.0f));
+}
 
 kernel void blend_source(
     global float *sums, int stride, read_only image2d_t source, float weight)

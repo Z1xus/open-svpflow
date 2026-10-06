@@ -100,6 +100,7 @@ pub struct Mask {
     pub area_scale: f64,
     pub area_sharp: f64,
     pub area_blend: f64,
+    pub still: Option<[f32; 3]>,
 }
 
 #[allow(dead_code)]
@@ -241,6 +242,10 @@ impl Options {
 
     pub const fn dither(&self) -> bool {
         self.render.dither
+    }
+
+    pub const fn mask_still(&self) -> Option<[f32; 3]> {
+        self.mask.still
     }
 
     pub fn apply_source_depth(&mut self, depth: i32) {
@@ -563,6 +568,7 @@ impl Default for Mask {
             area_scale: 1.0,
             area_sharp: 1.0,
             area_blend: 0.4,
+            still: None,
         }
     }
 }
@@ -655,8 +661,12 @@ impl Scene {
 }
 
 impl Mask {
+    #[allow(clippy::cast_possible_truncation)]
     fn from_value(value: &Value) -> Self {
         let area = value.int_at(&["mask", "area"]).unwrap_or(0);
+        let still = |key, default: f64, unit: f64| {
+            (value.float_at(&["mask", "still", key]).unwrap_or(default) / unit) as f32
+        };
         Self {
             cover: value.int_at(&["mask", "cover"]).unwrap_or(100).max(0),
             area,
@@ -664,6 +674,13 @@ impl Mask {
             area_scale: 1.0,
             area_sharp: value.float_at(&["mask", "area_sharp"]).unwrap_or(1.0),
             area_blend: value.float_at(&["mask", "area_blend"]).unwrap_or(0.4),
+            still: value.bool_at(&["mask", "still"]).unwrap_or(false).then(|| {
+                [
+                    still("limit", 4.5, 255.0),
+                    still("edge", 5.0, 255.0),
+                    still("tolerance", 30.0, 100.0),
+                ]
+            }),
         }
     }
 }
