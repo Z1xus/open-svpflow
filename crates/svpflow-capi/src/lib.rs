@@ -248,6 +248,31 @@ pub unsafe extern "C" fn osvp_smooth_fps_blend(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn osvp_still(
+    context: *const Context,
+    clip: *const Clip,
+    source: *const Clip,
+    limit: f64,
+    edge: f64,
+    tolerance: f64,
+) -> *mut Clip {
+    let (host, clip, source) = unsafe { (&(*context).0, &(*clip).node, &(*source).node) };
+    let mut input = Map::default();
+    input.set(c"clip", Value::Node(Arc::clone(clip)));
+    input.set(c"source", Value::Node(Arc::clone(source)));
+    for (key, value) in [
+        (c"limit", limit),
+        (c"edge", edge),
+        (c"tolerance", tolerance),
+    ] {
+        if value >= 0.0 {
+            input.set(key, Value::Float(value));
+        }
+    }
+    finish(host, c"Still", Ok(input))
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn osvp_clip_info(clip: *const Clip, info: *mut VideoInfo) {
     let source = unsafe { (*clip).node.info() };
     let id = unsafe { source.format.cast::<vs3::Format>().as_ref() }.map_or(0, |format| format.id);

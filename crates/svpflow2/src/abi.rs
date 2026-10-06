@@ -4,6 +4,10 @@ use svpflow_host::avs;
 
 use crate::{filter, strings, vs};
 
+#[cfg(feature = "still")]
+const STILL_ARGS: &std::ffi::CStr =
+    c"clip:clip;source:clip;limit:float:opt;edge:float:opt;tolerance:float:opt";
+
 #[unsafe(no_mangle)]
 pub extern "system" fn svpGetVersion() -> i64 {
     strings::VERSION
@@ -59,6 +63,14 @@ pub unsafe extern "system" fn VapourSynthPluginInit(
             std::ptr::null_mut(),
             plugin,
         );
+        #[cfg(feature = "still")]
+        register(
+            c"Still".as_ptr(),
+            STILL_ARGS.as_ptr(),
+            crate::still::create_still,
+            std::ptr::null_mut(),
+            plugin,
+        );
     }
 }
 
@@ -96,6 +108,13 @@ pub unsafe extern "system" fn VapourSynthPluginInit2(plugin: vs::Raw, api: vs::C
             args: text(strings::ARGS_BLEND),
             returns: c"clip:vnode;",
             create: crate::blend::create_smooth_fps_blend,
+        },
+        #[cfg(feature = "still")]
+        svpflow_host::vs4::Function {
+            name: c"Still",
+            args: STILL_ARGS,
+            returns: c"clip:vnode;",
+            create: crate::still::create_still,
         },
     ];
     unsafe { svpflow_host::vs4::init(plugin, api, &config, &functions) };

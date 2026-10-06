@@ -420,6 +420,12 @@ impl PlaneApi {
         }
     }
 
+    #[cfg(feature = "still")]
+    pub(crate) unsafe fn copy(&self, frame: vs::ConstRaw, core: vs::Raw) -> Option<vs::Raw> {
+        let copy = unsafe { (self.copy_frame?)(frame, core) };
+        (!copy.is_null()).then_some(copy)
+    }
+
     #[cfg(feature = "blend")]
     pub(crate) unsafe fn set_duration(&self, frame: vs::Raw, num: i64, den: i64) {
         let mut timing = unsafe { self.read_timing(frame.cast_const()) };

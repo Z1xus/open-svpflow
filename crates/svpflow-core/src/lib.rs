@@ -12,3 +12,4 @@ pub mod renderer;
 pub mod smooth;
 pub mod smooth_engine;
 pub mod smooth_options;
+pub mod still;

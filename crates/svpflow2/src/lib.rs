@@ -22,6 +22,8 @@ mod light;
 mod metadata;
 mod nvof;
 mod reference;
+#[cfg(feature = "still")]
+mod still;
 mod strings;
 mod video_format;
 mod vs;

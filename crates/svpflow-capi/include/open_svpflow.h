@@ -49,6 +49,9 @@ osvp_clip *osvp_smooth_fps_blend(const osvp_context *context, const osvp_clip *s
                                  const double *weights, int32_t weight_count, int64_t fps_num,
                                  int64_t fps_den);
 
+osvp_clip *osvp_still(const osvp_context *context, const osvp_clip *clip,
+                      const osvp_clip *source, double limit, double edge, double tolerance);
+
 void osvp_clip_info(const osvp_clip *clip, osvp_video_info *info);
 void osvp_clip_free(osvp_clip *clip);
 

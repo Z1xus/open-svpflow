@@ -17,8 +17,9 @@ svpflow-core = { path = "../svpflow-core" }
 svpflow-host = { path = "../svpflow-host" }
 
 [features]
-default = ["blend"]
+default = ["blend", "still"]
 blend = []
+still = []
 
 [lints.rust]
 unsafe_code = "warn"
