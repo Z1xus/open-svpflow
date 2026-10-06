@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use host::{Frame, Host, Map, Node, Pending, Read, Value};
+use host::{Frame, Host, Map, Node, Pending, Read, Release, Value};
 use svpflow_host::vs3;
 
 const FORMATS: [i32; 4] = [
@@ -90,6 +90,7 @@ pub unsafe extern "C" fn osvp_source(
     context: *const Context,
     info: *const VideoInfo,
     read: Read,
+    release: Option<Release>,
     user: *mut c_void,
 ) -> *mut Clip {
     let (context, info) = unsafe { (&*context, &*info) };
@@ -117,7 +118,7 @@ pub unsafe extern "C" fn osvp_source(
         num_frames: info.num_frames,
         flags: 0,
     };
-    clip(context.0.source(info, read, user))
+    clip(context.0.source(info, read, release, user))
 }
 
 unsafe fn vectors(

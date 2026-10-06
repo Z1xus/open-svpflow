@@ -15,6 +15,7 @@ const POOL_BYTES: usize = 256 << 20;
 const READ_AHEAD: i32 = 64;
 
 pub type Read = unsafe extern "C" fn(*mut c_void, i32, *const *mut u8, *const isize) -> i32;
+pub type Release = unsafe extern "C" fn(*mut c_void);
 
 struct Buffer {
     data: NonNull<u8>,
@@ -191,6 +192,7 @@ struct Reader {
 
 struct Source {
     read: Read,
+    release: Option<Release>,
     user: *mut c_void,
     state: Mutex<Reader>,
 }
@@ -547,9 +549,16 @@ impl Task {
 impl Drop for Node {
     fn drop(&mut self) {
         let id = self.id();
-        if let Kind::Filter { instance, free, .. } = &self.kind {
-            let core = Arc::as_ptr(&self.host).cast_mut().cast();
-            unsafe { free(*instance.get(), core, table()) };
+        match &self.kind {
+            Kind::Filter { instance, free, .. } => {
+                let core = Arc::as_ptr(&self.host).cast_mut().cast();
+                unsafe { free(*instance.get(), core, table()) };
+            }
+            Kind::Source(source) => {
+                if let Some(release) = source.release {
+                    unsafe { release(source.user) };
+                }
+            }
         }
         let mut cache = self
             .host
@@ -660,12 +669,19 @@ impl Host {
         self.queue.ready.notify_one();
     }
 
-    pub fn source(self: &Arc<Self>, info: VideoInfo, read: Read, user: *mut c_void) -> Arc<Node> {
+    pub fn source(
+        self: &Arc<Self>,
+        info: VideoInfo,
+        read: Read,
+        release: Option<Release>,
+        user: *mut c_void,
+    ) -> Arc<Node> {
         Arc::new(Node {
             host: Arc::clone(self),
             info: UnsafeCell::new(info),
             kind: Kind::Source(Source {
                 read,
+                release,
                 user,
                 state: Mutex::default(),
             }),
