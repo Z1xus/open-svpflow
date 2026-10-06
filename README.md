@@ -22,6 +22,7 @@ This proof of concept runs open-svpflow client-side in the browser as WASM and r
 - VapourSynth API 4 support, so it works on current VapourSynth (R80 and newer can't load the original at all, since it only has API 3).
 - AviSynth+ support with the original function names.
 - `SmoothFpsBlend`, an extra function that interpolates and frame-blends on the GPU in one go, so it's about 2x faster than blending separately (build with `--no-default-features` if you don't want it).
+- A C API for running it without VapourSynth or AviSynth (`open_svpflow.h`, build it with `cargo build --release -p svpflow-capi`).
 
 Output matches the original byte for byte in everything I've tested, on both CPU and GPU. But GPU algorithms 1 and 2 are the exception, since the original reads uninitialized memory there and doesn't even match its own previous run (±1 on about 0.01% of pixels, same as ours). So it should work anywhere SVPFlow already does, whether that's smoothie, SVP itself, mpv or your own scripts.
 
