@@ -150,7 +150,7 @@ fn normalize(num: i64, den: i64) -> (i64, i64) {
     )
 }
 
-fn gcd(mut left: u64, mut right: u64) -> u64 {
+pub(crate) fn gcd(mut left: u64, mut right: u64) -> u64 {
     while right != 0 {
         let next = left % right;
         left = right;

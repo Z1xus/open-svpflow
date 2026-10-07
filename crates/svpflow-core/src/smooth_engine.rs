@@ -10,7 +10,7 @@
 use std::ops::{Deref, Range};
 use std::sync::Arc;
 
-use crate::frame_math::Timing;
+use crate::frame_math::{Timing, gcd};
 use crate::metadata::{self, VectorData, VectorRecord};
 use crate::params;
 use crate::smooth::{
@@ -41,9 +41,11 @@ impl Rates {
         } else {
             (src_num * params.rate_num, src_den * params.rate_den)
         };
+        let (num, den) = (out_num * src_den, out_den * src_num);
+        let common = gcd(num, den).max(1);
         Self {
-            num: out_num * src_den,
-            den: out_den * src_num,
+            num: num / common,
+            den: den / common,
         }
     }
 
