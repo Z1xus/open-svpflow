@@ -49,7 +49,8 @@ cp target/"$target"/release/*."$ext" "$output/"
 cp LICENSE crates/svpflow-capi/include/open_svpflow.h "$output/"
 cargo tree --locked --target "$target" -e normal,build --prefix none --format '{p}' "${packages[@]}" \
   | awk 'NF == 2 { print $1 "-" substr($2, 2) }' | sort -u | while read -r crate; do
-  for file in "$cargo_home"/registry/src/*/"$crate"/LICENSE*; do
+  for file in "$cargo_home"/registry/src/*/"$crate"/LICENSE* "$cargo_home"/registry/src/*/"$crate"/license*; do
+    [[ -f "$file" ]] || continue
     printf '%s\n\n' "$crate"
     cat "$file"
     printf '\n\n'
