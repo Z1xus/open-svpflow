@@ -20,6 +20,9 @@ flags=("--remap-path-prefix=$root=/src" "--remap-path-prefix=$cargo_home=/cargo"
 if [[ "$target" == x86_64-* ]]; then
   flags+=(-C target-cpu=x86-64-v3)
 fi
+if [[ "$target" == *-windows-msvc ]]; then
+  flags+=(-C target-feature=+crt-static)
+fi
 printf -v CARGO_ENCODED_RUSTFLAGS '%s\x1f' "${flags[@]}"
 export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS%$'\x1f'}"
 unset RUSTFLAGS
@@ -32,7 +35,8 @@ export LC_ALL=C
 
 rustup show
 rustup target add "$target"
-cargo build --release --locked --target "$target" -p svpflow1 -p svpflow2
+packages=(-p svpflow1 -p svpflow2 -p svpflow-capi)
+cargo build --release --locked --target "$target" "${packages[@]}"
 
 case "$target" in
   *-windows-msvc) ext=dll ;;
@@ -42,6 +46,15 @@ case "$target" in
 esac
 mkdir "$output"
 cp target/"$target"/release/*."$ext" "$output/"
+cp LICENSE crates/svpflow-capi/include/open_svpflow.h "$output/"
+cargo tree --locked --target "$target" -e normal,build --prefix none --format '{p}' "${packages[@]}" \
+  | awk 'NF == 2 { print $1 "-" substr($2, 2) }' | sort -u | while read -r crate; do
+  for file in "$cargo_home"/registry/src/*/"$crate"/LICENSE*; do
+    printf '%s\n\n' "$crate"
+    cat "$file"
+    printf '\n\n'
+  done
+done > "$output/CRATES.txt"
 {
   echo "Commit: $(git -c safe.directory="$root" rev-parse HEAD)"
   echo "Target: $target"

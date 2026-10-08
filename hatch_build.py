@@ -17,7 +17,7 @@ class CustomBuildHook(BuildHookInterface):
         bin_dir = Path(os.environ["SVPFLOW_BIN"])
         build = (bin_dir / "BUILD.txt").read_text()
         target = next(line.split(": ", 1)[1] for line in build.splitlines() if line.startswith("Target: "))
-        libs = sorted(p for p in bin_dir.iterdir() if p.suffix in {".dll", ".so", ".dylib"})
+        libs = sorted(bin_dir.glob("*_vs.*"))
         if len(libs) != 2:
             raise RuntimeError(f"expected 2 plugins in {bin_dir}, found {len(libs)}")
         build_data["pure_python"] = False
