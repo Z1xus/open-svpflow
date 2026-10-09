@@ -307,7 +307,7 @@ pub unsafe extern "C" fn osvp_get_frame(clip: *const Clip, n: i32) -> *const Fra
     {
         let mut ahead = clip.ahead.lock().unwrap_or_else(PoisonError::into_inner);
         let (next, pending) = &mut *ahead;
-        let limit = n + 8 * host.threads();
+        let limit = n + (8 * host.threads()).min(host::READ_AHEAD - 1);
         if !(n + 1..=limit + 1).contains(next) {
             *next = n + 1;
             pending.clear();

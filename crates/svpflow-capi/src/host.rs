@@ -12,7 +12,7 @@ use svpflow_host::vs3::{self, ConstRaw, CoreInfo, Format, Raw, VideoInfo};
 const ALIGN: usize = 64;
 const CACHE_BYTES: usize = 1 << 30;
 const POOL_BYTES: usize = 256 << 20;
-const READ_AHEAD: i32 = 64;
+pub const READ_AHEAD: i32 = 64;
 
 pub type Read = unsafe extern "C" fn(*mut c_void, i32, *const *mut u8, *const isize) -> i32;
 pub type Release = unsafe extern "C" fn(*mut c_void);
