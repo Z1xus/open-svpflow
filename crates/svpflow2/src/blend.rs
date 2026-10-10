@@ -12,6 +12,7 @@ struct BlendState {
 struct Plan {
     weights: Vec<f32>,
     divisor: f32,
+    gamma: f32,
     info: vs::VideoInfo,
     step: (i64, i64),
     frames: i32,
@@ -112,6 +113,12 @@ unsafe fn plan(
         if error == 0 { value } else { default }
     };
     let fps = (int(strings::FPS_NUM, 0), int(strings::FPS_DEN, 1));
+    let mut error = 0;
+    let gamma = unsafe { get_float(input, strings::GAMMA.as_ptr().cast(), 0, &raw mut error) };
+    let gamma = if error == 0 { gamma } else { 1.0 };
+    if !gamma.is_finite() || gamma <= 0.0 {
+        return Err("'gamma' must be positive");
+    }
     let mut info = inner.output_info();
     if fps.0 <= 0 || fps.1 <= 0 || info.fps_num <= 0 || info.fps_den <= 0 {
         return Err("'fpsnum' and 'fpsden' must be positive");
@@ -126,6 +133,7 @@ unsafe fn plan(
     Ok(Plan {
         weights: weights.into_iter().map(|weight| weight as f32).collect(),
         divisor: divisor as f32,
+        gamma: gamma as f32,
         info,
         step,
         frames,
@@ -168,7 +176,7 @@ impl BlendState {
             (width / 2, height / 2),
             (width / 2, height / 2),
         ];
-        let job = gpu.blend_begin(width, height, height / 2)?;
+        let job = gpu.blend_begin(width, height, height / 2, self.plan.gamma)?;
         for (frame, weight) in self.plan.window(n) {
             job.start(weight);
             let rendered = unsafe {

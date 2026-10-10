@@ -44,6 +44,7 @@ struct Steps {
     phase: [i32; MAX_STEPS],
     sad_blend: [f32; MAX_STEPS],
     weight: [f32; MAX_STEPS],
+    gamma: f32,
 }
 
 #[derive(Default)]
@@ -59,6 +60,7 @@ impl Default for Steps {
             phase: [0; MAX_STEPS],
             sad_blend: [0.0; MAX_STEPS],
             weight: [0.0; MAX_STEPS],
+            gamma: 1.0,
         }
     }
 }
@@ -96,6 +98,8 @@ pub struct BlendJob {
     unit: RefCell<Unit>,
     width: usize,
     rows: usize,
+    luma: usize,
+    gamma: f32,
     weight: Cell<f32>,
     taken: Cell<bool>,
     failed: Cell<bool>,
@@ -233,7 +237,10 @@ impl GpuContext {
         unit: &mut Unit,
         buffers: &Buffers,
         divisor: f32,
+        gamma: f32,
+        luma: usize,
     ) -> Option<()> {
+        let luma = u32::try_from(luma).ok()?;
         let [_, resolve] = self.blend_kernels(unit)?;
         unsafe {
             let set = self.cl.SetKernelArg;
@@ -250,6 +257,8 @@ impl GpuContext {
                     (&raw const buffers.bytes).cast(),
                 ) != CL_SUCCESS
                 || set(resolve, 2, size_of::<f32>(), (&raw const divisor).cast()) != CL_SUCCESS
+                || set(resolve, 3, size_of::<f32>(), (&raw const gamma).cast()) != CL_SUCCESS
+                || set(resolve, 4, size_of::<u32>(), (&raw const luma).cast()) != CL_SUCCESS
             {
                 return None;
             }
@@ -296,6 +305,7 @@ impl GpuContext {
         width: usize,
         height: usize,
         chroma_height: usize,
+        gamma: f32,
     ) -> Option<BlendJob> {
         if self.hi10 || self.cl.CreateImage.is_none() {
             return None;
@@ -320,7 +330,7 @@ impl GpuContext {
             unsafe { self.release_unit(&unit) };
             return None;
         };
-        if fresh && unsafe { self.enqueue_resolve(&mut unit, &buffers, 1.0) }.is_none() {
+        if fresh && unsafe { self.enqueue_resolve(&mut unit, &buffers, 1.0, 1.0, 0) }.is_none() {
             unsafe {
                 self.release_buffers(&buffers);
                 self.release_unit(&unit);
@@ -332,6 +342,8 @@ impl GpuContext {
             unit: RefCell::new(unit),
             width,
             rows,
+            luma: height,
+            gamma,
             weight: Cell::new(0.0),
             taken: Cell::new(false),
             failed: Cell::new(false),
@@ -383,21 +395,19 @@ impl GpuContext {
                     return None;
                 }
             }
-            if set(
-                kernel,
-                8,
-                size_of::<Steps>(),
-                (&raw const group.steps).cast(),
-            ) != CL_SUCCESS
-            {
-                return None;
-            }
             if let Some(StillMask(still, _)) = group.still
                 && set(kernel, 9, size_of::<ClMem>(), (&raw const still).cast()) != CL_SUCCESS
             {
                 return None;
             }
             for (index, plane) in group.params.into_iter().enumerate() {
+                let steps = Steps {
+                    gamma: if index == 0 { job.gamma } else { 1.0 },
+                    ..group.steps
+                };
+                if set(kernel, 8, size_of::<Steps>(), (&raw const steps).cast()) != CL_SUCCESS {
+                    return None;
+                }
                 self.enqueue_plane(
                     unit.queue,
                     kernel,
@@ -514,6 +524,7 @@ impl GpuContext {
         let [source, _] = self.blend_kernels(&mut unit)?;
         let weight = job.weight.get();
         let stride = i32::try_from(job.width).ok()?;
+        let luma = i32::try_from(job.luma).ok()?;
         let image = entry.mems[1];
         let ready: ClEvent = entry.ready;
         let global = [job.width, job.rows];
@@ -529,6 +540,8 @@ impl GpuContext {
                 || set(source, 1, size_of::<i32>(), (&raw const stride).cast()) != CL_SUCCESS
                 || set(source, 2, size_of::<ClMem>(), (&raw const image).cast()) != CL_SUCCESS
                 || set(source, 3, size_of::<f32>(), (&raw const weight).cast()) != CL_SUCCESS
+                || set(source, 4, size_of::<f32>(), (&raw const job.gamma).cast()) != CL_SUCCESS
+                || set(source, 5, size_of::<i32>(), (&raw const luma).cast()) != CL_SUCCESS
             {
                 return None;
             }
@@ -582,28 +595,34 @@ impl GpuContext {
         let mut unit = job.unit.borrow_mut();
         let queue = unit.queue;
         let read = unsafe {
-            self.enqueue_resolve(&mut unit, &job.buffers, divisor)
-                .and_then(|()| self.take_staging(queue, job.buffers.len))
-                .and_then(|staging| {
-                    let mut done: ClEvent = std::ptr::null_mut();
-                    if (self.cl.EnqueueReadBuffer)(
-                        queue,
-                        job.buffers.bytes,
-                        CL_FALSE,
-                        0,
-                        job.buffers.len,
-                        staging.host.cast(),
-                        0,
-                        std::ptr::null(),
-                        (&raw mut done).cast(),
-                    ) == CL_SUCCESS
-                    {
-                        Some((staging, done))
-                    } else {
-                        self.put_staging(staging);
-                        None
-                    }
-                })
+            self.enqueue_resolve(
+                &mut unit,
+                &job.buffers,
+                divisor,
+                job.gamma,
+                job.width * job.luma,
+            )
+            .and_then(|()| self.take_staging(queue, job.buffers.len))
+            .and_then(|staging| {
+                let mut done: ClEvent = std::ptr::null_mut();
+                if (self.cl.EnqueueReadBuffer)(
+                    queue,
+                    job.buffers.bytes,
+                    CL_FALSE,
+                    0,
+                    job.buffers.len,
+                    staging.host.cast(),
+                    0,
+                    std::ptr::null(),
+                    (&raw mut done).cast(),
+                ) == CL_SUCCESS
+                {
+                    Some((staging, done))
+                } else {
+                    self.put_staging(staging);
+                    None
+                }
+            })
         };
         drop(unit);
         let Some((staging, done)) = read else {

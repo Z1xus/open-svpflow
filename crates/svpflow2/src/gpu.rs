@@ -1903,6 +1903,7 @@ typedef struct {
     int phase[MAX_STEPS];
     float sad_blend[MAX_STEPS];
     float weight[MAX_STEPS];
+    float gamma;
 } Steps;
 
 inline float4 layer_sample(read_only image2d_array_t image, float2 position, int layer) {
@@ -2036,7 +2037,9 @@ kernel void blend_frame(
 #endif
         {
 #pragma OPENCL FP_CONTRACT OFF
-            float term = steps.weight[step] * clamp(round(result), 0.0f, 255.0f);
+            float value = clamp(round(result), 0.0f, 255.0f);
+            if (steps.gamma != 1.0f) value = powr(value / 255.0f, steps.gamma);
+            float term = steps.weight[step] * value;
             total = term + total;
         }
     }
@@ -2075,20 +2078,25 @@ kernel void still_mask(read_only image2d_t same, write_only image2d_t still)
 }
 
 kernel void blend_source(
-    global float *sums, int stride, read_only image2d_t source, float weight)
+    global float *sums, int stride, read_only image2d_t source, float weight,
+    float gamma, int luma)
 {
 #pragma OPENCL FP_CONTRACT OFF
     int2 position = (int2)(get_global_id(0), get_global_id(1));
     float value = round(255.0f * read_imagef(source, nearest_sampler, position).x);
+    if (gamma != 1.0f && position.y < luma) value = powr(value / 255.0f, gamma);
     float term = weight * value;
     global float *sum = sums + position.y*stride + position.x;
     *sum = term + *sum;
 }
 
-kernel void blend_resolve(global float *sums, global uchar *destination, float divisor)
+kernel void blend_resolve(
+    global float *sums, global uchar *destination, float divisor, float gamma, uint luma)
 {
     size_t i = get_global_id(0);
-    destination[i] = (uchar)clamp(rint(sums[i] / divisor), 0.0f, 255.0f);
+    float value = sums[i] / divisor;
+    if (gamma != 1.0f && i < luma) value = 255.0f * powr(value, 1.0f / gamma);
+    destination[i] = (uchar)clamp(rint(value), 0.0f, 255.0f);
     sums[i] = 0.0f;
 }
 ";

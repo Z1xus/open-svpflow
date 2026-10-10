@@ -13,13 +13,15 @@ pub(crate) const BLEND_FILTER_NAME: &[u8] = b"SVSmoothFpsBlend\0";
 #[cfg(feature = "blend")]
 pub(crate) const SMOOTH_FPS_BLEND: &[u8] = b"SmoothFpsBlend\0";
 #[cfg(feature = "blend")]
-pub(crate) const ARGS_BLEND: &[u8] = b"clip:clip;super:clip;sdata:int;vectors:clip;vdata:int;opt:data;weights:float[];fpsnum:int;fpsden:int:opt;src:clip:opt;fps:float:opt\0";
+pub(crate) const ARGS_BLEND: &[u8] = b"clip:clip;super:clip;sdata:int;vectors:clip;vdata:int;opt:data;weights:float[];fpsnum:int;fpsden:int:opt;src:clip:opt;fps:float:opt;gamma:float:opt\0";
 #[cfg(feature = "blend")]
 pub(crate) const WEIGHTS: &[u8] = b"weights\0";
 #[cfg(feature = "blend")]
 pub(crate) const FPS_NUM: &[u8] = b"fpsnum\0";
 #[cfg(feature = "blend")]
 pub(crate) const FPS_DEN: &[u8] = b"fpsden\0";
+#[cfg(feature = "blend")]
+pub(crate) const GAMMA: &[u8] = b"gamma\0";
 
 pub(crate) const ARGS_SMOOTH_FPS: &[u8] =
     b"clip:clip;super:clip;sdata:int;vectors:clip;vdata:int;opt:data;src:clip:opt;fps:float:opt\0";

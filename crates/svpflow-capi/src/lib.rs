@@ -230,6 +230,7 @@ pub unsafe extern "C" fn osvp_smooth_fps_blend(
     weight_count: i32,
     fps_num: i64,
     fps_den: i64,
+    gamma: f64,
 ) -> *mut Clip {
     let (host, source) = unsafe { (&(*context).0, &(*source).node) };
     let weights =
@@ -242,6 +243,7 @@ pub unsafe extern "C" fn osvp_smooth_fps_blend(
             }
             input.set(c"fpsnum", Value::Int(fps_num));
             input.set(c"fpsden", Value::Int(fps_den));
+            input.set(c"gamma", Value::Float(gamma));
             input
         },
     );
