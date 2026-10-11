@@ -37,6 +37,7 @@ The speedup mainly comes from AVX2/AVX-512 motion search, running part of that s
 - Halve and DoubleVectors, which let the motion search run on a half-size frame, a lot faster for a small quality loss.
 - mask:{still:true} in the SmoothFps options, which finds text, logos and other things that stay in place and keeps them from smearing (GPU only, off by default). It can be tuned with mask:{still:{limit:4.5,edge:5,tolerance:30}}, and svp2.Still(clip, source) does the same for frames from any other interpolator.
 - mask:{peel:true} in the SmoothFps options, which learns the HUD and its opacity for each pixel from how the scene moves behind it, takes it off before the warp and puts it back after (GPU only, off by default). Tune it with mask:{peel:{limit:6}}.
+- dedup:0.5 in the SmoothFps options, which skips a frame that repeats the one before it and stretches the next motion over both frame times (the number is the mean difference below which two frames count as equal).
 - A [C API](crates/svpflow-capi/include/open_svpflow.h) for running it without VapourSynth or AviSynth (cargo build --release -p svpflow-capi).
 
 ## Install
