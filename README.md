@@ -6,7 +6,7 @@
 <a href="https://github.com/Z1xus/open-svpflow/releases"><picture><source media="(prefers-color-scheme: dark)" srcset="https://www.shieldcn.dev/github/downloads/Z1xus/open-svpflow.svg?variant=secondary&amp;size=xs&amp;mode=dark"><img alt="Total downloads" src="https://www.shieldcn.dev/github/downloads/Z1xus/open-svpflow.svg?variant=secondary&amp;size=xs&amp;mode=light"></picture></a>
 <a href="https://github.com/Z1xus/open-svpflow/commits/main"><picture><source media="(prefers-color-scheme: dark)" srcset="https://www.shieldcn.dev/github/last-commit/Z1xus/open-svpflow.svg?variant=secondary&amp;size=xs&amp;mode=dark"><img alt="Last commit" src="https://www.shieldcn.dev/github/last-commit/Z1xus/open-svpflow.svg?variant=secondary&amp;size=xs&amp;mode=light"></picture></a>
 
-open-svpflow is a drop-in open-source replacement for [SVPFlow](https://www.svp-team.com/wiki/Plugins:_SVPflow)'s VapourSynth plugins in Rust, reverse engineered from version 4.3.0.168. It runs up to 2.8x faster on CPU and up to 2.2x faster on GPU, adds [a few things](#on-top-of-svpflow) the original doesn't have, and works in places where the original doesn't.
+open-svpflow is a drop-in open-source replacement for [SVPFlow](https://www.svp-team.com/wiki/Plugins:_SVPflow)'s VapourSynth plugins in Rust, reverse engineered from version 4.3.0.168. It runs up to 2.9x faster on CPU and up to 2.7x faster on GPU, adds [a few things](#on-top-of-svpflow) the original doesn't have, and works in places where the original doesn't.
 
 It started as a side project, mostly to see if I could get couleur's [smoothie-rs](https://github.com/couleur-tweak-tips/smoothie-rs) running in a browser. That became the [demo](https://smoothie.z1x.us), which runs open-svpflow client-side as WASM with WebGPU (about 2-3x slower than native, since WASM can't use AVX2). It was only meant as a proof of concept, but it grew into another project, [interpolini](https://github.com/Z1xus/interpolini), which is meant as a showcase of how much faster you can get without VapourSynth and Python in the way.
 
@@ -22,10 +22,10 @@ Benchmarked on a 1080p 200 fps Counter-Strike 2 clip interpolated to 1920 fps wi
 
 | Preset | Path | Original | open-svpflow | Speed vs original |
 | --- | --- | ---: | ---: | ---: |
-| faster | CPU | 299.1 fps | 834.2 fps | 2.79x |
-| faster | GPU | 1247.4 fps | 1770.2 fps | 1.42x |
-| medium (default) | CPU | 219.7 fps | 549.8 fps | 2.50x |
-| medium (default) | GPU | 324.6 fps | 721.7 fps | 2.22x |
+| faster | CPU | 298.9 fps | 873.2 fps | 2.92x |
+| faster | GPU | 1254.8 fps | 2521.3 fps | 2.01x |
+| medium (default) | CPU | 211.7 fps | 582.9 fps | 2.75x |
+| medium (default) | GPU | 311.2 fps | 829.9 fps | 2.67x |
 
 The speedup mainly comes from AVX2/AVX-512 motion search, running part of that search on the GPU (when using GPU mode), and caching work the original redoes for every frame.
 
