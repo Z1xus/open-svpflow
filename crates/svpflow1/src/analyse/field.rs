@@ -552,8 +552,10 @@ impl Field {
             stacked_src: [None; 2],
             flat: [0; MAX_BLOCK_AREA],
             blurred: [0; MAX_BLOCK_AREA],
+            many: [(Mv::UNSET, 0); MAX_CANDIDATES],
         };
         let mut processed = vec![false; ((self.blk_x + 1) * (self.blk_y + 1)) as usize];
+        let mut neighbours = [Mv::default(); 9];
         let l = self.layout;
         for position in 0..self.order.len() {
             let (bx, by) = self.order[position];
@@ -627,10 +629,12 @@ impl Field {
                 state.bad_sad = state.bad_sad * CHROMA_MUL / CHROMA_DIV;
                 state.sad_limit = state.sad_limit * CHROMA_MUL / CHROMA_DIV;
             }
-            ctx.set_half(negative, self.full, self.half, self.layout);
+            if negative != ctx.half {
+                ctx.set_half(negative, self.full, self.half, self.layout);
+            }
             ctx.state = state;
             if searching {
-                let (neighbours, count) = self.neighbours(bx, by, &processed);
+                let count = self.neighbours(bx, by, &processed, &mut neighbours);
                 let reverse = index.map_or(Mv::UNSET, |i| self.reverse[i]);
                 ctx.search_block(negative, reverse, &neighbours[..count]);
             } else {
@@ -654,7 +658,7 @@ impl Field {
         }
     }
 
-    fn neighbours(&self, bx: i32, by: i32, processed: &[bool]) -> ([Mv; 9], usize) {
+    fn neighbours(&self, bx: i32, by: i32, processed: &[bool], found: &mut [Mv; 9]) -> usize {
         let x1 = (bx - 1).max(0);
         let x2 = if bx < self.blk_x {
             (self.blk_x - 1).min(bx + 1)
@@ -667,7 +671,6 @@ impl Field {
         } else {
             by - 1
         };
-        let mut found = [Mv::default(); 9];
         let mut count = 0;
         for y in y1..=y2 {
             for x in x1..=x2 {
@@ -678,7 +681,7 @@ impl Field {
                 }
             }
         }
-        (found, count)
+        count
     }
 }
 
@@ -891,6 +894,7 @@ struct BlockSearch<'a> {
     stacked_src: [Option<metric::WidePair8x4>; 2],
     flat: [u8; MAX_BLOCK_AREA],
     blurred: [u8; MAX_BLOCK_AREA],
+    many: [(Mv, i32); MAX_CANDIDATES],
 }
 
 const HEX2: [(i32, i32); 8] = [
@@ -1441,7 +1445,7 @@ impl BlockSearch<'_> {
         candidate: Mv,
         penalty: i32,
         absolute: bool,
-        slot: &mut (Mv, i32),
+        slot: usize,
     ) -> bool {
         let (vx, vy) = (i32::from(candidate.x), i32::from(candidate.y));
         self.move_block(vx, vy, 0);
@@ -1460,7 +1464,7 @@ impl BlockSearch<'_> {
         }
         if self.settings.try_many {
             self.refine(false);
-            *slot = (self.state.best, penalised(self.state.best.sad));
+            self.many[slot] = (self.state.best, penalised(self.state.best.sad));
         }
         accepted
     }
@@ -1534,23 +1538,24 @@ impl BlockSearch<'_> {
             };
         }
         self.state.min_cost = i32::MAX;
-        let mut many = [(Mv::UNSET, 0); MAX_CANDIDATES];
+        self.many[0].0 = Mv::UNSET;
+        self.many[1].0 = Mv::UNSET;
         let predictor = self.state.predictor;
         if predictor.sad >= 0 {
-            self.check_predictor(predictor, 0, true, &mut many[0]);
+            self.check_predictor(predictor, 0, true, 0);
         }
         if dont_search {
             return;
         }
         if self.state.index.is_some() && reverse.sad > 0 {
-            if self.check_predictor(reverse, self.settings.preverse, false, &mut many[1]) {
+            if self.check_predictor(reverse, self.settings.preverse, false, 1) {
                 self.state.predictor = reverse;
             }
         }
-        self.check_predictor(self.global, self.settings.pglobal, false, &mut many[2]);
-        self.check_predictor(Mv::UNSET, self.settings.pzero, false, &mut many[3]);
+        self.check_predictor(self.global, self.settings.pglobal, false, 2);
+        self.check_predictor(Mv::UNSET, self.settings.pzero, false, 3);
         for (i, &neighbour) in neighbours.iter().enumerate() {
-            self.check_predictor(neighbour, self.settings.pnbour, false, &mut many[4 + i]);
+            self.check_predictor(neighbour, self.settings.pnbour, false, 4 + i);
         }
         self.state.min_cost = self.state.best.sad;
         if flags & CONTRAST_FLAG != 0 && self.level > 0 {
@@ -1558,7 +1563,7 @@ impl BlockSearch<'_> {
         }
         if self.settings.try_many {
             self.state.min_cost = i32::MAX;
-            for &(candidate, cost) in &many[..4 + neighbours.len()] {
+            for &(candidate, cost) in &self.many[..4 + neighbours.len()] {
                 if candidate.sad >= 0 && cost < self.state.min_cost {
                     self.state.best = candidate;
                     self.state.min_cost = cost;
