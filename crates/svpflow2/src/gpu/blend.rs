@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use super::{
     CL_FALSE, CL_MEM_READ_WRITE, CL_RGBA, CL_SUCCESS, CL_UNORM_INT8, ClContext, ClEvent,
-    ClImageFormat, ClInt, ClKernel, ClMem, GpuBuf, GpuContext, KernelParams, StillMask, SuperEntry,
-    SuperHandle, Unit, UploadPlane,
+    ClImageFormat, ClInt, ClKernel, ClMem, ClUint, GpuBuf, GpuContext, KernelParams, Layer,
+    StillMask, SuperEntry, SuperHandle, Unit, UploadPlane, layer::LAYER_VARIANT,
 };
 
 pub(super) const BLEND_VARIANT: u32 = 1 << 13;
@@ -79,6 +79,7 @@ struct Group {
     sources: [[GpuBuf; 3]; 2],
     fields: (ClMem, ClMem),
     still: Option<StillMask>,
+    layer: Option<Layer>,
     key: (i64, bool, usize, usize),
     params: [KernelParams; 3],
     steps: Steps,
@@ -89,6 +90,7 @@ struct Group {
 struct Pending {
     group: Option<Group>,
     frames: Vec<Arc<SuperEntry>>,
+    layers: Vec<Layer>,
     motion: Vec<Vec<u16>>,
     masks: Vec<Vec<u8>>,
 }
@@ -400,6 +402,29 @@ impl GpuContext {
             {
                 return None;
             }
+            if let Some(layer) = &group.layer {
+                let base = 9 + ClUint::from(group.still.is_some());
+                let [fit, cover] = layer.images();
+                let raw = [group.sources[0][1].0, group.sources[1][1].0];
+                for (index, mem) in (base..).zip([fit, cover, raw[0], raw[1]]) {
+                    if set(kernel, index, size_of::<ClMem>(), (&raw const mem).cast()) != CL_SUCCESS
+                    {
+                        return None;
+                    }
+                }
+                for (index, camera) in (base + 4..).zip(&layer.camera) {
+                    if set(
+                        kernel,
+                        index,
+                        size_of::<[f32; 8]>(),
+                        std::ptr::from_ref(camera).cast(),
+                    ) != CL_SUCCESS
+                    {
+                        return None;
+                    }
+                }
+            }
+            pending.layers.extend(group.layer);
             for (index, plane) in group.params.into_iter().enumerate() {
                 let steps = Steps {
                     gamma: if index == 0 { job.gamma } else { 1.0 },
@@ -440,11 +465,13 @@ impl GpuContext {
         coverage: (&[u8], &[u8]),
         area: Option<(&[u8], &[u8])>,
         still: Option<StillMask>,
+        layer: Option<&Layer>,
     ) -> Option<()> {
         let key = (motion_key, linear, motion_width, motion_height);
         let joins = job.pending.borrow().group.as_ref().is_some_and(|group| {
             group.key == key
                 && group.still == still
+                && group.layer.is_some() == layer.is_some()
                 && (group.steps.count as usize) < MAX_STEPS
                 && shared(group.params) == shared(params)
                 && Arc::ptr_eq(&group.frames[0], &src0.entry)
@@ -454,8 +481,10 @@ impl GpuContext {
             self.flush(job)?;
             let mut unit = job.unit.borrow_mut();
             let unit = &mut *unit;
-            let variant =
-                Self::variant(&params[0], false) | BLEND_VARIANT | u32::from(still.is_some()) << 14;
+            let variant = Self::variant(&params[0], false)
+                | BLEND_VARIANT
+                | u32::from(still.is_some()) << 14
+                | if layer.is_some() { LAYER_VARIANT } else { 0 };
             let kernel = self.variant_kernel(&mut unit.variant_kernels, variant);
             let fields = unsafe {
                 self.upload_motion(
@@ -479,6 +508,7 @@ impl GpuContext {
                 sources: [src0.sources(linear), src1.sources(linear)],
                 fields: fields?,
                 still,
+                layer: layer.cloned(),
                 key,
                 params: shared(params),
                 steps: Steps::default(),

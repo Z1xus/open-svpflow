@@ -4,6 +4,9 @@ use core::ffi::{c_char, c_void};
 use std::ffi::CString;
 
 mod blend;
+mod layer;
+
+pub use layer::{Layer, LayerPair};
 
 pub use blend::BlendJob;
 #[cfg(feature = "blend")]
@@ -39,6 +42,7 @@ const CL_R: ClUint = 0x10B0;
 const CL_RGBA: ClUint = 0x10B5;
 const CL_UNORM_INT8: ClUint = 0x10D2;
 const CL_UNORM_INT16: ClUint = 0x10D3;
+const CL_HALF_FLOAT: ClUint = 0x10DD;
 const CL_FLOAT: ClUint = 0x10DE;
 
 type FnGetPlatformIDs = unsafe extern "C" fn(ClUint, *mut ClPlatformId, *mut ClUint) -> ClInt;
@@ -245,6 +249,7 @@ pub struct GpuContext {
     image_pool: std::sync::Arc<ImagePool>,
     staging: std::sync::Mutex<Vec<Staging>>,
     still: std::sync::Mutex<StillState>,
+    layer: std::sync::Mutex<layer::LayerState>,
     blend_pool: std::sync::Mutex<Vec<blend::Buffers>>,
     blend_units: std::sync::Mutex<Vec<Unit>>,
 }
@@ -326,6 +331,13 @@ pub struct SuperHandle {
     entry: std::sync::Arc<SuperEntry>,
 }
 impl SuperHandle {
+    #[must_use]
+    pub fn share(&self) -> Self {
+        Self {
+            entry: std::sync::Arc::clone(&self.entry),
+        }
+    }
+
     #[must_use]
     pub fn bufs(&self) -> [GpuBuf; 3] {
         [
@@ -476,6 +488,7 @@ impl Drop for GpuContext {
                     (self.cl.ReleaseCommandQueue)(still.queue);
                 }
             }
+            self.release_layer();
             if let Ok(mut pool) = self.blend_pool.lock() {
                 for buffers in pool.drain(..) {
                     (self.cl.ReleaseMemObject)(buffers.sums);
@@ -689,6 +702,7 @@ impl GpuContext {
                     scratch: std::ptr::null_mut(),
                     dims: (0, 0),
                 }),
+                layer: std::sync::Mutex::new(layer::LayerState::new()),
                 blend_pool: std::sync::Mutex::new(Vec::new()),
                 blend_units: std::sync::Mutex::new(Vec::new()),
             });
@@ -1060,7 +1074,7 @@ impl GpuContext {
                 program
             } else {
                 let source = format!(
-                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define STILL {}\n#define HI10P {}\n{}",
+                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define STILL {}\n#define LAYER {}\n#define HI10P {}\n{}",
                     variant & 0xFF,
                     (variant >> 8) & 1,
                     (variant >> 9) & 1,
@@ -1069,6 +1083,7 @@ impl GpuContext {
                     (variant >> 12) & 1,
                     (variant >> 13) & 1,
                     (variant >> 14) & 1,
+                    (variant >> 15) & 1,
                     u8::from(self.hi10),
                     KERNEL_SRC
                 );
@@ -1487,12 +1502,19 @@ impl GpuContext {
         coverage: (&[u8], &[u8]),
         area: Option<(&[u8], &[u8])>,
         still: Option<StillMask>,
+        layer: Option<&Layer>,
     ) -> Option<()> {
         let mut unit = self.acquire();
         unsafe {
             let k = self.bind_fields(
                 &mut unit,
-                Self::variant(&py, self.hi10) | u32::from(still.is_some()) << 14,
+                Self::variant(&py, self.hi10)
+                    | u32::from(still.is_some()) << 14
+                    | if layer.is_some() {
+                        layer::LAYER_VARIANT
+                    } else {
+                        0
+                    },
                 &py,
                 motion_key,
                 motion_width,
@@ -1509,6 +1531,28 @@ impl GpuContext {
                     return None;
                 }
                 waits.push(ready);
+            }
+            if let Some(layer) = layer {
+                let base = 8 + ClUint::from(still.is_some());
+                let [fit, cover] = layer.images();
+                for (index, mem) in (base..).zip([fit, cover, src0[1].0, src1[1].0]) {
+                    if (self.cl.SetKernelArg)(k, index, size_of::<ClMem>(), (&raw const mem).cast())
+                        != CL_SUCCESS
+                    {
+                        return None;
+                    }
+                }
+                for (index, camera) in (base + 4..).zip(&layer.camera) {
+                    if (self.cl.SetKernelArg)(
+                        k,
+                        index,
+                        size_of::<[f32; 8]>(),
+                        std::ptr::from_ref(camera).cast(),
+                    ) != CL_SUCCESS
+                    {
+                        return None;
+                    }
+                }
             }
             let q = unit.queue;
             let depth = if self.hi10 { 2 } else { 1 };
@@ -1679,6 +1723,10 @@ pub(crate) const KERNEL_SRC: &str = r"
 #ifndef STILL
 #define STILL 0
 #endif
+#ifndef LAYER
+#define LAYER 0
+#endif
+#define LAYER_MIN 0.2f
 #define STILL_AT(still, p, x, y) (read_imagef(still, linear_sampler, \
     ((float2)(x, y) + 0.5f) * (float2)(p.x_ratio, p.y_ratio)).x > 0.4f)
 #if HI10P
@@ -1785,6 +1833,63 @@ inline float base_sample(read_only image2d_t source, const Params *p) {
 #endif
 }
 
+const sampler_t cell_sampler = CLK_NORMALIZED_COORDS_FALSE |
+    CLK_ADDRESS_CLAMP_TO_EDGE | CLK_FILTER_NEAREST;
+
+inline float2 full_step(const Params *p, float vx, float vy) {
+    return native_divide(
+        (float2)(vx*65535.0f-1024.0f, vy*65535.0f-1024.0f),
+        (float2)((float)(p->x_ratio*p->pel), (float)(p->y_ratio*p->pel)));
+}
+
+inline float2 camera_step(const Params *p, float8 h, float2 at) {
+    float2 ratio = (float2)(p->x_ratio, p->y_ratio);
+    float2 size = (float2)(p->width, p->height) * ratio;
+    float scale = 0.5f*size.x;
+    float2 n = native_divide(at*ratio + 0.5f*(ratio-1.0f) - 0.5f*size, scale);
+    float d = h.s6*n.x + h.s7*n.y + 1.0f;
+    float2 to = native_divide(
+        (float2)(h.s0*n.x + h.s1*n.y + h.s2, h.s3*n.x + h.s4*n.y + h.s5), d);
+    return native_divide((to-n)*scale, ratio);
+}
+
+inline float2 scene_step(const Params *p, float2 step, float2 camera) {
+    float2 d = (step-camera) * (float2)(p->x_ratio, p->y_ratio);
+    return dot(d, d) > 1.0f && dot(step, step) < 0.25f*dot(camera, camera) ? camera : step;
+}
+
+inline float2 layer_luma(const Params *p, float2 at) {
+    return (at+0.5f) * (float2)(p->x_ratio, p->y_ratio);
+}
+
+inline float layer_offset(const Params *p, float4 model) {
+    return p->offset_y == 0 ? model.y : (p->offset_x == 0 ? model.z : model.w);
+}
+
+inline float layer_gap(read_only image2d_t cover, const Params *p, float2 at) {
+    return 2040.0f*read_imagef(cover, cell_sampler, layer_luma(p, at)*0.125f).x - 8.0f;
+}
+
+inline float layer_reach(const Params *p, float2 f, float2 b) {
+    float2 far = fmax(fabs(f), fabs(b)) * (float2)(p->x_ratio, p->y_ratio);
+    return fmax(fmax(far.x, far.y) + 1.0f, 16.0f);
+}
+
+inline float layer_raw(read_only image2d_t raw, const Params *p, float2 at) {
+    return 255.0f * read_imagef(raw, linear_sampler,
+        (float2)(p->offset_x, p->offset_y) + at + 0.5f).x;
+}
+
+inline float2 layer_scene(
+    read_only image2d_t raw, read_only image2d_t layer, const Params *p, float2 at)
+{
+    float4 model = read_imagef(layer, linear_sampler, layer_luma(p, at));
+    int solid = fabs(model.x) < LAYER_MIN;
+    float value = native_divide(
+        layer_raw(raw, p, at) - layer_offset(p, model), solid ? 1.0f : model.x);
+    return (float2)(clamp(value, 0.0f, 255.0f), solid ? 0.0f : 1.0f);
+}
+
 kernel void linear_luma(read_only image2d_t source, write_only image2d_t destination) {
     int2 position = (int2)(get_global_id(0), get_global_id(1));
 #if HI10P
@@ -1805,6 +1910,10 @@ kernel void render_frame(
 #if STILL
     , read_only image2d_t still
 #endif
+#if LAYER
+    , read_only image2d_t layer, read_only image2d_t cover,
+    read_only image2d_t raw_f, read_only image2d_t raw_b, float8 camera_f, float8 camera_b
+#endif
     )
 {
     int x = get_global_id(0), y = get_global_id(1);
@@ -1818,6 +1927,42 @@ kernel void render_frame(
     float4 mask = field_sample(masks, field_position, CUBIC);
 #endif
     float time = native_divide((float)p.phase, 256.0f);
+    float result;
+    int layered = 0;
+#if LAYER
+    float2 at = (float2)(x, y), top = (float2)(p.width-1, p.height-1);
+    float2 step_f = full_step(&p, vector.x, vector.w);
+    float2 step_b = full_step(&p, vector.z, vector.y);
+    float gap = layer_gap(cover, &p, at);
+    if (gap <= 16.0f) {
+        step_f = scene_step(&p, step_f, camera_step(&p, camera_f, at));
+        step_b = scene_step(&p, step_b, camera_step(&p, camera_b, at));
+    }
+    layered = gap <= layer_reach(&p, step_f*time, step_b*(1.0f-time));
+    if (layered) {
+        float2 at_f = clamp(at + step_f*time, (float2)(0.0f, 0.0f), top);
+        float2 at_b = clamp(at + step_b*(1.0f-time), (float2)(0.0f, 0.0f), top);
+        float4 model = read_imagef(layer, linear_sampler, layer_luma(&p, at));
+        float2 moved_f = layer_scene(raw_f, layer, &p, at_f);
+        float2 moved_b = layer_scene(raw_b, layer, &p, at_b);
+        float2 base_f = layer_scene(raw_f, layer, &p, at);
+        float2 base_b = layer_scene(raw_b, layer, &p, at);
+        float base = mix(base_f.x, base_b.x, time);
+        float scene;
+# if ALGO == 1
+        scene = moved_b.y > 0.5f ? moved_b.x : (moved_f.y > 0.5f ? moved_f.x : base);
+# elif ALGO == 2
+        scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
+# else
+        if (moved_f.y > 0.5f && moved_b.y > 0.5f) scene = median3(moved_f.x, moved_b.x, base);
+        else scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
+# endif
+        result = fabs(model.x) < LAYER_MIN
+            ? mix(layer_raw(raw_f, &p, at), layer_raw(raw_b, &p, at), time)
+            : model.x*scene + layer_offset(&p, model);
+    } else
+#endif
+    {
 
     float ref_b = source_sample(source_b, &p, vector.z, vector.y, 256-p.phase);
     float ref_f = source_sample(source_f, &p, vector.x, vector.w, p.phase);
@@ -1830,7 +1975,6 @@ kernel void render_frame(
     float ref_bb = linear_source_sample(source_b, &p, ext.z, ext.y, 256-p.phase);
     float ref_ff = linear_source_sample(source_f, &p, ext.x, ext.w, p.phase);
 #endif
-    float result;
 
 #if ALGO == 1
     result = ref_b + ref_f*0.00001f;
@@ -1868,9 +2012,10 @@ kernel void render_frame(
     if (STILL_AT(still, p, x, y))
         result = mix(base_sample(source_f, &p), base_sample(source_b, &p), time);
 #endif
+    }
 
 #if LINEAR_LUMA
-    if (p.linear_luma) {
+    if (p.linear_luma && !layered) {
 #if HI10P
         result = native_divide(result, 256.0f);
 #else
@@ -1942,6 +2087,10 @@ kernel void blend_frame(
 #if STILL
     , read_only image2d_t still
 #endif
+#if LAYER
+    , read_only image2d_t layer, read_only image2d_t cover,
+    read_only image2d_t raw_f, read_only image2d_t raw_b, float8 camera_f, float8 camera_b
+#endif
     )
 {
     int x = get_global_id(0), y = get_global_id(1);
@@ -1968,12 +2117,49 @@ kernel void blend_frame(
         kept_b = base_sample(source_b, &p);
     }
 #endif
+#if LAYER
+    float2 at = (float2)(x, y), top = (float2)(p.width-1, p.height-1);
+    float2 step_f = full_step(&p, vector.x, vector.w);
+    float2 step_b = full_step(&p, vector.z, vector.y);
+    float gap = layer_gap(cover, &p, at);
+    if (gap <= 16.0f) {
+        step_f = scene_step(&p, step_f, camera_step(&p, camera_f, at));
+        step_b = scene_step(&p, step_b, camera_step(&p, camera_b, at));
+    }
+#endif
 
     for (int step = 0; step < steps.count; step++) {
         p.phase = steps.phase[step];
         p.sad_blend = steps.sad_blend[step];
         float time = native_divide((float)p.phase, 256.0f);
         float result;
+        int layered = 0;
+#if LAYER
+        layered = gap <= layer_reach(&p, step_f*time, step_b*(1.0f-time));
+        if (layered) {
+            float2 at_f = clamp(at + step_f*time, (float2)(0.0f, 0.0f), top);
+            float2 at_b = clamp(at + step_b*(1.0f-time), (float2)(0.0f, 0.0f), top);
+            float4 model = read_imagef(layer, linear_sampler, layer_luma(&p, at));
+            float2 moved_f = layer_scene(raw_f, layer, &p, at_f);
+            float2 moved_b = layer_scene(raw_b, layer, &p, at_b);
+            float2 base_f = layer_scene(raw_f, layer, &p, at);
+            float2 base_b = layer_scene(raw_b, layer, &p, at);
+            float base = mix(base_f.x, base_b.x, time);
+            float scene;
+# if ALGO == 1
+            scene = moved_b.y > 0.5f ? moved_b.x : (moved_f.y > 0.5f ? moved_f.x : base);
+# elif ALGO == 2
+            scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
+# else
+            if (moved_f.y > 0.5f && moved_b.y > 0.5f)
+                scene = median3(moved_f.x, moved_b.x, base);
+            else scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
+# endif
+            result = fabs(model.x) < LAYER_MIN
+                ? mix(layer_raw(raw_f, &p, at), layer_raw(raw_b, &p, at), time)
+                : model.x*scene + layer_offset(&p, model);
+        } else
+#endif
 #if STILL
         if (kept) {
             result = mix(kept_f, kept_b, time);
@@ -2025,7 +2211,7 @@ kernel void blend_frame(
         }
 
 #if LINEAR_LUMA
-        if (p.linear_luma) {
+        if (p.linear_luma && !layered) {
             result = native_divide(result, 255.0f);
             if (result < 0.018f) result *= 4.5f;
             else result = 1.099f*native_powr(result, 0.45f)-0.099f;
@@ -2098,5 +2284,126 @@ kernel void blend_resolve(
     if (gamma != 1.0f && i < luma) value = 255.0f * powr(value, 1.0f / gamma);
     destination[i] = (uchar)clamp(rint(value), 0.0f, 255.0f);
     sums[i] = 0.0f;
+}
+
+inline float2 layer_model(const float *t, float n, float limit) {
+    float mp = t[0]/n, mi = t[1]/n;
+    float vp = t[2]/n - mp*mp, vi = t[4]/n - mi*mi, cov = t[3]/n - mp*mi;
+    float a = cov/(vp+4.0f), b = mi - a*mp;
+    float same = vi + vp - 2.0f*cov + (mi-mp)*(mi-mp);
+    float left = fmax(vi - 2.0f*a*cov + a*a*vp, 0.0f);
+    float g = clamp((1.0f - left/fmax(same, 1e-3f) - 0.5f)/0.2f, 0.0f, 1.0f)
+        * clamp((same-limit)/limit, 0.0f, 1.0f);
+    return (float2)(1.0f + g*(a-1.0f), g*b);
+}
+
+inline float layer_error(const float *t, float n, float2 m) {
+    return (t[4] - 2.0f*m.x*t[3] - 2.0f*m.y*t[1] + m.x*m.x*t[2] + 2.0f*m.x*m.y*t[0])/n
+        + m.y*m.y;
+}
+
+kernel void layer_stats(
+    global float *sums, read_only image2d_t first, read_only image2d_t second,
+    read_only image2d_t vectors, Params p, float8 camera_f, float8 camera_b,
+    int base, int channels, int reset)
+{
+    int x = get_global_id(0), y = get_global_id(1);
+    if (x >= p.width || y >= p.height) return;
+    float2 at = (float2)(x, y), top = (float2)(p.width-1, p.height-1);
+    float2 field_position = native_divide(
+        (float2)(x*p.x_ratio-p.origin_x, y*p.y_ratio-p.origin_y),
+        (float2)(p.block_w, p.block_h));
+    float4 vector = p.cubic ? cubic_sample(vectors, field_position)
+        : read_imagef(vectors, field_sampler, field_position);
+    float2 raw_f = full_step(&p, vector.x, vector.w);
+    float2 raw_b = full_step(&p, vector.z, vector.y);
+    float2 step_f = scene_step(&p, raw_f, camera_step(&p, camera_f, at));
+    float2 step_b = scene_step(&p, raw_b, camera_step(&p, camera_b, at));
+    float2 zero = (float2)(0.0f, 0.0f);
+    float ia = layer_raw(first, &p, at), ib = layer_raw(second, &p, at);
+    float pb = layer_raw(first, &p, clamp(at+step_f, zero, top));
+    float pa = layer_raw(second, &p, clamp(at+step_b, zero, top));
+    float v[6];
+    v[0] = pb + pa;
+    v[1] = ib + ia;
+    if (channels == 6) {
+        float rb = ib - pb, ra = ia - pa;
+        if (any(step_f != raw_f)) rb = ib - layer_raw(first, &p, clamp(at+raw_f, zero, top));
+        if (any(step_b != raw_b)) ra = ia - layer_raw(second, &p, clamp(at+raw_b, zero, top));
+        v[2] = pb*pb + pa*pa;
+        v[3] = pb*ib + pa*ia;
+        v[4] = ib*ib + ia*ia;
+        v[5] = rb*rb + ra*ra;
+    }
+    global float *sum = sums + base + (y*p.width+x)*channels;
+    for (int c = 0; c < channels; c++) sum[c] = reset ? v[c] : sum[c] + v[c];
+}
+
+kernel void layer_fit(
+    global const float *prev, global const float *cur, global const float *next,
+    int n_prev, int n_cur, int n_next, write_only image2d_t fit, int width, int height,
+    float limit)
+{
+    int x = get_global_id(0), y = get_global_id(1);
+    int at = (y*width+x)*6;
+    int second = (width/2)*(height/2)*2;
+    int at_u = width*height*6 + ((y/2)*(width/2) + x/2)*2;
+    global const float *parts[3] = {prev, cur, next};
+    int counts[3] = {n_prev, n_cur, n_next};
+    float own[6];
+    for (int c = 0; c < 6; c++) own[c] = cur[at+c];
+    float2 model = (float2)(1.0f, 0.0f);
+    float error = 0.0f;
+    int from = 1, to = 1;
+    for (int window = 0; window < 3; window++) {
+        int lo = window == 2 ? 1 : 0, hi = window == 1 ? 1 : 2;
+        float t[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        float n = 0.0f;
+        for (int part = lo; part <= hi; part++) {
+            if (!counts[part]) continue;
+            for (int c = 0; c < 6; c++) t[c] += parts[part][at+c];
+            n += counts[part];
+        }
+        float2 m = layer_model(t, n, limit*limit);
+        float e = layer_error(own, n_cur, m);
+        if (window == 0 || e*1.15f + 2.0f < error) {
+            model = m;
+            error = e;
+            from = lo;
+            to = hi;
+        }
+    }
+    if (!(error < 1.7f*own[5]/n_cur + 4.0f)) model = (float2)(1.0f, 0.0f);
+    float2 offset = (float2)(0.0f, 0.0f);
+    if (model.x != 1.0f || model.y != 0.0f) {
+        float t[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float n = 0.0f;
+        for (int part = from; part <= to; part++) {
+            if (!counts[part]) continue;
+            for (int c = 0; c < 2; c++) {
+                t[c] += parts[part][at_u+c];
+                t[2+c] += parts[part][at_u+second+c];
+            }
+            n += counts[part];
+        }
+        offset = (float2)(t[1] - model.x*t[0], t[3] - model.x*t[2]) / n;
+    }
+    write_imagef(fit, (int2)(x, y), (float4)(model.x, model.y, offset.x, offset.y));
+}
+
+kernel void layer_cover(read_only image2d_t fit, global uchar *cover, int width, int height)
+{
+    int cx = get_global_id(0), cy = get_global_id(1);
+    int found = 0;
+    for (int y = cy*8; y < min(cy*8+8, height) && !found; y++) {
+        for (int x = cx*8; x < min(cx*8+8, width); x++) {
+            float4 m = read_imagef(fit, nearest_sampler, (int2)(x, y));
+            if (fabs(m.x-1.0f) > 0.02f || fabs(m.y) > 1.0f) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    cover[cy*((width+7)/8) + cx] = found;
 }
 ";

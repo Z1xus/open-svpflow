@@ -6,6 +6,7 @@
 )]
 
 pub mod frame_math;
+pub mod layer;
 pub mod metadata;
 pub mod params;
 pub mod renderer;

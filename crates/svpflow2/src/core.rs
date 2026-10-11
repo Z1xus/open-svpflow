@@ -87,6 +87,7 @@ pub(crate) struct FilterState {
     pub(crate) quality_cache: std::sync::Mutex<Vec<(i32, i32, Vec<u8>)>>,
     pub(crate) quality_cells: Cache<(i32, Vec<u8>)>,
     pub(crate) motion_cache: Cache<[Vec<u16>; 8]>,
+    pub(crate) camera_cache: Cache<[[f32; 8]; 2]>,
 }
 
 pub(crate) type Cell<T> = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<T>>>>;
@@ -3467,6 +3468,7 @@ fn gpu_render_frame(
         motions,
         (coverage.a, coverage.b),
         area.map(|mask| (mask.a, mask.b)),
+        None,
         None,
     )
     .is_some()

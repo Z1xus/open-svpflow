@@ -376,6 +376,7 @@ unsafe fn collect_state(
         quality_cache: std::sync::Mutex::new(Vec::new()),
         quality_cells: std::sync::Mutex::new(Vec::new()),
         motion_cache: std::sync::Mutex::new(Vec::new()),
+        camera_cache: std::sync::Mutex::new(Vec::new()),
     }
 }
 

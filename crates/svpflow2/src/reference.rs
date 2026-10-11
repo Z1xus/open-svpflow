@@ -2,6 +2,7 @@
 
 use std::slice;
 
+use svpflow_core::layer;
 use svpflow_core::smooth::{
     BlockVector, FieldShape, Frame, FrameMut, PackedVectors, Plane, PlaneMut, Renderer,
     SceneLimits, VectorField,
@@ -11,6 +12,8 @@ use svpflow_core::smooth_engine::{self as engine, Rates};
 use crate::core::{FilterState, Mode, drop_frame, get_node, request_node, super_frame_planes};
 use crate::vs::Source as _;
 use crate::{frame, metadata, options::ReferenceParams, vs};
+
+const WORKERS: usize = 6;
 
 fn cache_cap(bytes: usize) -> usize {
     ((96 << 20) / bytes.max(1)).clamp(4, 48)
@@ -89,10 +92,229 @@ impl FilterState {
         if self.nvof.is_some() {
             return decode();
         }
-        let cap = cache_cap(shape.blocks() * std::mem::size_of::<BlockVector>() * 2);
+        let cap = self.field_cap(shape);
         crate::core::cache_cell(&self.field_cache, i64::from(k), cap)?
             .get_or_init(decode)
             .clone()
+    }
+
+    fn uploads(
+        &self,
+        api: &frame::PlaneApi,
+        raw: vs::ConstRaw,
+    ) -> Option<[crate::gpu::UploadPlane<'static>; 3]> {
+        let w = usize::try_from(self.video_info.width).ok()?;
+        let h = usize::try_from(self.video_info.height).ok()?;
+        let plane = |p: i32, pw: usize, ph: usize| -> Option<crate::gpu::UploadPlane<'static>> {
+            let (ptr, stride, len) = unsafe { api.read_plane(raw, p, ph) }?;
+            Some(crate::gpu::UploadPlane {
+                data: unsafe { slice::from_raw_parts(ptr, len) },
+                stride,
+                width: pw,
+                height: ph,
+            })
+        };
+        Some([
+            plane(0, w, h)?,
+            plane(1, w / 2, h / 2)?,
+            plane(2, w / 2, h / 2)?,
+        ])
+    }
+
+    fn field_cap(&self, shape: FieldShape) -> usize {
+        let cap = cache_cap(shape.blocks() * std::mem::size_of::<BlockVector>() * 2);
+        if self.options.mask_peel().is_some() {
+            cap.max(3 * layer::CHUNK as usize + 16)
+        } else {
+            cap
+        }
+    }
+
+    fn layer_plan(&self) -> Option<(i32, f32)> {
+        let limit = self.options.mask_peel()?;
+        let last = self.video_info.num_frames - 2;
+        (self.nvof.is_none() && last >= 0).then_some((last, limit))
+    }
+
+    fn layer_request(
+        &self,
+        request_frame: vs::RequestFrameFilter,
+        n: i32,
+        reach: i32,
+        frame_ctx: vs::Raw,
+    ) {
+        let (Some((last, _)), Some(gpu)) = (self.layer_plan(), self.gpu.as_ref()) else {
+            return;
+        };
+        let chunk = n / layer::CHUNK;
+        if gpu.layer_ready(chunk.into()) {
+            return;
+        }
+        for c in (chunk - 1).max(0)..=(chunk + 1).min(last / layer::CHUNK) {
+            if gpu.layer_stats_ready(c.into()) {
+                continue;
+            }
+            let pairs = layer::pairs(c, last);
+            for k in *pairs.start()..=pairs.end() + 1 {
+                if k != n && k != n + 1 {
+                    request_node(request_frame, self.clips.source, k, frame_ctx);
+                }
+            }
+            for k in pairs {
+                if !((n - reach).max(0)..=n + reach).contains(&k) {
+                    request_node(request_frame, self.clips.vectors, k, frame_ctx);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn layer(
+        &self,
+        api: &frame::PlaneApi,
+        fetch: &Fetch,
+        gpu: &crate::gpu::GpuContext,
+        n: i32,
+        params: &ReferenceParams,
+        vector_data: &metadata::VectorData,
+        field: &VectorField,
+    ) -> Option<crate::gpu::Layer> {
+        let (last, limit) = self.layer_plan()?;
+        let shape = *field.shape();
+        let block = vector_data.effective_block();
+        let (width, height) = (self.video_info.width, self.video_info.height);
+        let cells = (
+            usize::try_from(shape.packed_width()).ok()?,
+            usize::try_from(shape.packed_height()).ok()?,
+        );
+        let grid = layer::Grid {
+            width: cells.0,
+            height: cells.1,
+            cell: (f64::from(block.width), f64::from(block.height)),
+            origin: (
+                f64::from(shape.overlap_x / 2),
+                f64::from(shape.overlap_y / 2),
+            ),
+            pel: f64::from(shape.pel),
+            frame: (f64::from(width), f64::from(height)),
+        };
+        let motion = |k: i32, field: &VectorField| {
+            let none = |_| None::<std::sync::Arc<VectorField>>;
+            let motions = engine::motions(field, true, true, true, false, (false, false), none, k);
+            let camera = [
+                layer::camera(&motions[2], &motions[3], &grid),
+                layer::camera(&motions[0], &motions[1], &grid),
+            ];
+            (motions, camera)
+        };
+        let kernel =
+            engine::gpu_params(params, vector_data, (width, height), 13, 256, false, false);
+        let cap = self.field_cap(shape);
+        let pairs = |chunk: i64| {
+            let pairs: Vec<i32> = layer::pairs(i32::try_from(chunk).ok()?, last).collect();
+            let needed: Vec<i32> = (pairs[0]..=pairs[pairs.len() - 1] + 1).collect();
+            let frames: Vec<_> = needed
+                .iter()
+                .map(|&k| fetch.get(self.clips.source, k))
+                .collect();
+            let vectors: Vec<_> = pairs
+                .iter()
+                .map(|&k| fetch.get(self.clips.vectors, k))
+                .collect();
+            let planes: Option<Vec<_>> = frames
+                .iter()
+                .map(|&frame| {
+                    (!frame.is_null())
+                        .then(|| self.uploads(api, frame))
+                        .flatten()
+                })
+                .collect();
+            let payloads: Option<Vec<_>> = vectors
+                .iter()
+                .map(|&frame| {
+                    let (ptr, stride, len) =
+                        (!frame.is_null()).then(|| unsafe { api.read_plane(frame, 0, 1) })??;
+                    Some(unsafe { slice::from_raw_parts(ptr, len.max(stride)) })
+                })
+                .collect();
+            let made = planes.zip(payloads).map(|(planes, payloads)| {
+                let handles: Vec<_> = planes.iter().map(|_| std::sync::Mutex::new(None)).collect();
+                let moved: Vec<_> = payloads
+                    .iter()
+                    .map(|_| std::sync::Mutex::new(None))
+                    .collect();
+                let fields = &self.field_cache;
+                std::thread::scope(|scope| {
+                    for worker in 0..WORKERS {
+                        let (planes, payloads, handles, moved) =
+                            (&planes, &payloads, &handles, &moved);
+                        let (needed, pairs, motion) = (&needed, &pairs, &motion);
+                        scope.spawn(move || {
+                            for index in (worker..planes.len()).step_by(WORKERS) {
+                                let handle =
+                                    gpu.cache_frame(i64::from(needed[index]), planes[index]);
+                                if let Ok(mut slot) = handles[index].lock() {
+                                    *slot = handle;
+                                }
+                            }
+                            for index in (worker..payloads.len()).step_by(WORKERS) {
+                                let k = pairs[index];
+                                let field = crate::core::cache_cell(fields, i64::from(k), cap)
+                                    .and_then(|cell| {
+                                        cell.get_or_init(|| {
+                                            let mut field = VectorField::new(shape);
+                                            field.update(payloads[index]);
+                                            Some(std::sync::Arc::new(field))
+                                        })
+                                        .clone()
+                                    });
+                                if let (Some(field), Ok(mut slot)) = (field, moved[index].lock()) {
+                                    *slot = Some(motion(k, &field));
+                                }
+                            }
+                        });
+                    }
+                });
+                (handles, moved)
+            });
+            for frame in frames.into_iter().chain(vectors) {
+                fetch.drop(frame);
+            }
+            let (handles, moved) = made?;
+            let handles: Vec<crate::gpu::SuperHandle> = handles
+                .into_iter()
+                .map(|slot| slot.into_inner().ok().flatten())
+                .collect::<Option<_>>()?;
+            let frame = |k: i32| Some(handles[needed.binary_search(&k).ok()?].share());
+            pairs
+                .iter()
+                .zip(moved)
+                .map(|(&k, slot)| {
+                    let (motions, camera) = slot.into_inner().ok().flatten()?;
+                    Some(crate::gpu::LayerPair {
+                        first: frame(k)?,
+                        second: frame(k + 1)?,
+                        motions,
+                        camera,
+                    })
+                })
+                .collect()
+        };
+        let fit = gpu.layer_fit(
+            i64::from(n / layer::CHUNK),
+            i64::from(last / layer::CHUNK),
+            &kernel,
+            cells,
+            limit,
+            pairs,
+        )?;
+        let camera = crate::core::cache_cell(&self.camera_cache, i64::from(n), 64)?
+            .get_or_init(|| Some(std::sync::Arc::new(motion(n, field).1)))
+            .clone()?;
+        Some(crate::gpu::Layer {
+            fit,
+            camera: *camera,
+        })
     }
 
     fn cached_quality(&self, frame: i32, luma: &mut [u8]) -> Option<i32> {
@@ -132,28 +354,14 @@ impl FilterState {
         area: Option<(&[u8], &[u8])>,
         motion_key: i64,
         blend: Option<&crate::gpu::BlendJob>,
+        layer: Option<&crate::gpu::Layer>,
         core: vs::Raw,
     ) -> vs::ConstRaw {
         let w = usize::try_from(self.video_info.width).unwrap_or(0);
         let h = usize::try_from(self.video_info.height).unwrap_or(0);
-        let uploads = |raw: vs::ConstRaw| -> Option<[crate::gpu::UploadPlane<'static>; 3]> {
-            let plane =
-                |p: i32, pw: usize, ph: usize| -> Option<crate::gpu::UploadPlane<'static>> {
-                    let (ptr, stride, len) = unsafe { api.read_plane(raw, p, ph) }?;
-                    Some(crate::gpu::UploadPlane {
-                        data: unsafe { slice::from_raw_parts(ptr, len) },
-                        stride,
-                        width: pw,
-                        height: ph,
-                    })
-                };
-            Some([
-                plane(0, w, h)?,
-                plane(1, w / 2, h / 2)?,
-                plane(2, w / 2, h / 2)?,
-            ])
-        };
-        let (Some(current), Some(next)) = (uploads(source), uploads(next_source)) else {
+        let (Some(current), Some(next)) =
+            (self.uploads(api, source), self.uploads(api, next_source))
+        else {
             return std::ptr::null();
         };
         let (Some(current), Some(next)) = (
@@ -180,6 +388,7 @@ impl FilterState {
                 coverage,
                 area,
                 still,
+                layer,
             );
             return std::ptr::null();
         }
@@ -244,6 +453,7 @@ impl FilterState {
             coverage,
             area,
             still,
+            layer,
         );
         if done.is_none() {
             unsafe { api.free(output.cast_const()) };
@@ -350,6 +560,7 @@ impl FilterState {
         for k in (n - reach).max(0)..=n + reach {
             request_node(request_frame, self.clips.vectors, k, frame_ctx);
         }
+        self.layer_request(request_frame, n, reach, frame_ctx);
     }
 
     fn with_vectors<R>(
@@ -632,6 +843,7 @@ impl FilterState {
                 sad_masks.is_some(),
                 self.options.dither(),
             );
+            let layer = unsafe { self.layer(api, fetch, gpu, n, params, vector_data, field) };
             let output = unsafe {
                 self.reference_gpu(
                     api,
@@ -656,6 +868,7 @@ impl FilterState {
                         .map(|(first, second)| (&second[..], &first[..])),
                     motion_key,
                     blend,
+                    layer.as_ref(),
                     core,
                 )
             };
