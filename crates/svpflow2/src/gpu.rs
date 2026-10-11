@@ -1716,6 +1716,7 @@ pub(crate) const KERNEL_SRC: &str = r"
 #define LAYER 0
 #endif
 #define LAYER_MIN 0.2f
+#define LAYER_FILL 4.0f
 #define LAYER_NEAR 0.0f
 #define LAYER_SAME 2.5f
 #define STILL_AT(still, p, x, y) (read_imagef(still, linear_sampler, \
@@ -1856,13 +1857,32 @@ inline float layer_raw(read_only image2d_t raw, const Params *p, float2 at) {
 }
 
 inline float2 layer_scene(
-    read_only image2d_t raw, read_only image2d_t layer, const Params *p, float2 at)
+    read_only image2d_t raw, read_only image2d_t layer, const Params *p, float2 at, int moved)
 {
     float4 model = read_imagef(layer, linear_sampler, layer_luma(p, at));
-    int solid = fabs(model.x) < LAYER_MIN;
-    float value = native_divide(
-        layer_raw(raw, p, at) - layer_offset(p, model), solid ? 1.0f : model.x);
-    return (float2)(clamp(value, 0.0f, 255.0f), solid ? 0.0f : 1.0f);
+    float value = layer_raw(raw, p, at);
+    if (fabs(model.x) >= LAYER_MIN) {
+        value = native_divide(value - layer_offset(p, model), model.x);
+        return (float2)(clamp(value, 0.0f, 255.0f), 1.0f);
+    }
+    if (!moved) return (float2)(value, 0.0f);
+    float2 top = (float2)(p->width-1, p->height-1);
+    float total = 0.0f, weight = 0.0f;
+    for (int ring = 1; ring <= 3 && weight == 0.0f; ring++) {
+        float radius = LAYER_FILL*ring / p->x_ratio;
+        for (int turn = 0; turn < 8; turn++) {
+            float2 side = (float2)(
+                (turn == 0 || turn == 1 || turn == 7) - (turn >= 3 && turn <= 5),
+                (turn >= 1 && turn <= 3) - (turn >= 5));
+            float2 near = clamp(at + side*radius, (float2)(0.0f, 0.0f), top);
+            float4 m = read_imagef(layer, linear_sampler, layer_luma(p, near));
+            if (fabs(m.x) < LAYER_MIN) continue;
+            float scene = native_divide(layer_raw(raw, p, near) - layer_offset(p, m), m.x);
+            total += clamp(scene, 0.0f, 255.0f);
+            weight += 1.0f;
+        }
+    }
+    return weight > 0.0f ? (float2)(total/weight, 1.0f) : (float2)(value, 0.0f);
 }
 
 kernel void linear_luma(read_only image2d_t source, write_only image2d_t destination) {
@@ -1914,10 +1934,10 @@ kernel void render_frame(
         float2 at_f = clamp(at + step_f*time, (float2)(0.0f, 0.0f), top);
         float2 at_b = clamp(at + step_b*(1.0f-time), (float2)(0.0f, 0.0f), top);
         float4 model = read_imagef(layer, linear_sampler, layer_luma(&p, at));
-        float2 moved_f = layer_scene(raw_f, layer, &p, at_f);
-        float2 moved_b = layer_scene(raw_b, layer, &p, at_b);
-        float2 base_f = layer_scene(raw_f, layer, &p, at);
-        float2 base_b = layer_scene(raw_b, layer, &p, at);
+        float2 moved_f = layer_scene(raw_f, layer, &p, at_f, 1);
+        float2 moved_b = layer_scene(raw_b, layer, &p, at_b, 1);
+        float2 base_f = layer_scene(raw_f, layer, &p, at, 0);
+        float2 base_b = layer_scene(raw_b, layer, &p, at, 0);
         float base = mix(base_f.x, base_b.x, time);
         float scene;
 # if ALGO == 1
@@ -2108,10 +2128,10 @@ kernel void blend_frame(
             float2 at_f = clamp(at + step_f*time, (float2)(0.0f, 0.0f), top);
             float2 at_b = clamp(at + step_b*(1.0f-time), (float2)(0.0f, 0.0f), top);
             float4 model = read_imagef(layer, linear_sampler, layer_luma(&p, at));
-            float2 moved_f = layer_scene(raw_f, layer, &p, at_f);
-            float2 moved_b = layer_scene(raw_b, layer, &p, at_b);
-            float2 base_f = layer_scene(raw_f, layer, &p, at);
-            float2 base_b = layer_scene(raw_b, layer, &p, at);
+            float2 moved_f = layer_scene(raw_f, layer, &p, at_f, 1);
+            float2 moved_b = layer_scene(raw_b, layer, &p, at_b, 1);
+            float2 base_f = layer_scene(raw_f, layer, &p, at, 0);
+            float2 base_b = layer_scene(raw_b, layer, &p, at, 0);
             float base = mix(base_f.x, base_b.x, time);
             float scene;
 # if ALGO == 1
