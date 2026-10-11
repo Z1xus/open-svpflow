@@ -178,34 +178,17 @@ impl FilterState {
         params: &ReferenceParams,
         vector_data: &metadata::VectorData,
         field: &VectorField,
-    ) -> Option<crate::gpu::Layer> {
+    ) -> Option<std::sync::Arc<crate::gpu::Layer>> {
         let (last, limit) = self.layer_plan()?;
         let shape = *field.shape();
-        let block = vector_data.effective_block();
         let (width, height) = (self.video_info.width, self.video_info.height);
         let cells = (
             usize::try_from(shape.packed_width()).ok()?,
             usize::try_from(shape.packed_height()).ok()?,
         );
-        let grid = layer::Grid {
-            width: cells.0,
-            height: cells.1,
-            cell: (f64::from(block.width), f64::from(block.height)),
-            origin: (
-                f64::from(shape.overlap_x / 2),
-                f64::from(shape.overlap_y / 2),
-            ),
-            pel: f64::from(shape.pel),
-            frame: (f64::from(width), f64::from(height)),
-        };
         let motion = |k: i32, field: &VectorField| {
             let none = |_| None::<std::sync::Arc<VectorField>>;
-            let motions = engine::motions(field, true, true, true, false, (false, false), none, k);
-            let camera = [
-                layer::camera(&motions[2], &motions[3], &grid),
-                layer::camera(&motions[0], &motions[1], &grid),
-            ];
-            (motions, camera)
+            engine::motions(field, true, true, true, false, (false, false), none, k)
         };
         let kernel =
             engine::gpu_params(params, vector_data, (width, height), 13, 256, false, false);
@@ -290,31 +273,23 @@ impl FilterState {
                 .iter()
                 .zip(moved)
                 .map(|(&k, slot)| {
-                    let (motions, camera) = slot.into_inner().ok().flatten()?;
+                    let motions = slot.into_inner().ok().flatten()?;
                     Some(crate::gpu::LayerPair {
                         first: frame(k)?,
                         second: frame(k + 1)?,
                         motions,
-                        camera,
                     })
                 })
                 .collect()
         };
-        let fit = gpu.layer_fit(
+        gpu.layer_fit(
             i64::from(n / layer::CHUNK),
             i64::from(last / layer::CHUNK),
             &kernel,
             cells,
             limit,
             pairs,
-        )?;
-        let camera = crate::core::cache_cell(&self.camera_cache, i64::from(n), 64)?
-            .get_or_init(|| Some(std::sync::Arc::new(motion(n, field).1)))
-            .clone()?;
-        Some(crate::gpu::Layer {
-            fit,
-            camera: *camera,
-        })
+        )
     }
 
     fn cached_quality(&self, frame: i32, luma: &mut [u8]) -> Option<i32> {
@@ -354,7 +329,7 @@ impl FilterState {
         area: Option<(&[u8], &[u8])>,
         motion_key: i64,
         blend: Option<&crate::gpu::BlendJob>,
-        layer: Option<&crate::gpu::Layer>,
+        layer: Option<&std::sync::Arc<crate::gpu::Layer>>,
         core: vs::Raw,
     ) -> vs::ConstRaw {
         let w = usize::try_from(self.video_info.width).unwrap_or(0);
@@ -453,7 +428,7 @@ impl FilterState {
             coverage,
             area,
             still,
-            layer,
+            layer.map(|layer| &**layer),
         );
         if done.is_none() {
             unsafe { api.free(output.cast_const()) };

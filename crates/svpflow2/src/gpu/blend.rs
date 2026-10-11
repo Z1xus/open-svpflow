@@ -79,7 +79,7 @@ struct Group {
     sources: [[GpuBuf; 3]; 2],
     fields: (ClMem, ClMem),
     still: Option<StillMask>,
-    layer: Option<Layer>,
+    layer: Option<Arc<Layer>>,
     key: (i64, bool, usize, usize),
     params: [KernelParams; 3],
     steps: Steps,
@@ -90,7 +90,7 @@ struct Group {
 struct Pending {
     group: Option<Group>,
     frames: Vec<Arc<SuperEntry>>,
-    layers: Vec<Layer>,
+    layers: Vec<Arc<Layer>>,
     motion: Vec<Vec<u16>>,
     masks: Vec<Vec<u8>>,
 }
@@ -412,17 +412,6 @@ impl GpuContext {
                         return None;
                     }
                 }
-                for (index, camera) in (base + 4..).zip(&layer.camera) {
-                    if set(
-                        kernel,
-                        index,
-                        size_of::<[f32; 8]>(),
-                        std::ptr::from_ref(camera).cast(),
-                    ) != CL_SUCCESS
-                    {
-                        return None;
-                    }
-                }
             }
             pending.layers.extend(group.layer);
             for (index, plane) in group.params.into_iter().enumerate() {
@@ -465,7 +454,7 @@ impl GpuContext {
         coverage: (&[u8], &[u8]),
         area: Option<(&[u8], &[u8])>,
         still: Option<StillMask>,
-        layer: Option<&Layer>,
+        layer: Option<&Arc<Layer>>,
     ) -> Option<()> {
         let key = (motion_key, linear, motion_width, motion_height);
         let joins = job.pending.borrow().group.as_ref().is_some_and(|group| {

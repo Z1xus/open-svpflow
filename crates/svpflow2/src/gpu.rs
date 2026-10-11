@@ -1542,17 +1542,6 @@ impl GpuContext {
                         return None;
                     }
                 }
-                for (index, camera) in (base + 4..).zip(&layer.camera) {
-                    if (self.cl.SetKernelArg)(
-                        k,
-                        index,
-                        size_of::<[f32; 8]>(),
-                        std::ptr::from_ref(camera).cast(),
-                    ) != CL_SUCCESS
-                    {
-                        return None;
-                    }
-                }
             }
             let q = unit.queue;
             let depth = if self.hi10 { 2 } else { 1 };
@@ -1727,6 +1716,8 @@ pub(crate) const KERNEL_SRC: &str = r"
 #define LAYER 0
 #endif
 #define LAYER_MIN 0.2f
+#define LAYER_NEAR 0.0f
+#define LAYER_SAME 2.5f
 #define STILL_AT(still, p, x, y) (read_imagef(still, linear_sampler, \
     ((float2)(x, y) + 0.5f) * (float2)(p.x_ratio, p.y_ratio)).x > 0.4f)
 #if HI10P
@@ -1842,22 +1833,6 @@ inline float2 full_step(const Params *p, float vx, float vy) {
         (float2)((float)(p->x_ratio*p->pel), (float)(p->y_ratio*p->pel)));
 }
 
-inline float2 camera_step(const Params *p, float8 h, float2 at) {
-    float2 ratio = (float2)(p->x_ratio, p->y_ratio);
-    float2 size = (float2)(p->width, p->height) * ratio;
-    float scale = 0.5f*size.x;
-    float2 n = native_divide(at*ratio + 0.5f*(ratio-1.0f) - 0.5f*size, scale);
-    float d = h.s6*n.x + h.s7*n.y + 1.0f;
-    float2 to = native_divide(
-        (float2)(h.s0*n.x + h.s1*n.y + h.s2, h.s3*n.x + h.s4*n.y + h.s5), d);
-    return native_divide((to-n)*scale, ratio);
-}
-
-inline float2 scene_step(const Params *p, float2 step, float2 camera) {
-    float2 d = (step-camera) * (float2)(p->x_ratio, p->y_ratio);
-    return dot(d, d) > 1.0f && dot(step, step) < 0.25f*dot(camera, camera) ? camera : step;
-}
-
 inline float2 layer_luma(const Params *p, float2 at) {
     return (at+0.5f) * (float2)(p->x_ratio, p->y_ratio);
 }
@@ -1912,7 +1887,7 @@ kernel void render_frame(
 #endif
 #if LAYER
     , read_only image2d_t layer, read_only image2d_t cover,
-    read_only image2d_t raw_f, read_only image2d_t raw_b, float8 camera_f, float8 camera_b
+    read_only image2d_t raw_f, read_only image2d_t raw_b
 #endif
     )
 {
@@ -1934,10 +1909,6 @@ kernel void render_frame(
     float2 step_f = full_step(&p, vector.x, vector.w);
     float2 step_b = full_step(&p, vector.z, vector.y);
     float gap = layer_gap(cover, &p, at);
-    if (gap <= 16.0f) {
-        step_f = scene_step(&p, step_f, camera_step(&p, camera_f, at));
-        step_b = scene_step(&p, step_b, camera_step(&p, camera_b, at));
-    }
     layered = gap <= layer_reach(&p, step_f*time, step_b*(1.0f-time));
     if (layered) {
         float2 at_f = clamp(at + step_f*time, (float2)(0.0f, 0.0f), top);
@@ -1957,8 +1928,9 @@ kernel void render_frame(
         if (moved_f.y > 0.5f && moved_b.y > 0.5f) scene = median3(moved_f.x, moved_b.x, base);
         else scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
 # endif
-        result = fabs(model.x) < LAYER_MIN
-            ? mix(layer_raw(raw_f, &p, at), layer_raw(raw_b, &p, at), time)
+        float own_f = layer_raw(raw_f, &p, at), own_b = layer_raw(raw_b, &p, at);
+        result = fabs(model.x) < LAYER_MIN || (gap <= LAYER_NEAR && fabs(own_f-own_b) <= LAYER_SAME)
+            ? mix(own_f, own_b, time)
             : model.x*scene + layer_offset(&p, model);
     } else
 #endif
@@ -2089,7 +2061,7 @@ kernel void blend_frame(
 #endif
 #if LAYER
     , read_only image2d_t layer, read_only image2d_t cover,
-    read_only image2d_t raw_f, read_only image2d_t raw_b, float8 camera_f, float8 camera_b
+    read_only image2d_t raw_f, read_only image2d_t raw_b
 #endif
     )
 {
@@ -2122,10 +2094,6 @@ kernel void blend_frame(
     float2 step_f = full_step(&p, vector.x, vector.w);
     float2 step_b = full_step(&p, vector.z, vector.y);
     float gap = layer_gap(cover, &p, at);
-    if (gap <= 16.0f) {
-        step_f = scene_step(&p, step_f, camera_step(&p, camera_f, at));
-        step_b = scene_step(&p, step_b, camera_step(&p, camera_b, at));
-    }
 #endif
 
     for (int step = 0; step < steps.count; step++) {
@@ -2155,8 +2123,10 @@ kernel void blend_frame(
                 scene = median3(moved_f.x, moved_b.x, base);
             else scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
 # endif
+            float own_f = layer_raw(raw_f, &p, at), own_b = layer_raw(raw_b, &p, at);
             result = fabs(model.x) < LAYER_MIN
-                ? mix(layer_raw(raw_f, &p, at), layer_raw(raw_b, &p, at), time)
+                    || (gap <= LAYER_NEAR && fabs(own_f-own_b) <= LAYER_SAME)
+                ? mix(own_f, own_b, time)
                 : model.x*scene + layer_offset(&p, model);
         } else
 #endif
@@ -2304,8 +2274,7 @@ inline float layer_error(const float *t, float n, float2 m) {
 
 kernel void layer_stats(
     global float *sums, read_only image2d_t first, read_only image2d_t second,
-    read_only image2d_t vectors, Params p, float8 camera_f, float8 camera_b,
-    int base, int channels, int reset)
+    read_only image2d_t vectors, Params p, int base, int channels, int reset)
 {
     int x = get_global_id(0), y = get_global_id(1);
     if (x >= p.width || y >= p.height) return;
@@ -2315,25 +2284,19 @@ kernel void layer_stats(
         (float2)(p.block_w, p.block_h));
     float4 vector = p.cubic ? cubic_sample(vectors, field_position)
         : read_imagef(vectors, field_sampler, field_position);
-    float2 raw_f = full_step(&p, vector.x, vector.w);
-    float2 raw_b = full_step(&p, vector.z, vector.y);
-    float2 step_f = scene_step(&p, raw_f, camera_step(&p, camera_f, at));
-    float2 step_b = scene_step(&p, raw_b, camera_step(&p, camera_b, at));
+    float2 step_f = full_step(&p, vector.x, vector.w);
+    float2 step_b = full_step(&p, vector.z, vector.y);
     float2 zero = (float2)(0.0f, 0.0f);
     float ia = layer_raw(first, &p, at), ib = layer_raw(second, &p, at);
     float pb = layer_raw(first, &p, clamp(at+step_f, zero, top));
     float pa = layer_raw(second, &p, clamp(at+step_b, zero, top));
-    float v[6];
+    float v[5];
     v[0] = pb + pa;
     v[1] = ib + ia;
-    if (channels == 6) {
-        float rb = ib - pb, ra = ia - pa;
-        if (any(step_f != raw_f)) rb = ib - layer_raw(first, &p, clamp(at+raw_f, zero, top));
-        if (any(step_b != raw_b)) ra = ia - layer_raw(second, &p, clamp(at+raw_b, zero, top));
+    if (channels == 5) {
         v[2] = pb*pb + pa*pa;
         v[3] = pb*ib + pa*ia;
         v[4] = ib*ib + ia*ia;
-        v[5] = rb*rb + ra*ra;
     }
     global float *sum = sums + base + (y*p.width+x)*channels;
     for (int c = 0; c < channels; c++) sum[c] = reset ? v[c] : sum[c] + v[c];
@@ -2345,23 +2308,23 @@ kernel void layer_fit(
     float limit)
 {
     int x = get_global_id(0), y = get_global_id(1);
-    int at = (y*width+x)*6;
+    int at = (y*width+x)*5;
     int second = (width/2)*(height/2)*2;
-    int at_u = width*height*6 + ((y/2)*(width/2) + x/2)*2;
+    int at_u = width*height*5 + ((y/2)*(width/2) + x/2)*2;
     global const float *parts[3] = {prev, cur, next};
     int counts[3] = {n_prev, n_cur, n_next};
-    float own[6];
-    for (int c = 0; c < 6; c++) own[c] = cur[at+c];
+    float own[5];
+    for (int c = 0; c < 5; c++) own[c] = cur[at+c];
     float2 model = (float2)(1.0f, 0.0f);
     float error = 0.0f;
     int from = 1, to = 1;
     for (int window = 0; window < 3; window++) {
         int lo = window == 2 ? 1 : 0, hi = window == 1 ? 1 : 2;
-        float t[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        float t[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         float n = 0.0f;
         for (int part = lo; part <= hi; part++) {
             if (!counts[part]) continue;
-            for (int c = 0; c < 6; c++) t[c] += parts[part][at+c];
+            for (int c = 0; c < 5; c++) t[c] += parts[part][at+c];
             n += counts[part];
         }
         float2 m = layer_model(t, n, limit*limit);
@@ -2373,7 +2336,8 @@ kernel void layer_fit(
             to = hi;
         }
     }
-    if (!(error < 1.7f*own[5]/n_cur + 4.0f)) model = (float2)(1.0f, 0.0f);
+    float same = (own[4] - 2.0f*own[3] + own[2])/n_cur;
+    if (!(error < 1.7f*same + 4.0f)) model = (float2)(1.0f, 0.0f);
     float2 offset = (float2)(0.0f, 0.0f);
     if (model.x != 1.0f || model.y != 0.0f) {
         float t[4] = {0.0f, 0.0f, 0.0f, 0.0f};

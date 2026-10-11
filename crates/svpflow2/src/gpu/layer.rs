@@ -20,22 +20,15 @@ impl Drop for Owned {
     }
 }
 
-pub struct LayerFit {
+pub struct Layer {
     fit: Owned,
     cover: Owned,
-}
-
-#[derive(Clone)]
-pub struct Layer {
-    pub fit: Arc<LayerFit>,
-    pub camera: [[f32; 8]; 2],
 }
 
 pub struct LayerPair {
     pub first: SuperHandle,
     pub second: SuperHandle,
     pub motions: [Vec<u16>; 8],
-    pub camera: [[f32; 8]; 2],
 }
 
 pub(super) struct LayerState {
@@ -44,7 +37,7 @@ pub(super) struct LayerState {
     vectors: ImageSlot,
     found: (ClMem, usize),
     stats: Vec<(i64, Arc<Owned>, i32)>,
-    fits: Vec<(i64, Arc<LayerFit>)>,
+    fits: Vec<(i64, Arc<Layer>)>,
 }
 
 unsafe impl Send for LayerState {}
@@ -108,7 +101,7 @@ fn distances(cells: &mut [u8], width: usize) {
 
 impl Layer {
     pub(super) fn images(&self) -> [ClMem; 2] {
-        [self.fit.fit.0, self.fit.cover.0]
+        [self.fit.0, self.cover.0]
     }
 }
 
@@ -256,16 +249,14 @@ impl GpuContext {
                 && self.set(kernel, 1, &first.0)
                 && self.set(kernel, 2, &second.0)
                 && self.set(kernel, 3, &vectors)
-                && self.set(kernel, 5, &pair.camera[0])
-                && self.set(kernel, 6, &pair.camera[1])
-                && self.set(kernel, 9, &i32::from(reset));
+                && self.set(kernel, 7, &i32::from(reset));
             if !ready {
                 return None;
             }
             for (plane, base, channels) in [
-                (0, 0, 6i32),
-                (1, luma * 6, 2),
-                (2, luma * 6 + chroma * 2, 2),
+                (0, 0, 5i32),
+                (1, luma * 5, 2),
+                (2, luma * 5 + chroma * 2, 2),
             ] {
                 let p = params[plane];
                 let size = [
@@ -273,8 +264,8 @@ impl GpuContext {
                     usize::try_from(p.height).ok()?,
                 ];
                 let ok = self.set(kernel, 4, &p)
-                    && self.set(kernel, 7, &i32::try_from(base).ok()?)
-                    && self.set(kernel, 8, &channels)
+                    && self.set(kernel, 5, &i32::try_from(base).ok()?)
+                    && self.set(kernel, 6, &channels)
                     && self.run(queue, kernel, size);
                 if !ok {
                     return None;
@@ -292,7 +283,7 @@ impl GpuContext {
         grid: (usize, usize),
         limit: f32,
         mut pairs: impl FnMut(i64) -> Option<Vec<LayerPair>>,
-    ) -> Option<Arc<LayerFit>> {
+    ) -> Option<Arc<Layer>> {
         if self.hi10 {
             return None;
         }
@@ -307,7 +298,7 @@ impl GpuContext {
         let width = usize::try_from(params[0].width).ok()?;
         let height = usize::try_from(params[0].height).ok()?;
         let chroma = usize::try_from(params[1].width * params[1].height).ok()?;
-        let bytes = (width * height * 6 + chroma * 4) * size_of::<f32>();
+        let bytes = (width * height * 5 + chroma * 4) * size_of::<f32>();
         let mut parts = [None, None, None];
         for (slot, key) in parts.iter_mut().zip([chunk - 1, chunk, chunk + 1]) {
             if key < 0 || key > last {
@@ -349,7 +340,7 @@ impl GpuContext {
         let cells = (width.div_ceil(8), height.div_ceil(8));
         let fit = unsafe { self.create_image(CL_RGBA, CL_HALF_FLOAT, width, height) }?;
         let cover = unsafe { self.create_image(CL_R, CL_UNORM_INT8, cells.0, cells.1) }?;
-        let made = LayerFit {
+        let made = Layer {
             fit: Owned(fit.mem, self.cl.ReleaseMemObject),
             cover: Owned(cover.mem, self.cl.ReleaseMemObject),
         };
