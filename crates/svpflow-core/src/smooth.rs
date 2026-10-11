@@ -11,7 +11,7 @@ const LOG2_STEP: [i8; 32] = [
     0, 1, 2, 2, -1, 3, 3, 3, -1, -1, -1, 4, -1, 4, -1, 4, -1, -1, -1, -1, -1, -1, -1, 5, -1, -1,
     -1, 5, -1, -1, -1, 5,
 ];
-const LUT_LEN: usize = 2048;
+const VECTOR_BIAS: i32 = 1024;
 const NEUTRAL: u16 = 1024;
 const MAX_STEP: usize = 64;
 
@@ -623,8 +623,6 @@ pub struct Renderer {
     shifts: [i32; 4],
     time: i32,
     time_blend: i32,
-    lut_rev: Vec<i16>,
-    lut_fwd: Vec<i16>,
     x_luma: Vec<[i16; 2]>,
     y_luma: Vec<i16>,
     x_chroma: Vec<[i16; 2]>,
@@ -784,8 +782,6 @@ impl Renderer {
             shifts,
             time: -1,
             time_blend: 0,
-            lut_rev: vec![0; LUT_LEN],
-            lut_fwd: vec![0; LUT_LEN],
             x_luma,
             y_luma,
             x_chroma,
@@ -811,11 +807,6 @@ impl Renderer {
         } else {
             (256.0 - f64::from(rev) * self.shape.blend) as i32
         };
-        for (i, (r, f)) in self.lut_rev.iter_mut().zip(&mut self.lut_fwd).enumerate() {
-            let v = i as i32 - 1024;
-            *r = (v * rev / 256) as i16;
-            *f = (v * time / 256) as i16;
-        }
     }
 
     #[allow(clippy::cast_sign_loss)]
@@ -953,10 +944,10 @@ impl Renderer {
         }
     }
 
-    fn channel(raw: &[u16], lut: &[i16], div: i32) -> Vec<i16> {
+    fn channel(raw: &[u16], time: i32, div: i32) -> Vec<i16> {
         let map = |div: i32| {
             raw.iter()
-                .map(|&value| (i32::from(lut[usize::from(value)]) / div) as i16)
+                .map(|&value| ((i32::from(value) - VECTOR_BIAS) * time / 256 / div) as i16)
                 .collect()
         };
         match div {
@@ -980,12 +971,11 @@ impl Renderer {
         let rt = 256 - t;
         let tb = self.time_blend;
         let rtb = 256 - tb;
-        let fwd = &self.lut_fwd;
-        let rev = &self.lut_rev;
-        let vec2 = |x: &[u16], y: &[u16], lut: &[i16]| {
+        let (fwd, rev) = (t, rt);
+        let vec2 = |x: &[u16], y: &[u16], time: i32| {
             (
-                Self::channel(x, lut, pass.div_x),
-                Self::channel(y, lut, pass.div_y),
+                Self::channel(x, time, pass.div_x),
+                Self::channel(y, time, pass.div_y),
             )
         };
         let mask = |m: &[u8]| m.iter().map(|&x| i16::from(x)).collect::<Vec<i16>>();
