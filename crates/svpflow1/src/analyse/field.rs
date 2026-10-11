@@ -551,6 +551,21 @@ impl Field {
                 max_x: self.pel * (w - x0 - covered_w),
                 max_y: self.pel * (h - y0 - covered_h),
             };
+            if !searching
+                && !negative
+                && let Some(i) = index
+                && self.vectors[i].sad <= settings.bad_sad
+            {
+                if let Some(out) = output.as_deref_mut() {
+                    let best = self.vectors[i];
+                    let shape = Shape::new(l.width as usize, l.height as usize);
+                    let (block, pitch) = src.y.block(src.y.pel1(x0, y0), shape, &mut ctx.scratch);
+                    let luma = metric::block_average(block, pitch, shape);
+                    out[2 * i] = ((i32::from(best.x) << 16) + i32::from(best.y)) as u32;
+                    out[2 * i + 1] = packed_score(best, diagonal, luma);
+                }
+                continue;
+            }
             let predictor_index = index.unwrap_or_else(|| {
                 let px = if bx == self.blk_x { bx - 1 } else { bx };
                 let py = if by == self.blk_y { by - 1 } else { by };
@@ -1320,7 +1335,7 @@ impl BlockSearch<'_> {
         kernel: Kernel,
         flat: &mut [u8; MAX_BLOCK_AREA],
     ) -> (i32, i32) {
-        let average = metric::block_average(block, shape);
+        let average = metric::block_average(block, shape.width, shape);
         let area = shape.area();
         flat[..area].fill(average as u8);
         let deviation = kernel(block, &flat[..], shape.width) as i32;
@@ -1347,7 +1362,7 @@ impl BlockSearch<'_> {
                 &source.y
             };
         if !need {
-            self.block_luma = metric::block_average(luma, shape);
+            self.block_luma = metric::block_average(luma, shape.width, shape);
             return 0;
         }
         let (average, mut contrast) =
@@ -1433,7 +1448,8 @@ impl BlockSearch<'_> {
             return;
         }
         self.copy_luma(self.active);
-        self.block_luma = metric::block_average(&self.buffers[self.active].y, self.shape);
+        self.block_luma =
+            metric::block_average(&self.buffers[self.active].y, self.shape.width, self.shape);
         if !bad {
             return;
         }

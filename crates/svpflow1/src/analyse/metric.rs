@@ -114,12 +114,27 @@ fn generic(shape: Shape, use_satd: bool) -> Kernel {
     }
 }
 
-pub(crate) fn block_average(block: &[u8], shape: Shape) -> i32 {
+pub(crate) fn block_average(block: &[u8], pitch: usize, shape: Shape) -> i32 {
     if shape.height < 4 {
         return 0;
     }
-    let sum: u32 = block[..shape.area()].iter().map(|&p| u32::from(p)).sum();
+    let sum = match shape.width {
+        2 => rows_sum::<2>(block, pitch, shape.height),
+        4 => rows_sum::<4>(block, pitch, shape.height),
+        8 => rows_sum::<8>(block, pitch, shape.height),
+        16 => rows_sum::<16>(block, pitch, shape.height),
+        _ => rows_sum::<32>(block, pitch, shape.height),
+    };
     (sum >> shape.area().trailing_zeros()) as i32
+}
+
+fn rows_sum<const W: usize>(block: &[u8], pitch: usize, height: usize) -> u32 {
+    (0..height)
+        .map(|row| {
+            let row: &[u8; W] = block[row * pitch..][..W].try_into().unwrap();
+            row.iter().map(|&p| u32::from(p)).sum::<u32>()
+        })
+        .sum()
 }
 
 fn sad<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
