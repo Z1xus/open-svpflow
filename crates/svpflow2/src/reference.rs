@@ -136,13 +136,7 @@ impl FilterState {
         (self.nvof.is_none() && last >= 0).then_some((last, limit))
     }
 
-    fn layer_request(
-        &self,
-        request_frame: vs::RequestFrameFilter,
-        n: i32,
-        reach: i32,
-        frame_ctx: vs::Raw,
-    ) {
+    fn layer_wanted(&self, wanted: &mut Vec<(vs::Raw, i32)>, n: i32) {
         let (Some((last, _)), Some(gpu)) = (self.layer_plan(), self.gpu.as_ref()) else {
             return;
         };
@@ -155,17 +149,81 @@ impl FilterState {
                 continue;
             }
             let pairs = layer::pairs(c, last);
-            for k in *pairs.start()..=pairs.end() + 1 {
-                if k != n && k != n + 1 {
-                    request_node(request_frame, self.clips.source, k, frame_ctx);
-                }
-            }
-            for k in pairs {
-                if !((n - reach).max(0)..=n + reach).contains(&k) {
-                    request_node(request_frame, self.clips.vectors, k, frame_ctx);
-                }
-            }
+            wanted.extend((*pairs.start()..=pairs.end() + 1).map(|k| (self.clips.source, k)));
+            wanted.extend(pairs.map(|k| (self.clips.vectors, k)));
         }
+    }
+
+    fn repeat(&self, fetch: &Fetch, api: &frame::PlaneApi, k: i32, threshold: f64) -> bool {
+        if k < 1 || k >= self.video_info.num_frames {
+            return false;
+        }
+        let cached =
+            |cache: &Vec<(i32, bool)>| cache.iter().find(|(key, _)| *key == k).map(|v| v.1);
+        if let Some(known) = self
+            .repeat_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cached(&cache))
+        {
+            return known;
+        }
+        let frames = [k - 1, k].map(|k| fetch.get(self.clips.source, k));
+        let same = (|| {
+            let height = usize::try_from(self.video_info.height).ok()?;
+            let width = usize::try_from(self.video_info.width).ok()?;
+            let plane = |frame: vs::ConstRaw| {
+                let (ptr, stride, len) = (!frame.is_null())
+                    .then(|| unsafe { api.read_plane(frame, 0, height) })
+                    .flatten()?;
+                Some((unsafe { slice::from_raw_parts(ptr, len) }, stride))
+            };
+            let ((first, stride), (second, _)) = (plane(frames[0])?, plane(frames[1])?);
+            let mut total = 0u64;
+            let mut count = 0u64;
+            for y in (0..height).step_by(4) {
+                let row = y * stride..y * stride + width;
+                let pairs = first.get(row.clone())?.iter().zip(second.get(row)?);
+                for (a, b) in pairs.step_by(4) {
+                    total += u64::from(a.abs_diff(*b));
+                    count += 1;
+                }
+            }
+            Some((total as f64) < threshold * count as f64)
+        })();
+        for frame in frames {
+            fetch.drop(frame);
+        }
+        let Some(same) = same else {
+            return false;
+        };
+        if let Ok(mut cache) = self.repeat_cache.lock() {
+            if cache.len() >= 512 {
+                cache.remove(0);
+            }
+            cache.push((k, same));
+        }
+        same
+    }
+
+    fn dedup(&self, fetch: &Fetch, api: &frame::PlaneApi, n: i32, raw: f64) -> (i32, f64) {
+        let Some(threshold) = self.dedup_limit() else {
+            return (n, raw);
+        };
+        let repeat = |k: i32| self.repeat(fetch, api, k, threshold);
+        let single = |k: i32| repeat(k) && !repeat(k - 1) && !repeat(k + 1);
+        if n + 2 < self.video_info.num_frames && single(n + 1) {
+            (n + 1, raw / 2.0)
+        } else if single(n) {
+            (n, 128.0 + raw / 2.0)
+        } else {
+            (n, raw)
+        }
+    }
+
+    fn dedup_limit(&self) -> Option<f64> {
+        let plain = self.nvof.is_none() && crate::video_format::source_depth(&self.video_info) <= 8;
+        self.options.dedup().filter(|_| plain)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -513,29 +571,36 @@ impl FilterState {
         let params = self.options.reference();
         let rates = self.rates(&params);
         let engine::Step { n, phase, .. } = rates.step(&params, frame);
-        if !engine::needs_vectors(phase) {
-            for k in [n, n + 1] {
-                request_node(request_frame, self.clips.source, k, frame_ctx);
-            }
-            return;
-        }
-        for k in [n, n + 1] {
-            request_node(request_frame, self.clips.source, k, frame_ctx);
+        let dedup = self.dedup_limit().is_some();
+        let mut wanted = Vec::new();
+        let vectors = engine::needs_vectors(phase) || dedup;
+        let sources = if dedup {
+            (n - 2).max(0)..=n + 2
+        } else {
+            n..=n + 1
+        };
+        wanted.extend(sources.map(|k| (self.clips.source, k)));
+        if vectors {
+            let last = n + i32::from(dedup);
             if self.request_super {
-                request_node(request_frame, self.clips.super_clip, k, frame_ctx);
+                wanted.extend((n..=last + 1).map(|k| (self.clips.super_clip, k)));
+            }
+            let reach = engine::vector_reach(&params);
+            if self.nvof.is_some() {
+                let extra = nvof_extra(&params);
+                wanted.extend((n..=n + 1 + extra).map(|k| (self.clips.vec_src, k)));
+            } else {
+                wanted.extend(((n - reach).max(0)..=last + reach).map(|k| (self.clips.vectors, k)));
+                for base in n..=last {
+                    self.layer_wanted(&mut wanted, base);
+                }
             }
         }
-        let reach = engine::vector_reach(&params);
-        if self.nvof.is_some() {
-            for k in n..=n + 1 + nvof_extra(&params) {
-                request_node(request_frame, self.clips.vec_src, k, frame_ctx);
-            }
-            return;
+        wanted.sort_unstable_by_key(|&(node, k)| (node as usize, k));
+        wanted.dedup();
+        for (node, k) in wanted {
+            request_node(request_frame, node, k, frame_ctx);
         }
-        for k in (n - reach).max(0)..=n + reach {
-            request_node(request_frame, self.clips.vectors, k, frame_ctx);
-        }
-        self.layer_request(request_frame, n, reach, frame_ctx);
     }
 
     fn with_vectors<R>(
@@ -609,7 +674,16 @@ impl FilterState {
         };
         let params = self.options.reference();
         let rates = self.rates(&params);
-        let engine::Step { n, raw, mut phase } = rates.step(&params, frame);
+        let engine::Step {
+            mut n,
+            mut raw,
+            mut phase,
+        } = rates.step(&params, frame);
+        let moved = self.dedup(&fetch, &api, n, raw);
+        if moved != (n, raw) {
+            (n, raw) = moved;
+            phase = rates.phase(&params, raw);
+        }
         let shape = FieldShape::from_data(&vector_data);
         let mut luma = vec![0u8; shape.blocks()];
         let mut luma_table = None;

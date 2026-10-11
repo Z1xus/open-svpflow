@@ -110,11 +110,19 @@ impl Rates {
     pub fn step(&self, params: &ReferenceParams, frame: i32) -> Step {
         let n = self.source_frame(frame);
         let raw = self.raw_phase(frame, n);
-        let mut phase = (raw + 0.5) as i32;
-        if matches!(params.scene_mode, 1 | 2) {
-            phase = self.time_to_fixed(raw, if params.scene_mode == 1 { 0 } else { 2 });
+        Step {
+            n,
+            raw,
+            phase: self.phase(params, raw),
         }
-        Step { n, raw, phase }
+    }
+
+    pub fn phase(&self, params: &ReferenceParams, raw: f64) -> i32 {
+        if matches!(params.scene_mode, 1 | 2) {
+            self.time_to_fixed(raw, if params.scene_mode == 1 { 0 } else { 2 })
+        } else {
+            (raw + 0.5) as i32
+        }
     }
 }
 

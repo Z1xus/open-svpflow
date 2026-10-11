@@ -64,6 +64,7 @@ pub struct DebugOptions {
 pub struct RenderOptions {
     pub linear: bool,
     pub dither: bool,
+    pub dedup: f64,
 }
 
 #[allow(dead_code)]
@@ -243,6 +244,10 @@ impl Options {
 
     pub const fn dither(&self) -> bool {
         self.render.dither
+    }
+
+    pub fn dedup(&self) -> Option<f64> {
+        (self.render.dedup > 0.0).then_some(self.render.dedup)
     }
 
     pub const fn mask_still(&self) -> Option<[f32; 3]> {
@@ -584,6 +589,7 @@ impl Default for RenderOptions {
         Self {
             linear: true,
             dither: false,
+            dedup: 0.0,
         }
     }
 }
@@ -708,6 +714,7 @@ impl RenderOptions {
         Self {
             linear: value.bool_at(&["linear"]).unwrap_or(true),
             dither: value.bool_at(&["dither"]).unwrap_or(false),
+            dedup: value.float_at(&["dedup"]).unwrap_or(0.0),
         }
     }
 }
