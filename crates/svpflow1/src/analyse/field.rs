@@ -6,6 +6,7 @@ use super::planes::{LevelFrame, MAX_BLOCK_AREA, PlaneView};
 pub(crate) mod recalc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
 pub(crate) struct Mv {
     pub(crate) x: i16,
     pub(crate) y: i16,
@@ -338,7 +339,39 @@ impl Field {
         let (cx, cy) = (coarse.blk_x, coarse.blk_y);
         let at = |i: i32, j: i32| coarse.vectors[(i + j * cx) as usize];
         for l_y in 0..self.blk_y {
-            for k_x in 0..self.blk_x {
+            #[allow(unused_mut)]
+            let mut done = 1;
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            if for_recalc && (1..2 * cy - 1).contains(&l_y) {
+                let odd = l_y % 2 != 0;
+                let ay1 = if odd { odd_y } else { even_y };
+                let ay2 = l.step_y() * 4 - ay1;
+                let weights = [odd_x, even_x].map(|ax1| {
+                    let ax2 = l.step_x() * 4 - ax1;
+                    if l.overlap_x == 0 && l.overlap_y == 0 {
+                        [9, 3, 3, 1]
+                    } else {
+                        [ax1 * ay1, ax2 * ay1, ax1 * ay2, ax2 * ay2]
+                    }
+                });
+                let (divisor, bias) = if l.overlap_x == 0 && l.overlap_y == 0 {
+                    (1, 8)
+                } else {
+                    (norm_area, 0)
+                };
+                let row = |y: i32| &coarse.vectors[(y * cx) as usize..][..cx as usize];
+                let far = l_y / 2 + if odd { 1 } else { -1 };
+                done = unsafe {
+                    wide::blend_row(
+                        &mut self.vectors[(l_y * self.blk_x) as usize..][..self.blk_x as usize],
+                        [row(l_y / 2), row(far)],
+                        weights,
+                        (divisor, bias, norm),
+                        self.blk_x.min(2 * cx - 1) as usize,
+                    )
+                } as i32;
+            }
+            for k_x in (0..1).chain(done..self.blk_x) {
                 let index = (l_y * self.blk_x + k_x) as usize;
                 let (mut i, mut j) = (k_x, l_y);
                 if for_recalc {
@@ -646,6 +679,109 @@ impl Field {
             }
         }
         (found, count)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+mod wide {
+    use super::Mv;
+    use std::arch::x86_64::{
+        __m128i, __m256d, _mm_add_epi32, _mm_and_si128, _mm_cvtsi32_si128, _mm_mullo_epi32,
+        _mm_or_si128, _mm_set1_epi32, _mm_setzero_si128, _mm_slli_epi32, _mm_sra_epi32,
+        _mm_srai_epi32, _mm_storeu_si128, _mm_unpackhi_epi32, _mm_unpackhi_epi64,
+        _mm_unpacklo_epi32, _mm_unpacklo_epi64, _mm256_castsi256_si128, _mm256_cvtepi32_pd,
+        _mm256_cvttpd_epi32, _mm256_div_pd, _mm256_extracti128_si256, _mm256_loadu_si256,
+        _mm256_permutevar8x32_epi32, _mm256_set1_pd, _mm256_setr_epi32,
+    };
+
+    type Parts = [__m128i; 3];
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn sign(v: __m128i) -> __m128i {
+        _mm_srai_epi32::<16>(_mm_slli_epi32::<16>(v))
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn load(row: &[Mv], at: usize) -> Parts {
+        let split = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+        let v = unsafe { _mm256_loadu_si256(row[at..at + 4].as_ptr().cast()) };
+        let v = _mm256_permutevar8x32_epi32(v, split);
+        let xy = _mm256_castsi256_si128(v);
+        [
+            sign(xy),
+            _mm_srai_epi32::<16>(xy),
+            _mm256_extracti128_si256::<1>(v),
+        ]
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn part(
+        weights: [i32; 4],
+        vectors: [&Parts; 4],
+        c: usize,
+        bias: __m128i,
+        divisor: __m256d,
+    ) -> __m128i {
+        let [a, b, c, d] =
+            [0, 1, 2, 3].map(|k| _mm_mullo_epi32(vectors[k][c], _mm_set1_epi32(weights[k])));
+        let sum = _mm_add_epi32(
+            _mm_add_epi32(a, b),
+            _mm_add_epi32(_mm_add_epi32(c, d), bias),
+        );
+        _mm256_cvttpd_epi32(_mm256_div_pd(_mm256_cvtepi32_pd(sum), divisor))
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn blend(
+        weights: [i32; 4],
+        vectors: [&Parts; 4],
+        (divisor, bias, norm): (__m256d, __m128i, __m128i),
+    ) -> [__m128i; 2] {
+        let zero = _mm_setzero_si128();
+        let x = _mm_sra_epi32(sign(part(weights, vectors, 0, zero, divisor)), norm);
+        let y = _mm_sra_epi32(sign(part(weights, vectors, 1, zero, divisor)), norm);
+        let sad = _mm_srai_epi32::<6>(part(weights, vectors, 2, bias, divisor));
+        let xy = _mm_or_si128(
+            _mm_and_si128(x, _mm_set1_epi32(0xFFFF)),
+            _mm_slli_epi32::<16>(y),
+        );
+        [_mm_unpacklo_epi32(xy, sad), _mm_unpackhi_epi32(xy, sad)]
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) fn blend_row(
+        out: &mut [Mv],
+        [near, far]: [&[Mv]; 2],
+        weights: [[i32; 4]; 2],
+        (divisor, bias, norm): (i32, i32, i32),
+        end: usize,
+    ) -> usize {
+        let scale = (
+            _mm256_set1_pd(f64::from(divisor)),
+            _mm_set1_epi32(bias),
+            _mm_cvtsi32_si128(norm),
+        );
+        let mut column = 1;
+        while column + 8 <= end {
+            let at = column / 2;
+            let near = [load(near, at), load(near, at + 1)];
+            let far = [load(far, at), load(far, at + 1)];
+            let odd = blend(weights[0], [&near[0], &near[1], &far[0], &far[1]], scale);
+            let even = blend(weights[1], [&near[1], &near[0], &far[1], &far[0]], scale);
+            let target = out[column..column + 8].as_mut_ptr().cast::<__m128i>();
+            unsafe {
+                _mm_storeu_si128(target, _mm_unpacklo_epi64(odd[0], even[0]));
+                _mm_storeu_si128(target.add(1), _mm_unpackhi_epi64(odd[0], even[0]));
+                _mm_storeu_si128(target.add(2), _mm_unpacklo_epi64(odd[1], even[1]));
+                _mm_storeu_si128(target.add(3), _mm_unpackhi_epi64(odd[1], even[1]));
+            }
+            column += 8;
+        }
+        column
     }
 }
 
