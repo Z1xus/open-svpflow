@@ -33,7 +33,8 @@ pub struct LayerPair {
 
 pub(super) struct LayerState {
     queue: ClCommandQueue,
-    kernels: [ClKernel; 3],
+    kernels: [ClKernel; 4],
+    rough: ImageSlot,
     vectors: ImageSlot,
     found: (ClMem, usize),
     stats: Vec<(i64, Arc<Owned>, i32)>,
@@ -46,7 +47,8 @@ impl LayerState {
     pub(super) const fn new() -> Self {
         Self {
             queue: std::ptr::null_mut(),
-            kernels: [std::ptr::null_mut(); 3],
+            kernels: [std::ptr::null_mut(); 4],
+            rough: ImageSlot::EMPTY,
             vectors: ImageSlot::EMPTY,
             found: (std::ptr::null_mut(), 0),
             stats: Vec::new(),
@@ -116,7 +118,7 @@ impl GpuContext {
                         (self.cl.ReleaseKernel)(kernel);
                     }
                 }
-                for mem in [state.vectors.mem, state.found.0] {
+                for mem in [state.vectors.mem, state.rough.mem, state.found.0] {
                     if !mem.is_null() {
                         (self.cl.ReleaseMemObject)(mem);
                     }
@@ -177,12 +179,12 @@ impl GpuContext {
                 return None;
             }
         }
-        for (kernel, name) in
-            state
-                .kernels
-                .iter_mut()
-                .zip([c"layer_stats", c"layer_fit", c"layer_cover"])
-        {
+        for (kernel, name) in state.kernels.iter_mut().zip([
+            c"layer_stats",
+            c"layer_fit",
+            c"layer_clean",
+            c"layer_cover",
+        ]) {
             if kernel.is_null() {
                 let mut err = 0;
                 *kernel =
@@ -346,7 +348,9 @@ impl GpuContext {
         };
         std::mem::forget(fit);
         std::mem::forget(cover);
-        let [fit_kernel, cover_kernel] = [state.kernels[1], state.kernels[2]];
+        let [fit_kernel, clean_kernel, cover_kernel] =
+            [state.kernels[1], state.kernels[2], state.kernels[3]];
+        let rough = unsafe { self.ensure_image(&mut state.rough, width, height, CL_HALF_FLOAT) }?;
         let mut gaps = vec![0u8; cells.0 * cells.1];
         let found = unsafe { self.ensure_buffer(&mut state.found, gaps.len()) }?;
         let (w, h) = (params[0].width, params[0].height);
@@ -358,11 +362,14 @@ impl GpuContext {
                     self.set(fit_kernel, index, &mem) && self.set(fit_kernel, index + 3, &count);
             }
             ready = ready
-                && self.set(fit_kernel, 6, &made.fit.0)
+                && self.set(fit_kernel, 6, &rough)
                 && self.set(fit_kernel, 7, &w)
                 && self.set(fit_kernel, 8, &h)
                 && self.set(fit_kernel, 9, &limit)
                 && self.run(state.queue, fit_kernel, [width, height])
+                && self.set(clean_kernel, 0, &rough)
+                && self.set(clean_kernel, 1, &made.fit.0)
+                && self.run(state.queue, clean_kernel, [width, height])
                 && self.set(cover_kernel, 0, &made.fit.0)
                 && self.set(cover_kernel, 1, &found)
                 && self.set(cover_kernel, 2, &w)

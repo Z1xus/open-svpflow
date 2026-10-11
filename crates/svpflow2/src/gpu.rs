@@ -1716,6 +1716,7 @@ pub(crate) const KERNEL_SRC: &str = r"
 #define LAYER 0
 #endif
 #define LAYER_MIN 0.2f
+#define LAYER_GROUP 3
 #define LAYER_FILL 4.0f
 #define LAYER_NEAR 0.0f
 #define LAYER_SAME 2.5f
@@ -1856,6 +1857,10 @@ inline float layer_raw(read_only image2d_t raw, const Params *p, float2 at) {
         (float2)(p->offset_x, p->offset_y) + at + 0.5f).x;
 }
 
+inline int layer_set(float4 model) {
+    return fabs(model.x-1.0f) > 0.02f || fabs(model.y) > 1.0f;
+}
+
 inline float2 layer_scene(
     read_only image2d_t raw, read_only image2d_t layer, const Params *p, float2 at, int moved)
 {
@@ -1929,10 +1934,10 @@ kernel void render_frame(
     float2 step_f = full_step(&p, vector.x, vector.w);
     float2 step_b = full_step(&p, vector.z, vector.y);
     float gap = layer_gap(cover, &p, at);
+    float2 at_f = clamp(at + step_f*time, (float2)(0.0f, 0.0f), top);
+    float2 at_b = clamp(at + step_b*(1.0f-time), (float2)(0.0f, 0.0f), top);
     layered = gap <= layer_reach(&p, step_f*time, step_b*(1.0f-time));
     if (layered) {
-        float2 at_f = clamp(at + step_f*time, (float2)(0.0f, 0.0f), top);
-        float2 at_b = clamp(at + step_b*(1.0f-time), (float2)(0.0f, 0.0f), top);
         float4 model = read_imagef(layer, linear_sampler, layer_luma(&p, at));
         float2 moved_f = layer_scene(raw_f, layer, &p, at_f, 1);
         float2 moved_b = layer_scene(raw_b, layer, &p, at_b, 1);
@@ -2123,10 +2128,10 @@ kernel void blend_frame(
         float result;
         int layered = 0;
 #if LAYER
+        float2 at_f = clamp(at + step_f*time, (float2)(0.0f, 0.0f), top);
+        float2 at_b = clamp(at + step_b*(1.0f-time), (float2)(0.0f, 0.0f), top);
         layered = gap <= layer_reach(&p, step_f*time, step_b*(1.0f-time));
         if (layered) {
-            float2 at_f = clamp(at + step_f*time, (float2)(0.0f, 0.0f), top);
-            float2 at_b = clamp(at + step_b*(1.0f-time), (float2)(0.0f, 0.0f), top);
             float4 model = read_imagef(layer, linear_sampler, layer_luma(&p, at));
             float2 moved_f = layer_scene(raw_f, layer, &p, at_f, 1);
             float2 moved_b = layer_scene(raw_b, layer, &p, at_b, 1);
@@ -2375,6 +2380,20 @@ kernel void layer_fit(
     write_imagef(fit, (int2)(x, y), (float4)(model.x, model.y, offset.x, offset.y));
 }
 
+kernel void layer_clean(read_only image2d_t fit, write_only image2d_t clean)
+{
+    int2 at = (int2)(get_global_id(0), get_global_id(1));
+    float4 model = read_imagef(fit, cell_sampler, at);
+    if (layer_set(model)) {
+        int near = 0;
+        for (int y = -1; y <= 1; y++)
+            for (int x = -1; x <= 1; x++)
+                near += layer_set(read_imagef(fit, cell_sampler, at + (int2)(x, y)));
+        if (near < LAYER_GROUP) model = (float4)(1.0f, 0.0f, 0.0f, 0.0f);
+    }
+    write_imagef(clean, at, model);
+}
+
 kernel void layer_cover(read_only image2d_t fit, global uchar *cover, int width, int height)
 {
     int cx = get_global_id(0), cy = get_global_id(1);
@@ -2382,7 +2401,7 @@ kernel void layer_cover(read_only image2d_t fit, global uchar *cover, int width,
     for (int y = cy*8; y < min(cy*8+8, height) && !found; y++) {
         for (int x = cx*8; x < min(cx*8+8, width); x++) {
             float4 m = read_imagef(fit, nearest_sampler, (int2)(x, y));
-            if (fabs(m.x-1.0f) > 0.02f || fabs(m.y) > 1.0f) {
+            if (layer_set(m)) {
                 found = 1;
                 break;
             }
