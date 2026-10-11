@@ -1,5 +1,11 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+
 use crate::analyse::{self, AnalyseParams, RawPlane, SuperFrameView, SuperParams};
 use crate::{params, video_format, vs};
+
+const MAX_AHEAD: i64 = 8;
+const CACHE_SHARE: i64 = 16;
 
 struct AnalyseState {
     super_node: vs::Raw,
@@ -9,6 +15,164 @@ struct AnalyseState {
     super_height: usize,
     _header: Box<[i32]>,
     gray_format: vs::ConstRaw,
+    depth: i32,
+    ahead: Mutex<HashMap<i32, Arc<Slot>>>,
+}
+
+struct Inputs {
+    supers: [vs::ConstRaw; 2],
+    sources: [vs::ConstRaw; 2],
+}
+
+unsafe impl Send for Inputs {}
+
+enum Ahead {
+    Queued(Inputs),
+    Running,
+    Done(Vec<u8>),
+    Taken,
+}
+
+struct Slot {
+    state: Mutex<Ahead>,
+    done: Condvar,
+}
+
+impl Slot {
+    fn new(state: Ahead) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(state),
+            done: Condvar::new(),
+        })
+    }
+
+    fn claim(&self) -> Option<Inputs> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match std::mem::replace(&mut *state, Ahead::Running) {
+            Ahead::Queued(inputs) => Some(inputs),
+            other => {
+                *state = other;
+                None
+            }
+        }
+    }
+
+    fn running(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        matches!(*state, Ahead::Running)
+    }
+
+    fn set(&self, state: Ahead) {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = state;
+        self.done.notify_all();
+    }
+
+    fn take(&self) -> Option<Vec<u8>> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self
+            .done
+            .wait_while(state, |state| matches!(state, Ahead::Running))
+            .unwrap_or_else(PoisonError::into_inner);
+        match std::mem::replace(&mut *state, Ahead::Taken) {
+            Ahead::Done(payload) => Some(payload),
+            _ => None,
+        }
+    }
+}
+
+struct Job(*const AnalyseState);
+
+unsafe impl Send for Job {}
+
+impl AnalyseState {
+    fn pair(&self, n: i32) -> [i32; 2] {
+        [n, (n + self.params.delta).min(self.vi.num_frames - 1)]
+    }
+
+    fn full(&self) -> bool {
+        self.params.super_params.has_finest_level()
+    }
+
+    unsafe fn fetch(&self, api: &FrameApi, n: i32, frame_ctx: vs::Raw) -> Option<Inputs> {
+        let fetch = |node: vs::Raw| {
+            self.pair(n)
+                .map(|frame| unsafe { (api.get_frame)(frame, node, frame_ctx) })
+        };
+        let inputs = Inputs {
+            supers: fetch(self.super_node),
+            sources: if self.full() {
+                [std::ptr::null(); 2]
+            } else {
+                fetch(self.src_node)
+            },
+        };
+        let missing = |frames: &[vs::ConstRaw; 2]| frames.iter().any(|f| f.is_null());
+        if missing(&inputs.supers) || (!self.full() && missing(&inputs.sources)) {
+            unsafe { api.release(&inputs) };
+            return None;
+        }
+        Some(inputs)
+    }
+
+    unsafe fn compute(&self, api: &FrameApi, n: i32, inputs: &Inputs) -> Vec<u8> {
+        let params = &self.params;
+        let sp = params.super_params;
+        let y_shift = params.chroma_shift.1;
+        let full = self.full();
+        let view = |index: usize| SuperFrameView {
+            planes: unsafe { api.planes(inputs.supers[index], self.super_height, y_shift) },
+            source: (!full)
+                .then(|| unsafe { api.planes(inputs.sources[index], sp.height as usize, y_shift) }),
+            width: sp.width,
+            height: sp.height,
+            pel: sp.pel,
+            chroma_shift: params.chroma_shift,
+        };
+        let level0 = if full { self.super_node } else { self.src_node } as usize;
+        let keys = self.pair(n).map(|frame| (level0, frame));
+        analyse::analyse(params, &view(0), &view(1), Some(keys))
+    }
+
+    unsafe fn look_ahead(&self, api: &FrameApi, n: i32, frame_ctx: vs::Raw) -> (Arc<Slot>, bool) {
+        let mut ahead = self.ahead.lock().unwrap_or_else(PoisonError::into_inner);
+        ahead.retain(|&frame, slot| {
+            if (frame - n).abs() <= 2 * self.depth {
+                return true;
+            }
+            match slot.claim() {
+                Some(inputs) => {
+                    unsafe { api.release(&inputs) };
+                    false
+                }
+                None => slot.running(),
+            }
+        });
+        for frame in n + 1..=(n + self.depth).min(self.vi.num_frames - 1) {
+            if ahead.contains_key(&frame) {
+                continue;
+            }
+            let Some(inputs) = (unsafe { self.fetch(api, frame, frame_ctx) }) else {
+                continue;
+            };
+            let slot = Slot::new(Ahead::Queued(inputs));
+            ahead.insert(frame, slot.clone());
+            let (job, api) = (Job(self), *api);
+            rayon::spawn(move || {
+                let job = job;
+                if let Some(inputs) = slot.claim() {
+                    let payload = unsafe { (*job.0).compute(&api, frame, &inputs) };
+                    unsafe { api.release(&inputs) };
+                    slot.set(Ahead::Done(payload));
+                }
+            });
+        }
+        if let Some(slot) = ahead.get(&n) {
+            return (slot.clone(), false);
+        }
+        let slot = Slot::new(Ahead::Running);
+        ahead.insert(n, slot.clone());
+        (slot, true)
+    }
 }
 
 pub(crate) unsafe extern "system" fn create_analyse(
@@ -42,6 +206,8 @@ unsafe fn create_analyse_inner(
         unsafe { vs::table_fn::<vs::PropSetInt>(vsapi, vs::PROP_SET_INT) }.ok_or(INVALID_API)?;
     let get_int =
         unsafe { vs::table_fn::<vs::PropGetInt>(vsapi, vs::PROP_GET_INT) }.ok_or(INVALID_API)?;
+    let get_core_info =
+        unsafe { vs::table_fn::<vs::GetCoreInfo>(vsapi, vs::GET_CORE_INFO) }.ok_or(INVALID_API)?;
 
     let mut err = 0;
     let super_node = unsafe { get_node(input, c"clip".as_ptr(), 0, &raw mut err) };
@@ -111,6 +277,18 @@ unsafe fn create_analyse_inner(
             return Err("SVAnalyse: cannot get Gray8 format".into());
         }
 
+        let frame_bytes = |vi: &vs::VideoInfo| {
+            let luma = i64::from(vi.width) * i64::from(vi.height);
+            luma + ((2 * luma) >> (chroma_shift.0 + chroma_shift.1))
+        };
+        let held = frame_bytes(&super_vi) + if full { 0 } else { frame_bytes(&src_vi) };
+        let info = unsafe { get_core_info(core) };
+        let cache = if info.is_null() {
+            0
+        } else {
+            unsafe { (*info).max_framebuffer }
+        };
+
         let header: Box<[i32]> = Box::new(analyse::analysis_header(&params));
         unsafe { prop_set_int(output, c"data".as_ptr(), header.as_ptr() as i64, 0) };
 
@@ -135,6 +313,8 @@ unsafe fn create_analyse_inner(
             super_height: super_height as usize,
             _header: header,
             gray_format: gray,
+            depth: (cache / CACHE_SHARE / held).clamp(0, MAX_AHEAD) as i32,
+            ahead: Mutex::default(),
         })
     })();
     let state = match result {
@@ -213,10 +393,18 @@ unsafe extern "system" fn free_analyse(
     vsapi: vs::ConstRaw,
 ) {
     let state = unsafe { Box::from_raw(instance_data.cast::<AnalyseState>()) };
+    let ahead = std::mem::take(&mut *state.ahead.lock().unwrap_or_else(PoisonError::into_inner));
+    for slot in ahead.into_values() {
+        match (slot.claim(), unsafe { FrameApi::load(vsapi) }) {
+            (Some(inputs), Some(api)) => unsafe { api.release(&inputs) },
+            _ => drop(slot.take()),
+        }
+    }
     unsafe { vs::free_node(state.super_node, vsapi) };
     unsafe { vs::free_node(state.src_node, vsapi) };
 }
 
+#[derive(Clone, Copy)]
 struct FrameApi {
     get_frame: vs::GetFrameFilter,
     get_stride: vs::GetStride,
@@ -232,6 +420,14 @@ impl FrameApi {
             get_read: unsafe { vs::table_fn::<vs::GetReadPtr>(vsapi, vs::GET_READ_PTR)? },
             free_frame: unsafe { vs::table_fn::<vs::FreeFrame>(vsapi, vs::FREE_FRAME)? },
         })
+    }
+
+    unsafe fn release(&self, inputs: &Inputs) {
+        for &frame in inputs.supers.iter().chain(&inputs.sources) {
+            if !frame.is_null() {
+                unsafe { (self.free_frame)(frame) };
+            }
+        }
     }
 
     unsafe fn planes<'f>(
@@ -261,17 +457,20 @@ unsafe extern "system" fn get_frame_analyse(
     vsapi: vs::ConstRaw,
 ) -> vs::ConstRaw {
     let state = unsafe { &*(*instance_data).cast::<AnalyseState>() };
-    let params = &state.params;
-    let full = params.super_params.has_finest_level();
-    let next = (n + params.delta).min(state.vi.num_frames - 1);
+    let last = state.vi.num_frames - 1;
 
     if activation == vs::AR_INITIAL {
         if let Some(request) =
             unsafe { vs::table_fn::<vs::RequestFrameFilter>(vsapi, vs::REQUEST_FRAME_FILTER) }
         {
-            for frame in [n, next] {
+            let mut frames: Vec<i32> = (n..=(n + state.depth).min(last).max(n))
+                .flat_map(|frame| state.pair(frame))
+                .collect();
+            frames.sort_unstable();
+            frames.dedup();
+            for frame in frames {
                 unsafe { request(frame, state.super_node, frame_ctx) };
-                if !full {
+                if !state.full() {
                     unsafe { request(frame, state.src_node, frame_ctx) };
                 }
             }
@@ -294,54 +493,36 @@ unsafe extern "system" fn get_frame_analyse(
         return std::ptr::null();
     };
 
-    let fetch = |node: vs::Raw, frame: i32| unsafe { (api.get_frame)(frame, node, frame_ctx) };
-    let supers = [fetch(state.super_node, n), fetch(state.super_node, next)];
-    let sources = if full {
-        [std::ptr::null(); 2]
-    } else {
-        [fetch(state.src_node, n), fetch(state.src_node, next)]
-    };
-    let release = |frames: &[vs::ConstRaw]| {
-        for &frame in frames.iter().filter(|f| !f.is_null()) {
-            unsafe { (api.free_frame)(frame) };
-        }
-    };
-    if supers.iter().any(|f| f.is_null()) || (!full && sources.iter().any(|f| f.is_null())) {
-        release(&supers);
-        release(&sources);
+    let (slot, fresh) = unsafe { state.look_ahead(&api, n, frame_ctx) };
+    let Some(inputs) = (unsafe { state.fetch(&api, n, frame_ctx) }) else {
+        slot.set(Ahead::Taken);
         return std::ptr::null();
-    }
-
-    let sp = params.super_params;
-    let y_shift = params.chroma_shift.1;
-    let view = |index: usize| SuperFrameView {
-        planes: unsafe { api.planes(supers[index], state.super_height, y_shift) },
-        source: (!full).then(|| unsafe { api.planes(sources[index], sp.height as usize, y_shift) }),
-        width: sp.width,
-        height: sp.height,
-        pel: sp.pel,
-        chroma_shift: params.chroma_shift,
     };
-    let level0 = if full {
-        state.super_node
-    } else {
-        state.src_node
-    } as usize;
-    let payload = analyse::analyse(
-        params,
-        &view(0),
-        &view(1),
-        Some([(level0, n), (level0, next)]),
-    );
-    release(&sources);
-
-    let out = unsafe { new_frame(state.gray_format, payload.len() as i32, 1, supers[0], core) };
+    let ready = match slot.claim() {
+        _ if fresh => None,
+        Some(queued) => {
+            unsafe { api.release(&queued) };
+            None
+        }
+        None => slot.take(),
+    };
+    let payload = ready.unwrap_or_else(|| unsafe { state.compute(&api, n, &inputs) });
+    slot.set(Ahead::Taken);
+    let out = unsafe {
+        new_frame(
+            state.gray_format,
+            payload.len() as i32,
+            1,
+            inputs.supers[0],
+            core,
+        )
+    };
     if !out.is_null() {
         let dst = unsafe { get_write(out, 0) };
         if !dst.is_null() {
             unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), dst, payload.len()) };
         }
     }
-    release(&supers);
+    unsafe { api.release(&inputs) };
     out.cast_const()
 }

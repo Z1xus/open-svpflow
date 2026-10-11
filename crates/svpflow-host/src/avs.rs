@@ -141,6 +141,7 @@ api! {
     prop_set_int: fn(Raw, Raw, *const c_char, i64, i32) -> i32;
     save_string: fn(Raw, *const c_char, i32) -> *mut c_char;
     get_env_property: fn(Raw, i32) -> usize;
+    set_memory_max: fn(Raw, i32) -> i32;
 }
 
 fn libraries() -> Vec<Library> {
@@ -662,6 +663,7 @@ unsafe extern "system" fn get_core_info(core: Raw) -> *const CoreInfo {
     let threads = unsafe { (loaded().get_env_property)(core, AEP_THREADPOOL_THREADS) };
     let mut info = INFO.get();
     info.num_threads = i32::try_from(threads).unwrap_or(0);
+    info.max_framebuffer = i64::from(unsafe { (loaded().set_memory_max)(core, 0) }) << 20;
     INFO.set(info);
     INFO.with(Cell::as_ptr)
 }
