@@ -53,6 +53,16 @@ osvp_clip *osvp_smooth_fps_blend(const osvp_context *context, const osvp_clip *s
 osvp_clip *osvp_still(const osvp_context *context, const osvp_clip *clip,
                       const osvp_clip *source, double limit, double edge, double tolerance);
 
+osvp_clip *osvp_layer(const osvp_context *context, const osvp_clip *source,
+                      const char *super_opt, const char *analyse_opt, int32_t half_analysis,
+                      double limit);
+
+osvp_clip *osvp_peel(const osvp_context *context, const osvp_clip *source,
+                     const osvp_clip *layer);
+
+osvp_clip *osvp_unpeel(const osvp_context *context, const osvp_clip *clip,
+                       const osvp_clip *source, const osvp_clip *layer);
+
 void osvp_clip_info(const osvp_clip *clip, osvp_video_info *info);
 void osvp_clip_free(osvp_clip *clip);
 

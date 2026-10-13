@@ -137,21 +137,57 @@ impl FilterState {
     }
 
     fn layer_wanted(&self, wanted: &mut Vec<(vs::Raw, i32)>, n: i32) {
-        let (Some((last, _)), Some(gpu)) = (self.layer_plan(), self.gpu.as_ref()) else {
+        let Some((last, _)) = self.layer_plan() else {
             return;
         };
         let chunk = n / layer::CHUNK;
-        if gpu.layer_ready(chunk.into()) {
-            return;
-        }
-        for c in (chunk - 1).max(0)..=(chunk + 1).min(last / layer::CHUNK) {
-            if gpu.layer_stats_ready(c.into()) {
-                continue;
+        let near = (chunk - 1).max(0)..=(chunk + 1).min(last / layer::CHUNK);
+        let missing: Vec<i32> = if let Some(gpu) = self.gpu.as_ref() {
+            if gpu.layer_ready(chunk.into()) {
+                return;
             }
-            let pairs = layer::pairs(c, last);
-            wanted.extend((*pairs.start()..=pairs.end() + 1).map(|k| (self.clips.source, k)));
-            wanted.extend(pairs.map(|k| (self.clips.vectors, k)));
+            near.filter(|&c| !gpu.layer_stats_ready(c.into())).collect()
+        } else {
+            let Ok(layers) = self.layers.lock() else {
+                return;
+            };
+            if layers.ready(chunk).is_some() {
+                return;
+            }
+            near.filter(|&c| layers.held(c).is_none()).collect()
+        };
+        for c in missing {
+            let (sources, vectors) = crate::peel::frames(c, last);
+            wanted.extend(sources.map(|k| (self.clips.source, k)));
+            wanted.extend(vectors.map(|k| (self.clips.vectors, k)));
         }
+    }
+
+    fn layer_cpu(
+        &self,
+        api: &frame::PlaneApi,
+        fetch: &Fetch,
+        n: i32,
+        data: &metadata::VectorData,
+    ) -> Option<std::sync::Arc<layer::Fit>> {
+        let (last, limit) = self.layer_plan()?;
+        if !crate::video_format::is_yuv420p8(&self.video_info) {
+            return None;
+        }
+        let chunks = crate::peel::Chunks {
+            api,
+            get: &|node, k| fetch.get(node, k),
+            source: self.clips.source,
+            vectors: self.clips.vectors,
+            data,
+            size: (
+                self.video_info.width as usize,
+                self.video_info.height as usize,
+            ),
+            last,
+        };
+        let mut layers = self.layers.lock().ok()?;
+        layers.fit(&chunks, n / layer::CHUNK, limit, &Vec::new())
     }
 
     fn repeat(&self, fetch: &Fetch, api: &frame::PlaneApi, k: i32, threshold: f64) -> bool {
@@ -1042,6 +1078,51 @@ impl FilterState {
             sad: sad.as_deref().unwrap_or(&[]),
         };
         renderer.render(kind, interp, &mut dst, nxt.frame(), cur.frame(), &vectors);
+        let raw = unsafe {
+            (
+                crate::peel::planes(api, source, h),
+                crate::peel::planes(api, next_source, h),
+            )
+        };
+        let phase = if selected == 1 { 256 - time } else { time };
+        let phase = phase as f32 / 256.0;
+        if let (Some(limits), (Some(first), Some(second))) = (self.options.mask_still(), raw) {
+            let mask = crate::core::cache_cell(&self.still_cache, n.into(), 8).and_then(|cell| {
+                let (a, b) = (first[0], second[0]);
+                let mask = || svpflow_core::still::mask(a.data, b.data, a.pitch, w, h, limits);
+                cell.get_or_init(|| Some(std::sync::Arc::new(mask())))
+                    .clone()
+            });
+            if let Some(mask) = mask {
+                for (plane, target) in [&mut dst.y, &mut dst.u, &mut dst.v].into_iter().enumerate()
+                {
+                    let (a, b) = (first[plane], second[plane]);
+                    let (w, h) = if plane == 0 { (w, h) } else { (w / 2, h / 2) };
+                    let (data, pitch) = (&mut *target.data, target.pitch);
+                    let size = self.video_info.width as usize;
+                    svpflow_core::still::apply(
+                        data, pitch, a.data, b.data, a.pitch, w, h, &mask, size, phase,
+                    );
+                }
+            }
+        }
+        if let (Some(fit), (Some(first), Some(second))) =
+            (self.layer_cpu(api, fetch, n, vector_data), raw)
+        {
+            let fit = fit.layer((w, h));
+            let frames = layer::Frames {
+                first,
+                second,
+                time: phase,
+            };
+            let motion = crate::peel::motion((fwd_x, fwd_y), (bwd_x, bwd_y), vector_data);
+            if !fit.empty() {
+                for (plane, target) in [&mut dst.y, &mut dst.u, &mut dst.v].into_iter().enumerate()
+                {
+                    fit.render(plane, target.data, target.pitch, &frames, &motion, selected);
+                }
+            }
+        }
         unsafe { self.reference_overlays(api, output, frame, class, field, (luma, limits)) };
         unsafe { self.apply_light_border(api, output, frame) };
         if self.options.debug_tt() {

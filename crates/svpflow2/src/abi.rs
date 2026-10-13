@@ -8,6 +8,20 @@ use crate::{filter, strings, vs};
 const STILL_ARGS: &std::ffi::CStr =
     c"clip:clip;source:clip;limit:float:opt;edge:float:opt;tolerance:float:opt";
 
+const PEEL: [(&std::ffi::CStr, &std::ffi::CStr, vs::Create); 3] = [
+    (
+        c"Layer",
+        c"clip:clip;vectors:clip;vdata:int;limit:float:opt",
+        crate::peel::create_layer,
+    ),
+    (c"Peel", c"clip:clip;layer:clip", crate::peel::create_peel),
+    (
+        c"Unpeel",
+        c"clip:clip;source:clip;layer:clip",
+        crate::peel::create_unpeel,
+    ),
+];
+
 #[unsafe(no_mangle)]
 pub extern "system" fn svpGetVersion() -> i64 {
     strings::VERSION
@@ -71,6 +85,15 @@ pub unsafe extern "system" fn VapourSynthPluginInit(
             std::ptr::null_mut(),
             plugin,
         );
+        for (name, args, create) in PEEL {
+            register(
+                name.as_ptr(),
+                args.as_ptr(),
+                create,
+                std::ptr::null_mut(),
+                plugin,
+            );
+        }
     }
 }
 
@@ -117,6 +140,13 @@ pub unsafe extern "system" fn VapourSynthPluginInit2(plugin: vs::Raw, api: vs::C
             create: crate::still::create_still,
         },
     ];
+    let peel = PEEL.map(|(name, args, create)| svpflow_host::vs4::Function {
+        name,
+        args,
+        returns: c"clip:vnode;",
+        create,
+    });
+    let functions: Vec<_> = functions.into_iter().chain(peel).collect();
     unsafe { svpflow_host::vs4::init(plugin, api, &config, &functions) };
 }
 

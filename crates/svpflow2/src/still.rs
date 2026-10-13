@@ -160,10 +160,11 @@ impl StillState {
                 };
                 let (a, pitch) = plane(first, index, height)?;
                 let (b, _) = plane(second, index, height)?;
-                let (data, _, len) = unsafe { api.write_plane(output, index, height) }?;
+                let (data, stride, len) = unsafe { api.write_plane(output, index, height) }?;
                 let target = unsafe { std::slice::from_raw_parts_mut(data, len) };
                 still::apply(
                     target,
+                    stride,
                     a,
                     b,
                     pitch,

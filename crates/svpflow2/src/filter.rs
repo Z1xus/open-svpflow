@@ -377,6 +377,8 @@ unsafe fn collect_state(
         quality_cells: std::sync::Mutex::new(Vec::new()),
         motion_cache: std::sync::Mutex::new(Vec::new()),
         repeat_cache: std::sync::Mutex::new(Vec::new()),
+        still_cache: std::sync::Mutex::default(),
+        layers: std::sync::Mutex::default(),
     }
 }
 

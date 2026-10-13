@@ -276,6 +276,66 @@ pub unsafe extern "C" fn osvp_still(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn osvp_layer(
+    context: *const Context,
+    source: *const Clip,
+    super_opt: *const c_char,
+    analyse_opt: *const c_char,
+    half_analysis: i32,
+    limit: f64,
+) -> *mut Clip {
+    let (host, source) = unsafe { (&(*context).0, &(*source).node) };
+    let half = half_analysis != 0;
+    let found = unsafe { vectors(host, source, super_opt, analyse_opt, std::ptr::null(), half) };
+    let input = found.and_then(|found| {
+        let missing = || c"the plugin returned no clip".to_owned();
+        let mut input = Map::default();
+        input.set(c"clip", Value::Node(Arc::clone(source)));
+        input.set(
+            c"vectors",
+            Value::Node(found.node(c"vectors").ok_or_else(missing)?),
+        );
+        input.set(
+            c"vdata",
+            Value::Int(found.int(c"vdata").ok_or_else(missing)?),
+        );
+        if limit >= 0.0 {
+            input.set(c"limit", Value::Float(limit));
+        }
+        Ok(input)
+    });
+    finish(host, c"Layer", input)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn osvp_peel(
+    context: *const Context,
+    source: *const Clip,
+    layer: *const Clip,
+) -> *mut Clip {
+    let (host, source, layer) = unsafe { (&(*context).0, &(*source).node, &(*layer).node) };
+    let mut input = Map::default();
+    input.set(c"clip", Value::Node(Arc::clone(source)));
+    input.set(c"layer", Value::Node(Arc::clone(layer)));
+    finish(host, c"Peel", Ok(input))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn osvp_unpeel(
+    context: *const Context,
+    clip: *const Clip,
+    source: *const Clip,
+    layer: *const Clip,
+) -> *mut Clip {
+    let host = unsafe { &(*context).0 };
+    let mut input = Map::default();
+    for (key, clip) in [(c"clip", clip), (c"source", source), (c"layer", layer)] {
+        input.set(key, Value::Node(Arc::clone(unsafe { &(*clip).node })));
+    }
+    finish(host, c"Unpeel", Ok(input))
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn osvp_clip_info(clip: *const Clip, info: *mut VideoInfo) {
     let source = unsafe { (*clip).node.info() };
     let id = unsafe { source.format.cast::<vs3::Format>().as_ref() }.map_or(0, |format| format.id);

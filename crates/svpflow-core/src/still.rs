@@ -58,6 +58,7 @@ pub fn mask(
 )]
 pub fn apply(
     output: &mut [u8],
+    output_pitch: usize,
     first: &[u8],
     second: &[u8],
     pitch: usize,
@@ -78,7 +79,7 @@ pub fn apply(
             if kept * 10 > cells * 4 {
                 let at = y * pitch + x;
                 let (a, b) = (f32::from(first[at]), f32::from(second[at]));
-                output[at] = (a + (b - a) * time).round() as u8;
+                output[y * output_pitch + x] = (a + (b - a) * time).round() as u8;
             }
         }
     }

@@ -21,6 +21,7 @@ mod hdr;
 mod light;
 mod metadata;
 mod nvof;
+mod peel;
 mod reference;
 #[cfg(feature = "still")]
 mod still;

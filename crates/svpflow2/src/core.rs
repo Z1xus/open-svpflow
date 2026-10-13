@@ -88,6 +88,8 @@ pub(crate) struct FilterState {
     pub(crate) quality_cells: Cache<(i32, Vec<u8>)>,
     pub(crate) motion_cache: Cache<[Vec<u16>; 8]>,
     pub(crate) repeat_cache: std::sync::Mutex<Vec<(i32, bool)>>,
+    pub(crate) still_cache: Cache<Vec<u8>>,
+    pub(crate) layers: std::sync::Mutex<crate::peel::Layers>,
 }
 
 pub(crate) type Cell<T> = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<T>>>>;
