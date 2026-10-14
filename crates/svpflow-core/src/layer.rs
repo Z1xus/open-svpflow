@@ -488,10 +488,10 @@ impl Layer<'_> {
         let (width, height) = self.plane(plane);
         for y in 0..height {
             for x in 0..width {
-                if self.gap(plane, x, y) > 0.0 {
+                let (a, b) = self.texel(plane, x, y);
+                if self.gap(plane, x, y) > 0.0 || (a, b) == (1.0, 0.0) {
                     continue;
                 }
-                let (a, b) = self.texel(plane, x, y);
                 let own = (frames.first[plane].at(x, y), frames.second[plane].at(x, y));
                 let at = y * pitch + x;
                 if a.abs() < MIN || (own.0 - own.1).abs() <= SAME {
@@ -552,7 +552,8 @@ impl Layer<'_> {
                 };
                 let (a, b) = self.texel(plane, x, y);
                 let own = (first.at(x, y), second.at(x, y));
-                let kept = a.abs() < MIN || (gap <= 0.0 && (own.0 - own.1).abs() <= SAME);
+                let layered = gap <= 0.0 && (a, b) != (1.0, 0.0);
+                let kept = a.abs() < MIN || (layered && (own.0 - own.1).abs() <= SAME);
                 output[y * pitch + x] = pixel(if kept {
                     mix(own.0, own.1, time)
                 } else {

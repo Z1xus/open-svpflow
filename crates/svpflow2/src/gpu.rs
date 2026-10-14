@@ -1857,6 +1857,10 @@ inline float layer_raw(read_only image2d_t raw, const Params *p, float2 at) {
         (float2)(p->offset_x, p->offset_y) + at + 0.5f).x;
 }
 
+inline int layer_plain(const Params *p, float4 model) {
+    return fabs(model.x-1.0f) < 1e-4f && fabs(layer_offset(p, model)) < 1e-2f;
+}
+
 inline int layer_set(float4 model) {
     return fabs(model.x-1.0f) > 0.02f || fabs(model.y) > 1.0f;
 }
@@ -1954,7 +1958,7 @@ kernel void render_frame(
         else scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
 # endif
         float own_f = layer_raw(raw_f, &p, at), own_b = layer_raw(raw_b, &p, at);
-        result = fabs(model.x) < LAYER_MIN || (gap <= LAYER_NEAR && fabs(own_f-own_b) <= LAYER_SAME)
+        result = fabs(model.x) < LAYER_MIN || (gap <= LAYER_NEAR && !layer_plain(&p, model) && fabs(own_f-own_b) <= LAYER_SAME)
             ? mix(own_f, own_b, time)
             : model.x*scene + layer_offset(&p, model);
     } else
@@ -2150,7 +2154,7 @@ kernel void blend_frame(
 # endif
             float own_f = layer_raw(raw_f, &p, at), own_b = layer_raw(raw_b, &p, at);
             result = fabs(model.x) < LAYER_MIN
-                    || (gap <= LAYER_NEAR && fabs(own_f-own_b) <= LAYER_SAME)
+                    || (gap <= LAYER_NEAR && !layer_plain(&p, model) && fabs(own_f-own_b) <= LAYER_SAME)
                 ? mix(own_f, own_b, time)
                 : model.x*scene + layer_offset(&p, model);
         } else
