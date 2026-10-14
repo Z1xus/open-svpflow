@@ -203,7 +203,7 @@ pub fn stats(pairs: &[Pair], size: (usize, usize)) -> Stats {
     }
 }
 
-fn model(t: &[f32; 5], n: f32, limit: f32) -> (f32, f32) {
+fn model(t: &[f32; 5], n: f32, limit: f32, strict: bool) -> (f32, f32) {
     let (mp, mi) = (t[0] / n, t[1] / n);
     let (vp, vi, cov) = (t[2] / n - mp * mp, t[4] / n - mi * mi, t[3] / n - mp * mi);
     let a = cov / (vp + 4.0);
@@ -212,6 +212,11 @@ fn model(t: &[f32; 5], n: f32, limit: f32) -> (f32, f32) {
     let left = (vi - 2.0 * a * cov + a * a * vp).max(0.0);
     let g = ((1.0 - left / same.max(1e-3) - 0.5) / 0.2).clamp(0.0, 1.0)
         * ((same - limit) / limit).clamp(0.0, 1.0);
+    let g = if strict {
+        g * ((limit / 2.0 - left) / (limit / 4.0)).clamp(0.0, 1.0)
+    } else {
+        g
+    };
     (1.0 + g * (a - 1.0), g * b)
 }
 
@@ -264,6 +269,42 @@ fn distances(cells: &mut [u8], width: usize) {
     }
 }
 
+fn window(
+    parts: [Option<&Stats>; 3],
+    at: usize,
+    limit: f32,
+) -> Option<((f32, f32), std::ops::Range<usize>)> {
+    let own = parts[1]?;
+    let sums = &own.luma[at];
+    let same = (sums[4] - 2.0 * sums[3] + sums[2]) / own.count;
+    let pick = |strict| {
+        let mut best = ((1.0, 0.0), 0.0, 0..3);
+        for (window, range) in [0..3, 0..2, 1..3].into_iter().enumerate() {
+            let mut total = [0.0; 5];
+            let mut n = 0.0;
+            for part in parts[range.clone()].iter().flatten() {
+                for (total, sum) in total.iter_mut().zip(part.luma[at]) {
+                    *total += sum;
+                }
+                n += part.count;
+            }
+            let found = model(&total, n, limit, strict);
+            let e = error(sums, own.count, found);
+            if window == 0 || e * 1.15 + 2.0 < best.1 {
+                best = (found, e, range);
+            }
+        }
+        let (found, e, range) = best;
+        (e < 1.7 * same + 4.0 && found != (1.0, 0.0)).then_some((found, range))
+    };
+    // an overlay that changes here, like chat that scrolls, is clean in a near chunk
+    let near = [parts[0], parts[2]]
+        .into_iter()
+        .flatten()
+        .any(|part| set(model(&part.luma[at], part.count, limit, true)));
+    pick(true).or_else(|| near.then(|| pick(false)).flatten())
+}
+
 pub struct Fit {
     pub luma: Vec<i16>,
     pub chroma: [Vec<i16>; 2],
@@ -271,7 +312,7 @@ pub struct Fit {
 
 #[must_use]
 pub fn fit(parts: [Option<&Stats>; 3], (width, height): (usize, usize), limit: f32) -> Option<Fit> {
-    let own = parts[1]?;
+    parts[1]?;
     let half = width / 2;
     let limit = limit * limit;
     let mut rough = vec![(1.0, 0.0); width * height];
@@ -283,28 +324,9 @@ pub fn fit(parts: [Option<&Stats>; 3], (width, height): (usize, usize), limit: f
             scope.spawn(move || {
                 for (at, (rough, offsets)) in rough.iter_mut().zip(offsets).enumerate() {
                     let at = index * band + at;
-                    let sums = &own.luma[at];
-                    let mut best = ((1.0, 0.0), 0.0, 0..3);
-                    for (window, range) in [0..3, 0..2, 1..3].into_iter().enumerate() {
-                        let mut total = [0.0; 5];
-                        let mut n = 0.0;
-                        for part in parts[range.clone()].iter().flatten() {
-                            for (total, sum) in total.iter_mut().zip(part.luma[at]) {
-                                *total += sum;
-                            }
-                            n += part.count;
-                        }
-                        let found = model(&total, n, limit);
-                        let e = error(sums, own.count, found);
-                        if window == 0 || e * 1.15 + 2.0 < best.1 {
-                            best = (found, e, range);
-                        }
-                    }
-                    let ((a, b), e, range) = best;
-                    let same = (sums[4] - 2.0 * sums[3] + sums[2]) / own.count;
-                    if !(e < 1.7 * same + 4.0) || (a, b) == (1.0, 0.0) {
+                    let Some(((a, b), range)) = window(parts, at, limit) else {
                         continue;
-                    }
+                    };
                     let at = (at / width / 2) * half + (at % width) / 2;
                     let mut total = [0.0; 4];
                     let mut n = 0.0;
