@@ -344,6 +344,7 @@ impl RefineGpu {
             return None;
         }
         let device = self.device as Handle;
+        let _build = svpflow_core::OPENCL_BUILD.lock();
         let built = unsafe {
             (cl.BuildProgram)(
                 program,

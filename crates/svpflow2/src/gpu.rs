@@ -236,7 +236,7 @@ pub struct GpuContext {
     context: ClContext,
     device: ClDeviceId,
     program: ClProgram,
-    variants: std::sync::Mutex<Vec<(u32, ClProgram)>>,
+    variants: &'static std::sync::Mutex<Vec<(u32, ClProgram)>>,
     device_name: String,
     hi10: bool,
 
@@ -501,13 +501,6 @@ impl Drop for GpuContext {
                     (self.cl.ReleaseMemObject)(images.packed);
                 }
             }
-            if let Ok(variants) = self.variants.lock() {
-                for &(_, program) in variants.iter() {
-                    (self.cl.ReleaseProgram)(program);
-                }
-            }
-            (self.cl.ReleaseProgram)(self.program);
-            (self.cl.ReleaseContext)(self.context);
         }
     }
 }
@@ -589,29 +582,15 @@ impl GpuContext {
                 0
             };
             let device = devs[idx];
-            let mut err = 0;
-            let context = unsafe {
-                (cl.CreateContext)(
-                    std::ptr::null(),
-                    1,
-                    &raw const device,
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
-                    &raw mut err,
-                )
-            };
-            if err != CL_SUCCESS || context.is_null() {
+            let Some(&Shared {
+                context,
+                program,
+                ref variants,
+            }) = (unsafe { shared(&cl, device, hi10) })
+            else {
                 continue;
-            }
-
-            let base = format!("#define HI10P {}\n{KERNEL_SRC}", u8::from(hi10));
-            let program = match unsafe { build_program(&cl, context, device, &base) } {
-                Ok(p) => p,
-                Err(e) => {
-                    unsafe { (cl.ReleaseContext)(context) };
-                    return Err(e);
-                }
             };
+            let mut err = 0;
             let mut units = Vec::with_capacity(num_units);
             for _ in 0..num_units {
                 let name = CString::new("render_frame").map_err(|_| "nul")?;
@@ -624,10 +603,6 @@ impl GpuContext {
                 units.push(std::sync::Mutex::new(Unit::new(kernel, queue)));
             }
             if units.is_empty() {
-                unsafe {
-                    (cl.ReleaseProgram)(program);
-                    (cl.ReleaseContext)(context);
-                }
                 return Err("no render units".into());
             }
             let linear_name = CString::new("linear_luma").map_err(|_| "nul")?;
@@ -653,8 +628,6 @@ impl GpuContext {
                             (cl.ReleaseCommandQueue)(unit.queue);
                         }
                     }
-                    (cl.ReleaseProgram)(program);
-                    (cl.ReleaseContext)(context);
                 }
                 return Err("linear-luma render unit unavailable".into());
             }
@@ -686,7 +659,7 @@ impl GpuContext {
                 context,
                 device,
                 program,
-                variants: std::sync::Mutex::new(Vec::new()),
+                variants,
                 hi10,
                 device_name,
                 units,
@@ -1602,6 +1575,52 @@ impl GpuContext {
     }
 }
 
+struct Shared {
+    context: ClContext,
+    program: ClProgram,
+    variants: std::sync::Mutex<Vec<(u32, ClProgram)>>,
+}
+
+unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
+
+// shared by all clips, so no program builds while a clip frees its context
+unsafe fn shared(cl: &OpenCl, device: ClDeviceId, hi10: bool) -> Option<&'static Shared> {
+    static ALL: std::sync::Mutex<Vec<(usize, bool, &'static Shared)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut all = ALL.lock().ok()?;
+    let key = (device as usize, hi10);
+    if let Some(&(.., found)) = all.iter().find(|entry| (entry.0, entry.1) == key) {
+        return Some(found);
+    }
+    let mut err = 0;
+    let context = unsafe {
+        (cl.CreateContext)(
+            std::ptr::null(),
+            1,
+            &raw const device,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            &raw mut err,
+        )
+    };
+    if err != CL_SUCCESS || context.is_null() {
+        return None;
+    }
+    let base = format!("#define HI10P {}\n{KERNEL_SRC}", u8::from(hi10));
+    let Ok(program) = (unsafe { build_program(cl, context, device, &base) }) else {
+        unsafe { (cl.ReleaseContext)(context) };
+        return None;
+    };
+    let made = Box::leak(Box::new(Shared {
+        context,
+        program,
+        variants: std::sync::Mutex::new(Vec::new()),
+    }));
+    all.push((key.0, key.1, made));
+    Some(made)
+}
+
 unsafe fn build_program(
     cl: &OpenCl,
     context: ClContext,
@@ -1618,6 +1637,7 @@ unsafe fn build_program(
     if err != CL_SUCCESS || program.is_null() {
         return Err(format!("clCreateProgramWithSource failed ({err})"));
     }
+    let _build = svpflow_core::OPENCL_BUILD.lock();
     let build = unsafe {
         (cl.BuildProgram)(
             program,
