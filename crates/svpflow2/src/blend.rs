@@ -310,7 +310,7 @@ unsafe extern "system" fn get_frame(
     n: i32,
     activation_reason: i32,
     instance_data: *mut vs::Raw,
-    _: *mut vs::Raw,
+    frame_data: *mut vs::Raw,
     frame_ctx: vs::Raw,
     core: vs::Raw,
     vsapi: vs::ConstRaw,
@@ -328,6 +328,14 @@ unsafe extern "system" fn get_frame(
             std::ptr::null()
         }
         vs::AR_ALL_FRAMES_READY => {
+            let window: Vec<i32> = state.plan.window(n).map(|(frame, _)| frame).collect();
+            // called again once the dedup vectors are ready
+            if unsafe {
+                (*frame_data).is_null() && state.inner.reference_more(&window, frame_ctx, vsapi)
+            } {
+                unsafe { *frame_data = std::ptr::dangling_mut() };
+                return std::ptr::null();
+            }
             let output = unsafe { state.render(n, frame_ctx, core, vsapi) };
             if output.is_none()
                 && let Some(set_error) =

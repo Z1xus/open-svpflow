@@ -540,6 +540,7 @@ impl Options {
         }
         (f64_i64(timing.frame_num) / f64_i64(timing.frame_den) - 1.0).abs() < 0.001
             && self.hdr.mluminance < 0.0
+            && self.dedup().is_none()
     }
 
     fn algo_for_mode(&self, mode: i32) -> i64 {

@@ -19,6 +19,9 @@ fn cache_cap(bytes: usize) -> usize {
     ((96 << 20) / bytes.max(1)).clamp(4, 48)
 }
 
+// longer runs are still pictures
+const RUN: i32 = 3;
+
 struct Fetch {
     get_frame: vs::GetFrameFilter,
     free_frame: Option<vs::FreeFrame>,
@@ -247,13 +250,15 @@ impl FilterState {
             return (n, raw);
         };
         let repeat = |k: i32| self.repeat(fetch, api, k, threshold);
-        let single = |k: i32| repeat(k) && !repeat(k - 1) && !repeat(k + 1);
-        if n + 2 < self.video_info.num_frames && single(n + 1) {
-            (n + 1, raw / 2.0)
-        } else if single(n) {
-            (n, 128.0 + raw / 2.0)
-        } else {
-            (n, raw)
+        let start = (n - RUN..=n).rev().find(|&k| !repeat(k));
+        let end = (n + 1..=n + 1 + RUN).find(|&k| !repeat(k));
+        let end = end.filter(|&end| end < self.video_info.num_frames);
+        match (start, end) {
+            (Some(start), Some(end)) if end - start > 1 => {
+                let position = f64::from(n - start) * 256.0 + raw;
+                (end - 1, position / f64::from(end - start))
+            }
+            _ => (n, raw),
         }
     }
 
@@ -609,34 +614,78 @@ impl FilterState {
         let engine::Step { n, phase, .. } = rates.step(&params, frame);
         let dedup = self.dedup_limit().is_some();
         let mut wanted = Vec::new();
-        let vectors = engine::needs_vectors(phase) || dedup;
         let sources = if dedup {
-            (n - 2).max(0)..=n + 2
+            (n - RUN - 1).max(0)..=n + RUN + 1
         } else {
             n..=n + 1
         };
         wanted.extend(sources.map(|k| (self.clips.source, k)));
-        if vectors {
-            let last = n + i32::from(dedup);
-            if self.request_super {
-                wanted.extend((n..=last + 1).map(|k| (self.clips.super_clip, k)));
-            }
-            let reach = engine::vector_reach(&params);
-            if self.nvof.is_some() {
-                let extra = nvof_extra(&params);
-                wanted.extend((n..=n + 1 + extra).map(|k| (self.clips.vec_src, k)));
-            } else {
-                wanted.extend(((n - reach).max(0)..=last + reach).map(|k| (self.clips.vectors, k)));
-                for base in n..=last {
-                    self.layer_wanted(&mut wanted, base);
-                }
+        if engine::needs_vectors(phase) || dedup && !self.later {
+            let last = if dedup { n + RUN } else { n };
+            self.vectors_wanted(&mut wanted, n..=last, engine::vector_reach(&params));
+        }
+        request_all(request_frame, wanted, frame_ctx);
+    }
+
+    fn vectors_wanted(
+        &self,
+        wanted: &mut Vec<(vs::Raw, i32)>,
+        pairs: std::ops::RangeInclusive<i32>,
+        reach: i32,
+    ) {
+        let (n, last) = (*pairs.start(), *pairs.end());
+        if self.request_super {
+            wanted.extend((n..=last + 1).map(|k| (self.clips.super_clip, k)));
+        }
+        if self.nvof.is_some() {
+            let extra = nvof_extra(&self.options.reference());
+            wanted.extend((n..=n + 1 + extra).map(|k| (self.clips.vec_src, k)));
+        } else {
+            wanted.extend(((n - reach).max(0)..=last + reach).map(|k| (self.clips.vectors, k)));
+            for base in n..=last {
+                self.layer_wanted(wanted, base);
             }
         }
-        wanted.sort_unstable_by_key(|&(node, k)| (node as usize, k));
-        wanted.dedup();
-        for (node, k) in wanted {
-            request_node(request_frame, node, k, frame_ctx);
+    }
+
+    pub(crate) unsafe fn reference_more(
+        &self,
+        frames: &[i32],
+        frame_ctx: vs::Raw,
+        vsapi: vs::ConstRaw,
+    ) -> bool {
+        if !self.later || self.dedup_limit().is_none() || !self.reference_enabled() {
+            return false;
         }
+        let (Some(get_frame), Some(request_frame), Some(api)) = (unsafe {
+            (
+                vs::table_fn::<vs::GetFrameFilter>(vsapi, vs::GET_FRAME_FILTER),
+                vs::table_fn::<vs::RequestFrameFilter>(vsapi, vs::REQUEST_FRAME_FILTER),
+                frame::PlaneApi::load(vsapi),
+            )
+        }) else {
+            return false;
+        };
+        let fetch = Fetch {
+            get_frame,
+            free_frame: unsafe { vs::table_fn::<vs::FreeFrame>(vsapi, vs::FREE_FRAME) },
+            frame_ctx,
+        };
+        let params = self.options.reference();
+        let rates = self.rates(&params);
+        let mut wanted = Vec::new();
+        for &frame in frames {
+            let engine::Step { n, raw, phase } = rates.step(&params, frame);
+            let moved = self.dedup(&fetch, &api, n, raw);
+            if !engine::needs_vectors(phase) && moved != (n, raw) {
+                self.vectors_wanted(&mut wanted, moved.0..=moved.0, 0);
+            }
+        }
+        if wanted.is_empty() {
+            return false;
+        }
+        request_all(request_frame, wanted, frame_ctx);
+        true
     }
 
     fn with_vectors<R>(
@@ -716,6 +765,8 @@ impl FilterState {
             mut phase,
         } = rates.step(&params, frame);
         let moved = self.dedup(&fetch, &api, n, raw);
+        // its neighbors were not requested
+        let narrow = self.later && moved != (n, raw) && !engine::needs_vectors(phase);
         if moved != (n, raw) {
             (n, raw) = moved;
             phase = rates.phase(&params, raw);
@@ -726,6 +777,9 @@ impl FilterState {
         let limits = engine::limits(&params);
         let load = |k: i32| self.cached_field(&fetch, &api, (k, n), shape);
         let mut quality = |k: i32| -> i32 {
+            if narrow && k != n {
+                return 3;
+            }
             if self.nvof.is_none()
                 && let Some(cell) = crate::core::cache_cell(&self.quality_cells, i64::from(k), 64)
             {
@@ -1299,4 +1353,16 @@ fn draw_vectors(
 
 fn nvof_extra(params: &ReferenceParams) -> i32 {
     i32::from(params.level != 0 || params.algo == 23 || params.algo > 89)
+}
+
+fn request_all(
+    request_frame: vs::RequestFrameFilter,
+    mut wanted: Vec<(vs::Raw, i32)>,
+    frame_ctx: vs::Raw,
+) {
+    wanted.sort_unstable_by_key(|&(node, k)| (node as usize, k));
+    wanted.dedup();
+    for (node, k) in wanted {
+        request_node(request_frame, node, k, frame_ctx);
+    }
 }

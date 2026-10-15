@@ -70,6 +70,7 @@ pub(crate) struct FilterState {
     pub(crate) source_8bit_mode: bool,
     pub(crate) render_mode: i32,
     pub(crate) request_super: bool,
+    pub(crate) later: bool,
     pub(crate) options: options::Options,
     pub(crate) scene_luma_luts: [metadata::SceneLumaLut; 2],
     pub(crate) light: light::LightState,

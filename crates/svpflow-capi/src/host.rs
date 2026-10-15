@@ -451,10 +451,15 @@ impl Task {
             return self.complete(produced);
         }
         let frame = self.call(vs3::AR_INITIAL);
-        let context = unsafe { &mut *self.context.get() };
+        let context = unsafe { &*self.context.get() };
         if !frame.is_null() || context.error.is_some() {
             return self.finish(frame);
         }
+        self.wait();
+    }
+
+    fn wait(self: Arc<Self>) {
+        let context = unsafe { &mut *self.context.get() };
         self.waiting.store(1, Ordering::Relaxed);
         for (node, n) in std::mem::take(&mut context.requests) {
             let cell = node.start(n, self.priority);
@@ -474,6 +479,11 @@ impl Task {
 
     fn run(self: Arc<Self>) {
         let frame = self.call(vs3::AR_ALL_FRAMES_READY);
+        let context = unsafe { &*self.context.get() };
+        // a filter may request more frames in its second call
+        if frame.is_null() && context.error.is_none() && !context.requests.is_empty() {
+            return self.wait();
+        }
         self.finish(frame);
     }
 
@@ -625,7 +635,7 @@ impl Host {
         }
         Ok(Arc::new(Self {
             info: CoreInfo {
-                version: c"open-svpflow".as_ptr(),
+                version: vs3::LATER_REQUESTS.as_ptr(),
                 core: 0,
                 api: 3 << 16,
                 num_threads: i32::try_from(threads).unwrap_or(1),

@@ -97,6 +97,7 @@ pub(crate) unsafe fn build_state(
     options.normalize_scene_mode(mode, &video_info.source());
     options.apply_source_depth(video_format::source_depth(&video_info));
     let mut data = unsafe { collect_state(mode, input, vsapi, &api, source, video_info, options) };
+    data.later = unsafe { later_requests(core, vsapi) };
     if let metadata::VectorRecord::Ready(vectors) = data.vector_data() {
         data.options.scale_scene_limits(vectors.block);
     }
@@ -224,6 +225,18 @@ unsafe fn load_create_api(output: vs::Raw, vsapi: vs::ConstRaw) -> Option<Create
         unsafe { set_error(output, vsapi, strings::ERR_VSAPI.as_ptr().cast()) };
         None
     }
+}
+
+unsafe fn later_requests(core: vs::Raw, vsapi: vs::ConstRaw) -> bool {
+    let Some(get_core_info) =
+        (unsafe { vs::table_fn::<vs::GetCoreInfo>(vsapi, vs::GET_CORE_INFO) })
+    else {
+        return false;
+    };
+    let info = unsafe { get_core_info(core) };
+    !info.is_null()
+        && !unsafe { (*info).version }.is_null()
+        && unsafe { std::ffi::CStr::from_ptr((*info).version) } == vs::LATER_REQUESTS
 }
 
 unsafe fn core_threads(core: vs::Raw, vsapi: vs::ConstRaw) -> i32 {
@@ -362,6 +375,7 @@ unsafe fn collect_state(
         source_8bit_mode,
         render_mode,
         request_super: false,
+        later: false,
         options,
         scene_luma_luts,
         light: light::LightState::new(),
@@ -857,7 +871,7 @@ unsafe extern "system" fn get_frame(
     n: i32,
     activation_reason: i32,
     instance_data: *mut vs::Raw,
-    _: *mut vs::Raw,
+    frame_data: *mut vs::Raw,
     frame_ctx: vs::Raw,
     core: vs::Raw,
     vsapi: vs::ConstRaw,
@@ -875,7 +889,14 @@ unsafe extern "system" fn get_frame(
             unsafe { state.request_frame(n, frame_ctx, vsapi) };
             std::ptr::null()
         }
-        2 => unsafe { state.get_frame(n, None, frame_ctx, core, vsapi) },
+        2 => unsafe {
+            // called again once the dedup vectors are ready
+            if (*frame_data).is_null() && state.reference_more(&[n], frame_ctx, vsapi) {
+                *frame_data = std::ptr::dangling_mut();
+                return std::ptr::null();
+            }
+            state.get_frame(n, None, frame_ctx, core, vsapi)
+        },
         _ => std::ptr::null(),
     }
 }
