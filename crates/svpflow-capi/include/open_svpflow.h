@@ -66,6 +66,7 @@ osvp_clip *osvp_unpeel(const osvp_context *context, const osvp_clip *clip,
 void osvp_clip_info(const osvp_clip *clip, osvp_video_info *info);
 void osvp_clip_free(osvp_clip *clip);
 
+void osvp_clip_set_end(const osvp_clip *clip, int32_t last);
 const osvp_frame *osvp_get_frame(const osvp_clip *clip, int32_t n);
 const uint8_t *osvp_frame_data(const osvp_frame *frame, int32_t plane);
 ptrdiff_t osvp_frame_stride(const osvp_frame *frame, int32_t plane);

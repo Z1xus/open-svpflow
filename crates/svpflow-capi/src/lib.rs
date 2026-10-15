@@ -5,6 +5,7 @@ mod host;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use host::{Frame, Host, Map, Node, Pending, Read, Release, Value};
@@ -32,6 +33,7 @@ pub struct Context(Arc<Host>);
 pub struct Clip {
     node: Arc<Node>,
     ahead: Mutex<(i32, VecDeque<(i32, Pending)>)>,
+    end: AtomicI32,
 }
 
 thread_local! {
@@ -45,9 +47,11 @@ fn fail<T>(message: impl Into<Vec<u8>>) -> *mut T {
 }
 
 fn clip(node: Arc<Node>) -> *mut Clip {
+    let end = AtomicI32::new(node.info().num_frames - 1);
     Box::into_raw(Box::new(Clip {
         node,
         ahead: Mutex::default(),
+        end,
     }))
 }
 
@@ -362,10 +366,17 @@ pub unsafe extern "C" fn osvp_clip_free(clip: *mut Clip) {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn osvp_clip_set_end(clip: *const Clip, last: i32) {
+    let clip = unsafe { &*clip };
+    let frames = clip.node.info().num_frames;
+    clip.end.store(last.clamp(0, frames - 1), Ordering::Relaxed);
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn osvp_get_frame(clip: *const Clip, n: i32) -> *const Frame {
     let clip = unsafe { &*clip };
     let host = clip.node.host();
-    let last = clip.node.info().num_frames - 1;
+    let last = clip.end.load(Ordering::Relaxed);
     {
         let mut ahead = clip.ahead.lock().unwrap_or_else(PoisonError::into_inner);
         let (next, pending) = &mut *ahead;
