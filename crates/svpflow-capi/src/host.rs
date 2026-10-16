@@ -386,7 +386,9 @@ impl Node {
         if let Some(index) = state.ahead.iter().position(|(frame, _)| *frame == n) {
             return Ok(state.ahead.swap_remove(index).1);
         }
-        let first = if n < state.next || n - state.next > READ_AHEAD {
+        // more workers ask for source frames further apart
+        let reach = READ_AHEAD.max(8 * self.host.threads());
+        let first = if n < state.next || n - state.next > reach {
             n
         } else {
             state.next
@@ -413,7 +415,7 @@ impl Node {
             if index == n {
                 wanted = Some(frame);
             } else {
-                state.ahead.retain(|(frame, _)| *frame > index - READ_AHEAD);
+                state.ahead.retain(|(frame, _)| *frame > index - reach);
                 state.ahead.push((index, frame));
             }
         }
