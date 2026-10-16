@@ -246,6 +246,8 @@ pub struct GpuContext {
     next_upload: std::sync::atomic::AtomicUsize,
 
     super_cache: std::sync::Mutex<Vec<(i64, SuperCell)>>,
+    // frames out of the cache that a blend job still holds
+    super_held: std::sync::Mutex<Vec<(i64, std::sync::Weak<SuperEntry>)>>,
     image_pool: std::sync::Arc<ImagePool>,
     staging: std::sync::Mutex<Vec<Staging>>,
     still: std::sync::Mutex<StillState>,
@@ -670,6 +672,7 @@ impl GpuContext {
                 cache_resources,
                 next_upload: std::sync::atomic::AtomicUsize::new(0),
                 super_cache: std::sync::Mutex::new(Vec::new()),
+                super_held: std::sync::Mutex::new(Vec::new()),
                 image_pool: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 staging: std::sync::Mutex::new(Vec::new()),
                 still: std::sync::Mutex::new(StillState {
@@ -731,8 +734,17 @@ impl GpuContext {
                 cell
             } else {
                 let cell = std::sync::Arc::new(std::sync::OnceLock::new());
+                let mut held = self.super_held.lock().ok()?;
                 if cache.len() >= SUPER_CACHE_CAP {
-                    cache.remove(0);
+                    let (old, gone) = cache.remove(0);
+                    held.retain(|(k, entry)| *k != old && entry.strong_count() > 0);
+                    if let Some(Some(entry)) = gone.get() {
+                        held.push((old, std::sync::Arc::downgrade(entry)));
+                    }
+                }
+                let found = held.iter().find(|(k, _)| *k == key);
+                if let Some(entry) = found.and_then(|(_, entry)| entry.upgrade()) {
+                    let _ = cell.set(Some(entry));
                 }
                 cache.push((key, std::sync::Arc::clone(&cell)));
                 cell

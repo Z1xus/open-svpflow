@@ -39,11 +39,23 @@ pub(super) struct LayerState {
     found: (ClMem, usize),
     stats: Vec<(i64, Arc<Owned>, i32)>,
     fits: Vec<(i64, Arc<Layer>)>,
+    // fits out of the cache that a blend job still holds
+    held: Vec<(i64, std::sync::Weak<Layer>)>,
 }
 
 unsafe impl Send for LayerState {}
 
 impl LayerState {
+    fn keep(&mut self, chunk: i64, fit: &Arc<Layer>) {
+        if self.fits.len() >= FIT_CAP {
+            let (old, gone) = self.fits.remove(0);
+            self.held
+                .retain(|(key, fit)| *key != old && *key != chunk && fit.strong_count() > 0);
+            self.held.push((old, Arc::downgrade(&gone)));
+        }
+        self.fits.push((chunk, Arc::clone(fit)));
+    }
+
     pub(super) const fn new() -> Self {
         Self {
             queue: std::ptr::null_mut(),
@@ -53,6 +65,7 @@ impl LayerState {
             found: (std::ptr::null_mut(), 0),
             stats: Vec::new(),
             fits: Vec::new(),
+            held: Vec::new(),
         }
     }
 }
@@ -112,6 +125,7 @@ impl GpuContext {
         if let Ok(mut state) = self.layer.lock() {
             state.stats.clear();
             state.fits.clear();
+            state.held.clear();
             unsafe {
                 for kernel in state.kernels {
                     if !kernel.is_null() {
@@ -296,6 +310,11 @@ impl GpuContext {
             state.fits.push(entry);
             return Some(fit);
         }
+        let held = state.held.iter().find(|(key, _)| *key == chunk);
+        if let Some(fit) = held.and_then(|(_, fit)| fit.upgrade()) {
+            state.keep(chunk, &fit);
+            return Some(fit);
+        }
         unsafe { self.layer_setup(&mut state) }?;
         let width = usize::try_from(params[0].width).ok()?;
         let height = usize::try_from(params[0].height).ok()?;
@@ -412,10 +431,7 @@ impl GpuContext {
             }
         }
         let made = Arc::new(made);
-        if state.fits.len() >= FIT_CAP {
-            state.fits.remove(0);
-        }
-        state.fits.push((chunk, Arc::clone(&made)));
+        state.keep(chunk, &made);
         Some(made)
     }
 }
