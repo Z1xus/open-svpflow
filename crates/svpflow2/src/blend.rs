@@ -64,8 +64,8 @@ unsafe fn plan(
     let options = &inner.options;
     let reason = if inner.gpu.is_none() {
         Some("GPU rendering is required (build the super clip with gpu:1)")
-    } else if !video_format::is_yuv420p8(&inner.video_info) {
-        Some("clip must be YUV 4:2:0 8-bit")
+    } else if !video_format::is_cpu_source(&inner.video_info) {
+        Some("clip must be YUV 4:2:0 or 4:4:4 8-bit")
     } else if options.padding(&vs::Source::source(&inner.video_info)) != (0, 0)
         || options.debug_qmap()
         || options.debug_vectors()
@@ -171,12 +171,10 @@ impl BlendState {
         let Plan { info, .. } = &self.plan;
         let width = usize::try_from(info.width).ok()?;
         let height = usize::try_from(info.height).ok()?;
-        let sizes = [
-            (width, height),
-            (width / 2, height / 2),
-            (width / 2, height / 2),
-        ];
-        let job = gpu.blend_begin(width, height, height / 2, self.plan.gamma)?;
+        let (cx, cy) = video_format::chroma_divisors(info);
+        let chroma = (width / cx as usize, height / cy as usize);
+        let sizes = [(width, height), chroma, chroma];
+        let job = gpu.blend_begin(width.max(chroma.0 * 2), height, chroma.1, self.plan.gamma)?;
         for (frame, weight) in self.plan.window(n) {
             job.start(weight);
             let rendered = unsafe {

@@ -599,7 +599,7 @@ impl GpuContext {
         divisor: f32,
         planes: [OutputPlane<'_>; 3],
     ) -> Option<()> {
-        let fits = planes[0].width == job.width
+        let fits = planes[0].width <= job.width
             && planes[0].height + planes[1].height == job.rows
             && planes[1].width + planes[2].width <= job.width
             && planes.iter().all(|plane| {
