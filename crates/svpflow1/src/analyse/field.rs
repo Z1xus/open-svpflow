@@ -1198,7 +1198,7 @@ impl BlockSearch<'_> {
         let chroma_shape = self.chroma_shape();
         let chroma_span = chroma_shape.span(u.pitch);
         let (cx, cy) = (s.pos[1] * pel, s.pos_y[1] * pel);
-        if chroma && !self.planes_fit {
+        if chroma {
             let xs = (cx + (min_x >> sx), cx + (max_x >> sx));
             let ys = (cy + (min_y >> sy), cy + (max_y >> sy));
             if u.pitch != v.pitch
