@@ -366,6 +366,8 @@ impl GpuContext {
                 && self.set(fit_kernel, 7, &w)
                 && self.set(fit_kernel, 8, &h)
                 && self.set(fit_kernel, 9, &limit)
+                && self.set(fit_kernel, 10, &params[1].width)
+                && self.set(fit_kernel, 11, &params[1].height)
                 && self.run(state.queue, fit_kernel, [width, height])
                 && self.set(clean_kernel, 0, &rough)
                 && self.set(clean_kernel, 1, &made.fit.0)

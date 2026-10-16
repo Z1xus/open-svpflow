@@ -152,8 +152,9 @@ fn gather<const N: usize>(
     pairs: &[Pair],
     plane: usize,
     (width, height): (usize, usize),
+    chroma: usize,
 ) -> Vec<[f32; N]> {
-    let ratio = if plane == 0 { 1 } else { 2 };
+    let ratio = if plane == 0 { 1 } else { chroma };
     let size = (width / ratio, height / ratio);
     let top = ((size.0 - 1) as f32, (size.1 - 1) as f32);
     let mut sums = vec![[0.0; N]; size.0 * size.1];
@@ -194,11 +195,15 @@ fn gather<const N: usize>(
     sums
 }
 
+// chroma is 2 when the color planes are half the size of the picture, as in 4:2:0, and 1 in 4:4:4
 #[must_use]
-pub fn stats(pairs: &[Pair], size: (usize, usize)) -> Stats {
+pub fn stats(pairs: &[Pair], size: (usize, usize), chroma: usize) -> Stats {
     Stats {
-        luma: gather(pairs, 0, size),
-        chroma: [gather(pairs, 1, size), gather(pairs, 2, size)],
+        luma: gather(pairs, 0, size, 1),
+        chroma: [
+            gather(pairs, 1, size, chroma),
+            gather(pairs, 2, size, chroma),
+        ],
         count: (pairs.len() * 2) as f32,
     }
 }
@@ -311,9 +316,14 @@ pub struct Fit {
 }
 
 #[must_use]
-pub fn fit(parts: [Option<&Stats>; 3], (width, height): (usize, usize), limit: f32) -> Option<Fit> {
+pub fn fit(
+    parts: [Option<&Stats>; 3],
+    (width, height): (usize, usize),
+    limit: f32,
+    ratio: usize,
+) -> Option<Fit> {
     parts[1]?;
-    let half = width / 2;
+    let half = width / ratio;
     let limit = limit * limit;
     let mut rough = vec![(1.0, 0.0); width * height];
     let mut offsets = vec![[0.0f32; 2]; width * height];
@@ -327,7 +337,7 @@ pub fn fit(parts: [Option<&Stats>; 3], (width, height): (usize, usize), limit: f
                     let Some(((a, b), range)) = window(parts, at, limit) else {
                         continue;
                     };
-                    let at = (at / width / 2) * half + (at % width) / 2;
+                    let at = (at / width / ratio) * half + (at % width) / ratio;
                     let mut total = [0.0; 4];
                     let mut n = 0.0;
                     for part in parts[range].iter().flatten() {
@@ -346,7 +356,9 @@ pub fn fit(parts: [Option<&Stats>; 3], (width, height): (usize, usize), limit: f
 
     let fixed = |value: f32, scale: f32| (value * scale).round().clamp(-32767.0, 32767.0) as i16;
     let mut luma = vec![0; width * height * 2];
-    let mut chroma = [vec![0; half * height], vec![0; half * height]];
+    // the color planes hold the offsets, and below them in the second plane the distances to the layer
+    let rows = height / ratio * 2;
+    let mut chroma = [vec![0; half * rows], vec![0; half * rows]];
     let cells = (width.div_ceil(CELL), height.div_ceil(CELL));
     let mut cover = vec![255; cells.0 * cells.1];
     let (gains, shifts) = luma.split_at_mut(width * height);
@@ -372,15 +384,16 @@ pub fn fit(parts: [Option<&Stats>; 3], (width, height): (usize, usize), limit: f
             }
             gains[at] = fixed(rough[at].0, GAIN);
             shifts[at] = fixed(rough[at].1, OFFSET);
-            let at = (y / 2) * half + x / 2;
+            let at = (y / ratio) * half + x / ratio;
+            let share = (ratio * ratio) as f32;
             for (plane, offset) in chroma.iter_mut().zip(offsets[y * width + x]) {
-                plane[at] += fixed(offset / 4.0, OFFSET);
+                plane[at] += fixed(offset / share, OFFSET);
             }
         }
     }
     distances(&mut cover, cells.0);
     for (row, cover) in cover.chunks_exact(cells.0).enumerate() {
-        let at = (height / 2 + row) * half;
+        let at = (height / ratio + row) * half;
         for (cell, &distance) in chroma[1][at..].iter_mut().zip(cover) {
             *cell = i16::from(distance);
         }
@@ -390,12 +403,13 @@ pub fn fit(parts: [Option<&Stats>; 3], (width, height): (usize, usize), limit: f
 
 impl Fit {
     #[must_use]
-    pub fn layer(&self, (width, height): (usize, usize)) -> Layer<'_> {
+    pub fn layer(&self, (width, height): (usize, usize), ratio: usize) -> Layer<'_> {
         Layer {
             luma: &self.luma,
             chroma: [&self.chroma[0], &self.chroma[1]],
-            pitch: (width, width / 2),
+            pitch: (width, width / ratio),
             size: (width, height),
+            ratio,
         }
     }
 }
@@ -406,6 +420,8 @@ pub struct Layer<'a> {
     pub chroma: [&'a [i16]; 2],
     pub pitch: (usize, usize),
     pub size: (usize, usize),
+    // 2 when the color planes are half the size of the picture, 1 when they are as large
+    pub ratio: usize,
 }
 
 pub struct Frames<'a> {
@@ -415,21 +431,25 @@ pub struct Frames<'a> {
 }
 
 impl Layer<'_> {
+    fn ratio(&self, plane: usize) -> usize {
+        if plane == 0 { 1 } else { self.ratio }
+    }
+
     fn plane(&self, plane: usize) -> (usize, usize) {
-        let ratio = if plane == 0 { 1 } else { 2 };
+        let ratio = self.ratio(plane);
         (self.size.0 / ratio, self.size.1 / ratio)
     }
 
     fn gap(&self, plane: usize, x: usize, y: usize) -> f32 {
-        let cell = if plane == 0 { CELL } else { CELL / 2 };
-        let at = (self.size.1 / 2 + y / cell) * self.pitch.1 + x / cell;
+        let cell = CELL / self.ratio(plane);
+        let at = (self.size.1 / self.ratio + y / cell) * self.pitch.1 + x / cell;
         f32::from(self.chroma[1][at]) * 8.0 - 8.0
     }
 
     #[must_use]
     pub fn empty(&self) -> bool {
         let (width, height) = (self.size.0.div_ceil(CELL), self.size.1.div_ceil(CELL));
-        let rows = self.chroma[1][self.size.1 / 2 * self.pitch.1..].chunks(self.pitch.1);
+        let rows = self.chroma[1][self.size.1 / self.ratio * self.pitch.1..].chunks(self.pitch.1);
         rows.take(height)
             .all(|row| row[..width].iter().all(|&distance| distance != 0))
     }
@@ -440,10 +460,18 @@ impl Layer<'_> {
             let offset = self.luma[(self.size.1 + y) * self.pitch.0 + x];
             return (gain(x, y) / GAIN, f32::from(offset) / OFFSET);
         }
-        let (x2, y2) = (x * 2, y * 2);
-        let gain = gain(x2, y2) + gain(x2 + 1, y2) + gain(x2, y2 + 1) + gain(x2 + 1, y2 + 1);
+        let ratio = self.ratio;
+        let mut total = 0.0;
+        for dy in 0..ratio {
+            for dx in 0..ratio {
+                total += gain(x * ratio + dx, y * ratio + dy);
+            }
+        }
         let offset = self.chroma[plane - 1][y * self.pitch.1 + x];
-        (gain / (4.0 * GAIN), f32::from(offset) / OFFSET)
+        (
+            total / ((ratio * ratio) as f32 * GAIN),
+            f32::from(offset) / OFFSET,
+        )
     }
 
     fn model(&self, plane: usize, x: f32, y: f32) -> (f32, f32) {
@@ -471,7 +499,7 @@ impl Layer<'_> {
         if let Some(scene) = under(x, y) {
             return (scene, true);
         }
-        let radius = if plane == 0 { FILL } else { FILL / 2.0 };
+        let radius = FILL / self.ratio(plane) as f32;
         let top = ((size.0 - 1) as f32, (size.1 - 1) as f32);
         for ring in 1..=3 {
             if !fill {
@@ -537,7 +565,7 @@ impl Layer<'_> {
         algo: i32,
     ) {
         let (width, height) = self.plane(plane);
-        let ratio = if plane == 0 { 1 } else { 2 };
+        let ratio = self.ratio(plane);
         let top = ((width - 1) as f32, (height - 1) as f32);
         let (first, second, time) = (frames.first[plane], frames.second[plane], frames.time);
         let far = (motion.far() + 1.0).max(16.0);

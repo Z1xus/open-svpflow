@@ -11,11 +11,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use host::{Frame, Host, Map, Node, Pending, Read, Release, Value};
 use svpflow_host::vs3;
 
-const FORMATS: [i32; 4] = [
+const FORMATS: [i32; 5] = [
     vs3::PF_YUV420P8,
     vs3::PF_YUV444P8,
     vs3::PF_YUV420P10,
     vs3::PF_YUV420P16,
+    vs3::PF_YUV444P16,
 ];
 
 #[repr(C)]

@@ -2363,12 +2363,12 @@ kernel void layer_stats(
 kernel void layer_fit(
     global const float *prev, global const float *cur, global const float *next,
     int n_prev, int n_cur, int n_next, write_only image2d_t fit, int width, int height,
-    float limit)
+    float limit, int chroma_w, int chroma_h)
 {
     int x = get_global_id(0), y = get_global_id(1);
     int at = (y*width+x)*5;
-    int second = (width/2)*(height/2)*2;
-    int at_u = width*height*5 + ((y/2)*(width/2) + x/2)*2;
+    int second = chroma_w*chroma_h*2;
+    int at_u = width*height*5 + ((y/(height/chroma_h))*chroma_w + x/(width/chroma_w))*2;
     global const float *parts[3] = {prev, cur, next};
     int counts[3] = {n_prev, n_cur, n_next};
     float own[5];

@@ -16,7 +16,8 @@ enum {
     OSVP_YUV420P8,
     OSVP_YUV444P8,
     OSVP_YUV420P10,
-    OSVP_YUV420P16
+    OSVP_YUV420P16,
+    OSVP_YUV444P16
 };
 
 typedef struct {

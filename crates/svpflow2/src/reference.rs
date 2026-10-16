@@ -141,7 +141,9 @@ impl FilterState {
     fn layer_plan(&self) -> Option<(i32, f32)> {
         let limit = self.options.mask_peel()?;
         let last = self.video_info.num_frames - 2;
-        (self.nvof.is_none() && last >= 0 && self.chroma() == (2, 2)).then_some((last, limit))
+        let chroma = self.chroma();
+        let even = chroma == (2, 2) || chroma == (1, 1);
+        (self.nvof.is_none() && last >= 0 && even).then_some((last, limit))
     }
 
     fn layer_wanted(&self, wanted: &mut Vec<(vs::Raw, i32)>, n: i32) {
@@ -179,7 +181,7 @@ impl FilterState {
         data: &metadata::VectorData,
     ) -> Option<std::sync::Arc<layer::Fit>> {
         let (last, limit) = self.layer_plan()?;
-        if !crate::video_format::is_yuv420p8(&self.video_info) {
+        if !crate::video_format::is_cpu_source(&self.video_info) {
             return None;
         }
         let chunks = crate::peel::Chunks {
@@ -193,6 +195,7 @@ impl FilterState {
                 self.video_info.height as usize,
             ),
             last,
+            ratio: self.chroma().0 as usize,
         };
         let mut layers = self.layers.lock().ok()?;
         layers.fit(&chunks, n / layer::CHUNK, limit, &Vec::new())
@@ -298,7 +301,7 @@ impl FilterState {
             params,
             vector_data,
             (width, height),
-            (2, 2),
+            self.chroma(),
             13,
             256,
             false,
@@ -1198,7 +1201,7 @@ impl FilterState {
         if let (Some(fit), (Some(first), Some(second))) =
             (self.layer_cpu(api, fetch, n, vector_data), raw)
         {
-            let fit = fit.layer((w, h));
+            let fit = fit.layer((w, h), cx);
             let frames = layer::Frames {
                 first,
                 second,

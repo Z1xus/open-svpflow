@@ -93,6 +93,7 @@ pub const PF_YUV420P8: i32 = CM_YUV + 10;
 pub const PF_YUV444P8: i32 = CM_YUV + 12;
 pub const PF_YUV420P10: i32 = CM_YUV + 19;
 pub const PF_YUV420P16: i32 = CM_YUV + 22;
+pub const PF_YUV444P16: i32 = CM_YUV + 24;
 
 pub const PRESETS: [(i32, i32, i32, i32, i32, i32); 20] = [
     (CM_GRAY + 10, 1, 0, 8, 0, 0),

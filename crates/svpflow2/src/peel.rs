@@ -79,6 +79,8 @@ pub(crate) struct Chunks<'a> {
     pub(crate) data: &'a metadata::VectorData,
     pub(crate) size: (usize, usize),
     pub(crate) last: i32,
+    // 2 when the color planes are half the size of the picture, as in 4:2:0, and 1 in 4:4:4
+    pub(crate) ratio: usize,
 }
 
 impl Chunks<'_> {
@@ -89,7 +91,9 @@ impl Chunks<'_> {
         let made = (|| {
             let planes: Vec<_> = sources
                 .iter()
-                .map(|&frame| unsafe { planes(self.api, frame, (self.size.1, self.size.1 / 2)) })
+                .map(|&frame| unsafe {
+                    planes(self.api, frame, (self.size.1, self.size.1 / self.ratio))
+                })
                 .collect::<Option<_>>()?;
             let motions: Vec<_> = vectors
                 .iter()
@@ -119,7 +123,7 @@ impl Chunks<'_> {
                     ),
                 })
                 .collect();
-            Some(layer::stats(&pairs, self.size))
+            Some(layer::stats(&pairs, self.size, self.ratio))
         })();
         for frame in sources.into_iter().chain(vectors) {
             unsafe { self.api.free(frame) };
@@ -164,7 +168,7 @@ impl Layers {
             Some(stats)
         });
         let parts = parts.each_ref().map(Option::as_deref);
-        let fit = Arc::new(layer::fit(parts, chunks.size, limit)?);
+        let fit = Arc::new(layer::fit(parts, chunks.size, limit, chunks.ratio)?);
         keep(&mut self.fits, chunk, &fit, FIT_CAP);
         Some(fit)
     }
@@ -189,6 +193,11 @@ struct State {
     clips: [vs::Raw; 3],
     info: vs::VideoInfo,
     size: (usize, usize),
+    ratio: usize,
+}
+
+fn ratio(info: &vs::VideoInfo) -> usize {
+    video_format::chroma_divisors(info).0 as usize
 }
 
 unsafe fn clips<const N: usize>(
@@ -260,9 +269,14 @@ pub(crate) unsafe extern "system" fn create_layer(
             return None;
         };
         let limit = unsafe { get_float(input, c"limit".as_ptr(), 0, &raw mut error) };
-        let format = unsafe { preset(vs::PF_YUV420P16, core) };
+        let id = if ratio(&info) == 1 {
+            vs::PF_YUV444P16
+        } else {
+            vs::PF_YUV420P16
+        };
+        let format = unsafe { preset(id, core) };
         let even = info.width % 2 == 0 && info.height % 2 == 0;
-        let fits = video_format::is_yuv420p8(&info) && even && info.num_frames > 1;
+        let fits = video_format::is_cpu_source(&info) && even && info.num_frames > 1;
         (fits && !format.is_null()).then(|| State {
             kind: Kind::Layer {
                 data,
@@ -277,12 +291,14 @@ pub(crate) unsafe extern "system" fn create_layer(
                 ..info
             },
             size: size(&info),
+            ratio: ratio(&info),
         })
     })();
     if state.is_none() {
         unsafe { vs::free_nodes(nodes, vsapi) };
     }
-    let state = state.ok_or(c"SVLayer: the clip must be YUV420P8 with its vectors from SVAnalyse");
+    let state = state
+        .ok_or(c"SVLayer: the clip must be YUV420P8 or YUV444P8 with its vectors from SVAnalyse");
     unsafe { create(state, c"SVLayer", input, output, core, vsapi) };
     0
 }
@@ -297,7 +313,7 @@ pub(crate) unsafe extern "system" fn create_peel(
     let Some((nodes, [info, fit])) = (unsafe { clips(input, vsapi, [c"clip", c"layer"]) }) else {
         return 0;
     };
-    let fits = video_format::is_yuv420p8(&info)
+    let fits = video_format::is_cpu_source(&info)
         && (fit.width, fit.height) == (info.width, info.height * 2);
     if !fits {
         unsafe { vs::free_nodes(nodes, vsapi) };
@@ -307,8 +323,10 @@ pub(crate) unsafe extern "system" fn create_peel(
         clips: [nodes[0], nodes[1], std::ptr::null_mut()],
         info,
         size: size(&info),
+        ratio: ratio(&info),
     });
-    let state = state.ok_or(c"SVPeel: the clip must be YUV420P8 with its layer from SVLayer");
+    let state =
+        state.ok_or(c"SVPeel: the clip must be YUV420P8 or YUV444P8 with its layer from SVLayer");
     unsafe { create(state, c"SVPeel", input, output, core, vsapi) };
     0
 }
@@ -325,7 +343,7 @@ pub(crate) unsafe extern "system" fn create_unpeel(
         return 0;
     };
     let step = (source.fps_num * info.fps_den, source.fps_den * info.fps_num);
-    let fits = video_format::is_yuv420p8(&info)
+    let fits = video_format::is_cpu_source(&info)
         && info.format == source.format
         && (info.width, info.height) == (source.width, source.height)
         && (fit.width, fit.height) == (info.width, info.height * 2)
@@ -342,9 +360,10 @@ pub(crate) unsafe extern "system" fn create_unpeel(
         clips: nodes,
         info,
         size: size(&info),
+        ratio: ratio(&info),
     });
     let state = state.ok_or(
-        c"SVUnpeel: both clips must be YUV420P8 of one size with frame rates and the layer of the source",
+        c"SVUnpeel: both clips must be YUV420P8 or YUV444P8 of one size with frame rates and the layer of the source",
     );
     unsafe { create(state, c"SVUnpeel", input, output, core, vsapi) };
     0
@@ -355,6 +374,7 @@ unsafe fn fit<'a>(
     api: &frame::PlaneApi,
     frame: vs::ConstRaw,
     size: (usize, usize),
+    ratio: usize,
 ) -> Option<layer::Layer<'a>> {
     if frame.is_null() {
         return None;
@@ -370,13 +390,14 @@ unsafe fn fit<'a>(
         })
     };
     let (luma, pitch) = plane(0, size.1 * 2)?;
-    let (first, chroma) = plane(1, size.1)?;
-    let (second, _) = plane(2, size.1)?;
+    let (first, chroma) = plane(1, size.1 * 2 / ratio)?;
+    let (second, _) = plane(2, size.1 * 2 / ratio)?;
     Some(layer::Layer {
         luma,
         chroma: [first, second],
         pitch: (pitch, chroma),
         size,
+        ratio,
     })
 }
 
@@ -394,7 +415,7 @@ impl State {
             ..
         } = self.info;
         let output = unsafe { api.new_frame(format, width, height, std::ptr::null(), core) }?;
-        let half = self.size.0 / 2;
+        let half = self.size.0 / self.ratio;
         let planes = [
             (&fit.luma, self.size.0),
             (&fit.chroma[0], half),
@@ -429,7 +450,7 @@ impl State {
             let rows = if plane == 0 {
                 self.size.1
             } else {
-                self.size.1 / 2
+                self.size.1 / self.ratio
             };
             let Some((data, pitch, len)) = (unsafe { api.write_plane(output, plane, rows) }) else {
                 unsafe { api.free(output) };
@@ -528,6 +549,7 @@ unsafe extern "system" fn get_frame(
                     data,
                     size: state.size,
                     last: *last,
+                    ratio: state.ratio,
                 };
                 let fit = layers.fit(&chunks, chunk, *limit, held.as_deref()?)?;
                 drop(layers);
@@ -541,8 +563,10 @@ unsafe extern "system" fn get_frame(
                 }
                 let frames = [first, second].map(|node| get_node(get, node, n, frame_ctx));
                 let made = (|| {
-                    let raw = unsafe { planes(&api, frames[0], (state.size.1, state.size.1 / 2)) }?;
-                    let fit = unsafe { fit(&api, frames[1], state.size) }?;
+                    let raw = unsafe {
+                        planes(&api, frames[0], (state.size.1, state.size.1 / state.ratio))
+                    }?;
+                    let fit = unsafe { fit(&api, frames[1], state.size, state.ratio) }?;
                     unsafe {
                         state.changed(&api, frames[0], core, |plane, target, pitch| {
                             fit.peel(plane, target, pitch, raw[plane]);
@@ -568,14 +592,14 @@ unsafe extern "system" fn get_frame(
                 let made = (|| {
                     let sources = layer::Frames {
                         first: unsafe {
-                            planes(&api, frames[1], (state.size.1, state.size.1 / 2))
+                            planes(&api, frames[1], (state.size.1, state.size.1 / state.ratio))
                         }?,
                         second: unsafe {
-                            planes(&api, frames[2], (state.size.1, state.size.1 / 2))
+                            planes(&api, frames[2], (state.size.1, state.size.1 / state.ratio))
                         }?,
                         time,
                     };
-                    let fit = unsafe { fit(&api, frames[3], state.size) }?;
+                    let fit = unsafe { fit(&api, frames[3], state.size, state.ratio) }?;
                     if frames[0].is_null() {
                         return None;
                     }
