@@ -89,13 +89,13 @@ pub unsafe extern "C" fn osvp_destroy(context: *mut Context) {
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn osvp_source(
+unsafe fn source(
     context: *const Context,
     info: *const VideoInfo,
     read: Read,
     release: Option<Release>,
     user: *mut c_void,
+    parallel: bool,
 ) -> *mut Clip {
     let (context, info) = unsafe { (&*context, &*info) };
     let format = usize::try_from(info.format)
@@ -122,7 +122,29 @@ pub unsafe extern "C" fn osvp_source(
         num_frames: info.num_frames,
         flags: 0,
     };
-    clip(context.0.source(info, read, release, user))
+    clip(context.0.source(info, read, release, user, parallel))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn osvp_source(
+    context: *const Context,
+    info: *const VideoInfo,
+    read: Read,
+    release: Option<Release>,
+    user: *mut c_void,
+) -> *mut Clip {
+    unsafe { source(context, info, read, release, user, false) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn osvp_source_parallel(
+    context: *const Context,
+    info: *const VideoInfo,
+    read: Read,
+    release: Option<Release>,
+    user: *mut c_void,
+) -> *mut Clip {
+    unsafe { source(context, info, read, release, user, true) }
 }
 
 unsafe fn vectors(

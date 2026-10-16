@@ -194,6 +194,7 @@ struct Source {
     read: Read,
     release: Option<Release>,
     user: *mut c_void,
+    parallel: bool,
     state: Mutex<Reader>,
 }
 
@@ -379,9 +380,31 @@ impl Node {
         }
     }
 
-    fn read(&self, source: &Source, n: i32) -> Produced {
+    fn fill(&self, source: &Source, n: i32) -> Produced {
         let info = self.info();
         let format = unsafe { &*info.format.cast::<Format>() };
+        let mut props = Map::default();
+        props.set(c"_DurationNum", Value::Int(info.fps_den));
+        props.set(c"_DurationDen", Value::Int(info.fps_num));
+        let frame = Frame::new(format, info.width, info.height, props);
+        let mut planes = [std::ptr::null_mut(); 3];
+        let mut strides = [0isize; 3];
+        for (plane, (data, stride)) in
+            (0..format.num_planes).zip(planes.iter_mut().zip(&mut strides))
+        {
+            *data = unsafe { frame.write(plane) };
+            *stride = frame.stride(plane).cast_signed();
+        }
+        if unsafe { (source.read)(source.user, n, planes.as_ptr(), strides.as_ptr()) } != 0 {
+            return Err(Arc::from(c"the source callback failed"));
+        }
+        Ok(Arc::new(frame))
+    }
+
+    fn read(&self, source: &Source, n: i32) -> Produced {
+        if source.parallel {
+            return self.fill(source, n);
+        }
         let mut state = source.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(index) = state.ahead.iter().position(|(frame, _)| *frame == n) {
             return Ok(state.ahead.swap_remove(index).1);
@@ -395,23 +418,7 @@ impl Node {
         };
         let mut wanted = None;
         for index in first..=n {
-            let mut props = Map::default();
-            props.set(c"_DurationNum", Value::Int(info.fps_den));
-            props.set(c"_DurationDen", Value::Int(info.fps_num));
-            let frame = Frame::new(format, info.width, info.height, props);
-            let mut planes = [std::ptr::null_mut(); 3];
-            let mut strides = [0isize; 3];
-            for (plane, (data, stride)) in
-                (0..format.num_planes).zip(planes.iter_mut().zip(&mut strides))
-            {
-                *data = unsafe { frame.write(plane) };
-                *stride = frame.stride(plane).cast_signed();
-            }
-            if unsafe { (source.read)(source.user, index, planes.as_ptr(), strides.as_ptr()) } != 0
-            {
-                return Err(Arc::from(c"the source callback failed"));
-            }
-            let frame = Arc::new(frame);
+            let frame = self.fill(source, index)?;
             if index == n {
                 wanted = Some(frame);
             } else {
@@ -687,6 +694,7 @@ impl Host {
         read: Read,
         release: Option<Release>,
         user: *mut c_void,
+        parallel: bool,
     ) -> Arc<Node> {
         Arc::new(Node {
             host: Arc::clone(self),
@@ -695,6 +703,7 @@ impl Host {
                 read,
                 release,
                 user,
+                parallel,
                 state: Mutex::default(),
             }),
         })

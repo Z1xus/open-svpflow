@@ -39,6 +39,9 @@ void osvp_destroy(osvp_context *context);
 
 osvp_clip *osvp_source(const osvp_context *context, const osvp_video_info *info, osvp_read read,
                        osvp_release release, void *user);
+/* read runs on many threads, for frames in any order */
+osvp_clip *osvp_source_parallel(const osvp_context *context, const osvp_video_info *info,
+                                osvp_read read, osvp_release release, void *user);
 
 osvp_clip *osvp_smooth_fps(const osvp_context *context, const osvp_clip *source,
                            const char *super_opt, const char *analyse_opt,
