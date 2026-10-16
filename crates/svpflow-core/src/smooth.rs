@@ -615,11 +615,11 @@ pub struct RenderShape {
     pub origin_y: i32,
     pub pel: i32,
     pub blend: f64,
+    pub chroma: (i32, i32),
 }
 
 pub struct Renderer {
     shape: RenderShape,
-    chroma_div: i32,
     shifts: [i32; 4],
     time: i32,
     time_blend: i32,
@@ -753,12 +753,12 @@ fn weights(count: i32, scale: f64) -> Vec<i16> {
 
 impl Renderer {
     pub fn new(shape: RenderShape) -> Self {
-        let chroma_div = 2;
+        let (cx, cy) = shape.chroma;
         let shifts = [
             log2_step(shape.step_x),
             log2_step(shape.step_y),
-            log2_step(shape.step_x / 2),
-            log2_step(shape.step_y / 2),
+            log2_step(shape.step_x / cx),
+            log2_step(shape.step_y / cy),
         ];
         let pow = |shift: i32| 2f64.powf(f64::from(shift));
         let x_luma = weight_pairs(
@@ -768,17 +768,16 @@ impl Renderer {
         );
         let y_luma = weights(shape.step_y, pow(shifts[1]) / f64::from(shape.step_y));
         let x_chroma = weight_pairs(
-            shape.step_x / 2,
-            shape.step_x / 2,
-            (pow(shifts[2]) + pow(shifts[2])) / f64::from(shape.step_x),
+            shape.step_x / cx,
+            shape.step_x / cx,
+            pow(shifts[2]) * f64::from(cx) / f64::from(shape.step_x),
         );
         let y_chroma = weights(
-            shape.step_y / 2,
-            (pow(shifts[3]) + pow(shifts[3])) / f64::from(shape.step_y),
+            shape.step_y / cy,
+            pow(shifts[3]) * f64::from(cy) / f64::from(shape.step_y),
         );
         let mut renderer = Self {
             shape,
-            chroma_div,
             shifts,
             time: -1,
             time_blend: 0,
@@ -820,20 +819,20 @@ impl Renderer {
         let s = &self.shape;
         let shift = |i: usize| self.shifts[i].clamp(0, 31) as u32;
         let mut pass = if chroma {
-            let d = self.chroma_div;
+            let (cx, cy) = s.chroma;
             Pass {
-                width: s.width / 2,
-                height: s.height / d,
-                step_x: s.step_x / 2,
-                step_y: s.step_y / d,
-                origin_x: if interp { s.origin_x / 2 } else { 0 },
-                origin_y: if interp { s.origin_y / d } else { 0 },
-                div_x: 2,
-                div_y: d,
+                width: s.width / cx,
+                height: s.height / cy,
+                step_x: s.step_x / cx,
+                step_y: s.step_y / cy,
+                origin_x: if interp { s.origin_x / cx } else { 0 },
+                origin_y: if interp { s.origin_y / cy } else { 0 },
+                div_x: cx,
+                div_y: cy,
                 shift_x: shift(2),
                 shift_y: shift(3),
                 x_weights: &self.x_chroma,
-                y_weights: if d == 2 { &self.y_chroma } else { &self.y_luma },
+                y_weights: &self.y_chroma,
                 pitch,
                 blocks,
                 row_base: 0,
@@ -875,17 +874,18 @@ impl Renderer {
     }
 
     pub fn fill(&self, dst: &mut FrameMut<'_>) {
-        let h = self.shape.height as usize;
-        self.fill_rows(dst, [0..h, 0..h / 2]);
+        let h = self.shape.height;
+        self.fill_rows(dst, [0..h as usize, 0..(h / self.shape.chroma.1) as usize]);
     }
 
     fn fill_rows(&self, dst: &mut FrameMut<'_>, rows: [std::ops::Range<usize>; 2]) {
         let w = self.shape.width as usize;
+        let cw = (self.shape.width / self.shape.chroma.0) as usize;
         let [luma, chroma] = rows;
         for (plane, pw, ph, value) in [
             (&mut dst.y, w, luma.len(), 0x7F),
-            (&mut dst.u, w / 2, chroma.len(), 0x80),
-            (&mut dst.v, w / 2, chroma.len(), 0x80),
+            (&mut dst.u, cw, chroma.len(), 0x80),
+            (&mut dst.v, cw, chroma.len(), 0x80),
         ] {
             for row in 0..ph {
                 plane.data[row * plane.pitch..row * plane.pitch + pw].fill(value);
@@ -1156,16 +1156,12 @@ impl Renderer {
 
     fn bilinear(&self, buf: &[u8], skip: i32, x: i32, y: i32, pass: &Pass<'_>) -> u8 {
         let s = &self.shape;
-        let (ox, oy, sx, sy) = if pass.div_x == 2 {
-            (
-                s.origin_x / 2,
-                s.origin_y / self.chroma_div,
-                s.step_x / 2,
-                s.step_y / self.chroma_div,
-            )
-        } else {
-            (s.origin_x, s.origin_y, s.step_x, s.step_y)
-        };
+        let (ox, oy, sx, sy) = (
+            s.origin_x / pass.div_x,
+            s.origin_y / pass.div_y,
+            s.step_x / pass.div_x,
+            s.step_y / pass.div_y,
+        );
         let (bx, bx1) = if x >= ox {
             let b = (x - ox) / sx;
             (b, b + 1)

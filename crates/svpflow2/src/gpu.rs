@@ -278,10 +278,12 @@ struct SuperEntry {
     release: FnRelease,
     pool: std::sync::Arc<ImagePool>,
     dims: (usize, usize),
+    luma: (usize, usize),
 }
 
 struct PooledImages {
     dims: (usize, usize),
+    luma: (usize, usize),
     linear: ClMem,
     packed: ClMem,
 }
@@ -314,6 +316,7 @@ impl Drop for SuperEntry {
         {
             pool.push(PooledImages {
                 dims: self.dims,
+                luma: self.luma,
                 linear: self.mems[0],
                 packed: self.mems[1],
             });
@@ -750,9 +753,14 @@ impl GpuContext {
     fn upload_frame(&self, planes: [UploadPlane<'_>; 3]) -> Option<SuperEntry> {
         let width = planes[0].width;
         let height = planes[0].height;
-        let dims = (width, height + planes[1].height);
+        let dims = (
+            width.max(planes[1].width + planes[2].width),
+            height + planes[1].height,
+        );
         let reused = self.image_pool.lock().ok().and_then(|mut pool| {
-            let index = pool.iter().position(|images| images.dims == dims)?;
+            let index = pool
+                .iter()
+                .position(|images| (images.dims, images.luma) == (dims, (width, height)))?;
             Some(pool.swap_remove(index))
         });
         let (linear, packed) = if let Some(images) = reused {
@@ -779,6 +787,7 @@ impl GpuContext {
             release: self.cl.ReleaseMemObject,
             pool: std::sync::Arc::clone(&self.image_pool),
             dims,
+            luma: (width, height),
         };
         let resources = self.upload_resources()?;
         unsafe {
@@ -1345,7 +1354,7 @@ impl GpuContext {
         if self.hi10 || first.entry.dims != second.entry.dims {
             return None;
         }
-        let dims = (first.entry.dims.0, first.entry.dims.1 / 3 * 2);
+        let dims = first.entry.luma;
         let compute = || {
             let image = unsafe { self.create_image(CL_R, CL_UNORM_INT8, dims.0, dims.1) }?;
             let mut state = self.still.lock().ok()?;

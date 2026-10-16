@@ -419,7 +419,13 @@ pub const fn kind(selected: i32, sad_on: bool) -> Algo {
     }
 }
 
-pub fn render_shape(data: &VectorData, width: i32, height: i32, blend: f64) -> RenderShape {
+pub fn render_shape(
+    data: &VectorData,
+    width: i32,
+    height: i32,
+    blend: f64,
+    chroma: (i32, i32),
+) -> RenderShape {
     let shape = FieldShape::from_data(data);
     let block = data.effective_block();
     RenderShape {
@@ -433,6 +439,7 @@ pub fn render_shape(data: &VectorData, width: i32, height: i32, blend: f64) -> R
         origin_y: shape.block_h / 2,
         pel: shape.pel,
         blend,
+        chroma,
     }
 }
 
@@ -468,6 +475,7 @@ pub fn gpu_params(
     params: &ReferenceParams,
     data: &VectorData,
     (width, height): (i32, i32),
+    (cx, cy): (i32, i32),
     selected: i32,
     time: i32,
     has_sad: bool,
@@ -489,10 +497,10 @@ pub fn gpu_params(
     let block = data.effective_block();
     let make = |chroma: bool, offset_x: i32, offset_y: i32| GpuParams {
         algorithm: selected,
-        width: if chroma { width / 2 } else { width },
-        height: if chroma { height / 2 } else { height },
-        x_ratio: if chroma { 2 } else { 1 },
-        y_ratio: if chroma { 2 } else { 1 },
+        width: if chroma { width / cx } else { width },
+        height: if chroma { height / cy } else { height },
+        x_ratio: if chroma { cx } else { 1 },
+        y_ratio: if chroma { cy } else { 1 },
         pel: shape.pel,
         block_w: if cubic {
             block.width
@@ -519,7 +527,7 @@ pub fn gpu_params(
     [
         make(false, 0, 0),
         make(true, 0, height),
-        make(true, width / 2, height),
+        make(true, width / cx, height),
     ]
 }
 
@@ -634,7 +642,13 @@ impl Engine {
             return Err("light and aspect padding are not supported".into());
         }
         let params = options.reference();
-        let render = render_shape(&data, source.width, source.height, params.area_blend);
+        let render = render_shape(
+            &data,
+            source.width,
+            source.height,
+            params.area_blend,
+            (2, 2),
+        );
         Ok(Self {
             rates: Rates::new(&params, source),
             timing: options.timing(source),
@@ -741,6 +755,7 @@ impl Engine {
                 &self.params,
                 &self.data,
                 (self.width, self.height),
+                (2, 2),
                 planned.selected,
                 planned.time,
                 masks.sad.is_some(),

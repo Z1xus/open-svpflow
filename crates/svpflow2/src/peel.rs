@@ -30,7 +30,7 @@ fn keep<T>(kept: &mut Kept<T>, key: i32, value: &Arc<T>, cap: usize) {
 pub(crate) unsafe fn planes(
     api: &frame::PlaneApi,
     frame: vs::ConstRaw,
-    height: usize,
+    (height, chroma): (usize, usize),
 ) -> Option<[layer::Plane<'static>; 3]> {
     if frame.is_null() {
         return None;
@@ -40,11 +40,7 @@ pub(crate) unsafe fn planes(
         let data = unsafe { std::slice::from_raw_parts(data, len) };
         Some(layer::Plane { data, pitch })
     };
-    Some([
-        plane(0, height)?,
-        plane(1, height / 2)?,
-        plane(2, height / 2)?,
-    ])
+    Some([plane(0, height)?, plane(1, chroma)?, plane(2, chroma)?])
 }
 
 pub(crate) fn motion<'a>(
@@ -93,7 +89,7 @@ impl Chunks<'_> {
         let made = (|| {
             let planes: Vec<_> = sources
                 .iter()
-                .map(|&frame| unsafe { planes(self.api, frame, self.size.1) })
+                .map(|&frame| unsafe { planes(self.api, frame, (self.size.1, self.size.1 / 2)) })
                 .collect::<Option<_>>()?;
             let motions: Vec<_> = vectors
                 .iter()
@@ -545,7 +541,7 @@ unsafe extern "system" fn get_frame(
                 }
                 let frames = [first, second].map(|node| get_node(get, node, n, frame_ctx));
                 let made = (|| {
-                    let raw = unsafe { planes(&api, frames[0], state.size.1) }?;
+                    let raw = unsafe { planes(&api, frames[0], (state.size.1, state.size.1 / 2)) }?;
                     let fit = unsafe { fit(&api, frames[1], state.size) }?;
                     unsafe {
                         state.changed(&api, frames[0], core, |plane, target, pitch| {
@@ -571,8 +567,12 @@ unsafe extern "system" fn get_frame(
                 let frames = wanted.map(|(node, k)| get_node(get, node, k, frame_ctx));
                 let made = (|| {
                     let sources = layer::Frames {
-                        first: unsafe { planes(&api, frames[1], state.size.1) }?,
-                        second: unsafe { planes(&api, frames[2], state.size.1) }?,
+                        first: unsafe {
+                            planes(&api, frames[1], (state.size.1, state.size.1 / 2))
+                        }?,
+                        second: unsafe {
+                            planes(&api, frames[2], (state.size.1, state.size.1 / 2))
+                        }?,
                         time,
                     };
                     let fit = unsafe { fit(&api, frames[3], state.size) }?;

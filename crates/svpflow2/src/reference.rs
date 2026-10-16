@@ -71,6 +71,10 @@ impl Merged {
 }
 
 impl FilterState {
+    fn chroma(&self) -> (i32, i32) {
+        crate::video_format::chroma_divisors(&self.video_info)
+    }
+
     pub(crate) fn reference_enabled(&self) -> bool {
         (matches!(self.mode, Mode::SmoothFps) || self.nvof.is_some())
             && (self.render_mode == 1 || (self.render_mode == 2 && self.gpu.is_some()))
@@ -108,6 +112,7 @@ impl FilterState {
     ) -> Option<[crate::gpu::UploadPlane<'static>; 3]> {
         let w = usize::try_from(self.video_info.width).ok()?;
         let h = usize::try_from(self.video_info.height).ok()?;
+        let (cx, cy) = (self.chroma().0 as usize, self.chroma().1 as usize);
         let plane = |p: i32, pw: usize, ph: usize| -> Option<crate::gpu::UploadPlane<'static>> {
             let (ptr, stride, len) = unsafe { api.read_plane(raw, p, ph) }?;
             Some(crate::gpu::UploadPlane {
@@ -119,8 +124,8 @@ impl FilterState {
         };
         Some([
             plane(0, w, h)?,
-            plane(1, w / 2, h / 2)?,
-            plane(2, w / 2, h / 2)?,
+            plane(1, w / cx, h / cy)?,
+            plane(2, w / cx, h / cy)?,
         ])
     }
 
@@ -136,7 +141,7 @@ impl FilterState {
     fn layer_plan(&self) -> Option<(i32, f32)> {
         let limit = self.options.mask_peel()?;
         let last = self.video_info.num_frames - 2;
-        (self.nvof.is_none() && last >= 0).then_some((last, limit))
+        (self.nvof.is_none() && last >= 0 && self.chroma() == (2, 2)).then_some((last, limit))
     }
 
     fn layer_wanted(&self, wanted: &mut Vec<(vs::Raw, i32)>, n: i32) {
@@ -289,8 +294,16 @@ impl FilterState {
             let none = |_| None::<std::sync::Arc<VectorField>>;
             engine::motions(field, true, true, true, false, (false, false), none, k)
         };
-        let kernel =
-            engine::gpu_params(params, vector_data, (width, height), 13, 256, false, false);
+        let kernel = engine::gpu_params(
+            params,
+            vector_data,
+            (width, height),
+            (2, 2),
+            13,
+            256,
+            false,
+            false,
+        );
         let cap = self.field_cap(shape);
         let pairs = |chunk: i64| {
             let pairs: Vec<i32> = layer::pairs(i32::try_from(chunk).ok()?, last).collect();
@@ -484,15 +497,16 @@ impl FilterState {
         } else {
             1
         };
+        let (cx, cy) = (self.chroma().0 as usize, self.chroma().1 as usize);
         let plane = |p: i32, rows: usize| -> Option<(&'static mut [u8], i32)> {
-            let div = if p == 0 { 1 } else { 2 };
+            let (dx, dy) = if p == 0 { (1, 1) } else { (cx, cy) };
             let (px, py) = (
-                usize::try_from(pad_x / div).ok()?,
-                usize::try_from(pad_y / div).ok()?,
+                usize::try_from(pad_x).ok()? / dx,
+                usize::try_from(pad_y).ok()? / dy,
             );
             let (ptr, pitch, len) = unsafe { api.write_plane(output, p, rows + 2 * py) }?;
             let start = py * pitch + px * bytes;
-            let span = (rows.checked_sub(1)?) * pitch + (w / div as usize) * bytes;
+            let span = (rows.checked_sub(1)?) * pitch + (w / dx) * bytes;
             if start + span > len {
                 return None;
             }
@@ -502,7 +516,7 @@ impl FilterState {
             ))
         };
         let (Some((y, sy)), Some((u, su)), Some((v, sv))) =
-            (plane(0, h), plane(1, h / 2), plane(2, h / 2))
+            (plane(0, h), plane(1, h / cy), plane(2, h / cy))
         else {
             unsafe { api.free(output.cast_const()) };
             return std::ptr::null();
@@ -560,13 +574,16 @@ impl FilterState {
         let count = usize::try_from(pw * ph).unwrap_or(0);
         let w = self.video_info.width;
         let h = self.video_info.height;
+        let (cx, cy) = self.chroma();
+        let shift = (cx.trailing_zeros(), cy.trailing_zeros());
         let planes = || -> Option<[(&'static mut [u8], usize); 3]> {
             let hu = usize::try_from(h).ok()?;
             let plane = |p: i32, rows: usize| -> Option<(&'static mut [u8], usize)> {
                 let (ptr, pitch, len) = unsafe { api.write_plane(output, p, rows) }?;
                 Some((unsafe { slice::from_raw_parts_mut(ptr, len) }, pitch))
             };
-            Some([plane(0, hu)?, plane(1, hu / 2)?, plane(2, hu / 2)?])
+            let ch = hu / cy as usize;
+            Some([plane(0, hu)?, plane(1, ch)?, plane(2, ch)?])
         };
         let step_x = shape.block_w - shape.overlap_x;
         let step_y = shape.block_h - shape.overlap_y;
@@ -575,7 +592,14 @@ impl FilterState {
         {
             let mut map = vec![3u8; shape.blocks()];
             field.quality_map(backward, limits, luma, &mut map);
-            draw_quality_map(&map, &shape, (step_x, step_y), (w, h), (y, yp), (u, v, up));
+            draw_quality_map(
+                &map,
+                &shape,
+                (step_x, step_y),
+                (w, h),
+                (y, yp),
+                (u, v, up, shift),
+            );
         }
         if self.options.debug_vectors()
             && let Some([(y, yp), (u, up), (v, _)]) = planes()
@@ -592,7 +616,14 @@ impl FilterState {
                 ph,
             );
             let zero = (self.options.debug_zerox(), self.options.debug_zeroy());
-            draw_vectors((&xs, &ys, &sad), &shape, (w, h), zero, (y, yp), (u, v, up));
+            draw_vectors(
+                (&xs, &ys, &sad),
+                &shape,
+                (w, h),
+                zero,
+                (y, yp),
+                (u, v, up, shift),
+            );
         }
         if self.options.debug_qmode() {
             unsafe { self.apply_qmode_overlay(api, output, class) };
@@ -962,11 +993,13 @@ impl FilterState {
         let interp = !neither && !params.block;
         let sad = engine::merged_sad(selected, sad_masks.as_ref());
         let kind = engine::kind(selected, sad.is_some());
+        let chroma = self.chroma();
         let mut renderer = Renderer::new(engine::render_shape(
             vector_data,
             self.video_info.width,
             self.video_info.height,
             params.area_blend,
+            chroma,
         ));
         renderer.set_time(time);
         if self.render_mode == 2
@@ -977,6 +1010,7 @@ impl FilterState {
                 params,
                 vector_data,
                 (self.video_info.width, self.video_info.height),
+                chroma,
                 selected,
                 time,
                 sad_masks.is_some(),
@@ -1033,8 +1067,8 @@ impl FilterState {
             if shape.pel <= 1 || !self.request_super {
                 let h = usize::try_from(self.video_info.height).ok()?;
                 let (y, yp, yl) = unsafe { api.read_plane(raw, 0, h) }?;
-                let (u, up, ul) = unsafe { api.read_plane(raw, 1, h / 2) }?;
-                let (v, _, vl) = unsafe { api.read_plane(raw, 2, h / 2) }?;
+                let (u, up, ul) = unsafe { api.read_plane(raw, 1, h / chroma.1 as usize) }?;
+                let (v, _, vl) = unsafe { api.read_plane(raw, 2, h / chroma.1 as usize) }?;
                 return Some(Merged {
                     _keep: None,
                     y: unsafe { slice::from_raw_parts(y, yl) },
@@ -1094,15 +1128,16 @@ impl FilterState {
         let h = usize::try_from(self.video_info.height).unwrap_or(0);
         let w = usize::try_from(self.video_info.width).unwrap_or(0);
         let (pad_x, pad_y) = self.options.padding(&self.video_info.source());
+        let (cx, cy) = (chroma.0 as usize, chroma.1 as usize);
         let plane_mut = |p: i32, rows: usize| -> Option<PlaneMut<'static>> {
-            let div = if p == 0 { 1 } else { 2 };
+            let (dx, dy) = if p == 0 { (1, 1) } else { (cx, cy) };
             let (px, py) = (
-                usize::try_from(pad_x / div).ok()?,
-                usize::try_from(pad_y / div).ok()?,
+                usize::try_from(pad_x).ok()? / dx,
+                usize::try_from(pad_y).ok()? / dy,
             );
             let (ptr, pitch, len) = unsafe { api.write_plane(output, p, rows + 2 * py) }?;
             let start = py * pitch + px;
-            let span = (rows.checked_sub(1)?) * pitch + w / div as usize;
+            let span = (rows.checked_sub(1)?) * pitch + w / dx;
             if start + span > len {
                 return None;
             }
@@ -1112,7 +1147,7 @@ impl FilterState {
             })
         };
         let (Some(y), Some(u), Some(v)) =
-            (plane_mut(0, h), plane_mut(1, h / 2), plane_mut(2, h / 2))
+            (plane_mut(0, h), plane_mut(1, h / cy), plane_mut(2, h / cy))
         else {
             unsafe { api.free(output.cast_const()) };
             return std::ptr::null();
@@ -1134,8 +1169,8 @@ impl FilterState {
         renderer.render(kind, interp, &mut dst, nxt.frame(), cur.frame(), &vectors);
         let raw = unsafe {
             (
-                crate::peel::planes(api, source, h),
-                crate::peel::planes(api, next_source, h),
+                crate::peel::planes(api, source, (h, h / cy)),
+                crate::peel::planes(api, next_source, (h, h / cy)),
             )
         };
         let phase = if selected == 1 { 256 - time } else { time };
@@ -1151,7 +1186,7 @@ impl FilterState {
                 for (plane, target) in [&mut dst.y, &mut dst.u, &mut dst.v].into_iter().enumerate()
                 {
                     let (a, b) = (first[plane], second[plane]);
-                    let (w, h) = if plane == 0 { (w, h) } else { (w / 2, h / 2) };
+                    let (w, h) = if plane == 0 { (w, h) } else { (w / cx, h / cy) };
                     let (data, pitch) = (&mut *target.data, target.pitch);
                     let size = self.video_info.width as usize;
                     svpflow_core::still::apply(
@@ -1196,7 +1231,7 @@ fn draw_quality_map(
     (step_x, step_y): (i32, i32),
     (w, h): (i32, i32),
     (y, yp): (&mut [u8], usize),
-    (u, v, up): (&mut [u8], &mut [u8], usize),
+    (u, v, up, (sx, sy)): (&mut [u8], &mut [u8], usize, (u32, u32)),
 ) {
     let mut color = [0u8; 3];
     for by in 0..shape.grid_h {
@@ -1222,7 +1257,7 @@ fn draw_quality_map(
                         *dst = ((20 * u16::from(c) + 235 * u16::from(*dst)) >> 8) as u8;
                     };
                     blend(&mut y[py * yp + px], color[0]);
-                    let c = (py >> 1) * up + (px >> 1);
+                    let c = (py >> sy) * up + (px >> sx);
                     blend(&mut u[c], color[1]);
                     blend(&mut v[c], color[2]);
                 }
@@ -1238,7 +1273,7 @@ fn draw_vectors(
     (w, h): (i32, i32),
     (zero_x, zero_y): (bool, bool),
     (y, yp): (&mut [u8], usize),
-    (u, v, up): (&mut [u8], &mut [u8], usize),
+    (u, v, up, (sx, sy)): (&mut [u8], &mut [u8], usize, (u32, u32)),
 ) {
     let step_x = shape.block_w - shape.overlap_x;
     let step_y = shape.block_h - shape.overlap_y;
@@ -1253,7 +1288,7 @@ fn draw_vectors(
             };
         };
         mix(&mut y[yy * yp + x], c[0]);
-        let ci = (yy >> 1) * up + (x >> 1);
+        let ci = (yy >> sy) * up + (x >> sx);
         mix(&mut u[ci], c[1]);
         mix(&mut v[ci], c[2]);
     };
