@@ -820,8 +820,11 @@ unsafe extern "system" fn free_node(node: Raw) {
     drop(unsafe { Arc::from_raw(node.cast::<Node>()) });
 }
 
+// vapoursynth allows freeing null
 unsafe extern "system" fn free_frame(frame: ConstRaw) {
-    drop(unsafe { Arc::from_raw(frame.cast::<Frame>()) });
+    if !frame.is_null() {
+        drop(unsafe { Arc::from_raw(frame.cast::<Frame>()) });
+    }
 }
 
 unsafe extern "system" fn new_video_frame(
