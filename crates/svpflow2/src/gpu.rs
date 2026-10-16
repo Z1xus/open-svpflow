@@ -6,7 +6,7 @@ use std::ffi::CString;
 mod blend;
 mod layer;
 
-pub use layer::{Layer, LayerPair};
+pub use layer::{Layer, LayerHeld, LayerPair};
 
 pub use blend::BlendJob;
 #[cfg(feature = "blend")]

@@ -31,6 +31,12 @@ pub struct LayerPair {
     pub motions: [Vec<u16>; 8],
 }
 
+#[derive(Default)]
+pub struct LayerHeld {
+    stats: Vec<(i64, Arc<Owned>, i32)>,
+    fits: Vec<(i64, Arc<Layer>)>,
+}
+
 pub(super) struct LayerState {
     queue: ClCommandQueue,
     kernels: [ClKernel; 4],
@@ -144,16 +150,37 @@ impl GpuContext {
         }
     }
 
-    pub fn layer_ready(&self, chunk: i64) -> bool {
-        self.layer
-            .lock()
-            .is_ok_and(|state| state.fits.iter().any(|(key, _)| *key == chunk))
-    }
-
-    pub fn layer_stats_ready(&self, chunk: i64) -> bool {
-        self.layer
-            .lock()
-            .is_ok_and(|state| state.stats.iter().any(|(key, _, _)| *key == chunk))
+    // the chunks whose frames must be requested
+    pub fn layer_hold(&self, chunk: i32, last: i32, held: &mut LayerHeld) -> Vec<i32> {
+        let near = (chunk - 1).max(0)..=(chunk + 1).min(last);
+        let Ok(state) = self.layer.lock() else {
+            return near.collect();
+        };
+        let key = i64::from(chunk);
+        let fit = state.fits.iter().find(|(other, _)| *other == key);
+        let fit = fit.map(|(_, fit)| Arc::clone(fit)).or_else(|| {
+            let gone = state.held.iter().find(|(other, _)| *other == key);
+            gone.and_then(|(_, fit)| fit.upgrade())
+        });
+        if let Some(fit) = fit {
+            if !held.fits.iter().any(|(other, _)| *other == key) {
+                held.fits.push((key, fit));
+            }
+            return Vec::new();
+        }
+        near.filter(|&chunk| {
+            let key = i64::from(chunk);
+            match state.stats.iter().find(|(other, _, _)| *other == key) {
+                Some((_, sums, count)) => {
+                    if !held.stats.iter().any(|(other, _, _)| *other == key) {
+                        held.stats.push((key, Arc::clone(sums), *count));
+                    }
+                    false
+                }
+                None => true,
+            }
+        })
+        .collect()
     }
 
     unsafe fn set<T>(&self, kernel: ClKernel, index: ClUint, value: &T) -> bool {
@@ -298,10 +325,14 @@ impl GpuContext {
         params: &[KernelParams; 3],
         grid: (usize, usize),
         limit: f32,
+        held: &LayerHeld,
         mut pairs: impl FnMut(i64) -> Option<Vec<LayerPair>>,
     ) -> Option<Arc<Layer>> {
         if self.hi10 {
             return None;
+        }
+        if let Some((_, fit)) = held.fits.iter().find(|(key, _)| *key == chunk) {
+            return Some(Arc::clone(fit));
         }
         let mut state = self.layer.lock().ok()?;
         if let Some(pos) = state.fits.iter().position(|(key, _)| *key == chunk) {
@@ -310,8 +341,8 @@ impl GpuContext {
             state.fits.push(entry);
             return Some(fit);
         }
-        let held = state.held.iter().find(|(key, _)| *key == chunk);
-        if let Some(fit) = held.and_then(|(_, fit)| fit.upgrade()) {
+        let gone = state.held.iter().find(|(key, _)| *key == chunk);
+        if let Some(fit) = gone.and_then(|(_, fit)| fit.upgrade()) {
             state.keep(chunk, &fit);
             return Some(fit);
         }
@@ -325,7 +356,12 @@ impl GpuContext {
             if key < 0 || key > last {
                 continue;
             }
-            if let Some(found) = state.stats.iter().find(|(k, _, _)| *k == key) {
+            let found = held
+                .stats
+                .iter()
+                .chain(&state.stats)
+                .find(|(k, _, _)| *k == key);
+            if let Some(found) = found {
                 *slot = Some((Arc::clone(&found.1), found.2));
                 continue;
             }

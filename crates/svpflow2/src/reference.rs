@@ -22,6 +22,15 @@ fn cache_cap(bytes: usize) -> usize {
 // longer runs are still pictures
 const RUN: i32 = 3;
 
+// the layers that a frame uses, from its request until it is made
+#[derive(Default)]
+pub(crate) struct Held {
+    cpu: crate::peel::Held,
+    gpu: crate::gpu::LayerHeld,
+    // the dedup vectors are requested
+    pub(crate) more: bool,
+}
+
 struct Fetch {
     get_frame: vs::GetFrameFilter,
     free_frame: Option<vs::FreeFrame>,
@@ -146,25 +155,18 @@ impl FilterState {
         (self.nvof.is_none() && last >= 0 && even).then_some((last, limit))
     }
 
-    fn layer_wanted(&self, wanted: &mut Vec<(vs::Raw, i32)>, n: i32) {
+    fn layer_wanted(&self, wanted: &mut Vec<(vs::Raw, i32)>, n: i32, held: &mut Held) {
         let Some((last, _)) = self.layer_plan() else {
             return;
         };
-        let chunk = n / layer::CHUNK;
-        let near = (chunk - 1).max(0)..=(chunk + 1).min(last / layer::CHUNK);
-        let missing: Vec<i32> = if let Some(gpu) = self.gpu.as_ref() {
-            if gpu.layer_ready(chunk.into()) {
-                return;
-            }
-            near.filter(|&c| !gpu.layer_stats_ready(c.into())).collect()
+        let (chunk, chunks) = (n / layer::CHUNK, last / layer::CHUNK);
+        let missing = if let Some(gpu) = self.gpu.as_ref() {
+            gpu.layer_hold(chunk, chunks, &mut held.gpu)
         } else {
             let Ok(layers) = self.layers.lock() else {
                 return;
             };
-            if layers.ready(chunk).is_some() {
-                return;
-            }
-            near.filter(|&c| layers.held(c).is_none()).collect()
+            layers.hold(chunk, chunks, &mut held.cpu)
         };
         for c in missing {
             let (sources, vectors) = crate::peel::frames(c, last);
@@ -179,6 +181,7 @@ impl FilterState {
         fetch: &Fetch,
         n: i32,
         data: &metadata::VectorData,
+        held: &Held,
     ) -> Option<std::sync::Arc<layer::Fit>> {
         let (last, limit) = self.layer_plan()?;
         if !crate::video_format::is_cpu_source(&self.video_info) {
@@ -198,7 +201,7 @@ impl FilterState {
             ratio: self.chroma().0 as usize,
         };
         let mut layers = self.layers.lock().ok()?;
-        layers.fit(&chunks, n / layer::CHUNK, limit, &Vec::new())
+        layers.fit(&chunks, n / layer::CHUNK, limit, &held.cpu)
     }
 
     fn repeat(&self, fetch: &Fetch, api: &frame::PlaneApi, k: i32, threshold: f64) -> bool {
@@ -285,6 +288,7 @@ impl FilterState {
         params: &ReferenceParams,
         vector_data: &metadata::VectorData,
         field: &VectorField,
+        held: &Held,
     ) -> Option<std::sync::Arc<crate::gpu::Layer>> {
         let (last, limit) = self.layer_plan()?;
         let shape = *field.shape();
@@ -403,6 +407,7 @@ impl FilterState {
             &kernel,
             cells,
             limit,
+            &held.gpu,
             pairs,
         )
     }
@@ -642,6 +647,7 @@ impl FilterState {
         request_frame: vs::RequestFrameFilter,
         frame: i32,
         frame_ctx: vs::Raw,
+        held: &mut Held,
     ) {
         let params = self.options.reference();
         let rates = self.rates(&params);
@@ -656,7 +662,7 @@ impl FilterState {
         wanted.extend(sources.map(|k| (self.clips.source, k)));
         if engine::needs_vectors(phase) || dedup && !self.later {
             let last = if dedup { n + RUN } else { n };
-            self.vectors_wanted(&mut wanted, n..=last, engine::vector_reach(&params));
+            self.vectors_wanted(&mut wanted, n..=last, engine::vector_reach(&params), held);
         }
         request_all(request_frame, wanted, frame_ctx);
     }
@@ -666,6 +672,7 @@ impl FilterState {
         wanted: &mut Vec<(vs::Raw, i32)>,
         pairs: std::ops::RangeInclusive<i32>,
         reach: i32,
+        held: &mut Held,
     ) {
         let (n, last) = (*pairs.start(), *pairs.end());
         if self.request_super {
@@ -677,7 +684,7 @@ impl FilterState {
         } else {
             wanted.extend(((n - reach).max(0)..=last + reach).map(|k| (self.clips.vectors, k)));
             for base in n..=last {
-                self.layer_wanted(wanted, base);
+                self.layer_wanted(wanted, base, held);
             }
         }
     }
@@ -687,6 +694,7 @@ impl FilterState {
         frames: &[i32],
         frame_ctx: vs::Raw,
         vsapi: vs::ConstRaw,
+        held: &mut Held,
     ) -> bool {
         if !self.later || self.dedup_limit().is_none() || !self.reference_enabled() {
             return false;
@@ -712,7 +720,7 @@ impl FilterState {
             let engine::Step { n, raw, phase } = rates.step(&params, frame);
             let moved = self.dedup(&fetch, &api, n, raw);
             if !engine::needs_vectors(phase) && moved != (n, raw) {
-                self.vectors_wanted(&mut wanted, moved.0..=moved.0, 0);
+                self.vectors_wanted(&mut wanted, moved.0..=moved.0, 0, held);
             }
         }
         if wanted.is_empty() {
@@ -774,6 +782,7 @@ impl FilterState {
         frame_ctx: vs::Raw,
         core: vs::Raw,
         vsapi: vs::ConstRaw,
+        held: &Held,
     ) -> vs::ConstRaw {
         let Some(get_frame) =
             (unsafe { vs::table_fn::<vs::GetFrameFilter>(vsapi, vs::GET_FRAME_FILTER) })
@@ -912,6 +921,7 @@ impl FilterState {
                 &params,
                 &vector_data,
                 blend,
+                held,
                 core,
             )
         };
@@ -944,6 +954,7 @@ impl FilterState {
         params: &ReferenceParams,
         vector_data: &metadata::VectorData,
         blend: Option<&crate::gpu::BlendJob>,
+        held: &Held,
         core: vs::Raw,
     ) -> vs::ConstRaw {
         let shape = *field.shape();
@@ -1019,7 +1030,7 @@ impl FilterState {
                 sad_masks.is_some(),
                 self.options.dither(),
             );
-            let layer = unsafe { self.layer(api, fetch, gpu, n, params, vector_data, field) };
+            let layer = unsafe { self.layer(api, fetch, gpu, n, params, vector_data, field, held) };
             let output = unsafe {
                 self.reference_gpu(
                     api,
@@ -1199,7 +1210,7 @@ impl FilterState {
             }
         }
         if let (Some(fit), (Some(first), Some(second))) =
-            (self.layer_cpu(api, fetch, n, vector_data), raw)
+            (self.layer_cpu(api, fetch, n, vector_data, held), raw)
         {
             let fit = fit.layer((w, h), cx);
             let frames = layer::Frames {

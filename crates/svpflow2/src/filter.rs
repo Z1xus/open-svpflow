@@ -1,6 +1,7 @@
 use std::ffi::c_char;
 use std::slice;
 
+use crate::reference::Held;
 use crate::vs::Source as _;
 use crate::{core, light, metadata, nvof, options, params, strings, video_format, vs};
 
@@ -884,18 +885,26 @@ unsafe extern "system" fn get_frame(
         return std::ptr::null();
     }
     let state = unsafe { &*data };
+    let held = unsafe { std::mem::replace(&mut *frame_data, std::ptr::null_mut()) };
+    let mut held = if held.is_null() {
+        Box::<Held>::default()
+    } else {
+        unsafe { Box::from_raw(held.cast::<Held>()) }
+    };
     match activation_reason {
-        0 => {
-            unsafe { state.request_frame(n, frame_ctx, vsapi) };
+        0 => unsafe {
+            state.request_frame(n, frame_ctx, vsapi, &mut held);
+            *frame_data = Box::into_raw(held).cast();
             std::ptr::null()
-        }
+        },
         2 => unsafe {
             // called again once the dedup vectors are ready
-            if (*frame_data).is_null() && state.reference_more(&[n], frame_ctx, vsapi) {
-                *frame_data = std::ptr::dangling_mut();
+            if !held.more && state.reference_more(&[n], frame_ctx, vsapi, &mut held) {
+                held.more = true;
+                *frame_data = Box::into_raw(held).cast();
                 return std::ptr::null();
             }
-            state.get_frame(n, None, frame_ctx, core, vsapi)
+            state.get_frame(n, None, frame_ctx, core, vsapi, &held)
         },
         _ => std::ptr::null(),
     }

@@ -2,6 +2,7 @@ use std::ffi::CString;
 
 use crate::core::{FilterState, drop_frame, get_node};
 use crate::gpu::{BlendJob, GpuContext, OutputPlane, UploadPlane};
+use crate::reference::Held;
 use crate::{filter, frame, strings, video_format, vs};
 
 struct BlendState {
@@ -163,6 +164,7 @@ impl BlendState {
         frame_ctx: vs::Raw,
         core: vs::Raw,
         vsapi: vs::ConstRaw,
+        held: &Held,
     ) -> Option<vs::ConstRaw> {
         let gpu = self.inner.gpu.as_ref()?;
         let api = unsafe { frame::PlaneApi::load(vsapi) }?;
@@ -179,7 +181,7 @@ impl BlendState {
             job.start(weight);
             let rendered = unsafe {
                 self.inner
-                    .get_frame(frame, Some(&job), frame_ctx, core, vsapi)
+                    .get_frame(frame, Some(&job), frame_ctx, core, vsapi, held)
             };
             let added = job.taken()
                 || unsafe {
@@ -314,27 +316,43 @@ unsafe extern "system" fn get_frame(
     vsapi: vs::ConstRaw,
 ) -> vs::ConstRaw {
     let state = unsafe { &*(*instance_data).cast::<BlendState>() };
+    let held = unsafe { std::mem::replace(&mut *frame_data, std::ptr::null_mut()) };
+    let mut held = if held.is_null() {
+        Box::<Held>::default()
+    } else {
+        unsafe { Box::from_raw(held.cast::<Held>()) }
+    };
     match activation_reason {
         vs::AR_INITIAL => {
             let mut requested = -1;
             for (frame, _) in state.plan.window(n) {
                 if frame != requested {
-                    unsafe { state.inner.request_frame(frame, frame_ctx, vsapi) };
+                    unsafe {
+                        state
+                            .inner
+                            .request_frame(frame, frame_ctx, vsapi, &mut held);
+                    }
                     requested = frame;
                 }
             }
+            unsafe { *frame_data = Box::into_raw(held).cast() };
             std::ptr::null()
         }
         vs::AR_ALL_FRAMES_READY => {
             let window: Vec<i32> = state.plan.window(n).map(|(frame, _)| frame).collect();
             // called again once the dedup vectors are ready
-            if unsafe {
-                (*frame_data).is_null() && state.inner.reference_more(&window, frame_ctx, vsapi)
-            } {
-                unsafe { *frame_data = std::ptr::dangling_mut() };
+            if !held.more
+                && unsafe {
+                    state
+                        .inner
+                        .reference_more(&window, frame_ctx, vsapi, &mut held)
+                }
+            {
+                held.more = true;
+                unsafe { *frame_data = Box::into_raw(held).cast() };
                 return std::ptr::null();
             }
-            let output = unsafe { state.render(n, frame_ctx, core, vsapi) };
+            let output = unsafe { state.render(n, frame_ctx, core, vsapi, &held) };
             if output.is_none()
                 && let Some(set_error) =
                     unsafe { vs::table_fn::<vs::SetFilterError>(vsapi, vs::SET_FILTER_ERROR) }

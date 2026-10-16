@@ -210,7 +210,13 @@ impl VectorInput<'_> {
 }
 
 impl FilterState {
-    pub(crate) unsafe fn request_frame(&self, frame: i32, frame_ctx: vs::Raw, vsapi: vs::ConstRaw) {
+    pub(crate) unsafe fn request_frame(
+        &self,
+        frame: i32,
+        frame_ctx: vs::Raw,
+        vsapi: vs::ConstRaw,
+        held: &mut crate::reference::Held,
+    ) {
         if let Some(request_frame) =
             unsafe { vs::table_fn::<vs::RequestFrameFilter>(vsapi, vs::REQUEST_FRAME_FILTER) }
         {
@@ -221,7 +227,7 @@ impl FilterState {
                     self.source_frame(frame),
                     frame_ctx,
                 );
-                self.reference_request(request_frame, frame, frame_ctx);
+                self.reference_request(request_frame, frame, frame_ctx, held);
                 return;
             }
             let source_frame = self.source_frame(frame);
@@ -283,6 +289,7 @@ impl FilterState {
         frame_ctx: vs::Raw,
         core: vs::Raw,
         vsapi: vs::ConstRaw,
+        held: &crate::reference::Held,
     ) -> vs::ConstRaw {
         let Some(get_frame) =
             (unsafe { vs::table_fn::<vs::GetFrameFilter>(vsapi, vs::GET_FRAME_FILTER) })
@@ -296,7 +303,7 @@ impl FilterState {
                 get_node(get_frame, self.clips.src, source_frame, frame_ctx),
                 free_frame,
             );
-            return unsafe { self.reference_get(frame, blend, frame_ctx, core, vsapi) };
+            return unsafe { self.reference_get(frame, blend, frame_ctx, core, vsapi, held) };
         }
 
         drop_frame(

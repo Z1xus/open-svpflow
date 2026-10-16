@@ -138,13 +138,38 @@ pub(crate) struct Layers {
     fits: Kept<Fit>,
 }
 
+#[derive(Default)]
+pub(crate) struct Held {
+    stats: Kept<Stats>,
+    fits: Kept<Fit>,
+}
+
+fn pin<T>(kept: &mut Kept<T>, key: i32, value: Arc<T>) {
+    if find(kept, key).is_none() {
+        kept.push((key, value));
+    }
+}
+
 impl Layers {
     pub(crate) fn ready(&self, chunk: i32) -> Option<Arc<Fit>> {
         find(&self.fits, chunk)
     }
 
-    pub(crate) fn held(&self, chunk: i32) -> Option<Arc<Stats>> {
-        find(&self.stats, chunk)
+    // the chunks whose frames must be requested
+    pub(crate) fn hold(&self, chunk: i32, last: i32, held: &mut Held) -> Vec<i32> {
+        if let Some(fit) = find(&self.fits, chunk) {
+            pin(&mut held.fits, chunk, fit);
+            return Vec::new();
+        }
+        let near = (chunk - 1).max(0)..=(chunk + 1).min(last);
+        near.filter(|&key| match find(&self.stats, key) {
+            Some(stats) => {
+                pin(&mut held.stats, key, stats);
+                false
+            }
+            None => true,
+        })
+        .collect()
     }
 
     pub(crate) fn fit(
@@ -152,16 +177,16 @@ impl Layers {
         chunks: &Chunks,
         chunk: i32,
         limit: f32,
-        held: &Kept<Stats>,
+        held: &Held,
     ) -> Option<Arc<Fit>> {
-        if let Some(fit) = find(&self.fits, chunk) {
+        if let Some(fit) = find(&held.fits, chunk).or_else(|| find(&self.fits, chunk)) {
             return Some(fit);
         }
         let parts = [chunk - 1, chunk, chunk + 1].map(|key| {
             if key < 0 || key > chunks.last / layer::CHUNK {
                 return None;
             }
-            let stats = find(held, key)
+            let stats = find(&held.stats, key)
                 .or_else(|| find(&self.stats, key))
                 .or_else(|| chunks.stats(key).map(Arc::new))?;
             keep(&mut self.stats, key, &stats, STATS_CAP);
@@ -501,7 +526,7 @@ unsafe extern "system" fn get_frame(
 ) -> vs::ConstRaw {
     let state = unsafe { &*(*instance_data).cast::<State>() };
     let held = unsafe { std::mem::replace(&mut *frame_data, std::ptr::null_mut()) };
-    let held = (!held.is_null()).then(|| unsafe { Box::from_raw(held.cast::<Kept<Stats>>()) });
+    let held = (!held.is_null()).then(|| unsafe { Box::from_raw(held.cast::<Held>()) });
     let ready = match activation_reason {
         vs::AR_INITIAL => false,
         vs::AR_ALL_FRAMES_READY => true,
@@ -527,13 +552,8 @@ unsafe extern "system" fn get_frame(
                     if let Some(fit) = layers.ready(chunk) {
                         return unsafe { state.layer(&api, &fit, core) };
                     }
-                    let near = (chunk - 1).max(0)..=(chunk + 1).min(last / layer::CHUNK);
-                    let mut held = Box::new(Kept::new());
-                    for chunk in near {
-                        if let Some(stats) = layers.held(chunk) {
-                            held.push((chunk, stats));
-                            continue;
-                        }
+                    let mut held = Box::<Held>::default();
+                    for chunk in layers.hold(chunk, last / layer::CHUNK, &mut held) {
                         let (sources, vectors) = frames(chunk, *last);
                         sources.for_each(|k| request_node(request, first, k, frame_ctx));
                         vectors.for_each(|k| request_node(request, second, k, frame_ctx));
