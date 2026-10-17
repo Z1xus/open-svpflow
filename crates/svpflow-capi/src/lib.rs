@@ -403,12 +403,11 @@ pub unsafe extern "C" fn osvp_clip_set_end(clip: *const Clip, last: i32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn osvp_get_frame(clip: *const Clip, n: i32) -> *const Frame {
     let clip = unsafe { &*clip };
-    let host = clip.node.host();
     let last = clip.end.load(Ordering::Relaxed);
     {
         let mut ahead = clip.ahead.lock().unwrap_or_else(PoisonError::into_inner);
         let (next, pending) = &mut *ahead;
-        let limit = n + (8 * host.threads()).min(host::READ_AHEAD - 1);
+        let limit = n + clip.node.window() - 1;
         if !(n + 1..=limit + 1).contains(next) {
             *next = n + 1;
             pending.clear();

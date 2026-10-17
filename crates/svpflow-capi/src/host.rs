@@ -441,10 +441,6 @@ impl Node {
         unsafe { *self.info.get() }
     }
 
-    pub fn host(&self) -> &Arc<Host> {
-        &self.host
-    }
-
     fn id(&self) -> usize {
         std::ptr::from_ref(self) as usize
     }
@@ -508,6 +504,13 @@ impl Node {
             .unwrap_or_else(|| Err(Arc::from(c"no frame")))
     }
 
+    // how far ahead frames are asked for, by the memory and the workers
+    pub fn window(&self) -> i32 {
+        let frames = budget() / 4 / self.bytes().max(1);
+        let frames = frames.min(8 * threads()).clamp(8, READ_AHEAD as usize);
+        i32::try_from(frames).unwrap_or(READ_AHEAD)
+    }
+
     fn bytes(&self) -> usize {
         let info = self.info();
         let format = unsafe { &*info.format.cast::<Format>() };
@@ -568,10 +571,8 @@ impl Node {
         if let Some(index) = state.ahead.iter().position(|(frame, _)| *frame == n) {
             return Ok(state.ahead.swap_remove(index).1);
         }
-        let reach = budget() / 8 / self.bytes().max(1);
-        let reach = i32::try_from(reach)
-            .unwrap_or(READ_AHEAD)
-            .clamp(8, READ_AHEAD);
+        // the frames that the prefetch asks for come back here, out of order
+        let reach = self.window() + 16;
         let first = if n < state.next || n - state.next > reach {
             n
         } else {
@@ -846,10 +847,6 @@ impl Host {
             },
             functions: functions.as_ref().map_err(Clone::clone)?,
         }))
-    }
-
-    pub fn threads(&self) -> i32 {
-        self.info.num_threads
     }
 
     pub fn source(
