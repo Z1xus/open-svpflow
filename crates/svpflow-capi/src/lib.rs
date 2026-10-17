@@ -8,7 +8,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use host::{Frame, Host, Map, Node, Pending, Read, Release, Value};
+use host::{Frame, Host, Map, Need, Node, Pending, Read, Release, Render, Value};
 use svpflow_host::vs3;
 
 const FORMATS: [i32; 5] = [
@@ -70,14 +70,14 @@ pub extern "C" fn osvp_error() -> *const c_char {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn osvp_create(plugin_dir: *const c_char, threads: i32) -> *mut Context {
+pub unsafe extern "C" fn osvp_create(plugin_dir: *const c_char) -> *mut Context {
     let directory = unsafe { plugin_dir.as_ref() }.map(|directory| {
         unsafe { CStr::from_ptr(directory) }
             .to_string_lossy()
             .into_owned()
     });
     let directory = directory.as_deref().map(std::path::Path::new);
-    match Host::new(directory, usize::try_from(threads).unwrap_or(0)) {
+    match Host::new(directory) {
         Ok(host) => Box::into_raw(Box::new(Context(host))),
         Err(error) => fail(error),
     }
@@ -90,21 +90,14 @@ pub unsafe extern "C" fn osvp_destroy(context: *mut Context) {
     }
 }
 
-unsafe fn source(
-    context: *const Context,
-    info: *const VideoInfo,
-    read: Read,
-    release: Option<Release>,
-    user: *mut c_void,
-    parallel: bool,
-) -> *mut Clip {
-    let (context, info) = unsafe { (&*context, &*info) };
+unsafe fn info(info: *const VideoInfo) -> Result<vs3::VideoInfo, &'static str> {
+    let info = unsafe { &*info };
     let format = usize::try_from(info.format)
         .ok()
         .and_then(|format| FORMATS.get(format))
         .and_then(|&id| vs3::preset(id));
     let Some(format) = format else {
-        return fail("unknown format");
+        return Err("unknown format");
     };
     if info.width <= 0
         || info.height <= 0
@@ -112,9 +105,9 @@ unsafe fn source(
         || info.fps_num <= 0
         || info.fps_den <= 0
     {
-        return fail("the size, the frame rate and the frame count must be positive");
+        return Err("the size, the frame rate and the frame count must be positive");
     }
-    let info = vs3::VideoInfo {
+    Ok(vs3::VideoInfo {
         format: vs3::intern(format).cast(),
         fps_num: info.fps_num,
         fps_den: info.fps_den,
@@ -122,8 +115,7 @@ unsafe fn source(
         height: info.height,
         num_frames: info.num_frames,
         flags: 0,
-    };
-    clip(context.0.source(info, read, release, user, parallel))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -134,18 +126,31 @@ pub unsafe extern "C" fn osvp_source(
     release: Option<Release>,
     user: *mut c_void,
 ) -> *mut Clip {
-    unsafe { source(context, info, read, release, user, false) }
+    match unsafe { self::info(info) } {
+        Ok(info) => clip(unsafe { &*context }.0.source(info, read, release, user)),
+        Err(error) => fail(error),
+    }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn osvp_source_parallel(
+pub unsafe extern "C" fn osvp_map(
     context: *const Context,
     info: *const VideoInfo,
-    read: Read,
+    input: *const Clip,
+    need: Need,
+    render: Render,
     release: Option<Release>,
     user: *mut c_void,
 ) -> *mut Clip {
-    unsafe { source(context, info, read, release, user, true) }
+    let input = Arc::clone(unsafe { &(*input).node });
+    match unsafe { self::info(info) } {
+        Ok(info) => clip(
+            unsafe { &*context }
+                .0
+                .map(info, input, need, render, release, user),
+        ),
+        Err(error) => fail(error),
+    }
 }
 
 unsafe fn vectors(
@@ -412,7 +417,7 @@ pub unsafe extern "C" fn osvp_get_frame(clip: *const Clip, n: i32) -> *const Fra
             pending.pop_front();
         }
         let end = limit.min(*next + 1).min(last);
-        while *next <= end && !host.busy() {
+        while *next <= end && !host::busy() {
             pending.push_back((*next, clip.node.prepare(*next)));
             *next += 1;
         }

@@ -32,17 +32,22 @@ typedef struct {
 typedef int32_t (*osvp_read)(void *user, int32_t n, uint8_t *const planes[3],
                              const ptrdiff_t strides[3]);
 typedef void (*osvp_release)(void *user);
+typedef int32_t (*osvp_need)(void *user, int32_t n, int32_t *frames);
+typedef int32_t (*osvp_render)(void *user, int32_t n, const osvp_frame *const *inputs,
+                               int32_t count, uint8_t *const planes[3],
+                               const ptrdiff_t strides[3]);
 
 const char *osvp_error(void);
 
-osvp_context *osvp_create(const char *plugin_dir, int32_t threads);
+osvp_context *osvp_create(const char *plugin_dir);
 void osvp_destroy(osvp_context *context);
 
 osvp_clip *osvp_source(const osvp_context *context, const osvp_video_info *info, osvp_read read,
                        osvp_release release, void *user);
-/* read runs on many threads, for frames in any order */
-osvp_clip *osvp_source_parallel(const osvp_context *context, const osvp_video_info *info,
-                                osvp_read read, osvp_release release, void *user);
+/* need writes the input frames for frame n, at most 8, and returns their count */
+osvp_clip *osvp_map(const osvp_context *context, const osvp_video_info *info,
+                    const osvp_clip *input, osvp_need need, osvp_render render,
+                    osvp_release release, void *user);
 
 osvp_clip *osvp_smooth_fps(const osvp_context *context, const osvp_clip *source,
                            const char *super_opt, const char *analyse_opt,

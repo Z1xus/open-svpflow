@@ -5,17 +5,84 @@ use std::collections::{BinaryHeap, HashMap};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use svpflow_host::vs3::{self, ConstRaw, CoreInfo, Format, Raw, VideoInfo};
 
 const ALIGN: usize = 64;
-const CACHE_BYTES: usize = 1 << 30;
-const POOL_BYTES: usize = 256 << 20;
 pub const READ_AHEAD: i32 = 64;
+
+#[cfg(target_os = "linux")]
+fn memory() -> Option<usize> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|line| line.starts_with("MemTotal:"))?;
+    Some(line.split_whitespace().nth(1)?.parse::<usize>().ok()? * 1024)
+}
+
+#[cfg(windows)]
+fn memory() -> Option<usize> {
+    #[repr(C)]
+    struct Status {
+        length: u32,
+        load: u32,
+        total: u64,
+        rest: [u64; 6],
+    }
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(status: *mut Status) -> i32;
+    }
+    let mut status = Status {
+        length: u32::try_from(size_of::<Status>()).ok()?,
+        load: 0,
+        total: 0,
+        rest: [0; 6],
+    };
+    let done = unsafe { GlobalMemoryStatusEx(&raw mut status) } != 0;
+    done.then(|| usize::try_from(status.total).ok()).flatten()
+}
+
+#[cfg(target_os = "macos")]
+fn memory() -> Option<usize> {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const c_char,
+            value: *mut c_void,
+            size: *mut usize,
+            new: *mut c_void,
+            new_size: usize,
+        ) -> i32;
+    }
+    let (mut total, mut size) = (0u64, size_of::<u64>());
+    let none = std::ptr::null_mut();
+    let value = (&raw mut total).cast();
+    let code = unsafe { sysctlbyname(c"hw.memsize".as_ptr(), value, &raw mut size, none, 0) };
+    (code == 0).then(|| usize::try_from(total).ok()).flatten()
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+fn memory() -> Option<usize> {
+    None
+}
+
+fn budget() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET
+        .get_or_init(|| memory().map_or(1 << 30, |memory| (memory / 16).clamp(256 << 20, 1 << 30)))
+}
 
 pub type Read = unsafe extern "C" fn(*mut c_void, i32, *const *mut u8, *const isize) -> i32;
 pub type Release = unsafe extern "C" fn(*mut c_void);
+pub type Need = unsafe extern "C" fn(*mut c_void, i32, *mut i32) -> i32;
+pub type Render = unsafe extern "C" fn(
+    *mut c_void,
+    i32,
+    *const *const Frame,
+    i32,
+    *const *mut u8,
+    *const isize,
+) -> i32;
+
+const NEEDED: usize = 8;
 
 struct Buffer {
     data: NonNull<u8>,
@@ -52,7 +119,7 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         let mut pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
-        if pool.1 + self.len <= POOL_BYTES {
+        if pool.1 + self.len <= budget() / 4 {
             pool.1 += self.len;
             pool.0.push(Self {
                 data: self.data,
@@ -194,12 +261,20 @@ struct Source {
     read: Read,
     release: Option<Release>,
     user: *mut c_void,
-    parallel: bool,
     state: Mutex<Reader>,
+}
+
+struct Mapped {
+    input: Arc<Node>,
+    need: Need,
+    render: Render,
+    release: Option<Release>,
+    user: *mut c_void,
 }
 
 enum Kind {
     Source(Source),
+    Mapped(Mapped),
     Filter {
         instance: UnsafeCell<Raw>,
         get_frame: vs3::GetFrame,
@@ -285,17 +360,77 @@ impl Ord for Job {
     }
 }
 
-#[derive(Default)]
-struct Queue {
-    jobs: Mutex<(BinaryHeap<Job>, u64, bool)>,
+struct Pool {
+    jobs: Mutex<(BinaryHeap<Job>, u64)>,
     ready: Condvar,
+}
+
+fn threads() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
+}
+
+fn pool() -> &'static Pool {
+    static POOL: OnceLock<Pool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        for _ in 0..threads() {
+            std::thread::spawn(|| pool().work());
+        }
+        Pool {
+            jobs: Mutex::default(),
+            ready: Condvar::new(),
+        }
+    })
+}
+
+impl Pool {
+    fn spawn(&self, priority: i32, job: impl FnOnce() + Send + 'static) {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        jobs.1 += 1;
+        let order = Reverse((priority, jobs.1));
+        jobs.0.push(Job {
+            order,
+            run: Box::new(job),
+        });
+        drop(jobs);
+        self.ready.notify_one();
+    }
+
+    fn work(&self) {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if let Some(job) = jobs.0.pop() {
+                drop(jobs);
+                (job.run)();
+                jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+            } else {
+                jobs = self
+                    .ready
+                    .wait(jobs)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+    }
+}
+
+fn cache() -> MutexGuard<'static, Cache> {
+    static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Mutex::default);
+    CACHE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+pub fn busy() -> bool {
+    let cache = cache();
+    let used: usize = cache
+        .entries
+        .values()
+        .filter(|entry| Arc::strong_count(&entry.cell) > 1)
+        .map(|entry| entry.bytes)
+        .sum();
+    used > budget() / 2
 }
 
 pub struct Host {
     info: CoreInfo,
-    functions: Vec<(CString, vs3::Create)>,
-    cache: Mutex<Cache>,
-    queue: Arc<Queue>,
+    functions: &'static [(CString, vs3::Create)],
 }
 
 unsafe impl Send for Host {}
@@ -324,11 +459,7 @@ impl Node {
 
     fn start(self: &Arc<Self>, n: i32, priority: i32) -> Cell {
         let n = self.frame(n);
-        let mut cache = self
-            .host
-            .cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut cache = cache();
         cache.tick += 1;
         let tick = cache.tick;
         if let Some(entry) = cache.entries.get_mut(&(self.id(), n)) {
@@ -359,7 +490,7 @@ impl Node {
             }),
         });
         if matches!(self.kind, Kind::Source(_)) {
-            self.host.spawn(priority, move || task.begin());
+            pool().spawn(priority, move || task.begin());
         } else {
             task.begin();
         }
@@ -368,19 +499,24 @@ impl Node {
 
     pub fn get(self: &Arc<Self>, n: i32) -> Produced {
         let cell = self.start(n, n);
-        let mut state = cell.state.lock().unwrap_or_else(PoisonError::into_inner);
-        loop {
-            if let Some(produced) = &state.0 {
-                return produced.clone();
-            }
-            state = cell
-                .ready
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
+        let state = cell.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = cell.ready.wait_while(state, |state| state.0.is_none());
+        let state = state.unwrap_or_else(PoisonError::into_inner);
+        state
+            .0
+            .clone()
+            .unwrap_or_else(|| Err(Arc::from(c"no frame")))
     }
 
-    fn fill(&self, source: &Source, n: i32) -> Produced {
+    fn bytes(&self) -> usize {
+        let info = self.info();
+        let format = unsafe { &*info.format.cast::<Format>() };
+        let luma = usize::try_from(info.width * info.height * format.bytes_per_sample).unwrap_or(0);
+        let chroma = luma >> (format.sub_sampling_w + format.sub_sampling_h);
+        luma + chroma * usize::try_from(format.num_planes - 1).unwrap_or(0)
+    }
+
+    fn blank(&self) -> (Frame, [*mut u8; 3], [isize; 3]) {
         let info = self.info();
         let format = unsafe { &*info.format.cast::<Format>() };
         let mut props = Map::default();
@@ -395,22 +531,47 @@ impl Node {
             *data = unsafe { frame.write(plane) };
             *stride = frame.stride(plane).cast_signed();
         }
+        (frame, planes, strides)
+    }
+
+    fn fill(&self, source: &Source, n: i32) -> Produced {
+        let (frame, planes, strides) = self.blank();
         if unsafe { (source.read)(source.user, n, planes.as_ptr(), strides.as_ptr()) } != 0 {
             return Err(Arc::from(c"the source callback failed"));
         }
         Ok(Arc::new(frame))
     }
 
-    fn read(&self, source: &Source, n: i32) -> Produced {
-        if source.parallel {
-            return self.fill(source, n);
+    fn render(&self, mapped: &Mapped, n: i32, inputs: &[((usize, i32), Cell)]) -> Produced {
+        let mut frames = Vec::with_capacity(inputs.len());
+        for (_, cell) in inputs {
+            let state = cell.state.lock().unwrap_or_else(PoisonError::into_inner);
+            match &state.0 {
+                Some(Ok(frame)) => frames.push(Arc::clone(frame)),
+                Some(Err(error)) => return Err(Arc::clone(error)),
+                None => return Err(Arc::from(c"an input frame is missing")),
+            }
         }
+        let pointers: Vec<*const Frame> = frames.iter().map(Arc::as_ptr).collect();
+        let count = i32::try_from(pointers.len()).unwrap_or(0);
+        let (frame, planes, strides) = self.blank();
+        let (planes, strides) = (planes.as_ptr(), strides.as_ptr());
+        let user = mapped.user;
+        if unsafe { (mapped.render)(user, n, pointers.as_ptr(), count, planes, strides) } != 0 {
+            return Err(Arc::from(c"the render callback failed"));
+        }
+        Ok(Arc::new(frame))
+    }
+
+    fn read(&self, source: &Source, n: i32) -> Produced {
         let mut state = source.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(index) = state.ahead.iter().position(|(frame, _)| *frame == n) {
             return Ok(state.ahead.swap_remove(index).1);
         }
-        // more workers ask for source frames further apart
-        let reach = READ_AHEAD.max(8 * self.host.threads());
+        let reach = budget() / 8 / self.bytes().max(1);
+        let reach = i32::try_from(reach)
+            .unwrap_or(READ_AHEAD)
+            .clamp(8, READ_AHEAD);
         let first = if n < state.next || n - state.next > reach {
             n
         } else {
@@ -454,10 +615,43 @@ impl Task {
         }
     }
 
+    fn dropped(&self) -> bool {
+        let key = (self.node.id(), self.n);
+        let mut cache = cache();
+        let cached = cache
+            .entries
+            .get(&key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.cell, &self.cell));
+        if Arc::strong_count(&self.cell) > 1 + usize::from(cached) {
+            return false;
+        }
+        if cached {
+            cache.entries.remove(&key);
+        }
+        true
+    }
+
     fn begin(self: Arc<Self>) {
-        if let Kind::Source(source) = &self.node.kind {
-            let produced = self.node.read(source, self.n);
-            return self.complete(produced);
+        match &self.node.kind {
+            Kind::Source(source) => {
+                if self.dropped() {
+                    return;
+                }
+                let produced = self.node.read(source, self.n);
+                return self.complete(produced);
+            }
+            Kind::Mapped(mapped) => {
+                let mut frames = [0; NEEDED];
+                let count = unsafe { (mapped.need)(mapped.user, self.n, frames.as_mut_ptr()) };
+                let count = usize::try_from(count).unwrap_or(0).min(NEEDED);
+                let input = &mapped.input;
+                let requests = frames[..count]
+                    .iter()
+                    .map(|&n| (Arc::clone(input), input.frame(n)));
+                unsafe { &mut *self.context.get() }.requests = requests.collect();
+                return self.wait();
+            }
+            Kind::Filter { .. } => {}
         }
         let frame = self.call(vs3::AR_INITIAL);
         let context = unsafe { &*self.context.get() };
@@ -481,12 +675,21 @@ impl Task {
             context.frames.push(((node.id(), n), cell));
         }
         if self.waiting.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let host = Arc::clone(&self.node.host);
-            host.spawn(self.priority, move || self.run());
+            pool().spawn(self.priority, move || self.run());
         }
     }
 
     fn run(self: Arc<Self>) {
+        if self.dropped() {
+            self.call(vs3::AR_ERROR);
+            unsafe { &mut *self.context.get() }.frames.clear();
+            return;
+        }
+        if let Kind::Mapped(mapped) = &self.node.kind {
+            let frames = std::mem::take(&mut unsafe { &mut *self.context.get() }.frames);
+            let produced = self.node.render(mapped, self.n, &frames);
+            return self.complete(produced);
+        }
         let frame = self.call(vs3::AR_ALL_FRAMES_READY);
         let context = unsafe { &*self.context.get() };
         // a filter may request more frames in its second call
@@ -511,10 +714,9 @@ impl Task {
     }
 
     fn complete(self: Arc<Self>, produced: Produced) {
-        let host = &self.node.host;
         let key = (self.node.id(), self.n);
         {
-            let mut cache = host.cache.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut cache = cache();
             let cached = cache
                 .entries
                 .get(&key)
@@ -526,7 +728,7 @@ impl Task {
                         entry.bytes = bytes;
                     }
                     cache.bytes += bytes;
-                    while cache.bytes > CACHE_BYTES {
+                    while cache.bytes > budget() {
                         let oldest = cache
                             .entries
                             .iter()
@@ -559,7 +761,7 @@ impl Task {
         self.cell.ready.notify_all();
         for waiter in waiters {
             if waiter.waiting.fetch_sub(1, Ordering::AcqRel) == 1 {
-                host.spawn(waiter.priority, move || waiter.run());
+                pool().spawn(waiter.priority, move || waiter.run());
             }
         }
     }
@@ -573,17 +775,14 @@ impl Drop for Node {
                 let core = Arc::as_ptr(&self.host).cast_mut().cast();
                 unsafe { free(*instance.get(), core, table()) };
             }
-            Kind::Source(source) => {
-                if let Some(release) = source.release {
-                    unsafe { release(source.user) };
+            Kind::Source(Source { release, user, .. })
+            | Kind::Mapped(Mapped { release, user, .. }) => {
+                if let Some(release) = release {
+                    unsafe { release(*user) };
                 }
             }
         }
-        let mut cache = self
-            .host
-            .cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut cache = cache();
         let mut freed = 0;
         cache.entries.retain(|key, entry| {
             if key.0 == id {
@@ -619,73 +818,38 @@ unsafe extern "system" fn register(
 type PluginInit = unsafe extern "system" fn(vs3::Config, vs3::Register, Raw);
 
 impl Host {
-    pub fn new(directory: Option<&std::path::Path>, threads: usize) -> Result<Arc<Self>, String> {
-        let mut functions: Vec<(CString, vs3::Create)> = Vec::new();
-        for name in ["svpflow1_vs", "svpflow2_vs"] {
-            let file = libloading::library_filename(name);
-            let path =
-                directory.map_or_else(|| file.clone().into(), |directory| directory.join(&file));
-            let library = unsafe { libloading::Library::new(&path) }
-                .map_err(|error| format!("cannot load {}: {error}", path.display()))?;
-            let init = *unsafe { library.get::<PluginInit>(b"VapourSynthPluginInit\0") }
-                .map_err(|error| format!("{}: {error}", path.display()))?;
-            unsafe { init(config, register, (&raw mut functions).cast()) };
-            std::mem::forget(library);
-        }
-        let threads = if threads == 0 {
-            std::thread::available_parallelism().map_or(1, usize::from)
-        } else {
-            threads
-        };
-        let queue = Arc::new(Queue::default());
-        for _ in 0..threads {
-            let queue = Arc::clone(&queue);
-            std::thread::spawn(move || work(&queue));
-        }
+    pub fn new(directory: Option<&std::path::Path>) -> Result<Arc<Self>, String> {
+        static FUNCTIONS: OnceLock<Result<Vec<(CString, vs3::Create)>, String>> = OnceLock::new();
+        let functions = FUNCTIONS.get_or_init(|| {
+            let mut functions = Vec::new();
+            for name in ["svpflow1_vs", "svpflow2_vs"] {
+                let file = libloading::library_filename(name);
+                let path = directory
+                    .map_or_else(|| file.clone().into(), |directory| directory.join(&file));
+                let library = unsafe { libloading::Library::new(&path) }
+                    .map_err(|error| format!("cannot load {}: {error}", path.display()))?;
+                let init = *unsafe { library.get::<PluginInit>(b"VapourSynthPluginInit\0") }
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                unsafe { init(config, register, (&raw mut functions).cast()) };
+                std::mem::forget(library);
+            }
+            Ok(functions)
+        });
         Ok(Arc::new(Self {
             info: CoreInfo {
                 version: vs3::LATER_REQUESTS.as_ptr(),
                 core: 0,
                 api: 3 << 16,
-                num_threads: i32::try_from(threads).unwrap_or(1),
+                num_threads: i32::try_from(threads()).unwrap_or(1),
                 max_framebuffer: 0,
                 used_framebuffer: 0,
             },
-            functions,
-            cache: Mutex::default(),
-            queue,
+            functions: functions.as_ref().map_err(Clone::clone)?,
         }))
     }
 
     pub fn threads(&self) -> i32 {
         self.info.num_threads
-    }
-
-    pub fn busy(&self) -> bool {
-        let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        let used: usize = cache
-            .entries
-            .values()
-            .filter(|entry| Arc::strong_count(&entry.cell) > 1)
-            .map(|entry| entry.bytes)
-            .sum();
-        used > CACHE_BYTES / 2
-    }
-
-    fn spawn(&self, priority: i32, job: impl FnOnce() + Send + 'static) {
-        let mut jobs = self
-            .queue
-            .jobs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        jobs.1 += 1;
-        let order = Reverse((priority, jobs.1));
-        jobs.0.push(Job {
-            order,
-            run: Box::new(job),
-        });
-        drop(jobs);
-        self.queue.ready.notify_one();
     }
 
     pub fn source(
@@ -694,7 +858,6 @@ impl Host {
         read: Read,
         release: Option<Release>,
         user: *mut c_void,
-        parallel: bool,
     ) -> Arc<Node> {
         Arc::new(Node {
             host: Arc::clone(self),
@@ -703,8 +866,29 @@ impl Host {
                 read,
                 release,
                 user,
-                parallel,
                 state: Mutex::default(),
+            }),
+        })
+    }
+
+    pub fn map(
+        self: &Arc<Self>,
+        info: VideoInfo,
+        input: Arc<Node>,
+        need: Need,
+        render: Render,
+        release: Option<Release>,
+        user: *mut c_void,
+    ) -> Arc<Node> {
+        Arc::new(Node {
+            host: Arc::clone(self),
+            info: UnsafeCell::new(info),
+            kind: Kind::Mapped(Mapped {
+                input,
+                need,
+                render,
+                release,
+                user,
             }),
         })
     }
@@ -729,35 +913,6 @@ impl Host {
         match output.error.take() {
             Some(error) => Err(error),
             None => Ok(output),
-        }
-    }
-}
-
-impl Drop for Host {
-    fn drop(&mut self) {
-        self.queue
-            .jobs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .2 = true;
-        self.queue.ready.notify_all();
-    }
-}
-
-fn work(queue: &Queue) {
-    let mut jobs = queue.jobs.lock().unwrap_or_else(PoisonError::into_inner);
-    loop {
-        if let Some(job) = jobs.0.pop() {
-            drop(jobs);
-            (job.run)();
-            jobs = queue.jobs.lock().unwrap_or_else(PoisonError::into_inner);
-        } else if jobs.2 {
-            return;
-        } else {
-            jobs = queue
-                .ready
-                .wait(jobs)
-                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 }

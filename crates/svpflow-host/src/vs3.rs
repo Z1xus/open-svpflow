@@ -80,6 +80,7 @@ pub const PROP_SET_INT: usize = slot(57);
 
 const SLOTS: usize = 110;
 
+pub const AR_ERROR: i32 = -1;
 pub const AR_INITIAL: i32 = 0;
 pub const AR_ALL_FRAMES_READY: i32 = 2;
 pub const FM_PARALLEL: i32 = 100;
