@@ -360,6 +360,7 @@ unsafe fn collect_state(
             i32::try_from(options.gpu_id()).unwrap_or(0),
             options.gpu_qn(),
             video_format::source_depth(&video_info) == 10,
+            svpflow_core::smooth_engine::gpu_linear(&options.reference(), video_info.width),
         )
     } else {
         None

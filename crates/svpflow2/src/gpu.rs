@@ -239,6 +239,7 @@ pub struct GpuContext {
     variants: &'static std::sync::Mutex<Vec<(u32, ClProgram)>>,
     device_name: String,
     hi10: bool,
+    linear: bool,
 
     units: Vec<std::sync::Mutex<Unit>>,
     next_unit: std::sync::atomic::AtomicUsize,
@@ -502,7 +503,9 @@ impl Drop for GpuContext {
             }
             if let Ok(mut pool) = self.image_pool.lock() {
                 for images in pool.drain(..) {
-                    (self.cl.ReleaseMemObject)(images.linear);
+                    if !images.linear.is_null() {
+                        (self.cl.ReleaseMemObject)(images.linear);
+                    }
                     (self.cl.ReleaseMemObject)(images.packed);
                 }
             }
@@ -537,14 +540,19 @@ impl GpuContext {
         }
     }
 
-    pub fn new(gpuid: i32, qn: i64, hi10: bool) -> Option<Self> {
+    pub fn new(gpuid: i32, qn: i64, hi10: bool, linear: bool) -> Option<Self> {
         let units = usize::try_from(qn)
             .unwrap_or(DEFAULT_UNITS)
             .clamp(MIN_UNITS, MAX_UNITS);
-        unsafe { Self::try_new(gpuid, units, hi10) }.ok()
+        unsafe { Self::try_new(gpuid, units, hi10, linear) }.ok()
     }
 
-    unsafe fn try_new(gpuid: i32, num_units: usize, hi10: bool) -> Result<Self, String> {
+    unsafe fn try_new(
+        gpuid: i32,
+        num_units: usize,
+        hi10: bool,
+        linear: bool,
+    ) -> Result<Self, String> {
         let cl = unsafe { OpenCl::load()? };
 
         let mut num_plat = 0u32;
@@ -666,6 +674,7 @@ impl GpuContext {
                 program,
                 variants,
                 hi10,
+                linear,
                 device_name,
                 units,
                 next_unit: std::sync::atomic::AtomicUsize::new(0),
@@ -724,6 +733,10 @@ impl Drop for Buf<'_> {
 }
 
 impl GpuContext {
+    pub fn linear(&self) -> bool {
+        self.linear
+    }
+
     pub fn cache_frame(&self, key: i64, planes: [UploadPlane<'_>; 3]) -> Option<SuperHandle> {
         let cell = {
             let mut cache = self.super_cache.lock().ok()?;
@@ -784,9 +797,15 @@ impl GpuContext {
                 CL_UNORM_INT8
             };
             let packed = unsafe { self.create_image(CL_R, depth, dims.0, dims.1) }?;
-            let linear = unsafe { self.create_image(CL_R, CL_FLOAT, width, height) }?;
-            let mems = (linear.mem, packed.mem);
-            std::mem::forget(linear);
+            let linear = if self.linear {
+                let linear = unsafe { self.create_image(CL_R, CL_FLOAT, width, height) }?;
+                let mem = linear.mem;
+                std::mem::forget(linear);
+                mem
+            } else {
+                std::ptr::null_mut()
+            };
+            let mems = (linear, packed.mem);
             std::mem::forget(packed);
             mems
         };
@@ -806,6 +825,9 @@ impl GpuContext {
             self.enqueue_plane_at(resources.queue, packed, planes[0], 0, 0)?;
             self.enqueue_plane_at(resources.queue, packed, planes[1], 0, height)?;
             self.enqueue_plane_at(resources.queue, packed, planes[2], planes[1].width, height)?;
+            if !self.linear {
+                return Some(entry);
+            }
             if (self.cl.SetKernelArg)(
                 resources.kernel,
                 0,

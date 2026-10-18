@@ -3436,6 +3436,7 @@ fn gpu_render_frame(
         (next0.x, next0.y),
         (prev1.x, prev1.y),
     ];
+    let linear = gpu.linear();
     let make = |chroma: bool, offset_x: i32, offset_y: i32| {
         let p = cpu.gpu_plane_params(chroma);
         crate::gpu::KernelParams {
@@ -3451,7 +3452,7 @@ fn gpu_render_frame(
             origin_y: p.origin_y,
             phase,
             has_sad: i32::from(area.is_some()),
-            linear_luma: i32::from(!chroma),
+            linear_luma: i32::from(!chroma && linear),
             cubic: i32::from(cubic),
             cubic_ref: 0,
             offset_x,
@@ -3461,8 +3462,8 @@ fn gpu_render_frame(
         }
     };
     gpu.render_frame(
-        src0.bufs(),
-        src1.bufs(),
+        src0.sources(linear),
+        src1.sources(linear),
         dst.y.data,
         dst.y.stride as i32,
         make(false, 0, 0),
