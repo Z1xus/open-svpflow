@@ -142,6 +142,7 @@ impl AnalyseState {
             match slot.claim() {
                 Some(inputs) => {
                     unsafe { api.release(&inputs) };
+                    slot.set(Ahead::Taken);
                     false
                 }
                 None => slot.running(),
