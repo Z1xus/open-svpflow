@@ -172,7 +172,6 @@ struct Unit {
     mapped: usize,
     capacity: usize,
     used: usize,
-    retired: Vec<(usize, usize)>,
     kernels: Vec<(usize, usize)>,
     buffers: [Buffer; 18],
 }
@@ -435,13 +434,25 @@ impl Session<'_> {
         let cl = &self.gpu.cl;
         if self.unit.used.next_multiple_of(256) + needed > self.unit.capacity {
             if self.unit.staging != 0 {
-                let old = (self.unit.staging, self.unit.mapped);
-                self.unit.retired.push(old);
+                let queue = self.unit.queue as Handle;
+                unsafe {
+                    (cl.EnqueueUnmap)(
+                        queue,
+                        self.unit.staging as Handle,
+                        self.unit.mapped as *mut c_void,
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                    );
+                    (cl.Finish)(queue);
+                    (cl.ReleaseMemObject)(self.unit.staging as Handle);
+                }
                 self.unit.staging = 0;
             }
-            let capacity = (2 * self.unit.capacity)
+            let capacity = (self.unit.capacity + self.unit.capacity / 4)
+                .max(needed)
                 .max(STAGING)
-                .max(needed.next_power_of_two());
+                .next_multiple_of(1 << 20);
             let mut err = 0;
             let mem = unsafe {
                 (cl.CreateBuffer)(
@@ -881,22 +892,7 @@ impl Drop for Session<'_> {
         }
         let cl = &self.gpu.cl;
         let queue = self.unit.queue as Handle;
-        for &(mem, mapped) in &self.unit.retired {
-            unsafe {
-                (cl.EnqueueUnmap)(
-                    queue,
-                    mem as Handle,
-                    mapped as *mut c_void,
-                    0,
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
-                );
-            }
-        }
         unsafe { (cl.Finish)(queue) };
-        for (mem, _) in self.unit.retired.drain(..) {
-            unsafe { (cl.ReleaseMemObject)(mem as Handle) };
-        }
     }
 }
 
