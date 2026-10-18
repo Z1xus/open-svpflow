@@ -6,6 +6,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::thread::JoinHandle;
 
 use svpflow_host::vs3::{self, ConstRaw, CoreInfo, Format, Raw, VideoInfo};
 
@@ -360,52 +361,158 @@ impl Ord for Job {
     }
 }
 
+struct Queue {
+    jobs: BinaryHeap<Job>,
+    count: u64,
+    target: usize,
+    live: usize,
+}
+
 struct Pool {
-    jobs: Mutex<(BinaryHeap<Job>, u64)>,
+    queue: Mutex<Queue>,
     ready: Condvar,
+    exited: Condvar,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+static WANT: AtomicUsize = AtomicUsize::new(0);
+
+static WORKERS: Pool = Pool {
+    queue: Mutex::new(Queue {
+        jobs: BinaryHeap::new(),
+        count: 0,
+        target: 0,
+        live: 0,
+    }),
+    ready: Condvar::new(),
+    exited: Condvar::new(),
+    handles: Mutex::new(Vec::new()),
+};
+
+thread_local! {
+    static WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn threads() -> usize {
-    std::thread::available_parallelism().map_or(1, usize::from)
+    match WANT.load(Ordering::Relaxed) {
+        0 => std::thread::available_parallelism().map_or(1, usize::from),
+        count => count,
+    }
 }
 
 fn pool() -> &'static Pool {
-    static POOL: OnceLock<Pool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        for _ in 0..threads() {
-            std::thread::spawn(|| pool().work());
-        }
-        Pool {
-            jobs: Mutex::default(),
-            ready: Condvar::new(),
-        }
-    })
+    &WORKERS
 }
 
+pub fn set_threads(count: usize) {
+    WANT.store(count, Ordering::Relaxed);
+    let running = WORKERS
+        .queue
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .target
+        > 0;
+    if running {
+        WORKERS.resize(threads());
+    }
+    for plugin in PLUGINS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+    {
+        if let Some(set) = plugin.set {
+            unsafe { set(count) };
+        }
+    }
+}
+
+pub fn stop() {
+    WORKERS.resize(0);
+    for plugin in PLUGINS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+    {
+        if let Some(stop) = plugin.stop {
+            unsafe { stop() };
+        }
+    }
+}
+
+struct Plugin {
+    set: Option<unsafe extern "C" fn(usize)>,
+    stop: Option<unsafe extern "C" fn()>,
+}
+
+static PLUGINS: Mutex<Vec<Plugin>> = Mutex::new(Vec::new());
+
 impl Pool {
-    fn spawn(&self, priority: i32, job: impl FnOnce() + Send + 'static) {
-        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
-        jobs.1 += 1;
-        let order = Reverse((priority, jobs.1));
-        jobs.0.push(Job {
+    fn spawn(&'static self, priority: i32, job: impl FnOnce() + Send + 'static) {
+        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        queue.count += 1;
+        let order = Reverse((priority, queue.count));
+        queue.jobs.push(Job {
             order,
             run: Box::new(job),
         });
-        drop(jobs);
+        if queue.target == 0 && queue.live == 0 {
+            queue.target = threads();
+        }
+        self.grow(&mut queue);
+        drop(queue);
         self.ready.notify_one();
     }
 
+    fn grow(&'static self, queue: &mut Queue) {
+        let mut handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
+        handles.retain(|handle| !handle.is_finished());
+        while queue.live < queue.target {
+            queue.live += 1;
+            handles.push(std::thread::spawn(move || self.work()));
+        }
+    }
+
+    // count 0 stops the workers after the queue is empty
+    fn resize(&'static self, count: usize) {
+        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        queue.target = count;
+        self.grow(&mut queue);
+        self.ready.notify_all();
+        // a worker cannot wait for itself
+        if count > 0 || WORKER.get() {
+            return;
+        }
+        let queue = self
+            .exited
+            .wait_while(queue, |queue| queue.live > 0 && queue.target == 0)
+            .unwrap_or_else(PoisonError::into_inner);
+        if queue.target > 0 {
+            return;
+        }
+        drop(queue);
+        let handles =
+            std::mem::take(&mut *self.handles.lock().unwrap_or_else(PoisonError::into_inner));
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
     fn work(&self) {
-        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        WORKER.set(true);
+        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
-            if let Some(job) = jobs.0.pop() {
-                drop(jobs);
+            if let Some(job) = queue.jobs.pop() {
+                drop(queue);
                 (job.run)();
-                jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+                queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            } else if queue.live > queue.target {
+                queue.live -= 1;
+                self.exited.notify_all();
+                return;
             } else {
-                jobs = self
+                queue = self
                     .ready
-                    .wait(jobs)
+                    .wait(queue)
                     .unwrap_or_else(PoisonError::into_inner);
             }
         }
@@ -832,6 +939,20 @@ impl Host {
                 let init = *unsafe { library.get::<PluginInit>(b"VapourSynthPluginInit\0") }
                     .map_err(|error| format!("{}: {error}", path.display()))?;
                 unsafe { init(config, register, (&raw mut functions).cast()) };
+                let set =
+                    unsafe { library.get::<unsafe extern "C" fn(usize)>(b"osvp_plugin_threads\0") }
+                        .ok()
+                        .map(|symbol| *symbol);
+                let stop = unsafe { library.get::<unsafe extern "C" fn()>(b"osvp_plugin_stop\0") }
+                    .ok()
+                    .map(|symbol| *symbol);
+                if let Some(set) = set {
+                    unsafe { set(WANT.load(Ordering::Relaxed)) };
+                }
+                PLUGINS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(Plugin { set, stop });
                 std::mem::forget(library);
             }
             Ok(functions)

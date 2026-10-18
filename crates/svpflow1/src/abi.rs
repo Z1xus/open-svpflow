@@ -129,3 +129,13 @@ static AVS_FUNCTIONS: [avs::Function; 2] = [
 pub unsafe extern "system" fn avisynth_c_plugin_init(env: vs::Raw) -> *const c_char {
     unsafe { avs::init(env, &AVS_FUNCTIONS, c"SVPFlow1") }
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn osvp_plugin_threads(count: usize) {
+    svpflow_core::threads::set(count);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn osvp_plugin_stop() {
+    svpflow_core::threads::shutdown();
+}

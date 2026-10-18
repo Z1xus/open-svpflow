@@ -9,6 +9,9 @@ rust-version = "1.88"
 [lib]
 crate-type = ["rlib"]
 
+[dependencies]
+rayon = "1.12.0"
+
 [lints.rust]
 unsafe_code = "deny"
 

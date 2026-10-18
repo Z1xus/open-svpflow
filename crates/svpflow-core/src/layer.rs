@@ -15,7 +15,6 @@ const SAME: f32 = 2.5;
 const GAIN: f32 = 4096.0;
 const OFFSET: f32 = 64.0;
 const CELL: usize = 8;
-const WORKERS: usize = 6;
 
 #[must_use]
 pub fn limit(limit: Option<f64>) -> f32 {
@@ -158,10 +157,10 @@ fn gather<const N: usize>(
     let size = (width / ratio, height / ratio);
     let top = ((size.0 - 1) as f32, (size.1 - 1) as f32);
     let mut sums = vec![[0.0; N]; size.0 * size.1];
-    let band = size.1.div_ceil(WORKERS).max(1);
-    std::thread::scope(|scope| {
+    let band = size.1.div_ceil(crate::threads::workers()).max(1);
+    crate::threads::scope(|scope| {
         for (index, rows) in sums.chunks_mut(band * size.0).enumerate() {
-            scope.spawn(move || {
+            scope.spawn(move |_| {
                 for pair in pairs {
                     let (first, second) = (pair.first[plane], pair.second[plane]);
                     for (y, row) in rows.chunks_exact_mut(size.0).enumerate() {
@@ -327,11 +326,11 @@ pub fn fit(
     let limit = limit * limit;
     let mut rough = vec![(1.0, 0.0); width * height];
     let mut offsets = vec![[0.0f32; 2]; width * height];
-    let band = height.div_ceil(WORKERS).max(1) * width;
-    std::thread::scope(|scope| {
+    let band = height.div_ceil(crate::threads::workers()).max(1) * width;
+    crate::threads::scope(|scope| {
         let bands = rough.chunks_mut(band).zip(offsets.chunks_mut(band));
         for (index, (rough, offsets)) in bands.enumerate() {
-            scope.spawn(move || {
+            scope.spawn(move |_| {
                 for (at, (rough, offsets)) in rough.iter_mut().zip(offsets).enumerate() {
                     let at = index * band + at;
                     let Some(((a, b), range)) = window(parts, at, limit) else {

@@ -39,6 +39,12 @@ typedef int32_t (*osvp_render)(void *user, int32_t n, const osvp_frame *const *i
 
 const char *osvp_error(void);
 
+/* caps every thread of the library: the frame pool and the plugin pools. 0 uses the
+   number of cores. It applies at once, also with live contexts, and may run before
+   osvp_create. The threads exit and join when the last context is destroyed, so free
+   all clips first */
+void osvp_set_threads(int32_t count);
+
 osvp_context *osvp_create(const char *plugin_dir);
 void osvp_destroy(osvp_context *context);
 

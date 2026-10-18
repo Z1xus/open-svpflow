@@ -346,7 +346,7 @@ impl Pyramid {
 }
 
 fn both<A: Send, B: Send>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B + Send) -> (A, B) {
-    rayon::join(a, b)
+    svpflow_core::threads::join(a, b)
 }
 
 fn order_level(fields: &mut [Option<Field>], level: usize, sort: bool) {

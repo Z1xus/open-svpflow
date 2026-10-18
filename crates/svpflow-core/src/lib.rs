@@ -14,6 +14,7 @@ pub mod smooth;
 pub mod smooth_engine;
 pub mod smooth_options;
 pub mod still;
+pub mod threads;
 
 // the nvidia opencl compiler crashes on concurrent builds
 pub static OPENCL_BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());

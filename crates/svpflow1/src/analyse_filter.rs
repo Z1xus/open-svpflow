@@ -158,7 +158,7 @@ impl AnalyseState {
             let slot = Slot::new(Ahead::Queued(inputs));
             ahead.insert(frame, slot.clone());
             let (job, api) = (Job(self), *api);
-            rayon::spawn(move || {
+            svpflow_core::threads::spawn(move || {
                 let job = job;
                 if let Some(inputs) = slot.claim() {
                     let payload = unsafe { (*job.0).compute(&api, frame, &inputs) };

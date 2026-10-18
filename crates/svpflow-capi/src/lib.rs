@@ -5,7 +5,7 @@ mod host;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use host::{Frame, Host, Map, Need, Node, Pending, Read, Release, Render, Value};
@@ -69,6 +69,13 @@ pub extern "C" fn osvp_error() -> *const c_char {
     ERROR.with(|error| error.borrow().as_ptr())
 }
 
+static CONTEXTS: AtomicUsize = AtomicUsize::new(0);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn osvp_set_threads(count: i32) {
+    host::set_threads(usize::try_from(count).unwrap_or(0));
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn osvp_create(plugin_dir: *const c_char) -> *mut Context {
     let directory = unsafe { plugin_dir.as_ref() }.map(|directory| {
@@ -78,7 +85,10 @@ pub unsafe extern "C" fn osvp_create(plugin_dir: *const c_char) -> *mut Context 
     });
     let directory = directory.as_deref().map(std::path::Path::new);
     match Host::new(directory) {
-        Ok(host) => Box::into_raw(Box::new(Context(host))),
+        Ok(host) => {
+            CONTEXTS.fetch_add(1, Ordering::SeqCst);
+            Box::into_raw(Box::new(Context(host)))
+        }
         Err(error) => fail(error),
     }
 }
@@ -87,6 +97,9 @@ pub unsafe extern "C" fn osvp_create(plugin_dir: *const c_char) -> *mut Context 
 pub unsafe extern "C" fn osvp_destroy(context: *mut Context) {
     if !context.is_null() {
         drop(unsafe { Box::from_raw(context) });
+        if CONTEXTS.fetch_sub(1, Ordering::SeqCst) == 1 {
+            host::stop();
+        }
     }
 }
 

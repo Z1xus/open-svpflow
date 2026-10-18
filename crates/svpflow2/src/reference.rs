@@ -13,8 +13,6 @@ use crate::core::{FilterState, Mode, drop_frame, get_node, request_node, super_f
 use crate::vs::Source as _;
 use crate::{frame, metadata, options::ReferenceParams, vs};
 
-const WORKERS: usize = 6;
-
 fn cache_cap(bytes: usize) -> usize {
     ((96 << 20) / bytes.max(1)).clamp(4, 48)
 }
@@ -346,20 +344,21 @@ impl FilterState {
                     .map(|_| std::sync::Mutex::new(None))
                     .collect();
                 let fields = &self.field_cache;
-                std::thread::scope(|scope| {
-                    for worker in 0..WORKERS {
+                let workers = svpflow_core::threads::workers();
+                svpflow_core::threads::scope(|scope| {
+                    for worker in 0..workers {
                         let (planes, payloads, handles, moved) =
                             (&planes, &payloads, &handles, &moved);
                         let (needed, pairs, motion) = (&needed, &pairs, &motion);
-                        scope.spawn(move || {
-                            for index in (worker..planes.len()).step_by(WORKERS) {
+                        scope.spawn(move |_| {
+                            for index in (worker..planes.len()).step_by(workers) {
                                 let handle =
                                     gpu.cache_frame(i64::from(needed[index]), planes[index]);
                                 if let Ok(mut slot) = handles[index].lock() {
                                     *slot = handle;
                                 }
                             }
-                            for index in (worker..payloads.len()).step_by(WORKERS) {
+                            for index in (worker..payloads.len()).step_by(workers) {
                                 let k = pairs[index];
                                 let field = crate::core::cache_cell(fields, i64::from(k), cap)
                                     .and_then(|cell| {

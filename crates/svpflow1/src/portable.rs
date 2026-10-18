@@ -110,7 +110,7 @@ impl SuperBuilder {
         let mut u = vec![0; self.output_chroma_len];
         let mut v = vec![0; self.output_chroma_len];
         let opts = self.opts;
-        rayon::join(
+        svpflow_core::threads::join(
             || {
                 super_build::build_plane(
                     &mut y,
@@ -124,7 +124,7 @@ impl SuperBuilder {
                 );
             },
             || {
-                rayon::join(
+                svpflow_core::threads::join(
                     || {
                         super_build::build_plane(
                             &mut u,
