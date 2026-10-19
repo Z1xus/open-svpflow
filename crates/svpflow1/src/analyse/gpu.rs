@@ -178,12 +178,12 @@ pub(crate) struct RefineGpu {
     device: usize,
     programs: Mutex<Vec<(Variant, usize)>>,
     units: Vec<Mutex<Unit>>,
-    cache: Mutex<std::collections::VecDeque<std::sync::Arc<CachedFrame>>>,
+    cache: Mutex<Cache>,
     expand: OnceLock<Option<usize>>,
     pool: Mutex<Vec<(usize, usize)>>,
 }
 
-const CACHED_FRAMES: usize = 16;
+const RECENT_FRAMES: usize = 2;
 const POOLED: usize = 3;
 
 struct Uploaded {
@@ -191,6 +191,33 @@ struct Uploaded {
     sizes: [usize; 3],
     frame: Frame,
     event: usize,
+}
+
+#[derive(Default)]
+struct Cache {
+    recent: std::collections::VecDeque<std::sync::Arc<CachedFrame>>,
+    live: Vec<std::sync::Weak<CachedFrame>>,
+}
+
+impl Cache {
+    fn find(&self, key: (usize, i32)) -> Option<std::sync::Arc<CachedFrame>> {
+        self.recent
+            .iter()
+            .find(|e| e.key == key)
+            .cloned()
+            .or_else(|| {
+                self.live
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade)
+                    .find(|e| e.key == key)
+            })
+    }
+
+    fn remove(&mut self, key: (usize, i32)) {
+        self.recent.retain(|e| e.key != key);
+        self.live
+            .retain(|e| e.upgrade().is_some_and(|e| e.key != key));
+    }
 }
 
 struct CachedFrame {
@@ -295,7 +322,7 @@ impl RefineGpu {
                 device: device as usize,
                 programs: Mutex::new(Vec::new()),
                 units,
-                cache: Mutex::new(std::collections::VecDeque::new()),
+                cache: Mutex::new(Cache::default()),
                 expand: OnceLock::new(),
                 pool: Mutex::new(Vec::new()),
             });
@@ -519,7 +546,7 @@ impl Session<'_> {
             let Ok(mut cache) = gpu.cache.lock() else {
                 return false;
             };
-            if let Some(entry) = cache.iter().find(|e| e.key == key).cloned() {
+            if let Some(entry) = cache.find(key) {
                 drop(cache);
                 let Ok(state) = entry.state.lock() else {
                     return false;
@@ -542,9 +569,11 @@ impl Session<'_> {
             };
             let guard: std::sync::MutexGuard<'static, Option<Uploaded>> =
                 unsafe { std::mem::transmute(guard) };
-            cache.push_back(entry.clone());
-            while cache.len() > CACHED_FRAMES {
-                cache.pop_front();
+            cache.live.retain(|e| e.strong_count() > 0);
+            cache.live.push(std::sync::Arc::downgrade(&entry));
+            cache.recent.push_back(entry.clone());
+            if cache.recent.len() > RECENT_FRAMES {
+                cache.recent.pop_front();
             }
             (entry, guard)
         };
@@ -558,7 +587,7 @@ impl Session<'_> {
             return true;
         }
         if let Ok(mut cache) = gpu.cache.lock() {
-            cache.retain(|e| e.key != key);
+            cache.remove(key);
         }
         false
     }
