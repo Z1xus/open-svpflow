@@ -91,7 +91,7 @@ pub(crate) fn analyse(
                     pel: level.y.pel(),
                     expand: params.super_params.gpu == 1 && params.super_params.flags & 2 == 0,
                 };
-                session.upload(slot, key, &planes);
+                session.defer(slot, key, planes);
             }
         }
         search_stages(params, first, second, outputs, session.as_mut());
@@ -105,7 +105,7 @@ fn search_stages(
     first: &SuperFrameView<'_>,
     second: &SuperFrameView<'_>,
     outputs: [Option<&mut [u32]>; 2],
-    mut session: Option<&mut gpu::Session<'_>>,
+    mut session: Option<&mut gpu::Session<'_, '_>>,
 ) {
     let mut outputs = Some(outputs);
     let last = params.stages.len() - 1;

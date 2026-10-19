@@ -4,7 +4,7 @@ use super::field::recalc::RecalcPlan;
 
 pub(crate) struct RefineGpu;
 
-pub(crate) struct Session<'g>(std::marker::PhantomData<&'g ()>);
+pub(crate) struct Session<'g, 'p>(std::marker::PhantomData<(&'g (), &'p ())>);
 
 pub(crate) struct Planes<'a> {
     pub(crate) data: [&'a [u8]; 3],
@@ -20,15 +20,13 @@ pub(crate) fn refine_gpu() -> Option<&'static RefineGpu> {
 }
 
 impl RefineGpu {
-    pub(crate) fn session(&self) -> Option<Session<'_>> {
+    pub(crate) fn session<'p>(&self) -> Option<Session<'_, 'p>> {
         None
     }
 }
 
-impl Session<'_> {
-    pub(crate) fn upload(&mut self, _: usize, _: (usize, i32), _: &Planes<'_>) -> bool {
-        false
-    }
+impl<'p> Session<'_, 'p> {
+    pub(crate) fn defer(&mut self, _: usize, _: (usize, i32), _: Planes<'p>) {}
 
     pub(crate) fn submit(&mut self, _: &RecalcPlan, _: usize, _: usize) -> Option<usize> {
         None

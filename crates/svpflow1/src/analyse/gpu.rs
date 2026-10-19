@@ -365,7 +365,7 @@ impl RefineGpu {
         Some(program as usize)
     }
 
-    pub(crate) fn session(&self) -> Option<Session<'_>> {
+    pub(crate) fn session<'p>(&self) -> Option<Session<'_, 'p>> {
         let unit = self
             .units
             .iter()
@@ -375,6 +375,7 @@ impl RefineGpu {
             gpu: self,
             unit,
             keep: Vec::new(),
+            deferred: [None, None],
             frames: [None, None],
             tickets: Vec::new(),
             pending: Vec::new(),
@@ -423,16 +424,23 @@ struct Frame {
 
 type SessionFrame = (std::sync::Arc<CachedFrame>, [usize; 3], Frame, usize);
 
-pub(crate) struct Session<'g> {
+impl<'p> Session<'_, 'p> {
+    pub(crate) fn defer(&mut self, slot: usize, key: (usize, i32), planes: Planes<'p>) {
+        self.deferred[slot] = Some((key, planes));
+    }
+}
+
+pub(crate) struct Session<'g, 'p> {
     gpu: &'g RefineGpu,
     unit: std::sync::MutexGuard<'g, Unit>,
     frames: [Option<SessionFrame>; 2],
     tickets: Vec<Vec<[i32; 4]>>,
     pending: Vec<usize>,
     keep: Vec<Box<[u8]>>,
+    deferred: [Option<((usize, i32), Planes<'p>)>; 2],
 }
 
-impl Session<'_> {
+impl Session<'_, '_> {
     unsafe fn transfer(&mut self, mem: Handle, data: &[u8], event: *mut Handle) -> bool {
         let status = unsafe {
             (self.gpu.cl.EnqueueWriteBuffer)(
@@ -466,7 +474,15 @@ impl Session<'_> {
         Some(mem)
     }
 
-    pub(crate) fn upload(&mut self, slot: usize, key: (usize, i32), planes: &Planes<'_>) -> bool {
+    fn flush(&mut self) {
+        for slot in 0..2 {
+            if let Some((key, planes)) = self.deferred[slot].take() {
+                self.upload(slot, key, &planes);
+            }
+        }
+    }
+
+    fn upload(&mut self, slot: usize, key: (usize, i32), planes: &Planes<'_>) -> bool {
         self.frames[slot] = None;
         let gpu = self.gpu;
         let (entry, guard) = {
@@ -657,6 +673,7 @@ impl Session<'_> {
         src: usize,
         reference: usize,
     ) -> Option<usize> {
+        self.flush();
         let (source, target) = (
             self.frames[src].as_ref()?.2,
             self.frames[reference].as_ref()?.2,
@@ -856,7 +873,7 @@ impl Session<'_> {
     }
 }
 
-impl Drop for Session<'_> {
+impl Drop for Session<'_, '_> {
     fn drop(&mut self) {
         if !self.pending.is_empty() {
             self.wait();

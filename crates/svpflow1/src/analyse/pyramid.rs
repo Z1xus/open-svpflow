@@ -179,7 +179,7 @@ impl Pyramid {
         second: &SuperFrameView<'_>,
         lambda_out: &mut i32,
         outputs: [Option<VectorOutput<'_>>; 2],
-        session: Option<&mut Session<'_>>,
+        session: Option<&mut Session<'_, '_>>,
     ) {
         let [mut out_forward, mut out_backward] = outputs;
         let mut settings = stage.settings(params, 0, true);
@@ -279,7 +279,7 @@ impl Pyramid {
         seed: &Field,
         settings: &super::field::SearchSettings,
         frames: [&SuperFrameView<'_>; 2],
-        session: &mut Session<'_>,
+        session: &mut Session<'_, '_>,
         output: Option<VectorOutput<'_>>,
         lambda_out: Option<&mut i32>,
     ) -> Option<RefineStart> {
@@ -313,7 +313,7 @@ impl Pyramid {
         &mut self,
         starts: [Option<RefineStart>; 2],
         frames: [&SuperFrameView<'_>; 2],
-        session: &mut Session<'_>,
+        session: &mut Session<'_, '_>,
         outputs: [Option<VectorOutput<'_>>; 2],
     ) {
         let waited = starts.iter().flatten().any(|s| s.ticket.is_some()) && session.wait();
