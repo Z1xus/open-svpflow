@@ -293,11 +293,11 @@ impl GpuContext {
         }
         drop(job.pending);
         match self.blend_pool.lock() {
-            Ok(mut pool) if keep && pool.len() < super::IMAGE_POOL_CAP => pool.push(job.buffers),
+            Ok(mut pool) if keep && pool.len() < self.units.len() => pool.push(job.buffers),
             _ => unsafe { self.release_buffers(&job.buffers) },
         }
         match self.blend_units.lock() {
-            Ok(mut pool) if pool.len() < super::IMAGE_POOL_CAP => pool.push(unit),
+            Ok(mut pool) if pool.len() < self.units.len() => pool.push(unit),
             _ => unsafe { self.release_unit(&unit) },
         }
     }

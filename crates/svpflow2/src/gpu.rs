@@ -34,6 +34,7 @@ const CL_SUCCESS: ClInt = 0;
 const CL_EVENT_COMMAND_EXECUTION_STATUS: ClUint = 0x11D3;
 const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
 const CL_DEVICE_NAME: ClUint = 0x102B;
+const CL_DEVICE_GLOBAL_MEM_SIZE: ClUint = 0x101F;
 const CL_MEM_READ_WRITE: u64 = 1 << 0;
 const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
 const CL_MAP_READ: u64 = 1;
@@ -252,6 +253,10 @@ pub struct GpuContext {
 
     super_cache: std::sync::Mutex<Vec<(i64, SuperCell)>>,
     super_held: std::sync::Mutex<Vec<(i64, std::sync::Weak<SuperEntry>)>>,
+    super_evicted: std::sync::Mutex<std::collections::VecDeque<i64>>,
+    super_cap: std::sync::atomic::AtomicUsize,
+    frame_bytes: std::sync::atomic::AtomicUsize,
+    frame_budget: usize,
     image_pool: std::sync::Arc<ImagePool>,
     staging: std::sync::Mutex<Vec<Staging>>,
     still: std::sync::Mutex<StillState>,
@@ -283,6 +288,7 @@ struct SuperEntry {
     release_event: FnRelease,
     release: FnRelease,
     pool: std::sync::Arc<ImagePool>,
+    pool_cap: usize,
     dims: (usize, usize),
     luma: (usize, usize),
 }
@@ -298,7 +304,9 @@ unsafe impl Send for PooledImages {}
 
 type ImagePool = std::sync::Mutex<Vec<PooledImages>>;
 
-const IMAGE_POOL_CAP: usize = 16;
+const RECENT_FRAMES: usize = 2;
+const FRAME_BUDGET_SHARE: usize = 4;
+const EVICTED_KEYS: usize = 32;
 
 unsafe impl Send for SuperEntry {}
 unsafe impl Sync for SuperEntry {}
@@ -318,7 +326,7 @@ impl Drop for SuperEntry {
             }
         }
         if let Ok(mut pool) = self.pool.lock()
-            && pool.len() < IMAGE_POOL_CAP
+            && pool.len() < self.pool_cap
         {
             pool.push(PooledImages {
                 dims: self.dims,
@@ -450,7 +458,6 @@ struct StillState {
 
 unsafe impl Send for StillState {}
 
-const SUPER_CACHE_CAP: usize = 32;
 const UPLOAD_QUEUES: usize = 4;
 
 unsafe impl Send for GpuContext {}
@@ -673,6 +680,7 @@ impl GpuContext {
                 cache_resources.push(std::sync::Mutex::new(CacheResources { kernel, queue }));
             }
             let device_name = unsafe { device_name(&cl, device) };
+            let frame_budget = unsafe { device_memory(&cl, device) } / FRAME_BUDGET_SHARE;
             return Ok(Self {
                 cl,
                 context,
@@ -688,6 +696,10 @@ impl GpuContext {
                 next_upload: std::sync::atomic::AtomicUsize::new(0),
                 super_cache: std::sync::Mutex::new(Vec::new()),
                 super_held: std::sync::Mutex::new(Vec::new()),
+                super_evicted: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                super_cap: std::sync::atomic::AtomicUsize::new(RECENT_FRAMES),
+                frame_bytes: std::sync::atomic::AtomicUsize::new(0),
+                frame_budget,
                 image_pool: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 staging: std::sync::Mutex::new(Vec::new()),
                 still: std::sync::Mutex::new(StillState {
@@ -754,16 +766,35 @@ impl GpuContext {
             } else {
                 let cell = std::sync::Arc::new(std::sync::OnceLock::new());
                 let mut held = self.super_held.lock().ok()?;
-                if cache.len() >= SUPER_CACHE_CAP {
+                let cap = self.super_cap.load(std::sync::atomic::Ordering::Relaxed);
+                if cache.len() >= cap {
                     let (old, gone) = cache.remove(0);
                     held.retain(|(k, entry)| *k != old && entry.strong_count() > 0);
                     if let Some(Some(entry)) = gone.get() {
                         held.push((old, std::sync::Arc::downgrade(entry)));
                     }
+                    if let Ok(mut evicted) = self.super_evicted.lock() {
+                        evicted.push_back(old);
+                        if evicted.len() > EVICTED_KEYS {
+                            evicted.pop_front();
+                        }
+                    }
                 }
                 let found = held.iter().find(|(k, _)| *k == key);
                 if let Some(entry) = found.and_then(|(_, entry)| entry.upgrade()) {
                     let _ = cell.set(Some(entry));
+                } else if let Ok(mut evicted) = self.super_evicted.lock() {
+                    if let Some(at) = evicted.iter().position(|k| *k == key) {
+                        evicted.remove(at);
+                        let bytes = self.frame_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                        let most = (svpflow_core::threads::workers() + RECENT_FRAMES)
+                            .min((self.frame_budget / bytes.max(1)).max(RECENT_FRAMES));
+                        let _ = self.super_cap.fetch_update(
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                            |cap| (cap < most).then_some(cap + 1),
+                        );
+                    }
                 }
                 cache.push((key, std::sync::Arc::clone(&cell)));
                 cell
@@ -788,6 +819,10 @@ impl GpuContext {
             width.max(planes[1].width + planes[2].width),
             height + planes[1].height,
         );
+        let depth = if self.hi10 { 2 } else { 1 };
+        let bytes = dims.0 * dims.1 * depth + if self.linear { width * height * 4 } else { 0 };
+        self.frame_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
         let reused = self.image_pool.lock().ok().and_then(|mut pool| {
             let index = pool
                 .iter()
@@ -823,6 +858,7 @@ impl GpuContext {
             release_event: self.cl.ReleaseEvent,
             release: self.cl.ReleaseMemObject,
             pool: std::sync::Arc::clone(&self.image_pool),
+            pool_cap: self.super_cap.load(std::sync::atomic::Ordering::Relaxed),
             dims,
             luma: (width, height),
         };
@@ -2521,3 +2557,20 @@ kernel void cover_finish(global const int *points, global const uchar *table, wr
     write_imagef(mask, (int2)(x, y), (float4)(0.0f, level[1] / 255.0f, level[0] / 255.0f, 0.0f));
 }
 ";
+
+unsafe fn device_memory(cl: &OpenCl, device: ClDeviceId) -> usize {
+    let mut size = 0u64;
+    unsafe {
+        (cl.GetDeviceInfo)(
+            device,
+            CL_DEVICE_GLOBAL_MEM_SIZE,
+            size_of::<u64>(),
+            (&raw mut size).cast(),
+            std::ptr::null_mut(),
+        );
+    }
+    usize::try_from(size)
+        .ok()
+        .filter(|&size| size > 0)
+        .unwrap_or(usize::MAX)
+}
