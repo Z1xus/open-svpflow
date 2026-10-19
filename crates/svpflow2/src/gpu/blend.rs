@@ -2,7 +2,7 @@
 
 use core::ffi::c_void;
 use std::cell::{Cell, RefCell};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use super::{
     CL_FALSE, CL_MEM_READ_WRITE, CL_RGBA, CL_SUCCESS, CL_UNORM_INT8, ClContext, ClEvent,
@@ -95,7 +95,36 @@ struct Pending {
     masks: Vec<Vec<u8>>,
 }
 
+pub(super) struct Slots(Mutex<usize>, Condvar);
+
+impl Slots {
+    pub(super) fn new(count: usize) -> Self {
+        Self(Mutex::new(count), Condvar::new())
+    }
+
+    fn take(self: &Arc<Self>) -> Option<Slot> {
+        let mut free = self.0.lock().ok()?;
+        while *free == 0 {
+            free = self.1.wait(free).ok()?;
+        }
+        *free -= 1;
+        Some(Slot(Arc::clone(self)))
+    }
+}
+
+struct Slot(Arc<Slots>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Ok(mut free) = self.0.0.lock() {
+            *free += 1;
+            self.0.1.notify_one();
+        }
+    }
+}
+
 pub struct BlendJob {
+    _slot: Slot,
     buffers: Buffers,
     unit: RefCell<Unit>,
     width: usize,
@@ -314,6 +343,7 @@ impl GpuContext {
         }
         let rows = height + chroma_height;
         let len = width.checked_mul(rows).filter(|&len| len > 0)?;
+        let slot = self.blend_slots.take()?;
         let mut unit = self.blend_unit()?;
         let reused = self.blend_pool.lock().ok().and_then(|mut pool| {
             let index = pool.iter().position(|buffers| buffers.len == len)?;
@@ -340,6 +370,7 @@ impl GpuContext {
             return None;
         }
         Some(BlendJob {
+            _slot: slot,
             buffers,
             unit: RefCell::new(unit),
             width,

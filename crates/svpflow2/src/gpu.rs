@@ -263,6 +263,7 @@ pub struct GpuContext {
     still: std::sync::Mutex<StillState>,
     layer: std::sync::Mutex<layer::LayerState>,
     blend_pool: std::sync::Mutex<Vec<blend::Buffers>>,
+    blend_slots: std::sync::Arc<blend::Slots>,
     blend_units: std::sync::Mutex<Vec<Unit>>,
 }
 
@@ -669,6 +670,7 @@ impl GpuContext {
             }
             let device_name = unsafe { device_name(&cl, device) };
             let frame_budget = unsafe { device_memory(&cl, device) } / FRAME_BUDGET_SHARE;
+            let blend_slots = std::sync::Arc::new(blend::Slots::new(units.len()));
             return Ok(Self {
                 cl,
                 context,
@@ -697,6 +699,7 @@ impl GpuContext {
                 }),
                 layer: std::sync::Mutex::new(layer::LayerState::new()),
                 blend_pool: std::sync::Mutex::new(Vec::new()),
+                blend_slots,
                 blend_units: std::sync::Mutex::new(Vec::new()),
             });
         }
