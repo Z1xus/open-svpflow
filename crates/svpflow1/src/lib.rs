@@ -23,6 +23,10 @@
 )]
 
 #[cfg(not(target_arch = "wasm32"))]
+#[global_allocator]
+static ALLOC: svpflow_host::alloc::Cached = svpflow_host::alloc::Cached::new();
+
+#[cfg(not(target_arch = "wasm32"))]
 mod abi;
 mod analyse;
 #[cfg(not(target_arch = "wasm32"))]

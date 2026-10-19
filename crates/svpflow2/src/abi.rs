@@ -207,4 +207,5 @@ pub extern "C" fn osvp_plugin_threads(count: usize) {
 #[unsafe(no_mangle)]
 pub extern "C" fn osvp_plugin_stop() {
     svpflow_core::threads::shutdown();
+    crate::ALLOC.trim();
 }

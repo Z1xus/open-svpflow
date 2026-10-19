@@ -10,6 +10,9 @@
     clippy::too_many_lines
 )]
 
+#[global_allocator]
+static ALLOC: svpflow_host::alloc::Cached = svpflow_host::alloc::Cached::new();
+
 mod abi;
 #[cfg(feature = "blend")]
 mod blend;
