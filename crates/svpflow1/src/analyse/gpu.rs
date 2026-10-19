@@ -12,11 +12,10 @@ type Handle = *mut c_void;
 const CL_SUCCESS: ClInt = 0;
 const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
 const CL_MEM_READ_WRITE: u64 = 1;
-const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
-const CL_MAP_WRITE: u64 = 1 << 1;
-const STAGING: usize = 4 << 20;
+const CHUNK: usize = 16384;
+const RECORD: usize = 12;
+const RECORD_BYTES: usize = RECORD * size_of::<i32>();
 const CL_FALSE: ClUint = 0;
-const CL_TRUE: ClUint = 1;
 const CL_EVENT_COMMAND_EXECUTION_STATUS: ClUint = 0x11D3;
 const UNITS: usize = 32;
 
@@ -69,18 +68,6 @@ type FnEnqueueNDRangeKernel = unsafe extern "C" fn(
 type FnRelease = unsafe extern "C" fn(Handle) -> ClInt;
 type FnFinish = unsafe extern "C" fn(Handle) -> ClInt;
 type FnWaitForEvents = unsafe extern "C" fn(ClUint, *const Handle) -> ClInt;
-type FnEnqueueMapBuffer = unsafe extern "C" fn(
-    Handle,
-    Handle,
-    ClUint,
-    u64,
-    usize,
-    usize,
-    ClUint,
-    *const c_void,
-    *mut c_void,
-    *mut ClInt,
-) -> *mut c_void;
 type FnGetEventInfo = unsafe extern "C" fn(Handle, ClUint, usize, *mut c_void, *mut usize) -> ClInt;
 
 #[allow(non_snake_case)]
@@ -104,7 +91,6 @@ struct OpenCl {
     WaitForEvents: FnWaitForEvents,
     GetEventInfo: FnGetEventInfo,
     Flush: FnFinish,
-    EnqueueMapBuffer: FnEnqueueMapBuffer,
 }
 
 impl OpenCl {
@@ -141,7 +127,6 @@ impl OpenCl {
             WaitForEvents: sym!("clWaitForEvents"),
             GetEventInfo: sym!("clGetEventInfo"),
             Flush: sym!("clFlush"),
-            EnqueueMapBuffer: sym!("clEnqueueMapBuffer"),
             _lib: lib,
         })
     }
@@ -164,12 +149,8 @@ struct Buffer {
 struct Unit {
     queue: usize,
     expand: usize,
-    staging: usize,
-    mapped: usize,
-    capacity: usize,
-    used: usize,
     kernels: Vec<(usize, usize)>,
-    buffers: [Buffer; 18],
+    buffers: [Buffer; 4],
 }
 
 pub(crate) struct RefineGpu {
@@ -340,7 +321,7 @@ impl RefineGpu {
             return Some(program);
         }
         let program = self.build(&format!(
-            "#define W {}\n#define H {}\n#define SATD {}\n{KERNEL}",
+            "#define W {}\n#define H {}\n#define SATD {}\n#define RECORD {RECORD}\n{KERNEL}",
             variant.width,
             variant.height,
             u8::from(variant.satd)
@@ -385,18 +366,15 @@ impl RefineGpu {
     }
 
     pub(crate) fn session(&self) -> Option<Session<'_>> {
-        let n = self.units.len();
         let unit = self
             .units
             .iter()
             .find_map(|unit| unit.try_lock().ok())
             .or_else(|| self.units[0].lock().ok())?;
-        let mut unit = unit;
-        unit.used = 0;
-        let _ = n;
         Some(Session {
             gpu: self,
             unit,
+            keep: Vec::new(),
             frames: [None, None],
             tickets: Vec::new(),
             pending: Vec::new(),
@@ -410,7 +388,7 @@ impl RefineGpu {
                 unsafe { (self.cl.ReleaseMemObject)(buffer.mem as Handle) };
                 buffer.mem = 0;
             }
-            let capacity = size.next_multiple_of(64 << 10);
+            let capacity = size.next_multiple_of(4096);
             let mut err = 0;
             let mem = unsafe {
                 (self.cl.CreateBuffer)(
@@ -451,84 +429,33 @@ pub(crate) struct Session<'g> {
     frames: [Option<SessionFrame>; 2],
     tickets: Vec<Vec<[i32; 4]>>,
     pending: Vec<usize>,
+    keep: Vec<Box<[u8]>>,
 }
 
 impl Session<'_> {
-    unsafe fn reserve(&mut self, bytes: usize) -> Option<()> {
-        if self.unit.staging != 0 {
-            return Some(());
-        }
-        let cl = &self.gpu.cl;
-        let capacity = (bytes + STAGING).next_multiple_of(1 << 20);
-        let mut err = 0;
-        let mem = unsafe {
-            (cl.CreateBuffer)(
-                self.gpu.context as Handle,
-                CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
-                capacity,
-                std::ptr::null_mut(),
-                &raw mut err,
-            )
-        };
-        if err != CL_SUCCESS || mem.is_null() {
-            return None;
-        }
-        let pointer = unsafe {
-            (cl.EnqueueMapBuffer)(
-                self.unit.queue as Handle,
-                mem,
-                CL_TRUE,
-                CL_MAP_WRITE,
-                0,
-                capacity,
-                0,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                &raw mut err,
-            )
-        };
-        if err != CL_SUCCESS || pointer.is_null() {
-            unsafe { (cl.ReleaseMemObject)(mem) };
-            return None;
-        }
-        self.unit.staging = mem as usize;
-        self.unit.mapped = pointer as usize;
-        self.unit.capacity = capacity;
-        self.unit.used = 0;
-        Some(())
-    }
-
-    fn staging(&self, needed: usize) -> Option<*mut u8> {
-        (self.unit.used.next_multiple_of(256) + needed <= self.unit.capacity)
-            .then_some(self.unit.mapped as *mut u8)
-    }
-
     unsafe fn transfer(&mut self, mem: Handle, data: &[u8], event: *mut Handle) -> bool {
-        let cl = &self.gpu.cl;
-        let queue = self.unit.queue as Handle;
-        let mut source = data.as_ptr();
-        if let Some(pointer) = self.staging(data.len()) {
-            let start = self.unit.used.next_multiple_of(256);
-            unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), pointer.add(start), data.len());
-                source = pointer.add(start);
-            }
-            self.unit.used = start + data.len();
-        }
         let status = unsafe {
-            (cl.EnqueueWriteBuffer)(
-                queue,
+            (self.gpu.cl.EnqueueWriteBuffer)(
+                self.unit.queue as Handle,
                 mem,
                 CL_FALSE,
                 0,
                 data.len(),
-                source.cast_mut().cast(),
+                data.as_ptr().cast_mut().cast(),
                 0,
                 std::ptr::null(),
                 event.cast(),
             )
         };
         status == CL_SUCCESS
+    }
+
+    // writes do not block, so copies live until the session ends
+    fn hold<'h>(&mut self, data: &[u8]) -> &'h [u8] {
+        let copy: Box<[u8]> = data.into();
+        let held = unsafe { std::slice::from_raw_parts(copy.as_ptr(), copy.len()) };
+        self.keep.push(copy);
+        held
     }
 
     unsafe fn write(&mut self, index: usize, data: &[u8]) -> Option<Handle> {
@@ -627,7 +554,6 @@ impl Session<'_> {
                 lengths[plane]
             }
         });
-        unsafe { self.reserve(uploads.iter().sum())? };
         let mut mems = [0usize; 3];
         let mut event: Handle = std::ptr::null_mut();
         for (plane, data) in planes.data.iter().enumerate() {
@@ -772,8 +698,7 @@ impl Session<'_> {
                     self.unit.kernels.push((program, kernel as usize));
                     kernel
                 };
-            let field = self.tickets.len() % 2;
-            let base = 6 + field * 6;
+            let slot = self.tickets.len() % 2;
             let params: [i64; 24] = [
                 source.lengths[0],
                 source.lengths[1],
@@ -815,9 +740,12 @@ impl Session<'_> {
                 mems[plane] = source_mems[plane] as Handle;
                 mems[3 + plane] = target_mems[plane] as Handle;
             }
-            mems[6] = unsafe { self.write(base, bytes(&params))? };
-            mems[7] = unsafe { self.write(base + 1, bytes(&plan.records))? };
-            mems[8] = unsafe { self.gpu.buffer(&mut self.unit, base + 5, blocks * 16)? };
+            let chunk = CHUNK.min(blocks);
+            let params = self.hold(bytes(&params));
+            let records = self.hold(bytes(&plan.records));
+            mems[6] = unsafe { self.write(slot, params)? };
+            mems[7] = unsafe { self.gpu.buffer(&mut self.unit, 2, chunk * RECORD_BYTES)? };
+            mems[8] = unsafe { self.gpu.buffer(&mut self.unit, 3, chunk * 16)? };
             let set = mems.iter().enumerate().all(|(index, mem)| unsafe {
                 (cl.SetKernelArg)(
                     kernel,
@@ -830,39 +758,61 @@ impl Session<'_> {
                 return None;
             }
             let queue = self.unit.queue as Handle;
-            let (local, global) = (64usize, blocks * 64);
-            if unsafe {
-                (cl.EnqueueNDRangeKernel)(
-                    queue,
-                    kernel,
-                    1,
-                    std::ptr::null(),
-                    &raw const global,
-                    &raw const local,
-                    events.len() as ClUint,
-                    events.as_ptr().cast(),
-                    std::ptr::null_mut(),
-                )
-            } != CL_SUCCESS
-            {
-                return None;
-            }
             let mut done: Handle = std::ptr::null_mut();
-            if unsafe {
-                (cl.EnqueueReadBuffer)(
-                    queue,
-                    mems[8],
-                    CL_FALSE,
-                    0,
-                    blocks * 16,
-                    bests.as_mut_ptr().cast(),
-                    0,
-                    std::ptr::null(),
-                    (&raw mut done).cast(),
-                )
-            } != CL_SUCCESS
-            {
-                return None;
+            let mut start = 0;
+            while start < blocks {
+                let count = CHUNK.min(blocks - start);
+                let last = start + count == blocks;
+                if !unsafe {
+                    self.transfer(
+                        mems[7],
+                        &records[start * RECORD_BYTES..(start + count) * RECORD_BYTES],
+                        std::ptr::null_mut(),
+                    )
+                } {
+                    return None;
+                }
+                let (local, global) = (64usize, count * 64);
+                let waits: &[Handle] = if start == 0 { &events } else { &[] };
+                if unsafe {
+                    (cl.EnqueueNDRangeKernel)(
+                        queue,
+                        kernel,
+                        1,
+                        std::ptr::null(),
+                        &raw const global,
+                        &raw const local,
+                        waits.len() as ClUint,
+                        if waits.is_empty() {
+                            std::ptr::null()
+                        } else {
+                            waits.as_ptr().cast()
+                        },
+                        std::ptr::null_mut(),
+                    )
+                } != CL_SUCCESS
+                    || unsafe {
+                        (cl.EnqueueReadBuffer)(
+                            queue,
+                            mems[8],
+                            CL_FALSE,
+                            0,
+                            count * 16,
+                            bests.as_mut_ptr().add(start).cast(),
+                            0,
+                            std::ptr::null(),
+                            if last {
+                                (&raw mut done).cast()
+                            } else {
+                                std::ptr::null_mut()
+                            },
+                        )
+                    } != CL_SUCCESS
+                {
+                    unsafe { (cl.Finish)(queue) };
+                    return None;
+                }
+                start += count;
             }
             self.pending.push(done as usize);
         }
@@ -948,7 +898,6 @@ __kernel void expand(__global uchar *plane, long pitch, long height) {
 
 const KERNEL: &str = r"
 #define NONE_V (-2147483647 - 1)
-#define RECORD 12
 #define LO(v) (((v) << 16) >> 16)
 #define HI(v) ((v) >> 16)
 #define MAX_SLOTS 49
