@@ -447,6 +447,7 @@ impl FilterState {
         motion_key: i64,
         blend: Option<&crate::gpu::BlendJob>,
         layer: Option<&std::sync::Arc<crate::gpu::Layer>>,
+        cover: Option<&crate::gpu::Cover<'_>>,
         core: vs::Raw,
     ) -> vs::ConstRaw {
         let w = usize::try_from(self.video_info.width).unwrap_or(0);
@@ -547,6 +548,7 @@ impl FilterState {
             area,
             still,
             layer.map(|layer| &**layer),
+            cover,
         );
         if done.is_none() {
             unsafe { api.free(output.cast_const()) };
@@ -959,11 +961,17 @@ impl FilterState {
         let time = engine::render_time(phase, use_fwd, use_bwd);
         let neither = !use_fwd && !use_bwd;
         let algo = params.algo;
+        let gpu_cover = self.render_mode == 2
+            && self.gpu.is_some()
+            && blend.is_none()
+            && algo > 20
+            && !neither
+            && params.sad.is_none();
         let engine::Masks {
             cover_bwd,
             cover_fwd,
             sad: sad_masks,
-        } = engine::masks(field, params, time, neither);
+        } = engine::masks(field, params, time, neither, !gpu_cover);
         let want_extended = neighbors_ok && algo == 23 && !neither;
         let (zerox, zeroy) = (self.options.debug_zerox(), self.options.debug_zeroy());
         let motion_key = engine::motion_key(n, use_fwd, use_bwd, want_extended, (zerox, zeroy));
@@ -1026,6 +1034,14 @@ impl FilterState {
                 sad_masks.is_some(),
                 self.options.dither(),
             );
+            let layout = gpu_cover.then(|| field.cover_layout(params.cover));
+            let vectors = |out: &mut Vec<i16>| field.cover_vectors(out);
+            let cover = layout.as_ref().map(|layout| crate::gpu::Cover {
+                key: i64::from(n),
+                vectors: &vectors,
+                layout,
+                times: [256 - time, time],
+            });
             let layer = unsafe { self.layer(api, fetch, gpu, n, params, vector_data, field, held) };
             let output = unsafe {
                 self.reference_gpu(
@@ -1052,6 +1068,7 @@ impl FilterState {
                     motion_key,
                     blend,
                     layer.as_ref(),
+                    cover.as_ref(),
                     core,
                 )
             };

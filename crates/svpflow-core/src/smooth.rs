@@ -109,6 +109,29 @@ impl VectorField {
         }
     }
 
+    pub fn cover_layout(&self, cover: i32) -> CoverLayout {
+        let s = self.shape;
+        let area = s.block_w * s.block_h;
+        let scale = f64::from(cover) / 100.0;
+        CoverLayout {
+            grid: (s.grid_w, s.grid_h),
+            size: (s.packed_width(), s.packed_height()),
+            step: (s.block_w - s.overlap_x, s.block_h - s.overlap_y),
+            block: (s.block_w, s.block_h),
+            denom: s.pel << 8,
+            area,
+            scale: scale as f32,
+            table: cover_table(area, scale),
+        }
+    }
+
+    pub fn cover_vectors(&self, out: &mut Vec<i16>) {
+        out.clear();
+        for vector in self.backward.iter().chain(&self.forward) {
+            out.extend([vector.x, vector.y]);
+        }
+    }
+
     pub fn update(&mut self, payload: &[u8]) -> bool {
         let read = |offset: usize| -> Option<i32> {
             Some(i32::from_le_bytes(
@@ -325,11 +348,8 @@ impl VectorField {
             }
         }
         let scale = f64::from(cover) / 100.0;
-        let level = |covered: i32| {
-            let value = (f64::from(area - covered) * scale * 256.0 / f64::from(area)) as i32;
-            if value > 255 { 255 } else { value as u8 }
-        };
-        let table: Vec<u8> = (0..=area.max(0)).map(level).collect();
+        let level = |covered: i32| cover_level(area, scale, covered);
+        let table = cover_table(area, scale);
         let top = table.len() as i32 - 1;
         let width = width as usize;
         let mut column = vec![0i32; stride];
@@ -586,6 +606,29 @@ impl Scatter {
         }
         add(points, pending);
     }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn cover_level(area: i32, scale: f64, covered: i32) -> u8 {
+    let value = (f64::from(area - covered) * scale * 256.0 / f64::from(area)) as i32;
+    if value > 255 { 255 } else { value as u8 }
+}
+
+fn cover_table(area: i32, scale: f64) -> Vec<u8> {
+    (0..=area.max(0))
+        .map(|covered| cover_level(area, scale, covered))
+        .collect()
+}
+
+pub struct CoverLayout {
+    pub grid: (i32, i32),
+    pub size: (i32, i32),
+    pub step: (i32, i32),
+    pub block: (i32, i32),
+    pub denom: i32,
+    pub area: i32,
+    pub scale: f32,
+    pub table: Vec<u8>,
 }
 
 const fn floor_div(value: i32, divisor: i32) -> i32 {

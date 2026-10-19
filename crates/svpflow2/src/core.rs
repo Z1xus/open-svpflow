@@ -3481,6 +3481,7 @@ fn gpu_render_frame(
         area.map(|mask| (mask.a, mask.b)),
         None,
         None,
+        None,
     )
     .is_some()
 }

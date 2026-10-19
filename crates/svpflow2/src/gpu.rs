@@ -4,6 +4,7 @@ use core::ffi::{c_char, c_void};
 use std::ffi::CString;
 
 mod blend;
+mod cover;
 mod layer;
 
 pub use layer::{Layer, LayerHeld, LayerPair};
@@ -11,6 +12,7 @@ pub use layer::{Layer, LayerHeld, LayerPair};
 pub use blend::BlendJob;
 #[cfg(feature = "blend")]
 pub use blend::OutputPlane;
+pub use cover::Cover;
 
 type ClInt = i32;
 type ClUint = u32;
@@ -160,6 +162,7 @@ struct OpenCl {
     CreateImage2D: FnCreateImage2D,
     CreateImage: Option<blend::FnCreateImage>,
     EnqueueReadBuffer: FnEnqueueReadBuffer,
+    EnqueueWriteBuffer: FnEnqueueReadBuffer,
     EnqueueWriteImage: FnEnqueueWriteImage,
     EnqueueMapBuffer: FnEnqueueMapBuffer,
     SetKernelArg: FnSetKernelArg,
@@ -210,6 +213,7 @@ impl OpenCl {
                 CreateImage2D: sym!("clCreateImage2D"),
                 CreateImage: unsafe { lib.get(b"clCreateImage\0") }.ok().map(|f| *f),
                 EnqueueReadBuffer: sym!("clEnqueueReadBuffer"),
+                EnqueueWriteBuffer: sym!("clEnqueueWriteBuffer"),
                 EnqueueWriteImage: sym!("clEnqueueWriteImage"),
                 EnqueueMapBuffer: sym!("clEnqueueMapBuffer"),
                 SetKernelArg: sym!("clSetKernelArg"),
@@ -377,6 +381,7 @@ struct Unit {
     packed_mask: Vec<u8>,
     variant_kernels: Vec<(u32, ClKernel)>,
     blend: blend::UnitState,
+    cover: cover::UnitCover,
 }
 
 #[derive(Clone, Copy)]
@@ -413,6 +418,7 @@ impl Unit {
             packed_mask: Vec::new(),
             variant_kernels: Vec::new(),
             blend: blend::UnitState::default(),
+            cover: cover::UnitCover::default(),
         }
     }
 }
@@ -535,6 +541,7 @@ impl GpuContext {
             if !u.blend.masks.0.is_null() {
                 (self.cl.ReleaseMemObject)(u.blend.masks.0);
             }
+            self.release_cover(&u.cover);
             (self.cl.ReleaseCommandQueue)(u.queue);
         }
     }
@@ -1287,6 +1294,7 @@ impl GpuContext {
         motions: [(&[u16], &[u16]); 4],
         coverage: (&[u8], &[u8]),
         area: Option<(&[u8], &[u8])>,
+        cover: Option<&Cover<'_>>,
     ) -> Option<ClKernel> {
         let count = motion_width.checked_mul(motion_height)?;
         let k = self.variant_kernel(&mut unit.variant_kernels, variant)?;
@@ -1300,14 +1308,14 @@ impl GpuContext {
                 motion_height,
                 motions,
             )?;
-            let Unit {
-                mask, packed_mask, ..
-            } = unit;
-            packed_mask.clear();
-
-            let needs_coverage = py.algorithm >= 21;
-            let needs_mask = needs_coverage || py.has_sad != 0;
-            let mask_mem = if needs_mask {
+            let mask_mem = if let Some(cover) = cover {
+                self.bind_cover(unit, cover)?
+            } else if py.algorithm >= 21 || py.has_sad != 0 {
+                let Unit {
+                    mask, packed_mask, ..
+                } = unit;
+                packed_mask.clear();
+                let needs_coverage = py.algorithm >= 21;
                 Self::pack_masks(packed_mask, count, needs_coverage, coverage, area)?;
                 let mem = self.ensure_image(mask, motion_width, motion_height, CL_UNORM_INT8)?;
                 self.enqueue_image_raw(
@@ -1521,6 +1529,7 @@ impl GpuContext {
         area: Option<(&[u8], &[u8])>,
         still: Option<StillMask>,
         layer: Option<&Layer>,
+        cover: Option<&Cover<'_>>,
     ) -> Option<()> {
         let mut unit = self.acquire();
         unsafe {
@@ -1540,6 +1549,7 @@ impl GpuContext {
                 motions,
                 coverage,
                 area,
+                cover,
             )?;
             let mut waits = Self::source_waits(src0[0], src1[0]);
             if let Some(StillMask(still, ready)) = still {
@@ -2460,5 +2470,54 @@ kernel void layer_cover(read_only image2d_t fit, global uchar *cover, int width,
         }
     }
     cover[cy*((width+7)/8) + cx] = found;
+}
+
+kernel void cover_clear(global int *points, int count)
+{
+    int i = get_global_id(0);
+    if (i < count) points[i] = 0;
+}
+
+kernel void cover_scatter(global const short2 *vectors, global int *points, int grid_w, int grid_h,
+    int width, int height, int step_x, int step_y, int block_w, int block_h, int denom,
+    int time_backward, int time_forward)
+{
+    int bx = get_global_id(0), by = get_global_id(1), set = get_global_id(2);
+    short2 v = vectors[(set * grid_h + by) * grid_w + bx];
+    int time = set ? time_forward : time_backward;
+    int tx = time * v.x / denom, ty = time * v.y / denom;
+    int qx = tx < 0 ? (tx - step_x + 1) / step_x : tx / step_x;
+    int qy = ty < 0 ? (ty - step_y + 1) / step_y : ty / step_y;
+    int cx = bx + qx, cy = by + qy;
+    int rx = step_x * (qx + 1) - tx, ry = step_y * (qy + 1) - ty;
+    int lx = block_w - rx, ly = block_h - ry;
+    int stride = width + 2;
+    global int *grid = points + set * stride * (height + 2);
+    int2 at[4] = {(int2)(cx, cy), (int2)(cx + 1, cy), (int2)(cx + 1, cy + 1), (int2)(cx, cy + 1)};
+    int value[4] = {ry * rx, ry * lx, ly * lx, rx * ly};
+    for (int i = 0; i < 4; i++) {
+        if ((uint)at[i].x < (uint)width && (uint)at[i].y < (uint)height)
+            atomic_add(&grid[(at[i].y + 1) * stride + at[i].x + 1], value[i]);
+    }
+}
+
+kernel void cover_finish(global const int *points, global const uchar *table, write_only image2d_t mask,
+    int width, int height, int area, int top, float scale)
+{
+    int x = get_global_id(0), y = get_global_id(1);
+    int stride = width + 2;
+    float level[2];
+    for (int set = 0; set < 2; set++) {
+        global const int *grid = points + set * stride * (height + 2);
+        int sum = 0;
+        for (int row = 0; row < 3; row++)
+            for (int column = 0; column < 3; column++)
+                sum += grid[(y + row) * stride + x + column];
+        int covered = min(sum >> 3, area);
+        level[set] = covered < 0
+            ? floor(fmin(255.0f, (float)(area - covered) * scale * 256.0f / (float)area))
+            : (float)table[min(covered, top)];
+    }
+    write_imagef(mask, (int2)(x, y), (float4)(0.0f, level[1] / 255.0f, level[0] / 255.0f, 0.0f));
 }
 ";

@@ -269,13 +269,20 @@ pub struct Masks {
     pub sad: Option<(Vec<u8>, Vec<u8>)>,
 }
 
-pub fn masks(field: &VectorField, params: &ReferenceParams, time: i32, neither: bool) -> Masks {
+pub fn masks(
+    field: &VectorField,
+    params: &ReferenceParams,
+    time: i32,
+    neither: bool,
+    cover: bool,
+) -> Masks {
     let shape = *field.shape();
     let (width, height) = (shape.packed_width(), shape.packed_height());
     let count = usize::try_from(width * height).unwrap_or(0);
-    let mut cover_bwd = vec![0u8; count];
-    let mut cover_fwd = vec![0u8; count];
-    if params.algo > 20 && !neither {
+    let size = if cover { count } else { 0 };
+    let mut cover_bwd = vec![0u8; size];
+    let mut cover_fwd = vec![0u8; size];
+    if cover && params.algo > 20 && !neither {
         let mut scratch = Vec::new();
         field.cover_mask(
             &mut scratch,
@@ -828,7 +835,7 @@ impl Engine {
             .unwrap_or_else(|| Arc::new(VectorField::new(self.shape)));
         let neither = !use_fwd && !use_bwd;
         let time = render_time(phase, use_fwd, use_bwd);
-        let masks = masks(&field, &params, time, neither);
+        let masks = masks(&field, &params, time, neither, true);
         let extended = neighbors_ok && params.algo == 23 && !neither;
         let motions = motions(
             &field,
