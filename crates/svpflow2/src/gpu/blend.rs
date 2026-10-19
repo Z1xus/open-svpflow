@@ -613,6 +613,9 @@ impl GpuContext {
         }
         let mut unit = job.unit.borrow_mut();
         let queue = unit.queue;
+        let luma_rows = planes[0].height;
+        let chroma_width = planes[1].width;
+        let mut done: ClEvent = std::ptr::null_mut();
         let read = unsafe {
             self.enqueue_resolve(
                 &mut unit,
@@ -621,54 +624,51 @@ impl GpuContext {
                 job.gamma,
                 job.width * job.luma,
             )
-            .and_then(|()| self.take_staging(queue, job.buffers.len))
-            .and_then(|staging| {
-                let mut done: ClEvent = std::ptr::null_mut();
-                if (self.cl.EnqueueReadBuffer)(
-                    queue,
-                    job.buffers.bytes,
-                    CL_FALSE,
-                    0,
-                    job.buffers.len,
-                    staging.host.cast(),
-                    0,
-                    std::ptr::null(),
-                    (&raw mut done).cast(),
-                ) == CL_SUCCESS
-                {
-                    Some((staging, done))
-                } else {
-                    self.put_staging(staging);
-                    None
+            .and_then(|()| {
+                for (index, plane) in planes.into_iter().enumerate() {
+                    let origin = match index {
+                        0 => [0, 0, 0],
+                        1 => [0, luma_rows, 0],
+                        _ => [chroma_width, luma_rows, 0],
+                    };
+                    let region = [plane.width, plane.height, 1];
+                    if (self.cl.EnqueueReadBufferRect)(
+                        queue,
+                        job.buffers.bytes,
+                        CL_FALSE,
+                        origin.as_ptr(),
+                        [0; 3].as_ptr(),
+                        region.as_ptr(),
+                        job.width,
+                        0,
+                        plane.stride,
+                        0,
+                        plane.data.as_mut_ptr().cast(),
+                        0,
+                        std::ptr::null(),
+                        if index == 2 {
+                            (&raw mut done).cast()
+                        } else {
+                            std::ptr::null_mut()
+                        },
+                    ) != CL_SUCCESS
+                    {
+                        (self.cl.Finish)(queue);
+                        return None;
+                    }
                 }
+                Some(())
             })
         };
         drop(unit);
-        let Some((staging, done)) = read else {
+        if read.is_none() {
             self.blend_abort(job);
             return None;
-        };
+        }
         if !unsafe { self.wait_event(queue, done) } {
-            unsafe { (self.cl.ReleaseMemObject)(staging.mem) };
             self.blend_abort(job);
             return None;
         }
-        let host = unsafe { std::slice::from_raw_parts(staging.host, job.buffers.len) };
-        let luma_rows = planes[0].height;
-        let chroma_width = planes[1].width;
-        for (index, plane) in planes.into_iter().enumerate() {
-            let (x, y) = match index {
-                0 => (0, 0),
-                1 => (0, luma_rows),
-                _ => (chroma_width, luma_rows),
-            };
-            for row in 0..plane.height {
-                let from = (y + row) * job.width + x;
-                plane.data[row * plane.stride..][..plane.width]
-                    .copy_from_slice(&host[from..from + plane.width]);
-            }
-        }
-        self.put_staging(staging);
         self.release_job(job, true);
         Some(())
     }
