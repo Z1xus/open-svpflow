@@ -1285,8 +1285,8 @@ impl Renderer {
                 let tr = (upper * grid_w + right) as usize;
                 let bl = (lower * grid_w + left) as usize;
                 let br = (lower * grid_w + right) as usize;
-                let mut top = [0i16; 32];
-                let mut bottom = [0i16; 32];
+                blocks.push((px0, cols as usize, [0; 32], [0; 32]));
+                let (_, _, top, bottom) = blocks.last_mut().expect("pushed block");
                 for k in 0..N {
                     if !interp && let Some(buf) = samplers[k] {
                         let skip = if skip_rows { upper * grid_w } else { 0 };
@@ -1304,7 +1304,6 @@ impl Renderer {
                     bottom[2 * k] = ch[bl];
                     bottom[2 * k + 1] = ch[br];
                 }
-                blocks.push((px0, cols as usize, top, bottom));
             }
             for r in 0..rows {
                 let py = py0 + r;
@@ -1395,8 +1394,8 @@ mod row {
             _mm256_i32gather_epi32, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_max_epi32,
             _mm256_min_epi32, _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_mullo_epi32,
             _mm256_permutevar8x32_epi32, _mm256_set1_epi16, _mm256_set1_epi32, _mm256_setr_epi32,
-            _mm256_sll_epi32, _mm256_slli_epi32, _mm256_sra_epi16, _mm256_sra_epi32,
-            _mm256_srai_epi32, _mm256_srlv_epi32, _mm256_storeu_si256, _mm256_sub_epi32,
+            _mm256_shuffle_epi8, _mm256_sll_epi32, _mm256_slli_epi32, _mm256_sra_epi16,
+            _mm256_sra_epi32, _mm256_srai_epi32, _mm256_storeu_si256, _mm256_sub_epi32,
         };
         use std::marker::PhantomData;
 
@@ -1459,9 +1458,19 @@ mod row {
                         return _mm256_and_si256(words, _mm256_set1_epi32(0xFF));
                     }
                     let base = _mm256_min_epi32(index, self.safe);
-                    let shift = _mm256_slli_epi32::<3>(_mm256_sub_epi32(index, base));
+                    let lanes = _mm256_setr_epi32(
+                        0x8080_8000u32 as i32,
+                        0x8080_8004u32 as i32,
+                        0x8080_8008u32 as i32,
+                        0x8080_800Cu32 as i32,
+                        0x8080_8000u32 as i32,
+                        0x8080_8004u32 as i32,
+                        0x8080_8008u32 as i32,
+                        0x8080_800Cu32 as i32,
+                    );
+                    let pick = _mm256_add_epi32(_mm256_sub_epi32(index, base), lanes);
                     let words = _mm256_i32gather_epi32::<1>(self.ptr, base);
-                    _mm256_and_si256(_mm256_srlv_epi32(words, shift), _mm256_set1_epi32(0xFF))
+                    _mm256_shuffle_epi8(words, pick)
                 }
             }
 
