@@ -247,7 +247,6 @@ pub struct GpuContext {
     next_upload: std::sync::atomic::AtomicUsize,
 
     super_cache: std::sync::Mutex<Vec<(i64, SuperCell)>>,
-    // frames out of the cache that a blend job still holds
     super_held: std::sync::Mutex<Vec<(i64, std::sync::Weak<SuperEntry>)>>,
     image_pool: std::sync::Arc<ImagePool>,
     staging: std::sync::Mutex<Vec<Staging>>,
@@ -1627,7 +1626,7 @@ struct Shared {
 unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
-// shared by all clips, so no program builds while a clip frees its context
+// no program builds while a clip frees its context
 unsafe fn shared(cl: &OpenCl, device: ClDeviceId, hi10: bool) -> Option<&'static Shared> {
     static ALL: std::sync::Mutex<Vec<(usize, bool, &'static Shared)>> =
         std::sync::Mutex::new(Vec::new());

@@ -20,12 +20,10 @@ fn cache_cap(bytes: usize) -> usize {
 // longer runs are still pictures
 const RUN: i32 = 3;
 
-// the layers that a frame uses, from its request until it is made
 #[derive(Default)]
 pub(crate) struct Held {
     cpu: crate::peel::Held,
     gpu: crate::gpu::LayerHeld,
-    // the dedup vectors are requested
     pub(crate) more: bool,
 }
 
@@ -807,7 +805,6 @@ impl FilterState {
             mut phase,
         } = rates.step(&params, frame);
         let moved = self.dedup(&fetch, &api, n, raw);
-        // its neighbors were not requested
         let narrow = self.later && moved != (n, raw) && !engine::needs_vectors(phase);
         if moved != (n, raw) {
             (n, raw) = moved;

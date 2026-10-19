@@ -79,7 +79,6 @@ pub(crate) struct Chunks<'a> {
     pub(crate) data: &'a metadata::VectorData,
     pub(crate) size: (usize, usize),
     pub(crate) last: i32,
-    // 2 when the color planes are half the size of the picture, as in 4:2:0, and 1 in 4:4:4
     pub(crate) ratio: usize,
 }
 
@@ -155,7 +154,6 @@ impl Layers {
         find(&self.fits, chunk)
     }
 
-    // the chunks whose frames must be requested
     pub(crate) fn hold(&self, chunk: i32, last: i32, held: &mut Held) -> Vec<i32> {
         if let Some(fit) = find(&self.fits, chunk) {
             pin(&mut held.fits, chunk, fit);

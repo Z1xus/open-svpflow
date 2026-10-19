@@ -45,7 +45,6 @@ pub(super) struct LayerState {
     found: (ClMem, usize),
     stats: Vec<(i64, Arc<Owned>, i32)>,
     fits: Vec<(i64, Arc<Layer>)>,
-    // fits out of the cache that a blend job still holds
     held: Vec<(i64, std::sync::Weak<Layer>)>,
 }
 
@@ -150,7 +149,6 @@ impl GpuContext {
         }
     }
 
-    // the chunks whose frames must be requested
     pub fn layer_hold(&self, chunk: i32, last: i32, held: &mut LayerHeld) -> Vec<i32> {
         let near = (chunk - 1).max(0)..=(chunk + 1).min(last);
         let Ok(state) = self.layer.lock() else {

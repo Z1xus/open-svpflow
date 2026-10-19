@@ -3311,7 +3311,6 @@ fn cpu_map(value: i32) -> i32 {
 
 fn motion_luts(threshold: i32) -> std::sync::Arc<MotionLuts> {
     static CACHE: std::sync::OnceLock<MotionLutCache> = std::sync::OnceLock::new();
-    // ponytail: one short global lock; shard only if LUT setup becomes contended.
     let mut cache = CACHE
         .get_or_init(|| std::sync::Mutex::new(Vec::new()))
         .lock()

@@ -194,7 +194,6 @@ fn gather<const N: usize>(
     sums
 }
 
-// chroma is 2 when the color planes are half the size of the picture, as in 4:2:0, and 1 in 4:4:4
 #[must_use]
 pub fn stats(pairs: &[Pair], size: (usize, usize), chroma: usize) -> Stats {
     Stats {
@@ -301,7 +300,6 @@ fn window(
         let (found, e, range) = best;
         (e < 1.7 * same + 4.0 && found != (1.0, 0.0)).then_some((found, range))
     };
-    // an overlay that changes here, like chat that scrolls, is clean in a near chunk
     let near = [parts[0], parts[2]]
         .into_iter()
         .flatten()
@@ -355,7 +353,6 @@ pub fn fit(
 
     let fixed = |value: f32, scale: f32| (value * scale).round().clamp(-32767.0, 32767.0) as i16;
     let mut luma = vec![0; width * height * 2];
-    // the color planes hold the offsets, and below them in the second plane the distances to the layer
     let rows = height / ratio * 2;
     let mut chroma = [vec![0; half * rows], vec![0; half * rows]];
     let cells = (width.div_ceil(CELL), height.div_ceil(CELL));
@@ -419,7 +416,6 @@ pub struct Layer<'a> {
     pub chroma: [&'a [i16]; 2],
     pub pitch: (usize, usize),
     pub size: (usize, usize),
-    // 2 when the color planes are half the size of the picture, 1 when they are as large
     pub ratio: usize,
 }
 
