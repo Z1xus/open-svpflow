@@ -1143,6 +1143,9 @@ impl GpuContext {
             }
             std::thread::sleep(std::time::Duration::from_micros(50));
         };
+        if !done {
+            unsafe { (self.cl.Finish)(queue) };
+        }
         unsafe { (self.cl.ReleaseEvent)(event) };
         done
     }
@@ -1567,11 +1570,7 @@ impl GpuContext {
             let v_mem = self.ensure_buffer(&mut unit.dst[2], dst_v.len())?;
             self.enqueue_plane(q, k, v_mem, sv / depth, pv, src0[2], src1[2], &[])?;
             let mut done: ClEvent = std::ptr::null_mut();
-            let total = dst_y.len() + dst_u.len() + dst_v.len();
-            let staging = self.take_staging(q, total)?;
-            let host = staging.host;
-            let mut offset = 0;
-            for (index, (dmem, output)) in [(y_mem, &*dst_y), (u_mem, &*dst_u), (v_mem, &*dst_v)]
+            for (index, (dmem, output)) in [(y_mem, dst_y), (u_mem, dst_u), (v_mem, dst_v)]
                 .into_iter()
                 .enumerate()
             {
@@ -1581,7 +1580,7 @@ impl GpuContext {
                     CL_FALSE,
                     0,
                     output.len(),
-                    host.add(offset).cast(),
+                    output.as_mut_ptr().cast(),
                     0,
                     std::ptr::null(),
                     if index == 2 {
@@ -1595,23 +1594,10 @@ impl GpuContext {
                         (self.cl.ReleaseEvent)(done);
                     }
                     (self.cl.Finish)(q);
-                    self.put_staging(staging);
                     return None;
                 }
-                offset += output.len();
             }
-            let ok = self.wait_event(q, done);
-            drop(unit);
-            if !ok {
-                (self.cl.ReleaseMemObject)(staging.mem);
-                return None;
-            }
-            let mut offset = 0;
-            for output in [dst_y, dst_u, dst_v] {
-                output.copy_from_slice(std::slice::from_raw_parts(host.add(offset), output.len()));
-                offset += output.len();
-            }
-            self.put_staging(staging);
+            self.wait_event(q, done).then_some(())?;
         }
         Some(())
     }
