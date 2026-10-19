@@ -81,8 +81,6 @@ type FnEnqueueMapBuffer = unsafe extern "C" fn(
     *mut c_void,
     *mut ClInt,
 ) -> *mut c_void;
-type FnEnqueueUnmap =
-    unsafe extern "C" fn(Handle, Handle, *mut c_void, ClUint, *const c_void, *mut c_void) -> ClInt;
 type FnGetEventInfo = unsafe extern "C" fn(Handle, ClUint, usize, *mut c_void, *mut usize) -> ClInt;
 
 #[allow(non_snake_case)]
@@ -107,7 +105,6 @@ struct OpenCl {
     GetEventInfo: FnGetEventInfo,
     Flush: FnFinish,
     EnqueueMapBuffer: FnEnqueueMapBuffer,
-    EnqueueUnmap: FnEnqueueUnmap,
 }
 
 impl OpenCl {
@@ -145,7 +142,6 @@ impl OpenCl {
             GetEventInfo: sym!("clGetEventInfo"),
             Flush: sym!("clFlush"),
             EnqueueMapBuffer: sym!("clEnqueueMapBuffer"),
-            EnqueueUnmap: sym!("clEnqueueUnmapMemObject"),
             _lib: lib,
         })
     }
@@ -188,6 +184,7 @@ pub(crate) struct RefineGpu {
 }
 
 const CACHED_FRAMES: usize = 16;
+const POOLED: usize = 3;
 
 struct Uploaded {
     mems: [usize; 3],
@@ -216,7 +213,7 @@ impl Drop for CachedFrame {
             let mut pool = gpu.pool.lock().ok();
             for (mem, size) in uploaded.mems.into_iter().zip(uploaded.sizes) {
                 match pool.as_mut() {
-                    Some(pool) if pool.len() < 3 * CACHED_FRAMES => pool.push((mem, size)),
+                    Some(pool) if pool.len() < POOLED => pool.push((mem, size)),
                     _ => unsafe {
                         (gpu.cl.ReleaseMemObject)(mem as Handle);
                     },
@@ -386,7 +383,7 @@ impl RefineGpu {
                 unsafe { (self.cl.ReleaseMemObject)(buffer.mem as Handle) };
                 buffer.mem = 0;
             }
-            let capacity = size.next_power_of_two();
+            let capacity = size.next_multiple_of(64 << 10);
             let mut err = 0;
             let mem = unsafe {
                 (self.cl.CreateBuffer)(
@@ -430,75 +427,60 @@ pub(crate) struct Session<'g> {
 }
 
 impl Session<'_> {
-    unsafe fn staging(&mut self, needed: usize) -> Option<*mut u8> {
-        let cl = &self.gpu.cl;
-        if self.unit.used.next_multiple_of(256) + needed > self.unit.capacity {
-            if self.unit.staging != 0 {
-                let queue = self.unit.queue as Handle;
-                unsafe {
-                    (cl.EnqueueUnmap)(
-                        queue,
-                        self.unit.staging as Handle,
-                        self.unit.mapped as *mut c_void,
-                        0,
-                        std::ptr::null(),
-                        std::ptr::null_mut(),
-                    );
-                    (cl.Finish)(queue);
-                    (cl.ReleaseMemObject)(self.unit.staging as Handle);
-                }
-                self.unit.staging = 0;
-            }
-            let capacity = (self.unit.capacity + self.unit.capacity / 4)
-                .max(needed)
-                .max(STAGING)
-                .next_multiple_of(1 << 20);
-            let mut err = 0;
-            let mem = unsafe {
-                (cl.CreateBuffer)(
-                    self.gpu.context as Handle,
-                    CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
-                    capacity,
-                    std::ptr::null_mut(),
-                    &raw mut err,
-                )
-            };
-            if err != CL_SUCCESS || mem.is_null() {
-                self.unit.capacity = 0;
-                return None;
-            }
-            let pointer = unsafe {
-                (cl.EnqueueMapBuffer)(
-                    self.unit.queue as Handle,
-                    mem,
-                    CL_TRUE,
-                    CL_MAP_WRITE,
-                    0,
-                    capacity,
-                    0,
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
-                    &raw mut err,
-                )
-            };
-            if err != CL_SUCCESS || pointer.is_null() {
-                unsafe { (cl.ReleaseMemObject)(mem) };
-                self.unit.capacity = 0;
-                return None;
-            }
-            self.unit.staging = mem as usize;
-            self.unit.mapped = pointer as usize;
-            self.unit.capacity = capacity;
-            self.unit.used = 0;
+    unsafe fn reserve(&mut self, bytes: usize) -> Option<()> {
+        if self.unit.staging != 0 {
+            return Some(());
         }
-        Some(self.unit.mapped as *mut u8)
+        let cl = &self.gpu.cl;
+        let capacity = (bytes + STAGING).next_multiple_of(1 << 20);
+        let mut err = 0;
+        let mem = unsafe {
+            (cl.CreateBuffer)(
+                self.gpu.context as Handle,
+                CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
+                capacity,
+                std::ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        if err != CL_SUCCESS || mem.is_null() {
+            return None;
+        }
+        let pointer = unsafe {
+            (cl.EnqueueMapBuffer)(
+                self.unit.queue as Handle,
+                mem,
+                CL_TRUE,
+                CL_MAP_WRITE,
+                0,
+                capacity,
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        if err != CL_SUCCESS || pointer.is_null() {
+            unsafe { (cl.ReleaseMemObject)(mem) };
+            return None;
+        }
+        self.unit.staging = mem as usize;
+        self.unit.mapped = pointer as usize;
+        self.unit.capacity = capacity;
+        self.unit.used = 0;
+        Some(())
+    }
+
+    fn staging(&self, needed: usize) -> Option<*mut u8> {
+        (self.unit.used.next_multiple_of(256) + needed <= self.unit.capacity)
+            .then_some(self.unit.mapped as *mut u8)
     }
 
     unsafe fn transfer(&mut self, mem: Handle, data: &[u8], event: *mut Handle) -> bool {
         let cl = &self.gpu.cl;
         let queue = self.unit.queue as Handle;
         let mut source = data.as_ptr();
-        if let Some(pointer) = unsafe { self.staging(data.len()) } {
+        if let Some(pointer) = self.staging(data.len()) {
             let start = self.unit.used.next_multiple_of(256);
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), pointer.add(start), data.len());
@@ -603,10 +585,24 @@ impl Session<'_> {
         } else {
             None
         };
+        let pel = planes.pel.max(1) as usize;
+        let regions: [usize; 3] =
+            std::array::from_fn(|plane| planes.pitch[plane] * planes.height[plane].max(0) as usize);
+        let lengths: [usize; 3] = std::array::from_fn(|plane| {
+            (planes.base[plane] + pel * pel * regions[plane]).min(planes.data[plane].len())
+        });
+        let uploads: [usize; 3] = std::array::from_fn(|plane| {
+            if expand.is_some() {
+                regions[plane].min(lengths[plane])
+            } else {
+                lengths[plane]
+            }
+        });
+        unsafe { self.reserve(uploads.iter().sum())? };
         let mut mems = [0usize; 3];
         let mut event: Handle = std::ptr::null_mut();
         for (plane, data) in planes.data.iter().enumerate() {
-            let size = data.len().max(1);
+            let size = lengths[plane].max(1);
             let pooled = self.gpu.pool.lock().ok().and_then(|mut pool| {
                 let at = pool.iter().position(|&(_, s)| s == size)?;
                 Some(pool.swap_remove(at).0)
@@ -634,12 +630,8 @@ impl Session<'_> {
             };
             mems[plane] = mem as usize;
             let last = plane == 2 && expand.is_none();
-            let region = planes.pitch[plane] * planes.height[plane].max(0) as usize;
-            let upload = if expand.is_some() {
-                region.min(data.len())
-            } else {
-                data.len()
-            };
+            let region = regions[plane];
+            let upload = uploads[plane];
             let target = if last {
                 &raw mut event
             } else {
@@ -657,7 +649,7 @@ impl Session<'_> {
                     (8, (&raw const height).cast()),
                 ];
                 let global = 3 * region;
-                failed = region * 4 > data.len()
+                failed = region * 4 > lengths[plane]
                     || args
                         .iter()
                         .enumerate()
@@ -692,9 +684,9 @@ impl Session<'_> {
         }
         Some(Uploaded {
             mems,
-            sizes: planes.data.map(|d| d.len().max(1)),
+            sizes: lengths.map(|length| length.max(1)),
             frame: Frame {
-                lengths: planes.data.map(|d| d.len() as i64),
+                lengths: lengths.map(|length| length as i64),
                 pitches: planes.pitch.map(|p| p as i64),
                 bases: planes.base.map(|b| b as i64),
                 heights: planes.height.map(i64::from),
