@@ -833,7 +833,7 @@ impl Session<'_, '_> {
             }
             let chunk = CHUNK.min(blocks);
             let params = self.hold(bytes(&params));
-            let records = self.hold(bytes(&plan.records));
+            let records = bytes(&plan.records);
             mems[6] = unsafe { self.write(slot, params)? };
             mems[7] = unsafe { self.gpu.buffer(&mut self.unit, 2, chunk * RECORD_BYTES)? };
             mems[8] = unsafe { self.gpu.buffer(&mut self.unit, 3, chunk * 16)? };
@@ -861,6 +861,7 @@ impl Session<'_, '_> {
                         std::ptr::null_mut(),
                     )
                 } {
+                    unsafe { (cl.Finish)(queue) };
                     return None;
                 }
                 let (local, global) = (64usize, count * 64);

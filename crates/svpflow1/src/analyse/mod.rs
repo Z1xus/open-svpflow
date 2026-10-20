@@ -199,9 +199,7 @@ fn pack_frame(params: &AnalyseParams, regions: &[Vec<u32>; 2], written: [bool; 2
     let marker = (2 * params.written_count() + 1) as i32;
     for (region, written) in regions.iter().zip(written) {
         out.extend_from_slice(&if written { marker } else { 0 }.to_le_bytes());
-        for value in region {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
+        out.extend(region.iter().flat_map(|value| value.to_le_bytes()));
     }
     out
 }
