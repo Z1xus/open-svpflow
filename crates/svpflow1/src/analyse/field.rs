@@ -553,6 +553,9 @@ impl Field {
             flat: [0; MAX_BLOCK_AREA],
             blurred: [0; MAX_BLOCK_AREA],
             many: [(Mv::UNSET, 0); MAX_CANDIDATES],
+            known: [(0, 0, 0); MAX_CANDIDATES],
+            known_count: 0,
+            cached: None,
         };
         let mut processed = vec![false; ((self.blk_x + 1) * (self.blk_y + 1)) as usize];
         let mut neighbours = [Mv::default(); 9];
@@ -895,6 +898,9 @@ struct BlockSearch<'a> {
     flat: [u8; MAX_BLOCK_AREA],
     blurred: [u8; MAX_BLOCK_AREA],
     many: [(Mv, i32); MAX_CANDIDATES],
+    known: [(i32, i32, i32); MAX_CANDIDATES],
+    known_count: usize,
+    cached: Option<([i32; 3], [i32; 3])>,
 }
 
 const HEX2: [(i32, i32); 8] = [
@@ -945,6 +951,7 @@ impl BlockSearch<'_> {
         let shape = Shape::new(layout.width as usize, layout.height as usize);
         self.half = half;
         self.wide_ready = [false; 2];
+        self.cached = None;
         #[cfg(target_arch = "x86_64")]
         {
             self.stacked_src = [None; 2];
@@ -964,6 +971,9 @@ impl BlockSearch<'_> {
     }
 
     fn copy_luma(&mut self, set: usize) {
+        if set == 1 {
+            self.cached = None;
+        }
         let offset = self.src.y.pel1(self.state.pos[0], self.state.pos_y[0]);
         self.src
             .y
@@ -1042,7 +1052,13 @@ impl BlockSearch<'_> {
         s.bounds.max_y = b0.max_y - dy.max(0);
         s.bounds.min_x = b0.min_x - dx.min(0);
         s.bounds.min_y = b0.min_y - dy.min(0);
-        self.copy_source(1);
+        let key = (s.pos, s.pos_y);
+        if self.cached == Some(key) {
+            self.active = 1;
+        } else {
+            self.copy_source(1);
+            self.cached = Some(key);
+        }
         true
     }
 
@@ -1449,7 +1465,18 @@ impl BlockSearch<'_> {
     ) -> bool {
         let (vx, vy) = (i32::from(candidate.x), i32::from(candidate.y));
         self.move_block(vx, vy, 0);
-        let sad = self.full_sad(vx, vy);
+        let sad = if let Some(k) = self.known[..self.known_count]
+            .iter()
+            .find(|k| k.0 == vx && k.1 == vy)
+        {
+            k.2
+        } else {
+            let sad = self.full_sad(vx, vy);
+            self.known[self.known_count] = (vx, vy, sad);
+            self.known_count += 1;
+            sad
+        };
+
         let penalised = |sad: i32| {
             sad.wrapping_add(if absolute {
                 penalty
@@ -1538,6 +1565,7 @@ impl BlockSearch<'_> {
             };
         }
         self.state.min_cost = i32::MAX;
+        self.known_count = 0;
         self.many[0].0 = Mv::UNSET;
         self.many[1].0 = Mv::UNSET;
         let predictor = self.state.predictor;
