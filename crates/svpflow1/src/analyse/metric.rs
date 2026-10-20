@@ -5,9 +5,11 @@
 use core::arch::x86_64::{__m128i, _mm_unpacklo_epi64};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use core::arch::x86_64::{
-    __m256i, _mm256_abs_epi16, _mm256_add_epi16, _mm256_add_epi32, _mm256_castsi256_si128,
-    _mm256_cvtepu8_epi16, _mm256_extracti128_si256, _mm256_hadd_epi16, _mm256_hsub_epi16,
-    _mm256_madd_epi16, _mm256_max_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_sub_epi16,
+    __m256i, _mm256_abs_epi16, _mm256_add_epi16, _mm256_add_epi32, _mm256_add_epi64,
+    _mm256_castsi128_si256, _mm256_castsi256_si128, _mm256_cvtepu8_epi16, _mm256_extracti128_si256,
+    _mm256_hadd_epi16, _mm256_hsub_epi16, _mm256_inserti128_si256, _mm256_loadu_si256,
+    _mm256_madd_epi16, _mm256_max_epi16, _mm256_sad_epu8, _mm256_set1_epi16, _mm256_setzero_si256,
+    _mm256_sub_epi16,
 };
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
@@ -138,6 +140,11 @@ fn rows_sum<const W: usize>(block: &[u8], pitch: usize, height: usize) -> u32 {
 }
 
 fn sad<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if (W == 8 || W == 16) && H.is_multiple_of(2) {
+        assert!(src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
+        return unsafe { sad_until::<W, H>(src.as_ptr(), reference.as_ptr(), pitch, |_| false) };
+    }
     #[cfg(target_arch = "x86_64")]
     if W >= 8 {
         return unsafe { sad_sse2::<W, H>(src, reference, pitch) };
@@ -633,6 +640,74 @@ pub(crate) trait LumaCost {
     fn cost_until(&self, reference: &[u8], pitch: usize, _stop: impl Fn(u32) -> bool) -> u32 {
         self.cost(reference, pitch)
     }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub(crate) struct SadLuma<'a, const W: usize, const H: usize> {
+    pub(crate) src: &'a [u8],
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+impl<const W: usize, const H: usize> LumaCost for SadLuma<'_, W, H> {
+    #[inline]
+    fn cost(&self, reference: &[u8], pitch: usize) -> u32 {
+        self.cost_until(reference, pitch, |_| false)
+    }
+
+    #[inline]
+    fn cost_until(&self, reference: &[u8], pitch: usize, stop: impl Fn(u32) -> bool) -> u32 {
+        assert!(self.src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
+        unsafe { sad_until::<W, H>(self.src.as_ptr(), reference.as_ptr(), pitch, stop) }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+unsafe fn sad_until<const W: usize, const H: usize>(
+    src: *const u8,
+    reference: *const u8,
+    pitch: usize,
+    stop: impl Fn(u32) -> bool,
+) -> u32 {
+    let mut acc = _mm256_setzero_si256();
+    for row in (0..H).step_by(2) {
+        let (a, b) = unsafe {
+            let r0 = reference.add(row * pitch);
+            let r1 = reference.add((row + 1) * pitch);
+            if W == 16 {
+                let b = _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_loadu_si128(r0.cast())),
+                    _mm_loadu_si128(r1.cast()),
+                );
+                (_mm256_loadu_si256(src.add(row * W).cast()), b)
+            } else {
+                let b = _mm_unpacklo_epi64(_mm_loadl_epi64(r0.cast()), _mm_loadl_epi64(r1.cast()));
+                (
+                    _mm256_castsi128_si256(_mm_loadu_si128(src.add(row * W).cast())),
+                    _mm256_castsi128_si256(b),
+                )
+            }
+        };
+        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(a, b));
+        if row % 4 == 2 && row + 2 < H {
+            let total = sad_total(acc);
+            if stop(total) {
+                return total;
+            }
+        }
+    }
+    sad_total(acc)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[target_feature(enable = "avx2")]
+fn sad_total(acc: __m256i) -> u32 {
+    let sum = _mm_add_epi64(
+        _mm256_castsi256_si128(acc),
+        _mm256_extracti128_si256::<1>(acc),
+    );
+    _mm_cvtsi128_si32(_mm_add_epi32(sum, _mm_shuffle_epi32::<0b1110>(sum))) as u32
 }
 
 pub(crate) trait ChromaCost {

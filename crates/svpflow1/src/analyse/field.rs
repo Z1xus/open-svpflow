@@ -99,6 +99,11 @@ struct Kernels {
     wide: Option<metric::Wide>,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     stacked: bool,
+    #[cfg_attr(
+        not(all(target_arch = "x86_64", target_feature = "avx2")),
+        allow(dead_code)
+    )]
+    satd: bool,
 }
 
 pub(crate) struct Field {
@@ -157,6 +162,7 @@ impl Field {
                     .flatten(),
                 wide: metric::wide_shape(shape, satd),
                 stacked: chroma_shift == (1, 1) && metric::stacked_pair(shape, satd),
+                satd,
             },
             half: Kernels {
                 luma: metric::chroma420_kernel(shape, satd),
@@ -164,6 +170,7 @@ impl Field {
                 pair: None,
                 wide: None,
                 stacked: false,
+                satd,
             },
             satd,
             vectors: vec![Mv::default(); count],
@@ -553,7 +560,7 @@ impl Field {
             flat: [0; MAX_BLOCK_AREA],
             blurred: [0; MAX_BLOCK_AREA],
             many: [(Mv::UNSET, 0); MAX_CANDIDATES],
-            known: [(0, 0, 0); MAX_CANDIDATES],
+            known: [(0, 0, 0, None); MAX_CANDIDATES],
             known_count: 0,
             cached: None,
         };
@@ -898,7 +905,7 @@ struct BlockSearch<'a> {
     flat: [u8; MAX_BLOCK_AREA],
     blurred: [u8; MAX_BLOCK_AREA],
     many: [(Mv, i32); MAX_CANDIDATES],
-    known: [(i32, i32, i32); MAX_CANDIDATES],
+    known: [(i32, i32, i32, Option<i32>); MAX_CANDIDATES],
     known_count: usize,
     cached: Option<([i32; 3], [i32; 3])>,
 }
@@ -1258,14 +1265,43 @@ impl BlockSearch<'_> {
         spans: (usize, usize),
     ) {
         let buffer = &self.buffers[self.active];
-        let luma = metric::IndirectLuma {
-            kernel: self.kernels.luma,
-            src: &buffer.y,
-        };
         let chroma = metric::IndirectChroma {
             kernel: self.kernels.chroma,
             pair: self.kernels.pair,
             src: [&buffer.u, &buffer.v],
+        };
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if !self.kernels.satd {
+            let src = &buffer.y[..];
+            let result = match (self.shape.width, self.shape.height) {
+                (16, 16) => Some(self.exhaustive_loop::<BITS, _, _>(
+                    ranges,
+                    spans,
+                    &metric::SadLuma::<16, 16> { src },
+                    &chroma,
+                )),
+                (16, 8) => Some(self.exhaustive_loop::<BITS, _, _>(
+                    ranges,
+                    spans,
+                    &metric::SadLuma::<16, 8> { src },
+                    &chroma,
+                )),
+                (8, 8) => Some(self.exhaustive_loop::<BITS, _, _>(
+                    ranges,
+                    spans,
+                    &metric::SadLuma::<8, 8> { src },
+                    &chroma,
+                )),
+                _ => None,
+            };
+            if let Some(result) = result {
+                (self.state.best, self.state.min_cost) = result;
+                return;
+            }
+        }
+        let luma = metric::IndirectLuma {
+            kernel: self.kernels.luma,
+            src: &buffer.y,
         };
         (self.state.best, self.state.min_cost) =
             self.exhaustive_loop::<BITS, _, _>(ranges, spans, &luma, &chroma);
@@ -1465,18 +1501,6 @@ impl BlockSearch<'_> {
     ) -> bool {
         let (vx, vy) = (i32::from(candidate.x), i32::from(candidate.y));
         self.move_block(vx, vy, 0);
-        let sad = if let Some(k) = self.known[..self.known_count]
-            .iter()
-            .find(|k| k.0 == vx && k.1 == vy)
-        {
-            k.2
-        } else {
-            let sad = self.full_sad(vx, vy);
-            self.known[self.known_count] = (vx, vy, sad);
-            self.known_count += 1;
-            sad
-        };
-
         let penalised = |sad: i32| {
             sad.wrapping_add(if absolute {
                 penalty
@@ -1484,11 +1508,33 @@ impl BlockSearch<'_> {
                 penalty.wrapping_mul(sad) >> 8
             })
         };
-        let accepted = penalised(sad) < self.state.min_cost || self.settings.try_many;
-        if accepted {
-            self.state.best = Mv::new(vx, vy, sad);
-            self.state.min_cost = penalised(sad);
-        }
+        let try_many = self.settings.try_many;
+        let at = self.known[..self.known_count]
+            .iter()
+            .position(|k| k.0 == vx && k.1 == vy)
+            .unwrap_or_else(|| {
+                let luma = self.luma_sad(vx, vy);
+                self.known[self.known_count] = (vx, vy, luma, None);
+                self.known_count += 1;
+                self.known_count - 1
+            });
+        let luma = self.known[at].2;
+        let accepted = if penalty >= 0 && !try_many && penalised(luma) >= self.state.min_cost {
+            false
+        } else {
+            let chroma = self.known[at].3.unwrap_or_else(|| {
+                let chroma = self.chroma_sad(vx, vy);
+                self.known[at].3 = Some(chroma);
+                chroma
+            });
+            let sad = luma + chroma;
+            let accepted = penalised(sad) < self.state.min_cost || try_many;
+            if accepted {
+                self.state.best = Mv::new(vx, vy, sad);
+                self.state.min_cost = penalised(sad);
+            }
+            accepted
+        };
         if self.settings.try_many {
             self.refine(false);
             self.many[slot] = (self.state.best, penalised(self.state.best.sad));
