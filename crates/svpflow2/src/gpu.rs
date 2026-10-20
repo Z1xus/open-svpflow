@@ -2127,6 +2127,13 @@ kernel void blend_frame(
 #endif
     )
 {
+    local float curve[256];
+    if (steps.gamma != 1.0f) {
+        int lane = get_local_id(1)*get_local_size(0) + get_local_id(0);
+        int lanes = get_local_size(0)*get_local_size(1);
+        for (int i = lane; i < 256; i += lanes) curve[i] = powr((float)i / 255.0f, steps.gamma);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
     int x = get_global_id(0), y = get_global_id(1);
     if (x >= p.width || y >= p.height) return;
 
@@ -2256,7 +2263,7 @@ kernel void blend_frame(
         {
 #pragma OPENCL FP_CONTRACT OFF
             float value = clamp(round(result), 0.0f, 255.0f);
-            if (steps.gamma != 1.0f) value = powr(value / 255.0f, steps.gamma);
+            if (steps.gamma != 1.0f) value = curve[(int)value];
             float term = steps.weight[step] * value;
             total = term + total;
         }
