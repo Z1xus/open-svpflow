@@ -120,6 +120,11 @@ pub(crate) fn block_average(block: &[u8], pitch: usize, shape: Shape) -> i32 {
     if shape.height < 4 {
         return 0;
     }
+    #[cfg(target_arch = "x86_64")]
+    if pitch == shape.width && shape.area().is_multiple_of(16) {
+        let sum = unsafe { contiguous_sum(&block[..shape.area()]) };
+        return (sum >> shape.area().trailing_zeros()) as i32;
+    }
     let sum = match shape.width {
         2 => rows_sum::<2>(block, pitch, shape.height),
         4 => rows_sum::<4>(block, pitch, shape.height),
@@ -128,6 +133,18 @@ pub(crate) fn block_average(block: &[u8], pitch: usize, shape: Shape) -> i32 {
         _ => rows_sum::<32>(block, pitch, shape.height),
     };
     (sum >> shape.area().trailing_zeros()) as i32
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn contiguous_sum(block: &[u8]) -> u32 {
+    let mut acc = _mm_setzero_si128();
+    for chunk in block.as_chunks::<16>().0 {
+        let value = unsafe { _mm_loadu_si128(chunk.as_ptr().cast()) };
+        acc = _mm_add_epi64(acc, _mm_sad_epu8(value, _mm_setzero_si128()));
+    }
+    let high = _mm_shuffle_epi32::<0b1110>(acc);
+    _mm_cvtsi128_si32(_mm_add_epi32(acc, high)) as u32
 }
 
 fn rows_sum<const W: usize>(block: &[u8], pitch: usize, height: usize) -> u32 {
@@ -689,7 +706,7 @@ unsafe fn sad_until<const W: usize, const H: usize>(
             }
         };
         acc = _mm256_add_epi64(acc, _mm256_sad_epu8(a, b));
-        if row % 4 == 2 && row + 2 < H {
+        if row + 2 == H / 2 {
             let total = sad_total(acc);
             if stop(total) {
                 return total;
