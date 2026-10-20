@@ -14,7 +14,8 @@ use crate::vs::Source as _;
 use crate::{frame, metadata, options::ReferenceParams, vs};
 
 fn cache_cap(bytes: usize) -> usize {
-    ((96 << 20) / bytes.max(1)).clamp(4, 48)
+    // frames in flight share the entries, so a few per thread are enough
+    ((96 << 20) / bytes.max(1)).clamp(4, 2 * svpflow_core::threads::workers() + 2)
 }
 
 // longer runs are still pictures
