@@ -865,6 +865,9 @@ impl Session<'_, '_> {
             }
             unsafe { (cl.ReleaseEvent)(event) };
         }
+        if !ok {
+            unsafe { (cl.Finish)(self.unit.queue as Handle) };
+        }
         ok
     }
 
