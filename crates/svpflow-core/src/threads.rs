@@ -19,7 +19,7 @@ impl Pool {
     fn new() -> Self {
         let handles = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&handles);
-        let size = workers();
+        let size = pool_size();
         let pool = ThreadPoolBuilder::new()
             .num_threads(size)
             .spawn_handler(move |thread| {
@@ -78,8 +78,17 @@ pub fn workers() -> usize {
     }
 }
 
+// host frame threads also run filters, so the pool gets three quarters
+fn pool_size() -> usize {
+    (workers() * 3).div_ceil(4).max(2)
+}
+
 pub fn set(count: usize) {
     WANT.store(count, Ordering::Relaxed);
+}
+
+pub fn set_default(count: usize) {
+    let _ = WANT.compare_exchange(0, count, Ordering::Relaxed, Ordering::Relaxed);
 }
 
 pub fn shutdown() {
@@ -101,7 +110,7 @@ pub fn shutdown() {
 fn with<R>(f: impl FnOnce(&ThreadPool) -> R) -> R {
     let (used, stale) = {
         let mut slot = POOL.lock().unwrap_or_else(PoisonError::into_inner);
-        let stale = if slot.as_ref().is_none_or(|pool| pool.size != workers()) {
+        let stale = if slot.as_ref().is_none_or(|pool| pool.size != pool_size()) {
             slot.replace(Arc::new(Pool::new()))
         } else {
             None

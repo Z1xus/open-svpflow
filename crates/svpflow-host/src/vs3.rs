@@ -235,6 +235,18 @@ pub unsafe fn table_fn<T: Copy>(table: ConstRaw, offset: usize) -> Option<T> {
     Some(unsafe { table.cast::<u8>().add(offset).cast::<T>().read_unaligned() })
 }
 
+pub unsafe fn core_threads(core: Raw, vsapi: ConstRaw) -> usize {
+    let Some(get_core_info) = (unsafe { table_fn::<GetCoreInfo>(vsapi, GET_CORE_INFO) }) else {
+        return 0;
+    };
+    let info = unsafe { get_core_info(core) };
+    if info.is_null() {
+        0
+    } else {
+        usize::try_from(unsafe { (*info).num_threads }).unwrap_or(0)
+    }
+}
+
 pub unsafe fn free_node(node: Raw, vsapi: ConstRaw) {
     unsafe { free_nodes([node], vsapi) };
 }

@@ -210,6 +210,7 @@ unsafe fn create_analyse_inner(
     let get_core_info =
         unsafe { vs::table_fn::<vs::GetCoreInfo>(vsapi, vs::GET_CORE_INFO) }.ok_or(INVALID_API)?;
 
+    svpflow_core::threads::set_default(unsafe { vs::core_threads(core, vsapi) });
     let mut err = 0;
     let super_node = unsafe { get_node(input, c"clip".as_ptr(), 0, &raw mut err) };
     if super_node.is_null() {

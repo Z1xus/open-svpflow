@@ -23,6 +23,7 @@ unsafe fn create_super_inner(
     core: vs::Raw,
     vsapi: vs::ConstRaw,
 ) -> isize {
+    svpflow_core::threads::set_default(unsafe { vs::core_threads(core, vsapi) });
     let Some(get_node) = (unsafe { vs::table_fn::<vs::PropGetNode>(vsapi, vs::PROP_GET_NODE) })
     else {
         unsafe { vs::set_error(output, vsapi, c"SVSuper: invalid VSAPI table".as_ptr()) };

@@ -81,6 +81,7 @@ pub(crate) unsafe fn build_state(
 ) -> Option<(FilterData, CreateApi)> {
     let api = unsafe { load_create_api(output, vsapi) }?;
     let mut options = unsafe { parse_params(mode, input, output, vsapi) }?;
+    svpflow_core::threads::set_default(unsafe { vs::core_threads(core, vsapi) });
     options.apply_core_threads(unsafe { core_threads(core, vsapi) });
     if let Some(sar) = unsafe { sar(input, vsapi) } {
         options.apply_sar(sar);
