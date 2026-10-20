@@ -2,14 +2,13 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 type Handle = *mut c_void;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type Lookup = unsafe extern "C" fn(Handle) -> Handle;
 
 #[cfg(target_os = "linux")]
 const SIBLINGS: [&str; 2] = ["libsvpflow1_vs.so", "libsvpflow2_vs.so"];
 #[cfg(target_os = "windows")]
 const SIBLINGS: [&str; 2] = ["svpflow1_vs.dll", "svpflow2_vs.dll"];
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-const SIBLINGS: [&str; 0] = [];
 
 // contexts are never released, so plugins can share them
 static OWN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
@@ -24,6 +23,12 @@ pub extern "C" fn osvp_cl_context_v1(device: Handle) -> Handle {
         .map_or(std::ptr::null_mut(), |entry| entry.1 as Handle)
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn sibling(_: Handle) -> Handle {
+    std::ptr::null_mut()
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn sibling(device: Handle) -> Handle {
     for name in SIBLINGS {
         #[cfg(target_os = "linux")]
