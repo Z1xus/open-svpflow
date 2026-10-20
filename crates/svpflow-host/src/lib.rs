@@ -9,5 +9,7 @@
 pub mod alloc;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod avs;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod context;
 pub mod vs3;
 pub mod vs4;

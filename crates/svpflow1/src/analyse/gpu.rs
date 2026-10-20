@@ -12,6 +12,9 @@ type Handle = *mut c_void;
 const CL_SUCCESS: ClInt = 0;
 const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
 const CL_MEM_READ_WRITE: u64 = 1;
+const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
+const CL_MAP_READ: u64 = 1;
+const CL_TRUE: ClUint = 1;
 const CHUNK: usize = 16384;
 const RECORD: usize = 12;
 const RECORD_BYTES: usize = RECORD * size_of::<i32>();
@@ -65,6 +68,18 @@ type FnEnqueueNDRangeKernel = unsafe extern "C" fn(
     *const c_void,
     *mut c_void,
 ) -> ClInt;
+type FnEnqueueMapBuffer = unsafe extern "C" fn(
+    Handle,
+    Handle,
+    ClUint,
+    u64,
+    usize,
+    usize,
+    ClUint,
+    *const c_void,
+    *mut c_void,
+    *mut ClInt,
+) -> *mut c_void;
 type FnRelease = unsafe extern "C" fn(Handle) -> ClInt;
 type FnFinish = unsafe extern "C" fn(Handle) -> ClInt;
 type FnWaitForEvents = unsafe extern "C" fn(ClUint, *const Handle) -> ClInt;
@@ -83,6 +98,7 @@ struct OpenCl {
     CreateBuffer: FnCreateBuffer,
     EnqueueReadBuffer: FnEnqueueBuffer,
     EnqueueWriteBuffer: FnEnqueueBuffer,
+    EnqueueMapBuffer: FnEnqueueMapBuffer,
     SetKernelArg: FnSetKernelArg,
     EnqueueNDRangeKernel: FnEnqueueNDRangeKernel,
     ReleaseMemObject: FnRelease,
@@ -119,6 +135,7 @@ impl OpenCl {
             CreateBuffer: sym!("clCreateBuffer"),
             EnqueueReadBuffer: sym!("clEnqueueReadBuffer"),
             EnqueueWriteBuffer: sym!("clEnqueueWriteBuffer"),
+            EnqueueMapBuffer: sym!("clEnqueueMapBuffer"),
             SetKernelArg: sym!("clSetKernelArg"),
             EnqueueNDRangeKernel: sym!("clEnqueueNDRangeKernel"),
             ReleaseMemObject: sym!("clReleaseMemObject"),
@@ -143,6 +160,7 @@ pub(crate) struct Variant {
 struct Buffer {
     mem: usize,
     capacity: usize,
+    host: usize,
 }
 
 #[derive(Default)]
@@ -150,7 +168,7 @@ struct Unit {
     queue: usize,
     expand: usize,
     kernels: Vec<(usize, usize)>,
-    buffers: [Buffer; 4],
+    buffers: [Buffer; 6],
 }
 
 pub(crate) struct RefineGpu {
@@ -271,17 +289,24 @@ impl RefineGpu {
                 continue;
             }
             let mut err = 0;
-            let context = unsafe {
-                (cl.CreateContext)(
-                    std::ptr::null(),
-                    1,
-                    &raw const device,
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
-                    &raw mut err,
-                )
-            };
-            if err != CL_SUCCESS || context.is_null() {
+            let context = svpflow_host::context::shared(device, || {
+                let context = unsafe {
+                    (cl.CreateContext)(
+                        std::ptr::null(),
+                        1,
+                        &raw const device,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                        &raw mut err,
+                    )
+                };
+                if err == CL_SUCCESS {
+                    context
+                } else {
+                    std::ptr::null_mut()
+                }
+            });
+            if context.is_null() {
                 continue;
             }
             let mut units = Vec::with_capacity(UNITS);
@@ -407,9 +432,58 @@ impl RefineGpu {
             *buffer = Buffer {
                 mem: mem as usize,
                 capacity,
+                host: 0,
             };
         }
         Some(buffer.mem as Handle)
+    }
+
+    // pageable reads queue behind the other plugin's copies in a shared context
+    unsafe fn pinned(&self, unit: &mut Unit, index: usize, size: usize) -> Option<*mut u8> {
+        if unit.buffers[index].capacity < size {
+            let old = std::mem::take(&mut unit.buffers[index]);
+            if old.mem != 0 {
+                unsafe { (self.cl.ReleaseMemObject)(old.mem as Handle) };
+            }
+            let capacity = size.next_multiple_of(4096);
+            let mut err = 0;
+            let mem = unsafe {
+                (self.cl.CreateBuffer)(
+                    self.context as Handle,
+                    CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
+                    capacity,
+                    std::ptr::null_mut(),
+                    &raw mut err,
+                )
+            };
+            if err != CL_SUCCESS || mem.is_null() {
+                return None;
+            }
+            let host = unsafe {
+                (self.cl.EnqueueMapBuffer)(
+                    unit.queue as Handle,
+                    mem,
+                    CL_TRUE,
+                    CL_MAP_READ,
+                    0,
+                    capacity,
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    &raw mut err,
+                )
+            };
+            if err != CL_SUCCESS || host.is_null() {
+                unsafe { (self.cl.ReleaseMemObject)(mem) };
+                return None;
+            }
+            unit.buffers[index] = Buffer {
+                mem: mem as usize,
+                capacity,
+                host: host as usize,
+            };
+        }
+        Some(unit.buffers[index].host as *mut u8)
     }
 }
 
@@ -434,7 +508,7 @@ pub(crate) struct Session<'g, 'p> {
     gpu: &'g RefineGpu,
     unit: std::sync::MutexGuard<'g, Unit>,
     frames: [Option<SessionFrame>; 2],
-    tickets: Vec<Vec<[i32; 4]>>,
+    tickets: Vec<(usize, usize)>,
     pending: Vec<usize>,
     keep: Vec<Box<[u8]>>,
     deferred: [Option<((usize, i32), Planes<'p>)>; 2],
@@ -699,8 +773,9 @@ impl Session<'_, '_> {
         let cl = &self.gpu.cl;
         let blocks = plan.blocks();
 
-        let mut bests = vec![[0i32; 4]; blocks];
+        let slot = self.tickets.len() % 2;
         if blocks > 0 {
+            let bests = unsafe { self.gpu.pinned(&mut self.unit, 4 + slot, blocks * 16)? };
             let kernel =
                 if let Some(&(_, kernel)) = self.unit.kernels.iter().find(|(p, _)| *p == program) {
                     kernel as Handle
@@ -715,7 +790,6 @@ impl Session<'_, '_> {
                     self.unit.kernels.push((program, kernel as usize));
                     kernel
                 };
-            let slot = self.tickets.len() % 2;
             let params: [i64; 24] = [
                 source.lengths[0],
                 source.lengths[1],
@@ -815,7 +889,7 @@ impl Session<'_, '_> {
                             CL_FALSE,
                             0,
                             count * 16,
-                            bests.as_mut_ptr().add(start).cast(),
+                            bests.add(start * 16).cast(),
                             0,
                             std::ptr::null(),
                             if last {
@@ -833,7 +907,7 @@ impl Session<'_, '_> {
             }
             self.pending.push(done as usize);
         }
-        self.tickets.push(bests);
+        self.tickets.push((slot, blocks));
         Some(self.tickets.len() - 1)
     }
 
@@ -872,7 +946,12 @@ impl Session<'_, '_> {
     }
 
     pub(crate) fn take(&mut self, ticket: usize) -> Vec<[i32; 4]> {
-        std::mem::take(&mut self.tickets[ticket])
+        let (slot, blocks) = self.tickets[ticket];
+        if blocks == 0 {
+            return Vec::new();
+        }
+        let host = self.unit.buffers[4 + slot].host as *const [i32; 4];
+        unsafe { std::slice::from_raw_parts(host, blocks) }.to_vec()
     }
 }
 

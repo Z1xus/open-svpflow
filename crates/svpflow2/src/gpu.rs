@@ -179,7 +179,6 @@ struct OpenCl {
     ReleaseKernel: FnRelease,
     ReleaseProgram: FnRelease,
     ReleaseCommandQueue: FnRelease,
-    ReleaseContext: FnRelease,
 }
 
 impl OpenCl {
@@ -230,7 +229,6 @@ impl OpenCl {
                 ReleaseKernel: sym!("clReleaseKernel"),
                 ReleaseProgram: sym!("clReleaseProgram"),
                 ReleaseCommandQueue: sym!("clReleaseCommandQueue"),
-                ReleaseContext: sym!("clReleaseContext"),
                 _lib: lib,
             }
         };
@@ -1602,23 +1600,29 @@ unsafe fn shared(cl: &OpenCl, device: ClDeviceId, hi10: bool) -> Option<&'static
     if let Some(&(.., found)) = all.iter().find(|entry| (entry.0, entry.1) == key) {
         return Some(found);
     }
-    let mut err = 0;
-    let context = unsafe {
-        (cl.CreateContext)(
-            std::ptr::null(),
-            1,
-            &raw const device,
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            &raw mut err,
-        )
-    };
-    if err != CL_SUCCESS || context.is_null() {
+    let context = svpflow_host::context::shared(device, || {
+        let mut err = 0;
+        let context = unsafe {
+            (cl.CreateContext)(
+                std::ptr::null(),
+                1,
+                &raw const device,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        if err == CL_SUCCESS {
+            context
+        } else {
+            std::ptr::null_mut()
+        }
+    });
+    if context.is_null() {
         return None;
     }
     let base = format!("#define HI10P {}\n{KERNEL_SRC}", u8::from(hi10));
     let Ok(program) = (unsafe { build_program(cl, context, device, &base) }) else {
-        unsafe { (cl.ReleaseContext)(context) };
         return None;
     };
     let made = Box::leak(Box::new(Shared {

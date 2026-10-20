@@ -4,3 +4,6 @@ EXPORTS
     svpGetVersion @2
     VapourSynthPluginInit2 @3
     avisynth_c_plugin_init @4
+    osvp_plugin_threads
+    osvp_plugin_stop
+    osvp_cl_context_v1
