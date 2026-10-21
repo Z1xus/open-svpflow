@@ -567,6 +567,16 @@ impl Field {
         let mut processed = vec![false; ((self.blk_x + 1) * (self.blk_y + 1)) as usize];
         let mut neighbours = [Mv::default(); 9];
         let l = self.layout;
+        let predictor_only = searching
+            && search_param == 0
+            && self.level == 0
+            && !self.satd
+            && !border_negative
+            && self.chroma_shift == (1, 1)
+            && matches!((l.width, l.height), (8, 8) | (16, 8 | 16) | (32, 16 | 32));
+        if !searching && let Some(out) = output.as_deref_mut() {
+            self.write_kept(&src.y, settings.bad_sad, diagonal, out);
+        }
         for position in 0..self.order.len() {
             let (bx, by) = self.order[position];
             let (bx, by) = (i32::from(bx), i32::from(by));
@@ -574,6 +584,25 @@ impl Field {
             let index = (!is_border).then(|| (by * self.blk_x + bx) as usize);
             let negative = border_negative
                 && (bx == 0 || bx >= self.blk_x - 1 || by == 0 || by >= self.blk_y - 1);
+            if predictor_only
+                && let Some(i) = index
+                && let Some((best, luma)) =
+                    self.predictor_sad(i, bx, by, src, reference, output.is_some())
+            {
+                self.vectors[i] = best;
+                if let Some(out) = output.as_deref_mut() {
+                    out[2 * i] = ((i32::from(best.x) << 16) + i32::from(best.y)) as u32;
+                    out[2 * i + 1] = packed_score(best, diagonal, luma);
+                }
+                continue;
+            }
+            if !negative
+                && let Some(i) = index
+                && !searching
+                && self.vectors[i].sad <= settings.bad_sad
+            {
+                continue;
+            }
             let mut x0 = if bx < self.blk_x {
                 bx * l.step_x()
             } else {
@@ -596,21 +625,6 @@ impl Field {
                 max_x: self.pel * (w - x0 - covered_w),
                 max_y: self.pel * (h - y0 - covered_h),
             };
-            if !searching
-                && !negative
-                && let Some(i) = index
-                && self.vectors[i].sad <= settings.bad_sad
-            {
-                if let Some(out) = output.as_deref_mut() {
-                    let best = self.vectors[i];
-                    let shape = Shape::new(l.width as usize, l.height as usize);
-                    let (block, pitch) = src.y.block(src.y.pel1(x0, y0), shape, &mut ctx.scratch);
-                    let luma = metric::block_average(block, pitch, shape);
-                    out[2 * i] = ((i32::from(best.x) << 16) + i32::from(best.y)) as u32;
-                    out[2 * i + 1] = packed_score(best, diagonal, luma);
-                }
-                continue;
-            }
             let predictor_index = index.unwrap_or_else(|| {
                 let px = if bx == self.blk_x { bx - 1 } else { bx };
                 let py = if by == self.blk_y { by - 1 } else { by };
@@ -631,6 +645,7 @@ impl Field {
                 sad_limit: settings.lsad,
                 bad_sad: settings.bad_sad,
                 search_param,
+                want_luma: output.is_some(),
             };
             state.pos = state.origin;
             state.pos_y = state.origin_y;
@@ -664,6 +679,87 @@ impl Field {
                     }
                 }
                 None => self.border[(bx + self.blk_y - by) as usize] = best,
+            }
+        }
+    }
+
+    fn predictor_sad(
+        &self,
+        index: usize,
+        bx: i32,
+        by: i32,
+        src: &LevelFrame<'_>,
+        reference: &LevelFrame<'_>,
+        need_luma: bool,
+    ) -> Option<(Mv, i32)> {
+        let v = self.vectors[index];
+        if v.sad < 0 {
+            return None;
+        }
+        let l = self.layout;
+        let (x0, y0) = (bx * l.step_x(), by * l.step_y());
+        let (vx, vy) = (i32::from(v.x), i32::from(v.y));
+        let pel = self.pel;
+        if vx < -pel * x0
+            || vx >= pel * (src.y.width - x0 - l.width)
+            || vy < -pel * y0
+            || vy >= pel * (src.y.height - y0 - l.height)
+        {
+            return None;
+        }
+        let shape = Shape::new(l.width as usize, l.height as usize);
+        let luma_src = src.y.slice(src.y.pel1(x0, y0), shape.span(src.y.pitch))?;
+        let luma_ref = reference.y.slice(
+            reference.y.subpel(x0 * pel + vx, y0 * pel + vy),
+            shape.span(reference.y.pitch),
+        )?;
+        let luma = metric::sad_pitched(shape, luma_src, src.y.pitch, luma_ref, reference.y.pitch);
+        let half = shape.half();
+        let (cx0, cy0) = (x0 >> 1, y0 >> 1);
+        let offset = reference
+            .u
+            .subpel(cx0 * pel + (vx >> 1), cy0 * pel + (vy >> 1));
+        let mut chroma = 0;
+        for (plane, reference) in [(&src.u, &reference.u), (&src.v, &reference.v)] {
+            let s = plane.slice(plane.pel1(cx0, cy0), half.span(plane.pitch))?;
+            let r = reference.slice(offset, half.span(reference.pitch))?;
+            chroma += metric::sad_pitched(half, s, plane.pitch, r, reference.pitch);
+        }
+        let sad = luma as i32 + ((chroma as i32) << 2);
+        let average = if need_luma {
+            metric::block_average(luma_src, src.y.pitch, shape)
+        } else {
+            0
+        };
+        Some((Mv::new(vx, vy, sad), average))
+    }
+
+    fn write_kept(&self, plane: &PlaneView<'_>, bad_sad: i32, diagonal: i32, out: &mut [u32]) {
+        let l = self.layout;
+        let (w, h) = (l.width as usize, l.height as usize);
+        let shift = (w * h).trailing_zeros();
+        let edges = self.smallest && l.width > 4;
+        let width = ((self.blk_x - 1) * l.step_x() + l.width) as usize;
+        let mut columns = vec![0u16; width];
+        for by in 0..self.blk_y {
+            columns.fill(0);
+            for row in 0..l.height {
+                let start = plane.pel1(0, by * l.step_y() + row) as usize;
+                for (sum, &pixel) in columns.iter_mut().zip(&plane.data()[start..start + width]) {
+                    *sum += u16::from(pixel);
+                }
+            }
+            for bx in 0..self.blk_x {
+                let i = (by * self.blk_x + bx) as usize;
+                let vector = self.vectors[i];
+                let border = bx == 0 || bx >= self.blk_x - 1 || by == 0 || by >= self.blk_y - 1;
+                if vector.sad > bad_sad || (edges && border) {
+                    continue;
+                }
+                let x0 = (bx * l.step_x()) as usize;
+                let sum: u32 = columns[x0..x0 + w].iter().map(|&c| u32::from(c)).sum();
+                out[2 * i] = ((i32::from(vector.x) << 16) + i32::from(vector.y)) as u32;
+                out[2 * i + 1] = packed_score(vector, diagonal, (sum >> shift) as i32);
             }
         }
     }
@@ -813,7 +909,12 @@ fn planes_fit(frame: &LevelFrame<'_>, pel: i32) -> bool {
 
 pub(crate) fn packed_score(best: Mv, diagonal: i32, block_luma: i32) -> u32 {
     let mut sad = best.sad;
-    let relative = (i32::from(best.x).abs() + i32::from(best.y).abs()) * 100 / diagonal;
+    let distance = (i32::from(best.x).abs() + i32::from(best.y).abs()) * 100;
+    let relative = if distance < diagonal {
+        0
+    } else {
+        distance / diagonal
+    };
     if relative > 50 {
         sad = sad.wrapping_mul(20);
     } else if relative > 15 {
@@ -861,6 +962,7 @@ struct BlockState {
     sad_limit: i32,
     bad_sad: i32,
     search_param: i32,
+    want_luma: bool,
 }
 
 #[derive(Clone)]
@@ -1021,11 +1123,25 @@ impl BlockSearch<'_> {
         self.active = set;
     }
 
+    #[inline]
     fn move_block(&mut self, mut vx: i32, mut vy: i32, margin: i32) -> bool {
         if margin > 0 {
             vx = if vx < 0 { vx - margin } else { vx + margin };
             vy = if vy < 0 { vy - margin } else { vy + margin };
         }
+        let b0 = self.state.bounds0;
+        if vx >= b0.min_x && vx < b0.max_x && vy >= b0.min_y && vy < b0.max_y {
+            let s = &mut self.state;
+            self.active = 0;
+            s.pos = s.origin;
+            s.pos_y = s.origin_y;
+            return false;
+        }
+        self.shift_block(vx, vy)
+    }
+
+    #[inline(never)]
+    fn shift_block(&mut self, vx: i32, vy: i32) -> bool {
         let b0 = self.state.bounds0;
         let outside = |v: i32, min: i32, max: i32| {
             if v < min {
@@ -1039,12 +1155,6 @@ impl BlockSearch<'_> {
         let dx = outside(vx, b0.min_x, b0.max_x);
         let dy = outside(vy, b0.min_y, b0.max_y);
         let s = &mut self.state;
-        if dx == 0 && dy == 0 {
-            self.active = 0;
-            s.pos = s.origin;
-            s.pos_y = s.origin_y;
-            return false;
-        }
         let x = (s.origin[0] - dx)
             .max(0)
             .min(self.src.y.width - self.shape.width as i32);
@@ -1575,7 +1685,9 @@ impl BlockSearch<'_> {
                 &source.y
             };
         if !need {
-            self.block_luma = metric::block_average(luma, shape.width, shape);
+            if self.state.want_luma {
+                self.block_luma = metric::block_average(luma, shape.width, shape);
+            }
             return 0;
         }
         let (average, mut contrast) =

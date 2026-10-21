@@ -173,6 +173,82 @@ fn sad<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usiz
     sad_scalar(src, reference, pitch, W, H)
 }
 
+pub(crate) fn sad_pitched(shape: Shape, a: &[u8], a_pitch: usize, b: &[u8], b_pitch: usize) -> u32 {
+    assert!(a.len() >= shape.span(a_pitch) && b.len() >= shape.span(b_pitch));
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let (a, b) = (a.as_ptr(), b.as_ptr());
+        match (shape.width, shape.height) {
+            (4, 4) => return sad_4x4_pitched(a, a_pitch, b, b_pitch),
+            (8, 8) => return sad_rows_pitched::<8>(a, a_pitch, b, b_pitch, 8),
+            (16, 8) => return sad_rows_pitched::<16>(a, a_pitch, b, b_pitch, 8),
+            (16, 16) => return sad_rows_pitched::<16>(a, a_pitch, b, b_pitch, 16),
+            (32, 16) => return sad_rows_pitched::<32>(a, a_pitch, b, b_pitch, 16),
+            (32, 32) => return sad_rows_pitched::<32>(a, a_pitch, b, b_pitch, 32),
+            _ => {}
+        }
+    }
+    (0..shape.height)
+        .map(|row| {
+            a[row * a_pitch..][..shape.width]
+                .iter()
+                .zip(&b[row * b_pitch..][..shape.width])
+                .map(|(&x, &y)| u32::from(x.abs_diff(y)))
+                .sum::<u32>()
+        })
+        .sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn sad_rows_pitched<const W: usize>(
+    src: *const u8,
+    src_pitch: usize,
+    reference: *const u8,
+    reference_pitch: usize,
+    height: usize,
+) -> u32 {
+    let mut acc = _mm_setzero_si128();
+    for row in 0..height {
+        let (source, target) = unsafe {
+            (
+                src.add(row * src_pitch),
+                reference.add(row * reference_pitch),
+            )
+        };
+        if W == 8 {
+            let a = unsafe { _mm_loadl_epi64(source.cast()) };
+            let b = unsafe { _mm_loadl_epi64(target.cast()) };
+            acc = _mm_add_epi64(acc, _mm_sad_epu8(a, b));
+        } else {
+            for chunk in (0..W).step_by(16) {
+                let a = unsafe { _mm_loadu_si128(source.add(chunk).cast()) };
+                let b = unsafe { _mm_loadu_si128(target.add(chunk).cast()) };
+                acc = _mm_add_epi64(acc, _mm_sad_epu8(a, b));
+            }
+        }
+    }
+    let high = _mm_shuffle_epi32::<0b1110>(acc);
+    _mm_cvtsi128_si32(_mm_add_epi32(acc, high)) as u32
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn sad_4x4_pitched(a: *const u8, a_pitch: usize, b: *const u8, b_pitch: usize) -> u32 {
+    use core::arch::x86_64::{_mm_cvtsi32_si128, _mm_unpacklo_epi32};
+    let gather = |p: *const u8, pitch: usize| unsafe {
+        let load =
+            |row: usize| _mm_cvtsi32_si128(p.add(row * pitch).cast::<i32>().read_unaligned());
+        _mm_unpacklo_epi64(
+            _mm_unpacklo_epi32(load(0), load(1)),
+            _mm_unpacklo_epi32(load(2), load(3)),
+        )
+    };
+    let sums = _mm_sad_epu8(gather(a, a_pitch), gather(b, b_pitch));
+    let high = _mm_shuffle_epi32::<0b1110>(sums);
+    _mm_cvtsi128_si32(_mm_add_epi32(sums, high)) as u32
+}
+
 fn sad_scalar(src: &[u8], reference: &[u8], pitch: usize, width: usize, height: usize) -> u32 {
     let mut sum = 0;
     for row in 0..height {
