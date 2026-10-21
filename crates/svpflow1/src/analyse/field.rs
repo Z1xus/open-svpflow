@@ -1703,6 +1703,11 @@ impl BlockSearch<'_> {
         contrast.min(255)
     }
 
+    fn settled(&self) -> bool {
+        let sad = self.state.best.sad;
+        sad >= 0 && sad * 2 <= 3 * self.shape.area() as i32
+    }
+
     fn search_block(&mut self, negative: bool, reverse: Mv, neighbours: &[Mv]) {
         let s = &mut self.state;
         let ratio = s.sad_limit as f32 / (s.sad_limit + (s.predictor.sad >> 1)) as f32;
@@ -1738,10 +1743,17 @@ impl BlockSearch<'_> {
                 self.state.predictor = reverse;
             }
         }
+        let early = !self.settings.try_many && !negative;
+        if early && self.settled() {
+            return;
+        }
         self.check_predictor(self.global, self.settings.pglobal, false, 2);
         self.check_predictor(Mv::UNSET, self.settings.pzero, false, 3);
         for (i, &neighbour) in neighbours.iter().enumerate() {
             self.check_predictor(neighbour, self.settings.pnbour, false, 4 + i);
+        }
+        if early && self.settled() {
+            return;
         }
         self.state.min_cost = self.state.best.sad;
         if flags & CONTRAST_FLAG != 0 && self.level > 0 {
