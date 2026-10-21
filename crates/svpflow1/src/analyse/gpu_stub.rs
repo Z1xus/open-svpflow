@@ -32,6 +32,17 @@ impl<'p> Session<'_, 'p> {
         None
     }
 
+    pub(crate) fn submit_compact(
+        &mut self,
+        _: &super::field::recalc::CompactPlan,
+        _: usize,
+        _: usize,
+    ) -> Option<usize> {
+        None
+    }
+
+    pub(crate) fn take_into(&mut self, _: usize, _: &mut [u32]) {}
+
     pub(crate) fn wait(&mut self) -> bool {
         false
     }

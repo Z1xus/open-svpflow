@@ -3,7 +3,7 @@ use core::ffi::{c_char, c_void};
 use std::ffi::CString;
 use std::sync::{Mutex, OnceLock};
 
-use super::field::recalc::RecalcPlan;
+use super::field::recalc::{CompactPlan, RecalcPlan};
 
 type ClInt = i32;
 type ClUint = u32;
@@ -154,6 +154,7 @@ pub(crate) struct Variant {
     pub(crate) width: usize,
     pub(crate) height: usize,
     pub(crate) satd: bool,
+    pub(crate) shift: u32,
 }
 
 #[derive(Default)]
@@ -168,7 +169,7 @@ struct Unit {
     queue: usize,
     expand: usize,
     kernels: Vec<(usize, usize)>,
-    buffers: [Buffer; 6],
+    buffers: [Buffer; 7],
 }
 
 pub(crate) struct RefineGpu {
@@ -345,11 +346,13 @@ impl RefineGpu {
         if let Some(&(_, program)) = programs.iter().find(|(v, _)| *v == variant) {
             return Some(program);
         }
+        let kernel = if variant.width == 4 { COMPACT } else { KERNEL };
         let program = self.build(&format!(
-            "#define W {}\n#define H {}\n#define SATD {}\n#define RECORD {RECORD}\n{KERNEL}",
+            "#define W {}\n#define H {}\n#define SATD {}\n#define S {}\n#define RECORD {RECORD}\n{kernel}",
             variant.width,
             variant.height,
-            u8::from(variant.satd)
+            u8::from(variant.satd),
+            variant.shift
         ))?;
         programs.push((variant, program));
         Some(program)
@@ -756,9 +759,171 @@ impl Session<'_, '_> {
             width: plan.width,
             height: plan.height,
             satd: plan.satd,
+            shift: 1,
         };
         let program = self.gpu.program(variant)?;
         unsafe { self.enqueue(plan, src, reference, program, source, target) }
+    }
+
+    pub(crate) fn submit_compact(
+        &mut self,
+        plan: &CompactPlan,
+        src: usize,
+        reference: usize,
+    ) -> Option<usize> {
+        self.flush();
+        let (source, target) = (
+            self.frames[src].as_ref()?.2,
+            self.frames[reference].as_ref()?.2,
+        );
+        let variant = Variant {
+            width: 4,
+            height: 4,
+            satd: plan.satd,
+            shift: plan.shift,
+        };
+        let program = self.gpu.program(variant)?;
+        unsafe { self.enqueue_compact(plan, src, reference, program, source, target) }
+    }
+
+    unsafe fn enqueue_compact(
+        &mut self,
+        plan: &CompactPlan,
+        src: usize,
+        reference: usize,
+        program: usize,
+        source: Frame,
+        target: Frame,
+    ) -> Option<usize> {
+        let cl = &self.gpu.cl;
+        let blocks = plan.blocks();
+        let slot = self.tickets.len() % 2;
+        let results = unsafe { self.gpu.pinned(&mut self.unit, 4 + slot, blocks * 8)? };
+        let kernel = if let Some(&(_, kernel)) =
+            self.unit.kernels.iter().find(|(p, _)| *p == program)
+        {
+            kernel as Handle
+        } else {
+            let mut err = 0;
+            let kernel =
+                unsafe { (cl.CreateKernel)(program as Handle, c"recalc".as_ptr(), &raw mut err) };
+            if err != CL_SUCCESS || kernel.is_null() {
+                return None;
+            }
+            self.unit.kernels.push((program, kernel as usize));
+            kernel
+        };
+        let g = plan.geometry.map(i64::from);
+        let params: [i64; 33] = [
+            source.lengths[0],
+            source.lengths[1],
+            source.lengths[2],
+            source.pitches[0],
+            source.pitches[1],
+            source.pitches[2],
+            target.lengths[0],
+            target.lengths[1],
+            target.lengths[2],
+            target.pitches[0],
+            target.pitches[1],
+            target.pitches[2],
+            target.bases[0],
+            target.bases[1],
+            target.heights[0],
+            target.heights[1],
+            0,
+            blocks as i64,
+            g[0],
+            g[1],
+            g[2],
+            g[3],
+            g[4],
+            g[5],
+            g[6],
+            g[7],
+            g[8],
+            g[9],
+            g[10],
+            g[11],
+            source.bases[0],
+            source.bases[1],
+            source.bases[2],
+        ];
+        let (source_mems, target_mems) = (
+            self.frames[src].as_ref()?.1,
+            self.frames[reference].as_ref()?.1,
+        );
+        let events: Vec<Handle> = self
+            .frames
+            .iter()
+            .flatten()
+            .map(|f| f.3 as Handle)
+            .collect();
+        let mut mems = [std::ptr::null_mut(); 10];
+        for plane in 0..3 {
+            mems[plane] = source_mems[plane] as Handle;
+            mems[3 + plane] = target_mems[plane] as Handle;
+        }
+        let params = self.hold(bytes(&params));
+        let overrides = self.hold(bytes(&plan.overrides));
+        mems[6] = unsafe { self.write(slot, params)? };
+        mems[7] = unsafe { self.gpu.buffer(&mut self.unit, 2, blocks * 8)? };
+        mems[8] = unsafe { self.gpu.buffer(&mut self.unit, 3, blocks * 8)? };
+        mems[9] = unsafe { self.write(6, overrides)? };
+        let set = mems.iter().enumerate().all(|(index, mem)| unsafe {
+            (cl.SetKernelArg)(
+                kernel,
+                index as ClUint,
+                size_of::<Handle>(),
+                (&raw const *mem).cast(),
+            ) == CL_SUCCESS
+        });
+        let queue = self.unit.queue as Handle;
+        if !set || !unsafe { self.transfer(mems[7], bytes(&plan.vectors), std::ptr::null_mut()) } {
+            unsafe { (cl.Finish)(queue) };
+            return None;
+        }
+        let (local, global) = (64usize, blocks.next_multiple_of(64));
+        let mut done: Handle = std::ptr::null_mut();
+        if unsafe {
+            (cl.EnqueueNDRangeKernel)(
+                queue,
+                kernel,
+                1,
+                std::ptr::null(),
+                &raw const global,
+                &raw const local,
+                events.len() as ClUint,
+                events.as_ptr().cast(),
+                std::ptr::null_mut(),
+            )
+        } != CL_SUCCESS
+            || unsafe {
+                (cl.EnqueueReadBuffer)(
+                    queue,
+                    mems[8],
+                    CL_FALSE,
+                    0,
+                    blocks * 8,
+                    results.cast(),
+                    0,
+                    std::ptr::null(),
+                    (&raw mut done).cast(),
+                )
+            } != CL_SUCCESS
+        {
+            unsafe { (cl.Finish)(queue) };
+            return None;
+        }
+        self.pending.push(done as usize);
+        self.tickets.push((slot, blocks));
+        Some(self.tickets.len() - 1)
+    }
+
+    pub(crate) fn take_into(&mut self, ticket: usize, out: &mut [u32]) {
+        let (slot, blocks) = self.tickets[ticket];
+        let host = self.unit.buffers[4 + slot].host as *const u32;
+        out[..2 * blocks].copy_from_slice(unsafe { std::slice::from_raw_parts(host, 2 * blocks) });
     }
 
     unsafe fn enqueue(
@@ -993,6 +1158,184 @@ __kernel void expand(__global uchar *plane, long pitch, long height) {
         value = y == 0 ? (int)p0[x + 1] : (P0(i) + P0(i + pitch + 1) + 1) >> 1;
     }
     plane[k * size + i] = (uchar)value;
+}
+";
+
+const COMPACT: &str = r"
+#define LO(v) (((v) << 16) >> 16)
+#define HI(v) ((v) >> 16)
+#define CW (4 >> S)
+
+inline int fetch(__global const uchar *data, long length, long index) {
+    return (index >= 0 && index < length) ? (int)data[index] : 0;
+}
+
+inline long subpel(long base, long pitch, long height, int pel, int x, int y) {
+    if (pel == 1) return base + (long)y * pitch + x;
+    int bits = pel == 2 ? 1 : 2;
+    int mask = pel == 2 ? 1 : 3;
+    long index = (long)((x & mask) | ((y & mask) << bits));
+    return base + (long)(y >> bits) * pitch + (x >> bits) + index * pitch * height;
+}
+
+inline uint tile_cost(const int *src, __global const uchar *data, long length, long offset, long pitch) {
+    int d[4][4];
+    for (int y = 0; y < 4; y++) {
+        long row = offset + (long)y * pitch;
+        if (row >= 0 && row + 4 <= length) {
+            int4 r = convert_int4(vload4(0, data + row));
+            d[y][0] = r.x; d[y][1] = r.y; d[y][2] = r.z; d[y][3] = r.w;
+        } else {
+            for (int x = 0; x < 4; x++) d[y][x] = fetch(data, length, row + x);
+        }
+        for (int x = 0; x < 4; x++) d[y][x] = src[y * 4 + x] - d[y][x];
+    }
+#if SATD
+    for (int y = 0; y < 4; y++) {
+        int s0 = d[y][0] + d[y][1], s1 = d[y][2] + d[y][3];
+        int d0 = d[y][0] - d[y][1], d1 = d[y][2] - d[y][3];
+        d[y][0] = s0 + s1; d[y][1] = s0 - s1; d[y][2] = d0 + d1; d[y][3] = d0 - d1;
+    }
+    uint total = 0;
+    for (int x = 0; x < 4; x++) {
+        int s0 = d[0][x] + d[1][x], s1 = d[2][x] + d[3][x];
+        int d0 = d[0][x] - d[1][x], d1 = d[2][x] - d[3][x];
+        total += abs(s0 + s1) + abs(s0 - s1) + abs(d0 + d1) + abs(d0 - d1);
+    }
+    return total / 2;
+#else
+    uint total = 0;
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) total += abs(d[y][x]);
+    return total;
+#endif
+}
+
+#if S
+inline uint plane_cost(const int *src, __global const uchar *data, long length, long offset, long pitch) {
+    uint total = 0;
+    for (int x = 0; x < 2; x++) {
+        total += abs(src[x] - fetch(data, length, offset + pitch + x));
+        total += abs(src[2 + x] - fetch(data, length, offset + x));
+    }
+    return total;
+}
+#else
+#define plane_cost tile_cost
+#endif
+
+inline int chroma_value(const int *su, const int *sv, __global const uchar *ru,
+                        __global const uchar *rv, long lru, long lrv, long pru, long prv, long off) {
+    uint u = plane_cost(su, ru, lru, off, pru);
+    uint v = plane_cost(sv, rv, lrv, off, prv);
+    return (int)((u + v) << (2 * S));
+}
+
+inline int outside(int v, int low, int high) {
+    return v < low ? v - low : (v >= high ? v - high + 1 : 0);
+}
+
+__kernel __attribute__((reqd_work_group_size(64, 1, 1)))
+void recalc(__global const uchar *sy, __global const uchar *su, __global const uchar *sv,
+            __global const uchar *ry, __global const uchar *ru, __global const uchar *rv,
+            __global const long *p, __global const int2 *vectors, __global uint2 *out,
+            __global const int2 *overrides) {
+    long block = get_global_id(0);
+    if (block >= p[17]) return;
+    int fw = (int)p[18], fh = (int)p[19], blk_x = (int)p[20], step_x = (int)p[21], step_y = (int)p[22];
+    int radius = (int)p[23], bad_sad = (int)p[24], lambda = (int)p[25], diagonal = (int)p[26];
+    int pnew = (int)p[27], pel = (int)p[28], count = (int)p[29];
+    long lsy = p[0], lsu = p[1], lsv = p[2], psy = p[3], psu = p[4], psv = p[5];
+    long lry = p[6], lru = p[7], lrv = p[8], pry = p[9], pru = p[10], prv = p[11];
+    int x0 = (int)(block % blk_x) * step_x, y0 = (int)(block / blk_x) * step_y;
+    int2 vector = vectors[block];
+    int px = LO(vector.x), py = HI(vector.x);
+    int sum = 0;
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) sum += fetch(sy, lsy, p[30] + (long)(y0 + y) * psy + x0 + x);
+    int average = sum >> 4;
+    int best_x = px, best_y = py, bsad = vector.y;
+    if (bsad > bad_sad) {
+        int min_x0 = -pel * x0, min_y0 = -pel * y0;
+        int max_x0 = pel * (fw - x0 - 4), max_y0 = pel * (fh - y0 - 4);
+        int dx = outside(px < 0 ? px - 2 : px + 2, min_x0, max_x0);
+        int dy = outside(py < 0 ? py - 2 : py + 2, min_y0, max_y0);
+        int pos_x = x0, pos_y = y0, cpos_x = x0 >> S, cpos_y = y0 >> S;
+        int src_x = x0, src_y = y0, csrc_x = cpos_x, csrc_y = cpos_y;
+        int low_x = min_x0, high_x = max_x0, low_y = min_y0, high_y = max_y0;
+        if (dx != 0 || dy != 0) {
+            pos_x = min(max(x0 - dx, 0), fw - 4);
+            pos_y = min(max(y0 - dy, 0), fh - 4);
+            dx = x0 - pos_x;
+            dy = y0 - pos_y;
+            cpos_x = (x0 >> S) - (dx >> S);
+            cpos_y = (y0 >> S) - (dy >> S);
+            src_x = pos_x; src_y = pos_y; csrc_x = cpos_x; csrc_y = cpos_y;
+            low_x = min_x0 - min(dx, 0); high_x = max_x0 - max(dx, 0);
+            low_y = min_y0 - min(dy, 0); high_y = max_y0 - max(dy, 0);
+        } else if (count > 0) {
+            int lo = 0, hi = count;
+            while (lo < hi) {
+                int mid = (lo + hi) >> 1;
+                if (overrides[mid].x < block) lo = mid + 1; else hi = mid;
+            }
+            if (lo < count && overrides[lo].x == block) {
+                int first = overrides[lo].y;
+                src_x = (first % blk_x) * step_x;
+                src_y = (first / blk_x) * step_y;
+                csrc_x = src_x >> S;
+                csrc_y = src_y >> S;
+            }
+        }
+        int src_luma[16], src_u[CW * CW], src_v[CW * CW];
+        long luma_at = p[30] + (long)src_y * psy + src_x;
+        for (int b = 0; b < 16; b++) src_luma[b] = fetch(sy, lsy, luma_at + (long)(b >> 2) * psy + (b & 3));
+        long u_at = p[31] + (long)csrc_y * psu + csrc_x, v_at = p[32] + (long)csrc_y * psv + csrc_x;
+        for (int b = 0; b < CW * CW; b++) {
+            src_u[b] = fetch(su, lsu, u_at + (long)(b / CW) * psu + b % CW);
+            src_v[b] = fetch(sv, lsv, v_at + (long)(b / CW) * psv + b % CW);
+        }
+        int ref_x = pos_x * pel, ref_y = pos_y * pel, cref_x = cpos_x * pel, cref_y = cpos_y * pel;
+#define LUMA(vx, vy) ((int)tile_cost(src_luma, ry, lry, subpel(p[12], pry, p[14], pel, ref_x + (vx), ref_y + (vy)), pry))
+#define CHROMA(vx, vy) chroma_value(src_u, src_v, ru, rv, lru, lrv, pru, prv, subpel(p[13], pru, p[15], pel, cref_x + ((vx) >> S), cref_y + ((vy) >> S)))
+        bsad = LUMA(px, py) + CHROMA(px, py);
+        int min_cost = bsad;
+        int min_x = max(px - radius, low_x), max_x = min(px + radius, high_x - 1);
+        int min_y = max(py - radius, low_y), max_y = min(py + radius, high_y - 1);
+        if (min_x <= max_x && min_y <= max_y) {
+            for (int vy = min_y; vy <= max_y; vy++) {
+                int dy = py - vy;
+                uint dy2 = (uint)dy * (uint)dy;
+                int luma_x = min_x;
+                for (int vx = min_x; vx <= max_x; vx++) {
+                    int dx = px - vx;
+                    int cost = (int)((uint)lambda * ((uint)dx * (uint)dx + dy2)) >> 8;
+                    if (cost >= min_cost) continue;
+                    int at = pel == 1 ? luma_x : vx;
+                    if (pel == 1) luma_x++;
+                    int sad = LUMA(at, vy);
+                    cost = (int)((uint)cost + (uint)sad + (uint)(((int)((uint)pnew * (uint)sad)) >> 8));
+                    if (cost >= min_cost) continue;
+                    int uv = CHROMA(vx, vy);
+                    cost = (int)((uint)cost + (uint)uv + (uint)(((int)((uint)pnew * (uint)uv)) >> 8));
+                    if (cost >= min_cost) continue;
+                    best_x = vx;
+                    best_y = vy;
+                    bsad = sad + uv;
+                    min_cost = cost;
+                }
+            }
+        }
+    }
+    int mx = (int)(short)best_x, my = (int)(short)best_y;
+    int relative = (abs(mx) + abs(my)) * 100 / diagonal;
+    int score = bsad;
+    if (relative > 50) {
+        score = (int)((uint)bsad * 20u);
+    } else if (relative > 15) {
+        score = (int)((uint)bsad + (uint)((int)((uint)bsad * (uint)(relative - 15)) / 35 * 9));
+    }
+    out[block] = (uint2)(((uint)mx << 16) + (uint)my, (uint)((score & 0xFFFFFF) + (average << 24)));
 }
 ";
 

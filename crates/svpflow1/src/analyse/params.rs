@@ -108,10 +108,13 @@ impl Stage {
         let settings = self.settings(params, 0, true);
         let l = self.layout;
         params.gpu_mode == 1
-            && params.chroma_shift == (1, 1)
             && settings.search_type == SearchType::Exhaustive
             && settings.search_param.abs() <= 3
-            && matches!((l.width, l.height), (8, 8) | (16, 8 | 16))
+            && match (l.width, l.height) {
+                (4, 4) => matches!(params.chroma_shift, (0, 0) | (1, 1)),
+                (8, 8) | (16, 8 | 16) => params.chroma_shift == (1, 1),
+                _ => false,
+            }
     }
 
     pub(crate) fn settings(&self, params: &AnalyseParams, level: i32, top: bool) -> SearchSettings {

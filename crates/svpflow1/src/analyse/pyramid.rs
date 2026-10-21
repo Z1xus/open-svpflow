@@ -1,4 +1,4 @@
-use super::field::recalc::RecalcPlan;
+use super::field::recalc::{CompactPlan, RecalcPlan};
 use super::field::{Field, Mv, VectorOutput};
 use super::gpu::Session;
 use super::params::{AnalyseParams, Stage};
@@ -266,9 +266,24 @@ impl Pyramid {
     }
 }
 
-pub(crate) struct RefineStart {
-    plan: RecalcPlan,
-    ticket: Option<usize>,
+pub(crate) enum RefineStart {
+    Records {
+        plan: RecalcPlan,
+        ticket: Option<usize>,
+    },
+    Compact {
+        _plan: CompactPlan,
+        settings: super::field::SearchSettings,
+        ticket: Option<usize>,
+    },
+}
+
+impl RefineStart {
+    fn ticket(&self) -> Option<usize> {
+        match self {
+            Self::Records { ticket, .. } | Self::Compact { ticket, .. } => *ticket,
+        }
+    }
 }
 
 impl Pyramid {
@@ -297,6 +312,18 @@ impl Pyramid {
         } else {
             (frames[1].level(0), frames[0].level(0))
         };
+        let mut compact = CompactPlan::default();
+        if output.is_some() && field.plan_compact(&src, settings, &mut compact) {
+            if let Some(lambda) = lambda_out {
+                *lambda = settings.lambda >> 2;
+            }
+            let ticket = session.submit_compact(&compact, direction, 1 - direction);
+            return Some(RefineStart::Compact {
+                _plan: compact,
+                settings: *settings,
+                ticket,
+            });
+        }
         let mut plan = RecalcPlan::default();
         if !field.plan_recalculate(&src, settings, output.is_some(), &mut plan) {
             field.recalculate(&src, &reference, settings, lambda_out, output);
@@ -306,7 +333,7 @@ impl Pyramid {
             *lambda = settings.lambda >> 2;
         }
         let ticket = session.submit(&plan, direction, 1 - direction);
-        Some(RefineStart { plan, ticket })
+        Some(RefineStart::Records { plan, ticket })
     }
 
     pub(crate) fn refine_finish(
@@ -316,7 +343,7 @@ impl Pyramid {
         session: &mut Session<'_, '_>,
         outputs: [Option<VectorOutput<'_>>; 2],
     ) {
-        let waited = starts.iter().flatten().any(|s| s.ticket.is_some()) && session.wait();
+        let waited = starts.iter().flatten().any(|s| s.ticket().is_some()) && session.wait();
         for (direction, (start, output)) in starts.into_iter().zip(outputs).enumerate() {
             let Some(start) = start else {
                 continue;
@@ -334,13 +361,20 @@ impl Pyramid {
             } else {
                 (frames[1].level(0), frames[0].level(0))
             };
-            let bests = start
-                .ticket
-                .filter(|_| waited)
-                .map(|ticket| session.take(ticket))
-                .filter(|r| r.len() == start.plan.blocks())
-                .unwrap_or_else(|| Field::evaluate_recalc_cpu(&start.plan, &src, &reference));
-            field.finish_recalculate(&start.plan, &bests, output);
+            let ticket = start.ticket().filter(|_| waited);
+            match start {
+                RefineStart::Records { plan, .. } => {
+                    let bests = ticket
+                        .map(|ticket| session.take(ticket))
+                        .filter(|r| r.len() == plan.blocks())
+                        .unwrap_or_else(|| Field::evaluate_recalc_cpu(&plan, &src, &reference));
+                    field.finish_recalculate(&plan, &bests, output);
+                }
+                RefineStart::Compact { settings, .. } => match (ticket, output) {
+                    (Some(ticket), Some(out)) => session.take_into(ticket, out),
+                    (_, output) => field.recalculate(&src, &reference, &settings, None, output),
+                },
+            }
         }
     }
 }

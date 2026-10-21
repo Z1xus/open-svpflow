@@ -512,3 +512,98 @@ fn cost(
     }
     total / 2
 }
+
+#[derive(Default)]
+pub(crate) struct CompactPlan {
+    pub(crate) vectors: Vec<i32>,
+    pub(crate) overrides: Vec<i32>,
+    pub(crate) geometry: [i32; 12],
+    pub(crate) satd: bool,
+    pub(crate) shift: u32,
+}
+
+impl CompactPlan {
+    pub(crate) fn blocks(&self) -> usize {
+        self.vectors.len() / 2
+    }
+}
+
+impl Field {
+    pub(crate) fn plan_compact(
+        &self,
+        src: &LevelFrame<'_>,
+        settings: &SearchSettings,
+        plan: &mut CompactPlan,
+    ) -> bool {
+        let layout = self.layout;
+        let radius = settings.search_param.abs();
+        let limit = (i32::MAX / 2) as usize;
+        if (layout.width, layout.height) != (4, 4)
+            || !matches!(self.chroma_shift, (0, 0) | (1, 1))
+            || settings.search_type != SearchType::Exhaustive
+            || radius > 3
+            || self.order.len() != self.count()
+            || self.blk_x < 2
+            || self.blk_y < 2
+            || [src.y, src.u, src.v].iter().any(|p| p.data().len() > limit)
+        {
+            return false;
+        }
+        let (frame_w, frame_h) = (src.y.width, src.y.height);
+        let pel = self.pel;
+        plan.vectors.clear();
+        plan.vectors.reserve(2 * self.vectors.len());
+        for mv in &self.vectors {
+            let xy = u32::from(mv.x as u16) | (u32::from(mv.y as u16) << 16);
+            plan.vectors.extend([xy as i32, mv.sad]);
+        }
+        let margin = |v: i32| if v < 0 { v - 2 } else { v + 2 };
+        let outside = |v: i32, min: i32, max: i32| v < min || v >= max;
+        let (step_x, step_y) = (layout.step_x(), layout.step_y());
+        let (mut moved, mut first) = (false, 0);
+        let mut overrides = Vec::new();
+        for &(bx, by) in &self.order {
+            let (bx, by) = (i32::from(bx), i32::from(by));
+            let index = by * self.blk_x + bx;
+            let mv = self.vectors[index as usize];
+            if mv.sad <= settings.bad_sad {
+                continue;
+            }
+            let (x0, y0) = (bx * step_x, by * step_y);
+            let out_x = outside(margin(i32::from(mv.x)), -pel * x0, pel * (frame_w - x0 - 4));
+            let out_y = outside(margin(i32::from(mv.y)), -pel * y0, pel * (frame_h - y0 - 4));
+            if out_x || out_y {
+                if !moved {
+                    first = index;
+                }
+                moved = true;
+            } else {
+                if moved {
+                    overrides.push([index, first]);
+                }
+                moved = false;
+            }
+        }
+        overrides.sort_unstable();
+        plan.overrides.clear();
+        plan.overrides.extend(overrides.iter().flatten());
+        let diagonal = pel * f64::from(frame_w * frame_w + frame_h * frame_h).sqrt() as i32;
+        plan.geometry = [
+            frame_w,
+            frame_h,
+            self.blk_x,
+            step_x,
+            step_y,
+            radius,
+            settings.bad_sad,
+            settings.lambda >> 2,
+            diagonal,
+            settings.pnew,
+            pel,
+            overrides.len() as i32,
+        ];
+        plan.satd = self.satd;
+        plan.shift = self.chroma_shift.0;
+        true
+    }
+}
