@@ -746,6 +746,17 @@ impl Session<'_, '_> {
         status == CL_SUCCESS
     }
 
+    fn upload_events(&self) -> Vec<Handle> {
+        let mut events: Vec<Handle> = self
+            .frames
+            .iter()
+            .flatten()
+            .map(|f| f.3 as Handle)
+            .collect();
+        events.dedup();
+        events
+    }
+
     unsafe fn ckernel(&mut self, program: usize, name: &'static CStr) -> Option<(Handle, usize)> {
         if let Some(&(.., kernel, local)) = self
             .unit
@@ -1113,12 +1124,7 @@ impl Session<'_, '_> {
             self.frames[src].as_ref()?.1,
             self.frames[reference].as_ref()?.1,
         );
-        let events: Vec<Handle> = self
-            .frames
-            .iter()
-            .flatten()
-            .map(|f| f.3 as Handle)
-            .collect();
+        let events: Vec<Handle> = self.upload_events();
         let params = self.hold(bytes(&compact_params(
             &source,
             &target,
@@ -1211,12 +1217,7 @@ impl Session<'_, '_> {
                 self.frames[src].as_ref()?.1,
                 self.frames[reference].as_ref()?.1,
             );
-            let events: Vec<Handle> = self
-                .frames
-                .iter()
-                .flatten()
-                .map(|f| f.3 as Handle)
-                .collect();
+            let events: Vec<Handle> = self.upload_events();
             let chunk = CHUNK.min(blocks);
             let params = self.hold(bytes(&params));
             let records = bytes(&plan.records);
@@ -1404,12 +1405,7 @@ impl Session<'_, '_> {
             self.frames[src].as_ref()?.1,
             self.frames[reference].as_ref()?.1,
         );
-        let events: Vec<Handle> = self
-            .frames
-            .iter()
-            .flatten()
-            .map(|f| f.3 as Handle)
-            .collect();
+        let events: Vec<Handle> = self.upload_events();
         let mut border_q = params.q;
         border_q[33] = 1;
         let q = self.hold(bytes(&params.q));

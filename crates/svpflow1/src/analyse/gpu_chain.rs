@@ -246,12 +246,7 @@ impl Session<'_, '_> {
         if infos[0].1 != infos[1].1 || infos[0].1[1] != infos[0].1[2] {
             return None;
         }
-        let events: Vec<Handle> = self
-            .frames
-            .iter()
-            .flatten()
-            .map(|f| f.3 as Handle)
-            .collect();
+        let events: Vec<Handle> = self.upload_events();
         let queue = self.unit.queue as Handle;
         let stale = std::mem::replace(&mut self.unit.chain_stale, true);
         let all: Vec<Slabs> = plan.levels.iter().map(Slabs::new).collect();
