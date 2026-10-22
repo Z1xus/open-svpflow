@@ -2,7 +2,6 @@
 #define HI(v) ((v) >> 16)
 #define PK(x, y) (((x) & 0xFFFF) | ((y) << 16))
 #define IMAX 2147483647
-#define FREQ 16384
 
 inline int tapv(__global const uchar *s, int sp, int r, int c) { return (int)s[(long)r * sp + c]; }
 
@@ -284,7 +283,6 @@ inline int child_entries(int cxi, int cyi, int cx, int cy, int nx, int ny, int2 
 }
 
 #define SR_WG 1024
-#define SR_MAX 8192
 
 __kernel __attribute__((reqd_work_group_size(SR_WG, 1, 1)))
 void srank(__global const int4 *cout, __global int2 *rev, __global int *scratch, int8 g, int4 h, int8 st) {

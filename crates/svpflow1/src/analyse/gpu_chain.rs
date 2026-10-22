@@ -2,13 +2,13 @@ use super::{
     Arg, CL_FALSE, CL_SUCCESS, CL_TRUE, Frame, Handle, RefineGpu, SWEEPS, SearchMems, Session,
     Uploaded, Variant, bytes, compact_params, recalc_args,
 };
-use crate::analyse::chain::{ChainPlan, LevelPlan, Pyramid, RefinePlan};
+use crate::analyse::chain::{ChainPlan, LevelPlan, Pyramid, RANK_BLOCKS, RefinePlan};
 use std::ptr::null_mut;
 
 pub(super) const CHAIN: &str = include_str!("chain.cl");
 
 const FREQ: usize = 16384;
-const SORT_SCRATCH: usize = 2 * crate::analyse::chain::RANK_BLOCKS as usize;
+const SORT_SCRATCH: usize = 2 * RANK_BLOCKS as usize;
 const BASE: usize = 64;
 const ROLES: usize = 16;
 const SCRATCH: usize = 512;
@@ -102,7 +102,11 @@ impl RefineGpu {
     }
 
     fn chain_program(&self) -> Option<usize> {
-        *self.chain.get_or_init(|| self.build(CHAIN))
+        *self.chain.get_or_init(|| {
+            self.build(&format!(
+                "#define FREQ {FREQ}\n#define SR_MAX {RANK_BLOCKS}\n{CHAIN}"
+            ))
+        })
     }
 }
 
