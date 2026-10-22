@@ -23,6 +23,8 @@ pub(crate) fn refine_gpu() -> Option<&'static RefineGpu> {
     None
 }
 
+pub(crate) fn purge(_: usize) {}
+
 impl RefineGpu {
     pub(crate) fn session<'p>(&self, _: i32) -> Session<'_, 'p> {
         Session(std::marker::PhantomData)

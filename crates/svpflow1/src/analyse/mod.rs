@@ -11,6 +11,7 @@ mod params;
 mod planes;
 mod pyramid;
 
+pub(crate) use gpu::purge;
 pub(crate) use params::{AnalyseParams, SuperParams};
 pub(crate) use planes::{RawPlane, SuperFrameView, plane_size};
 

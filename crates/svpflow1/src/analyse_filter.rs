@@ -4,10 +4,12 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use crate::analyse::{self, AnalyseParams, RawPlane, SuperFrameView, SuperParams};
 use crate::{params, video_format, vs};
 
+static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 const MAX_AHEAD: i64 = 8;
 const CACHE_SHARE: i64 = 16;
 
 struct AnalyseState {
+    id: usize,
     super_node: vs::Raw,
     src_node: vs::Raw,
     vi: vs::VideoInfo,
@@ -150,8 +152,7 @@ impl AnalyseState {
             pel: sp.pel,
             chroma_shift: params.chroma_shift,
         };
-        let level0 = if full { self.super_node } else { self.src_node } as usize;
-        let keys = self.pair(n).map(|frame| (level0, frame, self.uses(frame)));
+        let keys = self.pair(n).map(|frame| (self.id, frame, self.uses(frame)));
         analyse::analyse(params, &view(0), &view(1), Some(keys))
     }
 
@@ -329,6 +330,7 @@ unsafe fn create_analyse_inner(
             flags: 0,
         };
         Ok(AnalyseState {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             super_node,
             src_node,
             vi,
@@ -423,6 +425,7 @@ unsafe extern "system" fn free_analyse(
             _ => drop(slot.take()),
         }
     }
+    crate::analyse::purge(state.id);
     unsafe { vs::free_node(state.super_node, vsapi) };
     unsafe { vs::free_node(state.src_node, vsapi) };
 }

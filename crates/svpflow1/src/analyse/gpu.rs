@@ -339,9 +339,21 @@ pub(crate) struct Planes<'a> {
     pub(crate) uses: u32,
 }
 
+static GPU: OnceLock<Option<RefineGpu>> = OnceLock::new();
+
 pub(crate) fn refine_gpu() -> Option<&'static RefineGpu> {
-    static GPU: OnceLock<Option<RefineGpu>> = OnceLock::new();
     GPU.get_or_init(|| unsafe { RefineGpu::new() }).as_ref()
+}
+
+pub(crate) fn purge(id: usize) {
+    if let Some(Some(gpu)) = GPU.get()
+        && let Ok(mut cache) = gpu.cache.lock()
+    {
+        cache.recent.retain(|e| e.key.0 != id);
+        cache
+            .live
+            .retain(|e| e.upgrade().is_some_and(|e| e.key.0 != id));
+    }
 }
 
 impl RefineGpu {
