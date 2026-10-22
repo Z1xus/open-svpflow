@@ -1295,7 +1295,7 @@ impl Session<'_, '_> {
             unsafe { self.gpu.buffer(&mut self.unit, base + 9, total)? },
         ];
         let passes: usize = if params.q[32] != 0 { 0 } else { SWEEPS };
-        let per = if params.q[32] != 0 && params.width == 8 && params.height == 8 {
+        let per = if params.width == 8 && params.height == 8 {
             4
         } else {
             1
