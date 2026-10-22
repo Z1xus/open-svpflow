@@ -204,7 +204,7 @@ impl GpuContext {
                 }
                 return None;
             }
-            Some(Unit::new(kernel, queue))
+            Some(Unit::new(kernel, queue, std::ptr::null_mut()))
         }
     }
 
@@ -657,6 +657,7 @@ impl GpuContext {
                     group.sources[0][index],
                     group.sources[1][index],
                     if index == 0 { &waits } else { &[] },
+                    std::ptr::null_mut(),
                 )?;
             }
             (self.cl.Flush)(unit.queue);

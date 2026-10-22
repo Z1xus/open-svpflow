@@ -283,6 +283,7 @@ pub struct GpuContext {
     blend_slots: std::sync::Arc<blend::Slots>,
     blend_units: std::sync::Mutex<Vec<Unit>>,
     pins: std::sync::Mutex<Vec<Pin>>,
+    dst_pool: std::sync::Mutex<Vec<[(ClMem, usize); 3]>>,
 }
 
 struct Pin {
@@ -400,7 +401,7 @@ impl SuperHandle {
 struct Unit {
     kernel: ClKernel,
     queue: ClCommandQueue,
-    dst: [(ClMem, usize); 3],
+    xfer: ClCommandQueue,
     motion: [ImageSlot; MOTION_SLOTS],
     motion_key: [i64; MOTION_SLOTS],
     mask: ImageSlot,
@@ -433,12 +434,11 @@ impl ImageSlot {
 unsafe impl Send for Unit {}
 
 impl Unit {
-    fn new(kernel: ClKernel, queue: ClCommandQueue) -> Self {
-        let z = (std::ptr::null_mut(), 0usize);
+    fn new(kernel: ClKernel, queue: ClCommandQueue, xfer: ClCommandQueue) -> Self {
         Self {
             kernel,
             queue,
-            dst: [z; 3],
+            xfer,
             motion: [ImageSlot::EMPTY; MOTION_SLOTS],
             motion_key: [i64::MIN; MOTION_SLOTS],
             mask: ImageSlot::EMPTY,
@@ -497,6 +497,15 @@ impl Drop for GpuContext {
                     self.release_unit(&u);
                 }
             }
+            if let Ok(mut pool) = self.dst_pool.lock() {
+                for set in pool.drain(..) {
+                    for b in set {
+                        if !b.0.is_null() {
+                            (self.cl.ReleaseMemObject)(b.0);
+                        }
+                    }
+                }
+            }
             if let Ok(mut pins) = self.pins.lock() {
                 for pin in pins.drain(..) {
                     (self.cl.ReleaseMemObject)(pin.mem);
@@ -551,11 +560,6 @@ impl Drop for GpuContext {
 impl GpuContext {
     unsafe fn release_unit(&self, u: &Unit) {
         unsafe {
-            for b in &u.dst {
-                if !b.0.is_null() {
-                    (self.cl.ReleaseMemObject)(b.0);
-                }
-            }
             for image in u.motion.iter().chain(std::iter::once(&u.mask)) {
                 if !image.mem.is_null() {
                     (self.cl.ReleaseMemObject)(image.mem);
@@ -573,6 +577,9 @@ impl GpuContext {
             }
             self.release_cover(&u.cover);
             (self.cl.ReleaseCommandQueue)(u.queue);
+            if !u.xfer.is_null() {
+                (self.cl.ReleaseCommandQueue)(u.xfer);
+            }
         }
     }
 
@@ -649,7 +656,11 @@ impl GpuContext {
                 if kerr != CL_SUCCESS || kernel.is_null() || err != CL_SUCCESS || queue.is_null() {
                     continue;
                 }
-                units.push(std::sync::Mutex::new(Unit::new(kernel, queue)));
+                let xfer = unsafe { (cl.CreateCommandQueue)(context, device, 0, &raw mut err) };
+                if err != CL_SUCCESS || xfer.is_null() {
+                    continue;
+                }
+                units.push(std::sync::Mutex::new(Unit::new(kernel, queue, xfer)));
             }
             if units.is_empty() {
                 return Err("no render units".into());
@@ -741,6 +752,7 @@ impl GpuContext {
                 blend_slots,
                 blend_units: std::sync::Mutex::new(Vec::new()),
                 pins: std::sync::Mutex::new(Vec::new()),
+                dst_pool: std::sync::Mutex::new(Vec::new()),
             });
         }
         Err("no usable GPU device".into())
@@ -1374,6 +1386,7 @@ impl GpuContext {
         s0: GpuBuf,
         s1: GpuBuf,
         waits: &[ClEvent],
+        event: *mut ClEvent,
     ) -> Option<()> {
         unsafe {
             (self.cl.SetKernelArg)(k, 0, size_of::<ClMem>(), (&raw const dmem).cast());
@@ -1402,7 +1415,7 @@ impl GpuContext {
                 } else {
                     waits.as_ptr().cast()
                 },
-                std::ptr::null_mut(),
+                event.cast(),
             ) != CL_SUCCESS
             {
                 return None;
@@ -1646,16 +1659,71 @@ impl GpuContext {
                 }
             }
             let q = unit.queue;
+            let xq = unit.xfer;
             let depth = if self.hi10 { 2 } else { 1 };
-            let y_mem = self.ensure_buffer(&mut unit.dst[0], dst_y.len())?;
-            self.enqueue_plane(q, k, y_mem, sy / depth, py, src0[0], src1[0], &waits)?;
-            let u_mem = self.ensure_buffer(&mut unit.dst[1], dst_u.len())?;
-            self.enqueue_plane(q, k, u_mem, su / depth, pu, src0[1], src1[1], &[])?;
-            let v_mem = self.ensure_buffer(&mut unit.dst[2], dst_v.len())?;
-            self.enqueue_plane(q, k, v_mem, sv / depth, pv, src0[2], src1[2], &[])?;
+            let mut dst = self
+                .dst_pool
+                .lock()
+                .ok()?
+                .pop()
+                .unwrap_or([(std::ptr::null_mut(), 0); 3]);
+            let mems = [
+                self.ensure_buffer(&mut dst[0], dst_y.len()),
+                self.ensure_buffer(&mut dst[1], dst_u.len()),
+                self.ensure_buffer(&mut dst[2], dst_v.len()),
+            ];
+            let [Some(y_mem), Some(u_mem), Some(v_mem)] = mems else {
+                self.put_dst(dst);
+                return None;
+            };
+            let mut kernel_done: ClEvent = std::ptr::null_mut();
+            let queued = self
+                .enqueue_plane(
+                    q,
+                    k,
+                    y_mem,
+                    sy / depth,
+                    py,
+                    src0[0],
+                    src1[0],
+                    &waits,
+                    std::ptr::null_mut(),
+                )
+                .and_then(|()| {
+                    self.enqueue_plane(
+                        q,
+                        k,
+                        u_mem,
+                        su / depth,
+                        pu,
+                        src0[1],
+                        src1[1],
+                        &[],
+                        std::ptr::null_mut(),
+                    )
+                })
+                .and_then(|()| {
+                    self.enqueue_plane(
+                        q,
+                        k,
+                        v_mem,
+                        sv / depth,
+                        pv,
+                        src0[2],
+                        src1[2],
+                        &[],
+                        &raw mut kernel_done,
+                    )
+                });
+            if queued.is_none() {
+                (self.cl.Finish)(q);
+                self.put_dst(dst);
+                return None;
+            }
+            (self.cl.Flush)(q);
             let mut done: ClEvent = std::ptr::null_mut();
             let total = dst_y.len() + dst_u.len() + dst_v.len();
-            let pin = self.take_pin(q, total);
+            let pin = self.take_pin(xq, total);
             let mut offset = 0;
             for (index, (dmem, output)) in [
                 (y_mem, &mut *dst_y),
@@ -1670,15 +1738,20 @@ impl GpuContext {
                     None => output.as_mut_ptr(),
                 };
                 offset += output.len();
+                let (count, list) = if index == 0 {
+                    (1, (&raw const kernel_done).cast())
+                } else {
+                    (0, std::ptr::null())
+                };
                 if (self.cl.EnqueueReadBuffer)(
-                    q,
+                    xq,
                     dmem,
                     CL_FALSE,
                     0,
                     output.len(),
                     target.cast(),
-                    0,
-                    std::ptr::null(),
+                    count,
+                    list,
                     if index == 2 {
                         (&raw mut done).cast()
                     } else {
@@ -1689,13 +1762,17 @@ impl GpuContext {
                     if !done.is_null() {
                         (self.cl.ReleaseEvent)(done);
                     }
+                    (self.cl.Finish)(xq);
                     (self.cl.Finish)(q);
+                    (self.cl.ReleaseEvent)(kernel_done);
+                    self.put_dst(dst);
                     if let Some(pin) = pin {
                         self.put_pin(pin);
                     }
                     return None;
                 }
             }
+            (self.cl.ReleaseEvent)(kernel_done);
             let held = (
                 std::mem::take(&mut unit.held),
                 std::mem::take(&mut unit.packed_base),
@@ -1703,13 +1780,14 @@ impl GpuContext {
                 std::mem::take(&mut unit.packed_mask),
             );
             drop(unit);
-            let finished = self.wait_event(q, done);
+            let finished = self.wait_event(xq, done);
             drop(held);
+            self.put_dst(dst);
             if let Some(pin) = pin {
                 if finished {
                     let mut at = pin.ptr.cast_const();
                     for output in [dst_y, dst_u, dst_v] {
-                        std::ptr::copy_nonoverlapping(at, output.as_mut_ptr(), output.len());
+                        copy_stream(at, output.as_mut_ptr(), output.len());
                         at = at.add(output.len());
                     }
                 }
@@ -1719,6 +1797,41 @@ impl GpuContext {
         }
         Some(())
     }
+
+    fn put_dst(&self, dst: [(ClMem, usize); 3]) {
+        if let Ok(mut pool) = self.dst_pool.lock() {
+            pool.push(dst);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn copy_avx2(src: *const u8, dst: *mut u8, len: usize) {
+    use std::arch::x86_64::{__m256i, _mm_sfence, _mm256_loadu_si256, _mm256_stream_si256};
+    let head = dst.align_offset(32).min(len);
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, head);
+        let mut at = head;
+        while at + 32 <= len {
+            _mm256_stream_si256(
+                dst.add(at).cast::<__m256i>(),
+                _mm256_loadu_si256(src.add(at).cast()),
+            );
+            at += 32;
+        }
+        _mm_sfence();
+        std::ptr::copy_nonoverlapping(src.add(at), dst.add(at), len - at);
+    }
+}
+
+unsafe fn copy_stream(src: *const u8, dst: *mut u8, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe { copy_avx2(src, dst, len) };
+    }
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
 }
 
 struct Shared {
