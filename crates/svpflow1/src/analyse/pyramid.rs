@@ -331,7 +331,6 @@ pub(crate) enum RefineStart {
         ticket: Option<usize>,
     },
     Compact {
-        _plan: CompactPlan,
         settings: super::field::SearchSettings,
         ticket: Option<usize>,
     },
@@ -376,7 +375,6 @@ impl Pyramid {
             }
             let ticket = session.submit_compact(&compact, direction, 1 - direction);
             return Some(RefineStart::Compact {
-                _plan: compact,
                 settings: *settings,
                 ticket,
             });

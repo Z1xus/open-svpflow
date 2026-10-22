@@ -1,10 +1,9 @@
 use super::{
-    CL_FALSE, CL_SUCCESS, ClUint, Frame, Handle, OpenCl, RefineGpu, SWEEPS, SearchMems, Session,
-    Uploaded, Variant, bytes,
+    Arg, CL_FALSE, CL_SUCCESS, CL_TRUE, Frame, Handle, RefineGpu, SWEEPS, SearchMems, Session,
+    Uploaded, Variant, bytes, compact_params, recalc_args,
 };
 use crate::analyse::chain::{ChainPlan, LevelPlan, Pyramid, RefinePlan};
-use core::ffi::c_void;
-use std::ffi::CString;
+use std::ptr::null_mut;
 
 pub(super) const CHAIN: &str = include_str!("chain.cl");
 
@@ -30,25 +29,6 @@ const D0: usize = 9;
 const D1: usize = 10;
 const MINSAD: usize = 11;
 const MINIDX: usize = 12;
-
-enum Arg {
-    Mem(Handle),
-    Int(i32),
-    V4([i32; 4]),
-    V8([i32; 8]),
-}
-
-unsafe fn set_args(cl: &OpenCl, kernel: Handle, args: &[Arg]) -> bool {
-    args.iter().enumerate().all(|(index, arg)| {
-        let (size, value): (usize, *const c_void) = match arg {
-            Arg::Mem(mem) => (size_of::<Handle>(), (&raw const *mem).cast()),
-            Arg::Int(v) => (4, (&raw const *v).cast()),
-            Arg::V4(v) => (16, v.as_ptr().cast()),
-            Arg::V8(v) => (32, v.as_ptr().cast()),
-        };
-        unsafe { (cl.SetKernelArg)(kernel, index as ClUint, size, value) == CL_SUCCESS }
-    })
-}
 
 fn slab(bytes: usize) -> usize {
     bytes.next_multiple_of(256)
@@ -127,63 +107,6 @@ impl RefineGpu {
 }
 
 impl Session<'_, '_> {
-    unsafe fn ckernel(&mut self, name: &'static str) -> Option<Handle> {
-        let program = self.gpu.chain_program()?;
-        if let Some(&(_, _, kernel)) = self
-            .unit
-            .ckernels
-            .iter()
-            .find(|(p, n, _)| *p == program && *n == name)
-        {
-            return Some(kernel as Handle);
-        }
-        let mut err = 0;
-        let cname = CString::new(name).ok()?;
-        let kernel =
-            unsafe { (self.gpu.cl.CreateKernel)(program as Handle, cname.as_ptr(), &raw mut err) };
-        if err != CL_SUCCESS || kernel.is_null() {
-            return None;
-        }
-        self.unit.ckernels.push((program, name, kernel as usize));
-        Some(kernel)
-    }
-
-    unsafe fn launch(
-        &mut self,
-        name: &'static str,
-        args: &[Arg],
-        global: usize,
-        local: Option<usize>,
-        waits: &[Handle],
-    ) -> Option<()> {
-        let kernel = unsafe { self.ckernel(name)? };
-        if !unsafe { set_args(&self.gpu.cl, kernel, args) } {
-            return None;
-        }
-        let global = match local {
-            Some(local) => global.next_multiple_of(local),
-            None => global.max(1),
-        };
-        let status = unsafe {
-            (self.gpu.cl.EnqueueNDRangeKernel)(
-                self.unit.queue as Handle,
-                kernel,
-                1,
-                std::ptr::null(),
-                &raw const global,
-                local.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
-                waits.len() as ClUint,
-                if waits.is_empty() {
-                    std::ptr::null()
-                } else {
-                    waits.as_ptr().cast()
-                },
-                std::ptr::null_mut(),
-            )
-        };
-        (status == CL_SUCCESS).then_some(())
-    }
-
     unsafe fn cbuf(&mut self, index: usize, size: usize) -> Option<(Handle, bool)> {
         let before = self.unit.buffers.get(index).map_or(0, |b| b.capacity);
         let mem = unsafe { self.gpu.buffer(&mut self.unit, index, size.max(16))? };
@@ -195,8 +118,11 @@ impl Session<'_, '_> {
         if pitches[1] != pitches[2] || up.frame.bases != [0; 3] {
             return false;
         }
+        let Some(chain) = self.gpu.chain_program() else {
+            return false;
+        };
         let mems = up.mems.map(|m| m as Handle);
-        let mut last: Handle = std::ptr::null_mut();
+        let mut last: Handle = null_mut();
         for level in 1..pyramid.levels {
             let (g, p) = (pyramid.geom(level), pyramid.geom(level - 1));
             let (so_y, so_c, sp_y, sp_c) = if level == 1 {
@@ -212,9 +138,6 @@ impl Session<'_, '_> {
             };
             let (d_y, d_c) = pyramid.offsets(level);
             let n = (g.width * g.height + 2 * g.chroma_width * g.chroma_height) as usize;
-            let Some(kernel) = (unsafe { self.ckernel("reduce") }) else {
-                return false;
-            };
             let args = [
                 Arg::Mem(mems[0]),
                 Arg::Mem(mems[1]),
@@ -231,28 +154,21 @@ impl Session<'_, '_> {
                     (up.coarse[1] + d_c) as i32,
                 ]),
             ];
-            let cl = &self.gpu.cl;
-            if !unsafe { set_args(cl, kernel, &args) } {
-                return false;
-            }
-            let status = unsafe {
-                (cl.EnqueueNDRangeKernel)(
-                    self.unit.queue as Handle,
-                    kernel,
-                    1,
-                    std::ptr::null(),
-                    &raw const n,
-                    std::ptr::null(),
-                    0,
-                    std::ptr::null(),
+            let launched = unsafe {
+                self.launch(
+                    (chain, c"reduce"),
+                    &args,
+                    n,
+                    None,
+                    &[],
                     if level + 1 == pyramid.levels {
-                        (&raw mut last).cast()
+                        &raw mut last
                     } else {
-                        std::ptr::null_mut()
+                        null_mut()
                     },
                 )
             };
-            if status != CL_SUCCESS {
+            if launched.is_none() {
                 return false;
             }
         }
@@ -309,16 +225,8 @@ impl Session<'_, '_> {
         plan: &ChainPlan,
         top_out: &[Vec<[i32; 4]>],
     ) -> Option<Vec<usize>> {
-        unsafe { self.chain_inner(plan, top_out) }
-    }
-
-    unsafe fn chain_inner(
-        &mut self,
-        plan: &ChainPlan,
-        top_out: &[Vec<[i32; 4]>],
-    ) -> Option<Vec<usize>> {
         self.flush();
-        self.gpu.chain_program()?;
+        let chain = self.gpu.chain_program()?;
         let dirs = 1 + usize::from(plan.both);
         let top = plan.top();
         let mut infos = Vec::new();
@@ -369,7 +277,7 @@ impl Session<'_, '_> {
             let (lp, b) = (&plan.levels[0], bufs[0]);
             unsafe {
                 self.launch(
-                    "pinit",
+                    (chain, c"pinit"),
                     &[
                         Arg::Mem(b.minsad),
                         Arg::Mem(b.minidx),
@@ -380,6 +288,7 @@ impl Session<'_, '_> {
                     (lp.blk_x * lp.blk_y) as usize * dirs,
                     Some(64),
                     &[],
+                    null_mut(),
                 )?;
             }
         }
@@ -429,7 +338,7 @@ impl Session<'_, '_> {
             let (res, _) = unsafe { self.cbuf(SHARED + 1, 16)? };
             unsafe {
                 self.launch(
-                    "gest",
+                    (chain, c"gest"),
                     &[
                         Arg::Mem(c.out),
                         Arg::Int((c.slabs.out / 16) as i32),
@@ -440,10 +349,11 @@ impl Session<'_, '_> {
                     256 * dirs,
                     Some(256),
                     waits,
+                    null_mut(),
                 )?;
                 waits = &[];
                 self.launch(
-                    "gfin",
+                    (chain, c"gfin"),
                     &[
                         Arg::Mem(res),
                         Arg::Mem(b.q),
@@ -455,6 +365,7 @@ impl Session<'_, '_> {
                     1,
                     None,
                     &[],
+                    null_mut(),
                 )?;
             }
             let norm = 3 - lp.pel.ilog2() as i32;
@@ -476,7 +387,7 @@ impl Session<'_, '_> {
             let global = nb as usize * dirs;
             unsafe {
                 self.launch(
-                    "pred1",
+                    (chain, c"pred1"),
                     &[
                         Arg::Mem(c.out),
                         Arg::Mem(b.pred),
@@ -488,9 +399,10 @@ impl Session<'_, '_> {
                     global,
                     Some(64),
                     &[],
+                    null_mut(),
                 )?;
                 self.launch(
-                    "pred2",
+                    (chain, c"pred2"),
                     &[
                         Arg::Mem(b.pred),
                         Arg::Mem(b.minsad),
@@ -501,9 +413,10 @@ impl Session<'_, '_> {
                     global,
                     Some(64),
                     &[],
+                    null_mut(),
                 )?;
                 self.launch(
-                    "pred3",
+                    (chain, c"pred3"),
                     &[
                         Arg::Mem(b.pred),
                         Arg::Mem(b.minsad),
@@ -515,6 +428,7 @@ impl Session<'_, '_> {
                     global,
                     Some(64),
                     &[],
+                    null_mut(),
                 )?;
             }
             if lp.rmax > 0 {
@@ -524,7 +438,7 @@ impl Session<'_, '_> {
                     st_sort[0] = (c.slabs.out / 16) as i32;
                     unsafe {
                         self.launch(
-                            "srank",
+                            (chain, c"srank"),
                             &[
                                 Arg::Mem(c.out),
                                 Arg::Mem(b.rev),
@@ -545,6 +459,7 @@ impl Session<'_, '_> {
                             1024 * dirs,
                             Some(1024),
                             &[],
+                            null_mut(),
                         )?;
                     }
                 } else {
@@ -553,7 +468,7 @@ impl Session<'_, '_> {
                     if self.unit.buffers[at].tag != tag {
                         unsafe {
                             self.launch(
-                                "rank_serp",
+                                (chain, c"rank_serp"),
                                 &[
                                     Arg::Mem(b.rev),
                                     Arg::Int(nb),
@@ -564,6 +479,7 @@ impl Session<'_, '_> {
                                 global,
                                 Some(64),
                                 &[],
+                                null_mut(),
                             )?;
                         }
                         self.unit.buffers[at].tag = tag;
@@ -606,7 +522,7 @@ impl Session<'_, '_> {
         match &plan.refine {
             None => unsafe {
                 self.launch(
-                    "packout",
+                    (chain, c"packout"),
                     &[
                         Arg::Mem(out0.out),
                         Arg::Mem(words),
@@ -616,6 +532,7 @@ impl Session<'_, '_> {
                     blocks * dirs,
                     Some(64),
                     &[],
+                    null_mut(),
                 )?;
             },
             Some(refine) => {
@@ -670,38 +587,20 @@ impl Session<'_, '_> {
     }
 
     unsafe fn chain_search(&mut self, lp: &LevelPlan, mems: &SearchMems) -> Option<()> {
-        let variant = Variant {
-            width: lp.width,
-            height: lp.height,
-            satd: lp.satd,
-            shift: 1,
-            dev: false,
-        };
-        let spec = [lp.q[6], lp.q[31], lp.q[32], lp.q[34], 0];
-        let program = self.gpu.search_program(variant, lp.rmax, spec)?;
-        let border_program = if lp.border > 0 {
-            let mut spec = spec;
-            spec[4] = 1;
-            self.gpu.search_program(variant, lp.rmax, spec)?
-        } else {
-            program
-        };
-        let eight = lp.width == 8 && lp.height == 8;
-        let main_kernel = unsafe { self.search_kernel(program, false)? };
-        let border_kernel = unsafe { self.search_kernel(border_program, false)? };
-        let refine_kernel = if eight {
-            unsafe { self.search_kernel(program, true) }
-        } else {
-            None
-        };
+        let programs = self.gpu.search_pair(
+            Variant::new(lp.width, lp.height, lp.satd),
+            lp.rmax,
+            &lp.q,
+            lp.border,
+        )?;
         let nb = (lp.blk_x * lp.blk_y) as usize;
         unsafe {
             self.launch_search(
                 mems,
                 (nb, lp.border),
                 if lp.q[32] == 0 { SWEEPS } else { 0 },
-                (main_kernel, border_kernel, refine_kernel),
-                eight,
+                programs,
+                lp.width == 8 && lp.height == 8,
                 &[],
             )
         }
@@ -715,13 +614,14 @@ impl Session<'_, '_> {
         (src, reference): ([Handle; 3], [Handle; 3]),
         (src_slot, ref_slot): (usize, usize),
     ) -> Option<()> {
+        let chain = self.gpu.chain_program()?;
         let blocks = (refine.blk_x * refine.blk_y) as usize;
         let (flags, _) = unsafe { self.cbuf(SHARED + 3, blocks)? };
         let (ovr, _) = unsafe { self.cbuf(SHARED + 4, blocks * 4)? };
         let (counter, fresh) = unsafe { self.cbuf(SHARED + 5, 4)? };
         if fresh {
             let zero = self.hold(&[0u8; 4]);
-            if !unsafe { self.transfer(counter, zero, std::ptr::null_mut()) } {
+            if !unsafe { self.transfer(counter, zero, null_mut()) } {
                 return None;
             }
         }
@@ -729,7 +629,7 @@ impl Session<'_, '_> {
         let (coarse_x, coarse_y) = (r.geometry[12], r.geometry[13]);
         unsafe {
             self.launch(
-                "ovf",
+                (chain, c"ovf"),
                 &[
                     Arg::Mem(seed),
                     Arg::Mem(flags),
@@ -760,9 +660,10 @@ impl Session<'_, '_> {
                 blocks,
                 Some(64),
                 &[],
+                null_mut(),
             )?;
             self.launch(
-                "ovs",
+                (chain, c"ovs"),
                 &[
                     Arg::Mem(flags),
                     Arg::Mem(ovr),
@@ -773,117 +674,47 @@ impl Session<'_, '_> {
                 256,
                 Some(256),
                 &[],
+                null_mut(),
             )?;
         }
         let (source, target) = (
             self.frames[src_slot].as_ref()?.2,
             self.frames[ref_slot].as_ref()?.2,
         );
-        let variant = Variant {
-            width: 4,
-            height: 4,
-            satd: r.satd,
+        let program = self.gpu.program(Variant {
             shift: r.shift,
             dev: true,
-        };
-        let program = self.gpu.program(variant)?;
-        let kernel =
-            if let Some(&(_, kernel)) = self.unit.kernels.iter().find(|(p, _)| *p == program) {
-                kernel as Handle
-            } else {
-                let mut err = 0;
-                let kernel = unsafe {
-                    (self.gpu.cl.CreateKernel)(program as Handle, c"recalc".as_ptr(), &raw mut err)
-                };
-                if err != CL_SUCCESS || kernel.is_null() {
-                    return None;
-                }
-                self.unit.kernels.push((program, kernel as usize));
-                kernel
-            };
-        let mut g = r.geometry.map(i64::from);
-        g[11] = 1;
-        let params: [i64; 41] = [
-            source.lengths[0],
-            source.lengths[1],
-            source.lengths[2],
-            source.pitches[0],
-            source.pitches[1],
-            source.pitches[2],
-            target.lengths[0],
-            target.lengths[1],
-            target.lengths[2],
-            target.pitches[0],
-            target.pitches[1],
-            target.pitches[2],
-            target.bases[0],
-            target.bases[1],
-            target.heights[0],
-            target.heights[1],
-            0,
-            blocks as i64,
-            g[0],
-            g[1],
-            g[2],
-            g[3],
-            g[4],
-            g[5],
-            g[6],
-            g[7],
-            g[8],
-            g[9],
-            g[10],
-            g[11],
-            source.bases[0],
-            source.bases[1],
-            source.bases[2],
-            g[12],
-            g[13],
-            g[14],
-            g[15],
-            g[16],
-            g[17],
-            g[18],
-            g[19],
-        ];
-        let params = self.hold(bytes(&params));
+            ..Variant::new(4, 4, r.satd)
+        })?;
+        let mut geometry = r.geometry;
+        geometry[11] = 1;
+        let params = self.hold(bytes(&compact_params(&source, &target, blocks, geometry)));
         let (params_mem, _) = unsafe { self.cbuf(SHARED + 6, params.len())? };
-        if !unsafe { self.transfer(params_mem, params, std::ptr::null_mut()) } {
+        if !unsafe { self.transfer(params_mem, params, null_mut()) } {
             return None;
         }
-        let mems = [
-            src[0],
-            src[1],
-            src[2],
-            reference[0],
-            reference[1],
-            reference[2],
-            params_mem,
-            seed,
-            words,
-            ovr,
-        ];
-        let mut args: Vec<Arg> = mems.into_iter().map(Arg::Mem).collect();
-        args.push(Arg::Int(seed_off));
-        args.push(Arg::Int(words_off));
-        if !unsafe { set_args(&self.gpu.cl, kernel, &args) } {
-            return None;
-        }
-        let (local, global) = (64usize, blocks.next_multiple_of(64));
-        let status = unsafe {
-            (self.gpu.cl.EnqueueNDRangeKernel)(
-                self.unit.queue as Handle,
-                kernel,
-                1,
-                std::ptr::null(),
-                &raw const global,
-                &raw const local,
-                0,
-                std::ptr::null(),
-                std::ptr::null_mut(),
+        let args = recalc_args(
+            src,
+            reference,
+            &[
+                Arg::Mem(params_mem),
+                Arg::Mem(seed),
+                Arg::Mem(words),
+                Arg::Mem(ovr),
+                Arg::Int(seed_off),
+                Arg::Int(words_off),
+            ],
+        );
+        unsafe {
+            self.launch(
+                (program, c"recalc"),
+                &args,
+                blocks,
+                Some(64),
+                &[],
+                null_mut(),
             )
-        };
-        (status == CL_SUCCESS).then_some(())
+        }
     }
 
     pub(crate) fn host_levels(
@@ -918,7 +749,7 @@ impl Session<'_, '_> {
                 (self.gpu.cl.EnqueueReadBuffer)(
                     queue,
                     up.mems[plane] as Handle,
-                    1,
+                    CL_TRUE,
                     up.coarse[plane] + from,
                     to - from,
                     data.as_mut_ptr().cast(),
@@ -934,11 +765,5 @@ impl Session<'_, '_> {
         let host = std::sync::Arc::new(host);
         up.host = Some(host.clone());
         Some(host)
-    }
-
-    pub(crate) fn take_words(&self, ticket: usize, out: &mut [u32]) {
-        let (index, blocks) = self.tickets[ticket];
-        let host = self.unit.buffers[index].host as *const u32;
-        out[..2 * blocks].copy_from_slice(unsafe { std::slice::from_raw_parts(host, 2 * blocks) });
     }
 }

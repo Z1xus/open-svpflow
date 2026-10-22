@@ -354,7 +354,7 @@ fn run_chain<'o>(
             return None;
         }
         for (ticket, out) in tickets.into_iter().zip(outputs.iter_mut()) {
-            session.take_words(ticket, out.as_deref_mut()?);
+            session.take_into(ticket, out.as_deref_mut()?);
         }
         Some(())
     })();

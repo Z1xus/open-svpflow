@@ -1,5 +1,5 @@
 #![allow(unsafe_code)]
-use core::ffi::{c_char, c_void};
+use core::ffi::{CStr, c_char, c_void};
 use std::ffi::CString;
 use std::sync::{Mutex, OnceLock};
 
@@ -20,6 +20,7 @@ const CL_MEM_READ_WRITE: u64 = 1;
 const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
 const CL_MAP_READ: u64 = 1;
 const CL_TRUE: ClUint = 1;
+const CL_KERNEL_COMPILE_WORK_GROUP_SIZE: ClUint = 0x11B1;
 const CHUNK: usize = 16384;
 const RECORD: usize = 12;
 const RECORD_BYTES: usize = RECORD * size_of::<i32>();
@@ -169,6 +170,27 @@ pub(crate) struct Variant {
     pub(crate) dev: bool,
 }
 
+impl Variant {
+    fn new(width: usize, height: usize, satd: bool) -> Self {
+        Self {
+            width,
+            height,
+            satd,
+            shift: 1,
+            dev: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Arg {
+    Mem(Handle),
+    Int(i32),
+    Long(i64),
+    V4([i32; 4]),
+    V8([i32; 8]),
+}
+
 #[derive(Default)]
 struct Buffer {
     mem: usize,
@@ -178,20 +200,6 @@ struct Buffer {
 }
 
 type SearchKey = (Variant, usize, [i32; 5]);
-
-type Launch = (
-    usize,
-    Handle,
-    Handle,
-    Handle,
-    Handle,
-    i32,
-    Handle,
-    (Handle, usize),
-    usize,
-);
-
-type Kernel = (Handle, usize);
 
 struct SearchMems {
     src: [Handle; 3],
@@ -212,11 +220,8 @@ struct SearchMems {
 #[derive(Default)]
 struct Unit {
     queue: usize,
-    expand: usize,
-    kernels: Vec<(usize, usize)>,
-    search: Vec<(usize, bool, usize, usize)>,
+    kernels: Vec<(usize, &'static CStr, usize, usize)>,
     buffers: Vec<Buffer>,
-    ckernels: Vec<(usize, &'static str, usize)>,
     chain_stale: bool,
 }
 
@@ -471,6 +476,23 @@ impl RefineGpu {
         Some(program)
     }
 
+    fn search_pair(
+        &self,
+        variant: Variant,
+        rmax: usize,
+        q: &[i32; 40],
+        border: usize,
+    ) -> Option<(usize, usize)> {
+        let spec = [q[6], q[31], q[32], q[34], 0];
+        let program = self.search_program(variant, rmax, spec)?;
+        let border_program = if border > 0 {
+            self.search_program(variant, rmax, [spec[0], spec[1], spec[2], spec[3], 1])?
+        } else {
+            program
+        };
+        Some((program, border_program))
+    }
+
     fn build(&self, text: &str) -> Option<usize> {
         self.build_with(text, c"")
     }
@@ -714,6 +736,93 @@ impl Session<'_, '_> {
         status == CL_SUCCESS
     }
 
+    unsafe fn ckernel(&mut self, program: usize, name: &'static CStr) -> Option<(Handle, usize)> {
+        if let Some(&(.., kernel, local)) = self
+            .unit
+            .kernels
+            .iter()
+            .find(|k| k.0 == program && k.1 == name)
+        {
+            return Some((kernel as Handle, local));
+        }
+        let cl = &self.gpu.cl;
+        let mut err = 0;
+        let kernel = unsafe { (cl.CreateKernel)(program as Handle, name.as_ptr(), &raw mut err) };
+        if err != CL_SUCCESS || kernel.is_null() {
+            return None;
+        }
+        let mut size = [0usize; 3];
+        if unsafe {
+            (cl.GetKernelWorkGroupInfo)(
+                kernel,
+                self.gpu.device as Handle,
+                CL_KERNEL_COMPILE_WORK_GROUP_SIZE,
+                size_of_val(&size),
+                size.as_mut_ptr().cast(),
+                std::ptr::null_mut(),
+            )
+        } != CL_SUCCESS
+        {
+            unsafe { (cl.ReleaseKernel)(kernel) };
+            return None;
+        }
+        self.unit
+            .kernels
+            .push((program, name, kernel as usize, size[0]));
+        Some((kernel, size[0]))
+    }
+
+    unsafe fn launch(
+        &mut self,
+        (program, name): (usize, &'static CStr),
+        args: &[Arg],
+        global: usize,
+        local: Option<usize>,
+        waits: &[Handle],
+        event: *mut Handle,
+    ) -> Option<()> {
+        let (kernel, _) = unsafe { self.ckernel(program, name)? };
+        let cl = &self.gpu.cl;
+        let queue = self.unit.queue as Handle;
+        let set = args.iter().enumerate().all(|(index, arg)| {
+            let (size, value): (usize, *const c_void) = match arg {
+                Arg::Mem(v) => (size_of::<Handle>(), (&raw const *v).cast()),
+                Arg::Int(v) => (4, (&raw const *v).cast()),
+                Arg::Long(v) => (8, (&raw const *v).cast()),
+                Arg::V4(v) => (16, v.as_ptr().cast()),
+                Arg::V8(v) => (32, v.as_ptr().cast()),
+            };
+            unsafe { (cl.SetKernelArg)(kernel, index as ClUint, size, value) == CL_SUCCESS }
+        });
+        let global = match local {
+            Some(local) => global.next_multiple_of(local),
+            None => global.max(1),
+        };
+        if !set
+            || unsafe {
+                (cl.EnqueueNDRangeKernel)(
+                    queue,
+                    kernel,
+                    1,
+                    std::ptr::null(),
+                    &raw const global,
+                    local.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+                    waits.len() as ClUint,
+                    if waits.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        waits.as_ptr().cast()
+                    },
+                    event.cast(),
+                )
+            } != CL_SUCCESS
+        {
+            unsafe { (cl.Finish)(queue) };
+            return None;
+        }
+        Some(())
+    }
+
     // writes do not block, so copies live until the session ends
     fn hold<'h>(&mut self, data: &[u8]) -> &'h [u8] {
         self.hold_boxed(data.into())
@@ -813,22 +922,7 @@ impl Session<'_, '_> {
     unsafe fn upload_planes(&mut self, planes: &Planes<'_>) -> Option<Uploaded> {
         let cl = &self.gpu.cl;
         let expand = if planes.expand && planes.pel == 2 {
-            let program = self.gpu.expand_program()?;
-            let kernel = match self.unit.expand {
-                0 => {
-                    let mut err = 0;
-                    let kernel = unsafe {
-                        (cl.CreateKernel)(program as Handle, c"expand".as_ptr(), &raw mut err)
-                    };
-                    if err != CL_SUCCESS || kernel.is_null() {
-                        return None;
-                    }
-                    self.unit.expand = kernel as usize;
-                    kernel
-                }
-                kernel => kernel as Handle,
-            };
-            Some(kernel)
+            Some(self.gpu.expand_program()?)
         } else {
             None
         };
@@ -909,41 +1003,29 @@ impl Session<'_, '_> {
                 };
             }
             failed = failed || !unsafe { self.transfer(mem, &data[..upload], target) };
-            if let Some(kernel) = expand
+            if let Some(program) = expand
                 && !failed
             {
-                let pitch = planes.pitch[plane] as i64;
-                let height = i64::from(planes.height[plane]);
-                let args: [(usize, *const c_void); 3] = [
-                    (size_of::<Handle>(), (&raw const mem).cast()),
-                    (8, (&raw const pitch).cast()),
-                    (8, (&raw const height).cast()),
-                ];
-                let global = 3 * region;
                 failed = region * 4 > lengths[plane]
-                    || args
-                        .iter()
-                        .enumerate()
-                        .any(|(index, &(size, value))| unsafe {
-                            (cl.SetKernelArg)(kernel, index as ClUint, size, value) != CL_SUCCESS
-                        })
                     || unsafe {
-                        (cl.EnqueueNDRangeKernel)(
-                            self.unit.queue as Handle,
-                            kernel,
-                            1,
-                            std::ptr::null(),
-                            &raw const global,
-                            std::ptr::null(),
-                            0,
-                            std::ptr::null(),
+                        self.launch(
+                            (program, c"expand"),
+                            &[
+                                Arg::Mem(mem),
+                                Arg::Long(planes.pitch[plane] as i64),
+                                Arg::Long(i64::from(planes.height[plane])),
+                            ],
+                            3 * region,
+                            None,
+                            &[],
                             if plane == 2 {
-                                (&raw mut event).cast()
+                                &raw mut event
                             } else {
                                 std::ptr::null_mut()
                             },
                         )
-                    } != CL_SUCCESS;
+                    }
+                    .is_none();
             }
             if failed {
                 unsafe { (cl.Finish)(self.unit.queue as Handle) };
@@ -981,14 +1063,9 @@ impl Session<'_, '_> {
             self.frames[src].as_ref()?.2,
             self.frames[reference].as_ref()?.2,
         );
-        let variant = Variant {
-            width: plan.width,
-            height: plan.height,
-            satd: plan.satd,
-            shift: 1,
-            dev: false,
-        };
-        let program = self.gpu.program(variant)?;
+        let program = self
+            .gpu
+            .program(Variant::new(plan.width, plan.height, plan.satd))?;
         unsafe { self.enqueue(plan, src, reference, program, source, target) }
     }
 
@@ -1003,14 +1080,10 @@ impl Session<'_, '_> {
             self.frames[src].as_ref()?.2,
             self.frames[reference].as_ref()?.2,
         );
-        let variant = Variant {
-            width: 4,
-            height: 4,
-            satd: plan.satd,
+        let program = self.gpu.program(Variant {
             shift: plan.shift,
-            dev: false,
-        };
-        let program = self.gpu.program(variant)?;
+            ..Variant::new(4, 4, plan.satd)
+        })?;
         unsafe { self.enqueue_compact(plan, src, reference, program, source, target) }
     }
 
@@ -1027,64 +1100,6 @@ impl Session<'_, '_> {
         let blocks = plan.blocks();
         let slot = self.tickets.len() % 2;
         let results = unsafe { self.gpu.pinned(&mut self.unit, 4 + slot, blocks * 8)? };
-        let kernel = if let Some(&(_, kernel)) =
-            self.unit.kernels.iter().find(|(p, _)| *p == program)
-        {
-            kernel as Handle
-        } else {
-            let mut err = 0;
-            let kernel =
-                unsafe { (cl.CreateKernel)(program as Handle, c"recalc".as_ptr(), &raw mut err) };
-            if err != CL_SUCCESS || kernel.is_null() {
-                return None;
-            }
-            self.unit.kernels.push((program, kernel as usize));
-            kernel
-        };
-        let g = plan.geometry.map(i64::from);
-        let params: [i64; 41] = [
-            source.lengths[0],
-            source.lengths[1],
-            source.lengths[2],
-            source.pitches[0],
-            source.pitches[1],
-            source.pitches[2],
-            target.lengths[0],
-            target.lengths[1],
-            target.lengths[2],
-            target.pitches[0],
-            target.pitches[1],
-            target.pitches[2],
-            target.bases[0],
-            target.bases[1],
-            target.heights[0],
-            target.heights[1],
-            0,
-            blocks as i64,
-            g[0],
-            g[1],
-            g[2],
-            g[3],
-            g[4],
-            g[5],
-            g[6],
-            g[7],
-            g[8],
-            g[9],
-            g[10],
-            g[11],
-            source.bases[0],
-            source.bases[1],
-            source.bases[2],
-            g[12],
-            g[13],
-            g[14],
-            g[15],
-            g[16],
-            g[17],
-            g[18],
-            g[19],
-        ];
         let (source_mems, target_mems) = (
             self.frames[src].as_ref()?.1,
             self.frames[reference].as_ref()?.1,
@@ -1095,49 +1110,46 @@ impl Session<'_, '_> {
             .flatten()
             .map(|f| f.3 as Handle)
             .collect();
-        let mut mems = [std::ptr::null_mut(); 10];
-        for plane in 0..3 {
-            mems[plane] = source_mems[plane] as Handle;
-            mems[3 + plane] = target_mems[plane] as Handle;
-        }
-        let params = self.hold(bytes(&params));
+        let params = self.hold(bytes(&compact_params(
+            &source,
+            &target,
+            blocks,
+            plan.geometry,
+        )));
         let overrides = self.hold(bytes(&plan.overrides));
-        mems[6] = unsafe { self.write(slot, params)? };
-        mems[7] = unsafe { self.gpu.buffer(&mut self.unit, 2, plan.seed.len() * 4)? };
-        mems[8] = unsafe { self.gpu.buffer(&mut self.unit, 3, blocks * 8)? };
-        mems[9] = unsafe { self.write(6, overrides)? };
-        let set = mems.iter().enumerate().all(|(index, mem)| unsafe {
-            (cl.SetKernelArg)(
-                kernel,
-                index as ClUint,
-                size_of::<Handle>(),
-                (&raw const *mem).cast(),
-            ) == CL_SUCCESS
-        });
+        let seed = self.hold(bytes(&plan.seed));
+        let params_mem = unsafe { self.write(slot, params)? };
+        let seed_mem = unsafe { self.gpu.buffer(&mut self.unit, 2, seed.len())? };
+        let results_mem = unsafe { self.gpu.buffer(&mut self.unit, 3, blocks * 8)? };
+        let overrides_mem = unsafe { self.write(6, overrides)? };
+        let args = recalc_args(
+            source_mems.map(|m| m as Handle),
+            target_mems.map(|m| m as Handle),
+            &[
+                Arg::Mem(params_mem),
+                Arg::Mem(seed_mem),
+                Arg::Mem(results_mem),
+                Arg::Mem(overrides_mem),
+            ],
+        );
         let queue = self.unit.queue as Handle;
-        if !set || !unsafe { self.transfer(mems[7], bytes(&plan.seed), std::ptr::null_mut()) } {
-            unsafe { (cl.Finish)(queue) };
-            return None;
-        }
-        let (local, global) = (64usize, blocks.next_multiple_of(64));
         let mut done: Handle = std::ptr::null_mut();
-        if unsafe {
-            (cl.EnqueueNDRangeKernel)(
-                queue,
-                kernel,
-                1,
-                std::ptr::null(),
-                &raw const global,
-                &raw const local,
-                events.len() as ClUint,
-                events.as_ptr().cast(),
-                std::ptr::null_mut(),
-            )
-        } != CL_SUCCESS
+        if !unsafe { self.transfer(seed_mem, seed, std::ptr::null_mut()) }
+            || unsafe {
+                self.launch(
+                    (program, c"recalc"),
+                    &args,
+                    blocks,
+                    Some(64),
+                    &events,
+                    std::ptr::null_mut(),
+                )
+            }
+            .is_none()
             || unsafe {
                 (cl.EnqueueReadBuffer)(
                     queue,
-                    mems[8],
+                    results_mem,
                     CL_FALSE,
                     0,
                     blocks * 8,
@@ -1152,13 +1164,13 @@ impl Session<'_, '_> {
             return None;
         }
         self.pending.push(done as usize);
-        self.tickets.push((slot, blocks));
+        self.tickets.push((4 + slot, blocks));
         Some(self.tickets.len() - 1)
     }
 
     pub(crate) fn take_into(&mut self, ticket: usize, out: &mut [u32]) {
-        let (slot, blocks) = self.tickets[ticket];
-        let host = self.unit.buffers[4 + slot].host as *const u32;
+        let (index, blocks) = self.tickets[ticket];
+        let host = self.unit.buffers[index].host as *const u32;
         out[..2 * blocks].copy_from_slice(unsafe { std::slice::from_raw_parts(host, 2 * blocks) });
     }
 
@@ -1177,47 +1189,15 @@ impl Session<'_, '_> {
         let slot = self.tickets.len() % 2;
         if blocks > 0 {
             let bests = unsafe { self.gpu.pinned(&mut self.unit, 4 + slot, blocks * 16)? };
-            let kernel =
-                if let Some(&(_, kernel)) = self.unit.kernels.iter().find(|(p, _)| *p == program) {
-                    kernel as Handle
-                } else {
-                    let mut err = 0;
-                    let kernel = unsafe {
-                        (cl.CreateKernel)(program as Handle, c"recalc".as_ptr(), &raw mut err)
-                    };
-                    if err != CL_SUCCESS || kernel.is_null() {
-                        return None;
-                    }
-                    self.unit.kernels.push((program, kernel as usize));
-                    kernel
-                };
-            let params: [i64; 24] = [
-                source.lengths[0],
-                source.lengths[1],
-                source.lengths[2],
-                source.pitches[0],
-                source.pitches[1],
-                source.pitches[2],
-                target.lengths[0],
-                target.lengths[1],
-                target.lengths[2],
-                target.pitches[0],
-                target.pitches[1],
-                target.pitches[2],
-                target.bases[0],
-                target.bases[1],
-                target.heights[0],
-                target.heights[1],
+            let mut params = [0i64; 24];
+            params[..16].copy_from_slice(&frame_params(&source, &target));
+            params[16..21].copy_from_slice(&[
                 target.pel,
                 plan.slots as i64,
                 blocks as i64,
                 i64::from(plan.pnew),
                 i64::from(plan.pel),
-                0,
-                0,
-                0,
-            ];
-            let mut mems = [std::ptr::null_mut(); 9];
+            ]);
             let (source_mems, target_mems) = (
                 self.frames[src].as_ref()?.1,
                 self.frames[reference].as_ref()?.1,
@@ -1228,66 +1208,49 @@ impl Session<'_, '_> {
                 .flatten()
                 .map(|f| f.3 as Handle)
                 .collect();
-            for plane in 0..3 {
-                mems[plane] = source_mems[plane] as Handle;
-                mems[3 + plane] = target_mems[plane] as Handle;
-            }
             let chunk = CHUNK.min(blocks);
             let params = self.hold(bytes(&params));
             let records = bytes(&plan.records);
-            mems[6] = unsafe { self.write(slot, params)? };
-            mems[7] = unsafe { self.gpu.buffer(&mut self.unit, 2, chunk * RECORD_BYTES)? };
-            mems[8] = unsafe { self.gpu.buffer(&mut self.unit, 3, chunk * 16)? };
-            let set = mems.iter().enumerate().all(|(index, mem)| unsafe {
-                (cl.SetKernelArg)(
-                    kernel,
-                    index as ClUint,
-                    size_of::<Handle>(),
-                    (&raw const *mem).cast(),
-                ) == CL_SUCCESS
-            });
-            if !set {
-                return None;
-            }
+            let params_mem = unsafe { self.write(slot, params)? };
+            let records_mem = unsafe { self.gpu.buffer(&mut self.unit, 2, chunk * RECORD_BYTES)? };
+            let bests_mem = unsafe { self.gpu.buffer(&mut self.unit, 3, chunk * 16)? };
+            let args = recalc_args(
+                source_mems.map(|m| m as Handle),
+                target_mems.map(|m| m as Handle),
+                &[
+                    Arg::Mem(params_mem),
+                    Arg::Mem(records_mem),
+                    Arg::Mem(bests_mem),
+                ],
+            );
             let queue = self.unit.queue as Handle;
             let mut done: Handle = std::ptr::null_mut();
             let mut start = 0;
             while start < blocks {
                 let count = CHUNK.min(blocks - start);
                 let last = start + count == blocks;
+                let waits: &[Handle] = if start == 0 { &events } else { &[] };
                 if !unsafe {
                     self.transfer(
-                        mems[7],
+                        records_mem,
                         &records[start * RECORD_BYTES..(start + count) * RECORD_BYTES],
                         std::ptr::null_mut(),
                     )
-                } {
-                    unsafe { (cl.Finish)(queue) };
-                    return None;
-                }
-                let (local, global) = (64usize, count * 64);
-                let waits: &[Handle] = if start == 0 { &events } else { &[] };
-                if unsafe {
-                    (cl.EnqueueNDRangeKernel)(
-                        queue,
-                        kernel,
-                        1,
-                        std::ptr::null(),
-                        &raw const global,
-                        &raw const local,
-                        waits.len() as ClUint,
-                        if waits.is_empty() {
-                            std::ptr::null()
-                        } else {
-                            waits.as_ptr().cast()
-                        },
+                } || unsafe {
+                    self.launch(
+                        (program, c"recalc"),
+                        &args,
+                        count * 64,
+                        Some(64),
+                        waits,
                         std::ptr::null_mut(),
                     )
-                } != CL_SUCCESS
+                }
+                .is_none()
                     || unsafe {
                         (cl.EnqueueReadBuffer)(
                             queue,
-                            mems[8],
+                            bests_mem,
                             CL_FALSE,
                             0,
                             count * 16,
@@ -1324,64 +1287,13 @@ impl Session<'_, '_> {
         self.flush();
         self.frames[src].as_ref()?;
         self.frames[reference].as_ref()?;
-        let variant = Variant {
-            width: params.width,
-            height: params.height,
-            satd: params.satd,
-            shift: 1,
-            dev: false,
-        };
-        let spec = [params.q[6], params.q[31], params.q[32], params.q[34], 0];
-        let program = self.gpu.search_program(variant, params.rmax, spec)?;
-        let border_program = if params.border > 0 {
-            let mut spec = spec;
-            spec[4] = 1;
-            self.gpu.search_program(variant, params.rmax, spec)?
-        } else {
-            program
-        };
-        unsafe { self.enqueue_search(params, pred, rev, src, reference, program, border_program) }
-    }
-
-    unsafe fn search_kernel(&mut self, program: usize, refine: bool) -> Option<(Handle, usize)> {
-        if let Some(&(_, _, kernel, local)) = self
-            .unit
-            .search
-            .iter()
-            .find(|(p, r, _, _)| *p == program && *r == refine)
-        {
-            return (kernel != 0).then_some((kernel as Handle, local));
-        }
-        let cl = &self.gpu.cl;
-        let mut err = 0;
-        let name = if refine { c"refine" } else { c"search" };
-        let kernel = unsafe { (cl.CreateKernel)(program as Handle, name.as_ptr(), &raw mut err) };
-        if err != CL_SUCCESS || kernel.is_null() {
-            if refine {
-                self.unit.search.push((program, refine, 0, 0));
-            }
-            return None;
-        }
-        let mut size = [0usize; 3];
-        if unsafe {
-            (cl.GetKernelWorkGroupInfo)(
-                kernel,
-                self.gpu.device as Handle,
-                0x11B1,
-                size_of_val(&size),
-                size.as_mut_ptr().cast(),
-                std::ptr::null_mut(),
-            )
-        } != CL_SUCCESS
-            || size[0] < 32
-        {
-            unsafe { (cl.ReleaseKernel)(kernel) };
-            return None;
-        }
-        self.unit
-            .search
-            .push((program, refine, kernel as usize, size[0]));
-        Some((kernel, size[0]))
+        let programs = self.gpu.search_pair(
+            Variant::new(params.width, params.height, params.satd),
+            params.rmax,
+            &params.q,
+            params.border,
+        )?;
+        unsafe { self.enqueue_search(params, pred, rev, src, reference, programs) }
     }
 
     unsafe fn launch_search(
@@ -1389,101 +1301,77 @@ impl Session<'_, '_> {
         m: &SearchMems,
         (blocks, border): (usize, usize),
         passes: usize,
-        (main_kernel, border_kernel, refine_kernel): (Kernel, Kernel, Option<Kernel>),
+        (program, border_program): (usize, usize),
         eight: bool,
         events: &[Handle],
     ) -> Option<()> {
-        let cl = &self.gpu.cl;
-        let queue = self.unit.queue as Handle;
         let per = if eight { 4 } else { 1 };
-        let mut launches: Vec<Launch> = Vec::new();
+        let mut launches = Vec::new();
         for pass in 0..=passes {
-            let (rin, rout) = (m.res[(pass + 1) % 2], m.res[pass % 2]);
-            let (din, dout) = (m.dirty[(pass + 1) % 2], m.dirty[pass % 2]);
-            let (kernel, per) = match refine_kernel {
-                Some(kernel) if pass > 0 => (kernel, 4),
-                _ => (main_kernel, per),
+            let name = if eight && pass > 0 {
+                c"refine"
+            } else {
+                c"search"
             };
-            launches.push((blocks, rin, rout, din, dout, pass as i32, m.q, kernel, per));
-        }
-        if border > 0 {
-            let last = m.res[passes % 2];
-            let other = m.res[(passes + 1) % 2];
             launches.push((
-                border,
-                last,
-                other,
-                m.dirty[0],
-                m.dirty[1],
-                0,
-                m.q2,
-                border_kernel,
-                per,
+                blocks,
+                (m.res[(pass + 1) % 2], m.res[pass % 2]),
+                (m.dirty[(pass + 1) % 2], m.dirty[pass % 2]),
+                pass as i32,
+                m.q,
+                (program, name),
             ));
         }
-        for (index, &(count, rin, rout, din, dout, pass, qm, (kernel, local), per)) in
-            launches.iter().enumerate()
+        if border > 0 {
+            launches.push((
+                border,
+                (m.res[passes % 2], m.res[(passes + 1) % 2]),
+                (m.dirty[0], m.dirty[1]),
+                0,
+                m.q2,
+                (border_program, c"search"),
+            ));
+        }
+        for (index, (count, (rin, rout), (din, dout), pass, q, kernel)) in
+            launches.into_iter().enumerate()
         {
-            let mems: [Handle; 15] = [
-                m.src[0],
-                m.src[1],
-                m.src[2],
-                m.reference[0],
-                m.reference[1],
-                m.reference[2],
-                qm,
-                m.pred,
-                m.rev,
-                rin,
-                rout,
-                m.cen,
-                m.aux,
-                m.out,
-                din,
-            ];
-            let mut set = mems.iter().enumerate().all(|(index, mem)| unsafe {
-                (cl.SetKernelArg)(
-                    kernel,
-                    index as ClUint,
-                    size_of::<Handle>(),
-                    (&raw const *mem).cast(),
-                ) == CL_SUCCESS
-            });
-            let groups = count.div_ceil(per * (local / 32));
-            let mut mdir = m.strides;
-            mdir[0] = if m.dirs > 1 { groups as i32 } else { i32::MAX };
-            set = set
-                && unsafe {
-                    (cl.SetKernelArg)(kernel, 15, size_of::<Handle>(), (&raw const dout).cast())
-                        == CL_SUCCESS
-                        && (cl.SetKernelArg)(kernel, 16, 4, (&raw const pass).cast()) == CL_SUCCESS
-                        && (cl.SetKernelArg)(kernel, 17, 32, mdir.as_ptr().cast()) == CL_SUCCESS
-                };
-            if !set {
+            let (_, local) = unsafe { self.ckernel(kernel.0, kernel.1)? };
+            if local < 32 {
                 return None;
             }
-            let global = groups * m.dirs * local;
+            let groups = count.div_ceil(per * (local / 32));
+            let mut strides = m.strides;
+            strides[0] = if m.dirs > 1 { groups as i32 } else { i32::MAX };
+            let args = [
+                Arg::Mem(m.src[0]),
+                Arg::Mem(m.src[1]),
+                Arg::Mem(m.src[2]),
+                Arg::Mem(m.reference[0]),
+                Arg::Mem(m.reference[1]),
+                Arg::Mem(m.reference[2]),
+                Arg::Mem(q),
+                Arg::Mem(m.pred),
+                Arg::Mem(m.rev),
+                Arg::Mem(rin),
+                Arg::Mem(rout),
+                Arg::Mem(m.cen),
+                Arg::Mem(m.aux),
+                Arg::Mem(m.out),
+                Arg::Mem(din),
+                Arg::Mem(dout),
+                Arg::Int(pass),
+                Arg::V8(strides),
+            ];
             let waits: &[Handle] = if index == 0 { events } else { &[] };
-            if unsafe {
-                (cl.EnqueueNDRangeKernel)(
-                    queue,
+            unsafe {
+                self.launch(
                     kernel,
-                    1,
-                    std::ptr::null(),
-                    &raw const global,
-                    &raw const local,
-                    waits.len() as ClUint,
-                    if waits.is_empty() {
-                        std::ptr::null()
-                    } else {
-                        waits.as_ptr().cast()
-                    },
+                    &args,
+                    groups * m.dirs * local,
+                    Some(local),
+                    waits,
                     std::ptr::null_mut(),
-                )
-            } != CL_SUCCESS
-            {
-                unsafe { (cl.Finish)(queue) };
-                return None;
+                )?;
             }
         }
         Some(())
@@ -1496,20 +1384,12 @@ impl Session<'_, '_> {
         rev: &[Mv],
         src: usize,
         reference: usize,
-        program: usize,
-        border_program: usize,
+        programs: (usize, usize),
     ) -> Option<usize> {
         let cl = &self.gpu.cl;
         let blocks = pred.len();
         let total = blocks + params.border;
         let base = 7 + 12 * src;
-        let main_kernel = unsafe { self.search_kernel(program, false)? };
-        let border_kernel = unsafe { self.search_kernel(border_program, false)? };
-        let refine_kernel = if params.width == 8 && params.height == 8 {
-            unsafe { self.search_kernel(program, true) }
-        } else {
-            None
-        };
         unsafe { self.gpu.pinned(&mut self.unit, base + 6, total * 16)? };
         let (source_mems, target_mems) = (
             self.frames[src].as_ref()?.1,
@@ -1566,7 +1446,7 @@ impl Session<'_, '_> {
                 &mems,
                 (blocks, params.border),
                 if params.q[32] == 0 { SWEEPS } else { 0 },
-                (main_kernel, border_kernel, refine_kernel),
+                programs,
                 params.width == 8 && params.height == 8,
                 &events,
             )?;
@@ -1679,6 +1559,36 @@ impl Drop for Session<'_, '_> {
 
 unsafe impl Send for RefineGpu {}
 unsafe impl Sync for RefineGpu {}
+
+fn recalc_args(src: [Handle; 3], reference: [Handle; 3], rest: &[Arg]) -> Vec<Arg> {
+    src.into_iter()
+        .chain(reference)
+        .map(Arg::Mem)
+        .chain(rest.iter().copied())
+        .collect()
+}
+
+fn frame_params(source: &Frame, target: &Frame) -> [i64; 16] {
+    let mut head = [0; 16];
+    head[0..3].copy_from_slice(&source.lengths);
+    head[3..6].copy_from_slice(&source.pitches);
+    head[6..9].copy_from_slice(&target.lengths);
+    head[9..12].copy_from_slice(&target.pitches);
+    head[12..14].copy_from_slice(&target.bases[..2]);
+    head[14..16].copy_from_slice(&target.heights[..2]);
+    head
+}
+
+fn compact_params(source: &Frame, target: &Frame, blocks: usize, geometry: [i32; 20]) -> [i64; 41] {
+    let g = geometry.map(i64::from);
+    let mut params = [0; 41];
+    params[..16].copy_from_slice(&frame_params(source, target));
+    params[17] = blocks as i64;
+    params[18..30].copy_from_slice(&g[..12]);
+    params[30..33].copy_from_slice(&source.bases);
+    params[33..].copy_from_slice(&g[12..]);
+    params
+}
 
 fn bytes<T: Copy>(values: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), size_of_val(values)) }
