@@ -10,21 +10,21 @@ pub(super) const CHAIN: &str = include_str!("chain.cl");
 
 const FREQ: usize = 16384;
 const SORT_SCRATCH: usize = 2 * crate::analyse::chain::RANK_BLOCKS as usize;
-pub(super) const BASE: usize = 64;
-pub(super) const ROLES: usize = 16;
+const BASE: usize = 64;
+const ROLES: usize = 16;
 const SHARED: usize = 40;
 const WORDS: usize = 48;
 const PINNED: usize = 32;
 
-pub(super) const Q: usize = 0;
+const Q: usize = 0;
 const Q2: usize = 1;
-pub(super) const PRED: usize = 2;
-pub(super) const REV: usize = 3;
+const PRED: usize = 2;
+const REV: usize = 3;
 const RES0: usize = 4;
 const RES1: usize = 5;
 const AUX: usize = 6;
 const CEN: usize = 7;
-pub(super) const OUT: usize = 8;
+const OUT: usize = 8;
 const D0: usize = 9;
 const D1: usize = 10;
 const MINSAD: usize = 11;
@@ -49,6 +49,48 @@ unsafe fn set_args(cl: &OpenCl, kernel: Handle, args: &[Arg]) -> bool {
     })
 }
 
+fn slab(bytes: usize) -> usize {
+    bytes.next_multiple_of(256)
+}
+
+#[derive(Clone, Copy)]
+struct Slabs {
+    out: usize,
+    pred: usize,
+    min: usize,
+    rev: usize,
+    q: usize,
+    dirty: usize,
+}
+
+impl Slabs {
+    fn new(lp: &LevelPlan) -> Self {
+        let nb = (lp.blk_x * lp.blk_y) as usize;
+        let total = nb + lp.border;
+        Self {
+            out: slab(total * 16),
+            pred: slab(nb * 8),
+            min: slab(nb * 4),
+            rev: slab(nb * 12),
+            q: slab(160),
+            dirty: slab(total),
+        }
+    }
+
+    fn stride(&self) -> [i32; 8] {
+        [
+            (self.out / 16) as i32,
+            (self.pred / 8) as i32,
+            (self.min / 4) as i32,
+            (self.rev / 8) as i32,
+            0,
+            0,
+            0,
+            0,
+        ]
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Lb {
     q: Handle,
@@ -62,6 +104,7 @@ struct Lb {
     dirty: [Handle; 2],
     minsad: Handle,
     minidx: Handle,
+    slabs: Slabs,
 }
 
 impl RefineGpu {
@@ -214,26 +257,26 @@ impl Session<'_, '_> {
         true
     }
 
-    unsafe fn level_bufs(&mut self, lp: &LevelPlan, d: usize) -> Option<(Lb, bool)> {
-        let nb = (lp.blk_x * lp.blk_y) as usize;
-        let total = nb + lp.border;
-        let at = |role: usize| BASE + (lp.level as usize * 2 + d) * ROLES + role;
-        let get = |this: &mut Self, role: usize, size: usize| unsafe {
-            this.cbuf(at(role), size).map(|b| b.0)
+    unsafe fn level_bufs(&mut self, lp: &LevelPlan, dirs: usize) -> Option<(Lb, bool)> {
+        let slabs = Slabs::new(lp);
+        let at = |role: usize| BASE + lp.level as usize * ROLES + role;
+        let get = |this: &mut Self, role: usize, per: usize| unsafe {
+            this.cbuf(at(role), per * dirs).map(|b| b.0)
         };
-        let fresh = unsafe { self.cbuf(at(MINSAD), nb * 4)?.1 };
+        let fresh = unsafe { self.cbuf(at(MINSAD), slabs.min * dirs)?.1 };
         let lb = Lb {
-            q: get(self, Q, 160)?,
-            q2: get(self, Q2, 160)?,
-            pred: get(self, PRED, nb * 8)?,
-            rev: get(self, REV, nb * 12)?,
-            res: [get(self, RES0, total * 16)?, get(self, RES1, total * 16)?],
-            aux: get(self, AUX, total * 16)?,
-            cen: get(self, CEN, total * 16)?,
-            out: get(self, OUT, total * 16)?,
-            dirty: [get(self, D0, total)?, get(self, D1, total)?],
-            minsad: get(self, MINSAD, nb * 4)?,
-            minidx: get(self, MINIDX, nb * 4)?,
+            q: get(self, Q, slabs.q)?,
+            q2: get(self, Q2, slabs.q)?,
+            pred: get(self, PRED, slabs.pred)?,
+            rev: get(self, REV, slabs.rev)?,
+            res: [get(self, RES0, slabs.out)?, get(self, RES1, slabs.out)?],
+            aux: get(self, AUX, slabs.out)?,
+            cen: get(self, CEN, slabs.out)?,
+            out: get(self, OUT, slabs.out)?,
+            dirty: [get(self, D0, slabs.dirty)?, get(self, D1, slabs.dirty)?],
+            minsad: get(self, MINSAD, slabs.min)?,
+            minidx: get(self, MINIDX, slabs.min)?,
+            slabs,
         };
         Some((lb, fresh))
     }
@@ -275,32 +318,34 @@ impl Session<'_, '_> {
             .map(|f| f.3 as Handle)
             .collect();
         let queue = self.unit.queue as Handle;
-        let mut bufs: Vec<[Option<Lb>; 2]> = Vec::new();
         let stale = std::mem::replace(&mut self.unit.chain_stale, true);
+        let mut bufs: Vec<Lb> = Vec::new();
         for lp in &plan.levels {
-            let mut entry = [None, None];
-            for (d, slot) in entry.iter_mut().enumerate().take(dirs) {
-                let (b, fresh) = unsafe { self.level_bufs(lp, d)? };
-                if fresh || stale {
-                    let nb = lp.blk_x * lp.blk_y;
-                    unsafe {
-                        self.launch(
-                            "pinit",
-                            &[Arg::Mem(b.minsad), Arg::Mem(b.minidx), Arg::Int(nb)],
-                            nb as usize,
-                            Some(64),
-                            &[],
-                        )?;
-                    }
+            let (b, fresh) = unsafe { self.level_bufs(lp, dirs)? };
+            if fresh || stale {
+                let nb = lp.blk_x * lp.blk_y;
+                unsafe {
+                    self.launch(
+                        "pinit",
+                        &[
+                            Arg::Mem(b.minsad),
+                            Arg::Mem(b.minidx),
+                            Arg::Int(nb),
+                            Arg::Int((b.slabs.min / 4) as i32),
+                            Arg::Int(dirs as i32),
+                        ],
+                        nb as usize * dirs,
+                        Some(64),
+                        &[],
+                    )?;
                 }
-                *slot = Some(b);
             }
-            bufs.push(entry);
+            bufs.push(b);
         }
-        let lb = |level: usize, d: usize| bufs[level][d].expect("direction buffer");
         for (level, lp) in plan.levels.iter().enumerate() {
+            let b = bufs[level];
+            let nb = (lp.blk_x * lp.blk_y) as usize;
             for d in 0..dirs {
-                let b = lb(level, d);
                 let mut q = lp.q;
                 if level > 0 {
                     let (y, c) = plan.pyramid.offsets(level as i32);
@@ -312,18 +357,19 @@ impl Session<'_, '_> {
                 }
                 let mut q2 = q;
                 q2[33] = 1;
-                let q = self.hold(bytes(&q));
-                let q2 = self.hold(bytes(&q2));
-                let nb = (lp.blk_x * lp.blk_y) as usize;
+                let (q, q2) = (self.hold(bytes(&q)), self.hold(bytes(&q2)));
+                let at = d * b.slabs.q;
                 for (mem, data) in [(b.q, q), (b.q2, q2)] {
-                    if !unsafe { self.transfer(mem, data, std::ptr::null_mut()) } {
+                    if !unsafe { self.transfer_at(mem, at, data, std::ptr::null_mut()) } {
                         return None;
                     }
                 }
                 if level == top {
                     let out = self.hold(bytes(top_out.get(d)?));
                     if out.len() != (nb + lp.border) * 16
-                        || !unsafe { self.transfer(b.out, out, std::ptr::null_mut()) }
+                        || !unsafe {
+                            self.transfer_at(b.out, d * b.slabs.out, out, std::ptr::null_mut())
+                        }
                     {
                         return None;
                     }
@@ -331,217 +377,227 @@ impl Session<'_, '_> {
             }
         }
         let mut waits: &[Handle] = &events;
-        for level in (0..=top).rev() {
+        let both = i32::from(plan.both);
+        for level in (0..top).rev() {
             let lp = &plan.levels[level];
+            let (b, c) = (bufs[level], bufs[level + 1]);
             let nb = (lp.blk_x * lp.blk_y) as i32;
-            if level < top {
-                let coarse = &plan.levels[level + 1];
-                let cnb = (coarse.blk_x * coarse.blk_y) as i32;
-                let (hist, _) = unsafe { self.cbuf(SHARED, 2 * FREQ * 4)? };
-                let (res, _) = unsafe { self.cbuf(SHARED + 1, 16)? };
-                let c0 = lb(level + 1, 0).out;
-                let c1 = if plan.both { lb(level + 1, 1).out } else { c0 };
-                unsafe {
-                    self.launch(
-                        "gest",
-                        &[
-                            Arg::Mem(c0),
-                            Arg::Mem(c1),
-                            Arg::Mem(hist),
-                            Arg::Mem(res),
-                            Arg::Int(cnb),
-                        ],
-                        256 * dirs,
-                        Some(256),
-                        waits,
-                    )?;
-                }
+            let coarse = &plan.levels[level + 1];
+            let cnb = (coarse.blk_x * coarse.blk_y) as i32;
+            let (hist, _) = unsafe { self.cbuf(SHARED, 2 * FREQ * 4)? };
+            let (res, _) = unsafe { self.cbuf(SHARED + 1, 16)? };
+            unsafe {
+                self.launch(
+                    "gest",
+                    &[
+                        Arg::Mem(c.out),
+                        Arg::Int((c.slabs.out / 16) as i32),
+                        Arg::Mem(hist),
+                        Arg::Mem(res),
+                        Arg::Int(cnb),
+                    ],
+                    256 * dirs,
+                    Some(256),
+                    waits,
+                )?;
                 waits = &[];
-                let (fwd, bwd) = (lb(level, 0), lb(level, usize::from(plan.both)));
-                unsafe {
-                    self.launch(
-                        "gfin",
-                        &[
-                            Arg::Mem(res),
-                            Arg::Mem(fwd.q),
-                            Arg::Mem(fwd.q2),
-                            Arg::Mem(bwd.q),
-                            Arg::Mem(bwd.q2),
-                            Arg::Int(lp.pel),
-                            Arg::Int(i32::from(plan.both)),
-                        ],
-                        1,
-                        None,
-                        &[],
-                    )?;
-                }
-                let norm = 3 - lp.pel.ilog2() as i32;
-                let geo = [
-                    lp.blk_x,
-                    lp.blk_y,
-                    coarse.blk_x,
-                    coarse.blk_y,
-                    lp.step_x,
-                    lp.step_y,
-                    lp.width as i32,
-                    lp.height as i32,
-                ];
-                let blend = [i32::from(lp.flat), norm, lp.step_x * lp.step_y, 0];
-                for d in 0..dirs {
-                    let (b, c) = (lb(level, d), lb(level + 1, d));
+                self.launch(
+                    "gfin",
+                    &[
+                        Arg::Mem(res),
+                        Arg::Mem(b.q),
+                        Arg::Mem(b.q2),
+                        Arg::Int((b.slabs.q / 4) as i32),
+                        Arg::Int(lp.pel),
+                        Arg::Int(both),
+                    ],
+                    1,
+                    None,
+                    &[],
+                )?;
+            }
+            let norm = 3 - lp.pel.ilog2() as i32;
+            let geo = [
+                lp.blk_x,
+                lp.blk_y,
+                coarse.blk_x,
+                coarse.blk_y,
+                lp.step_x,
+                lp.step_y,
+                lp.width as i32,
+                lp.height as i32,
+            ];
+            let blend = [i32::from(lp.flat), norm, lp.step_x * lp.step_y, 0];
+            let mut st = b.slabs.stride();
+            st[4] = both;
+            let mut st_coarse = st;
+            st_coarse[0] = (c.slabs.out / 16) as i32;
+            let global = nb as usize * dirs;
+            unsafe {
+                self.launch(
+                    "pred1",
+                    &[
+                        Arg::Mem(c.out),
+                        Arg::Mem(b.pred),
+                        Arg::Mem(b.minsad),
+                        Arg::V8(geo),
+                        Arg::V4(blend),
+                        Arg::V8(st_coarse),
+                    ],
+                    global,
+                    Some(64),
+                    &[],
+                )?;
+                self.launch(
+                    "pred2",
+                    &[
+                        Arg::Mem(b.pred),
+                        Arg::Mem(b.minsad),
+                        Arg::Mem(b.minidx),
+                        Arg::V8(geo),
+                        Arg::V8(st),
+                    ],
+                    global,
+                    Some(64),
+                    &[],
+                )?;
+                self.launch(
+                    "pred3",
+                    &[
+                        Arg::Mem(b.pred),
+                        Arg::Mem(b.minsad),
+                        Arg::Mem(b.minidx),
+                        Arg::Mem(b.rev),
+                        Arg::Int(nb),
+                        Arg::V8(st),
+                    ],
+                    global,
+                    Some(64),
+                    &[],
+                )?;
+            }
+            if lp.rmax > 0 {
+                if lp.sorted {
+                    let (scratch, _) = unsafe { self.cbuf(SHARED + 2, SORT_SCRATCH * 4 * dirs)? };
+                    let mut st_sort = st;
+                    st_sort[0] = (c.slabs.out / 16) as i32;
                     unsafe {
                         self.launch(
-                            "pred1",
+                            "srank",
                             &[
                                 Arg::Mem(c.out),
-                                Arg::Mem(b.pred),
-                                Arg::Mem(b.minsad),
-                                Arg::V8(geo),
-                                Arg::V4(blend),
+                                Arg::Mem(b.rev),
+                                Arg::Mem(scratch),
+                                Arg::V8([
+                                    lp.blk_x,
+                                    lp.blk_y,
+                                    coarse.blk_x,
+                                    coarse.blk_y,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                ]),
+                                Arg::V4([plan.sort_shift, plan.sort_buckets, 0, 0]),
+                                Arg::V8(st_sort),
                             ],
-                            nb as usize,
-                            Some(64),
-                            &[],
-                        )?;
-                        self.launch(
-                            "pred2",
-                            &[
-                                Arg::Mem(b.pred),
-                                Arg::Mem(b.minsad),
-                                Arg::Mem(b.minidx),
-                                Arg::V8(geo),
-                            ],
-                            nb as usize,
-                            Some(64),
-                            &[],
-                        )?;
-                    }
-                }
-                for d in 0..dirs {
-                    let b = lb(level, d);
-                    let target = lb(level, if plan.both { 1 - d } else { d });
-                    unsafe {
-                        self.launch(
-                            "pred3",
-                            &[
-                                Arg::Mem(b.pred),
-                                Arg::Mem(b.minsad),
-                                Arg::Mem(b.minidx),
-                                Arg::Mem(target.rev),
-                                Arg::Int(nb),
-                            ],
-                            nb as usize,
-                            Some(64),
+                            1024 * dirs,
+                            Some(1024),
                             &[],
                         )?;
                     }
-                }
-            }
-            if level == top {
-                continue;
-            }
-            for d in 0..dirs {
-                let b = lb(level, d);
-                if lp.rmax > 0 {
-                    if lp.sorted {
-                        let c = lb(level + 1, d);
-                        let coarse = &plan.levels[level + 1];
-                        let (scratch, _) = unsafe { self.cbuf(SHARED + 2, SORT_SCRATCH * 4)? };
+                } else {
+                    let at = BASE + level * ROLES + REV;
+                    let tag = (u64::from(lp.blk_x as u32) << 32) | u64::from(lp.blk_y as u32);
+                    if self.unit.buffers[at].tag != tag {
                         unsafe {
                             self.launch(
-                                "srank",
+                                "rank_serp",
                                 &[
-                                    Arg::Mem(c.out),
                                     Arg::Mem(b.rev),
-                                    Arg::Mem(scratch),
-                                    Arg::V8([
-                                        lp.blk_x,
-                                        lp.blk_y,
-                                        coarse.blk_x,
-                                        coarse.blk_y,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                    ]),
-                                    Arg::V4([plan.sort_shift, plan.sort_buckets, 0, 0]),
+                                    Arg::Int(nb),
+                                    Arg::Int(lp.blk_x),
+                                    Arg::Int(lp.blk_y),
+                                    Arg::V8(st),
                                 ],
-                                1024,
-                                Some(1024),
-                                waits,
+                                global,
+                                Some(64),
+                                &[],
                             )?;
                         }
-                    } else {
-                        let at = BASE + (level * 2 + d) * ROLES + REV;
-                        let tag = (u64::from(lp.blk_x as u32) << 32) | u64::from(lp.blk_y as u32);
-                        if self.unit.buffers[at].tag != tag {
-                            unsafe {
-                                self.launch(
-                                    "rank_serp",
-                                    &[
-                                        Arg::Mem(b.rev),
-                                        Arg::Int(nb),
-                                        Arg::Int(lp.blk_x),
-                                        Arg::Int(lp.blk_y),
-                                    ],
-                                    nb as usize,
-                                    Some(64),
-                                    waits,
-                                )?;
-                            }
-                            self.unit.buffers[at].tag = tag;
-                        }
+                        self.unit.buffers[at].tag = tag;
                     }
-                    waits = &[];
                 }
-                let (src_slot, ref_slot) = if d == 0 { (0, 1) } else { (1, 0) };
-                let mems = SearchMems {
-                    src: infos[src_slot].0,
-                    reference: infos[ref_slot].0,
-                    q: b.q,
-                    q2: b.q2,
-                    pred: b.pred,
-                    rev: b.rev,
-                    res: b.res,
-                    aux: b.aux,
-                    cen: b.cen,
-                    out: b.out,
-                    dirty: b.dirty,
-                };
-                unsafe { self.chain_search(lp, &mems, waits)? };
-                waits = &[];
             }
+            let mems = SearchMems {
+                src: infos[0].0,
+                reference: infos[1].0,
+                q: b.q,
+                q2: b.q2,
+                pred: b.pred,
+                rev: b.rev,
+                res: b.res,
+                aux: b.aux,
+                cen: b.cen,
+                out: b.out,
+                dirty: b.dirty,
+                dirs,
+                strides: [
+                    0,
+                    (b.slabs.q / 4) as i32,
+                    (b.slabs.pred / 8) as i32,
+                    (b.slabs.rev / 8) as i32,
+                    (b.slabs.out / 16) as i32,
+                    b.slabs.dirty as i32,
+                    0,
+                    0,
+                ],
+            };
+            unsafe { self.chain_search(lp, &mems)? };
         }
-        let mut tickets = Vec::new();
         let blocks = plan.output_blocks();
-        for d in 0..dirs {
-            let out0 = lb(0, d).out;
-            let (words, _) = unsafe { self.cbuf(WORDS + d, blocks * 8)? };
-            match &plan.refine {
-                None => unsafe {
-                    self.launch(
-                        "packout",
-                        &[Arg::Mem(out0), Arg::Mem(words), Arg::Int(blocks as i32)],
-                        blocks,
-                        Some(64),
-                        &[],
-                    )?;
-                },
-                Some(refine) => {
+        let words_slab = slab(blocks * 8);
+        let (words, _) = unsafe { self.cbuf(WORDS, words_slab * dirs)? };
+        let out0 = bufs[0];
+        let mut st = out0.slabs.stride();
+        st[4] = both;
+        st[5] = (words_slab / 8) as i32;
+        match &plan.refine {
+            None => unsafe {
+                self.launch(
+                    "packout",
+                    &[
+                        Arg::Mem(out0.out),
+                        Arg::Mem(words),
+                        Arg::Int(blocks as i32),
+                        Arg::V8(st),
+                    ],
+                    blocks * dirs,
+                    Some(64),
+                    &[],
+                )?;
+            },
+            Some(refine) => {
+                for d in 0..dirs {
                     let (src_slot, ref_slot) = if d == 0 { (0, 1) } else { (1, 0) };
+                    let offsets = (
+                        (d * out0.slabs.out / 16) as i32,
+                        (d * words_slab / 8) as i32,
+                    );
                     unsafe {
                         self.chain_refine(
                             refine,
-                            out0,
-                            words,
-                            infos[src_slot].0,
-                            infos[ref_slot].0,
-                            src_slot,
-                            ref_slot,
+                            (out0.out, words),
+                            offsets,
+                            (infos[src_slot].0, infos[ref_slot].0),
+                            (src_slot, ref_slot),
                         )?;
                     }
                 }
             }
+        }
+        let mut tickets = Vec::new();
+        for d in 0..dirs {
             let host = unsafe { self.gpu.pinned(&mut self.unit, PINNED + d, blocks * 8)? };
             let mut done: Handle = std::ptr::null_mut();
             if unsafe {
@@ -549,7 +605,7 @@ impl Session<'_, '_> {
                     queue,
                     words,
                     CL_FALSE,
-                    0,
+                    d * words_slab,
                     blocks * 8,
                     host.cast(),
                     0,
@@ -572,12 +628,7 @@ impl Session<'_, '_> {
         Some(tickets)
     }
 
-    unsafe fn chain_search(
-        &mut self,
-        lp: &LevelPlan,
-        mems: &SearchMems,
-        waits: &[Handle],
-    ) -> Option<()> {
+    unsafe fn chain_search(&mut self, lp: &LevelPlan, mems: &SearchMems) -> Option<()> {
         let variant = Variant {
             width: lp.width,
             height: lp.height,
@@ -610,7 +661,7 @@ impl Session<'_, '_> {
                 if lp.q[32] == 0 { SWEEPS } else { 0 },
                 (main_kernel, border_kernel, refine_kernel),
                 eight,
-                waits,
+                &[],
             )
         }
     }
@@ -618,12 +669,10 @@ impl Session<'_, '_> {
     unsafe fn chain_refine(
         &mut self,
         refine: &RefinePlan,
-        seed: Handle,
-        words: Handle,
-        src: [Handle; 3],
-        reference: [Handle; 3],
-        src_slot: usize,
-        ref_slot: usize,
+        (seed, words): (Handle, Handle),
+        (seed_off, words_off): (i32, i32),
+        (src, reference): ([Handle; 3], [Handle; 3]),
+        (src_slot, ref_slot): (usize, usize),
     ) -> Option<()> {
         let blocks = (refine.blk_x * refine.blk_y) as usize;
         let (flags, _) = unsafe { self.cbuf(SHARED + 3, blocks)? };
@@ -665,7 +714,7 @@ impl Session<'_, '_> {
                         r.frame.1,
                         r.pel,
                     ]),
-                    Arg::V4([r.norm_area, 0, 0, 0]),
+                    Arg::V4([r.norm_area, seed_off, 0, 0]),
                 ],
                 blocks,
                 Some(64),
@@ -773,7 +822,9 @@ impl Session<'_, '_> {
             words,
             ovr,
         ];
-        let args: Vec<Arg> = mems.into_iter().map(Arg::Mem).collect();
+        let mut args: Vec<Arg> = mems.into_iter().map(Arg::Mem).collect();
+        args.push(Arg::Int(seed_off));
+        args.push(Arg::Int(words_off));
         if !unsafe { set_args(&self.gpu.cl, kernel, &args) } {
             return None;
         }

@@ -203,6 +203,8 @@ struct SearchMems {
     cen: Handle,
     out: Handle,
     dirty: [Handle; 2],
+    dirs: usize,
+    strides: [i32; 8],
 }
 
 #[derive(Default)]
@@ -1367,16 +1369,20 @@ impl Session<'_, '_> {
                     (&raw const *mem).cast(),
                 ) == CL_SUCCESS
             });
+            let groups = count.div_ceil(per * (local / 32));
+            let mut mdir = m.strides;
+            mdir[0] = if m.dirs > 1 { groups as i32 } else { i32::MAX };
             set = set
                 && unsafe {
                     (cl.SetKernelArg)(kernel, 15, size_of::<Handle>(), (&raw const dout).cast())
                         == CL_SUCCESS
                         && (cl.SetKernelArg)(kernel, 16, 4, (&raw const pass).cast()) == CL_SUCCESS
+                        && (cl.SetKernelArg)(kernel, 17, 32, mdir.as_ptr().cast()) == CL_SUCCESS
                 };
             if !set {
                 return None;
             }
-            let global = count.div_ceil(per * (local / 32)) * local;
+            let global = groups * m.dirs * local;
             let waits: &[Handle] = if index == 0 { events } else { &[] };
             if unsafe {
                 (cl.EnqueueNDRangeKernel)(
@@ -1470,6 +1476,8 @@ impl Session<'_, '_> {
             cen,
             out,
             dirty,
+            dirs: 1,
+            strides: [0; 8],
         };
         let queue = self.unit.queue as Handle;
         let mut done: Handle = std::ptr::null_mut();
@@ -1686,7 +1694,15 @@ __kernel __attribute__((reqd_work_group_size(64, 1, 1)))
 void recalc(__global const uchar *sy, __global const uchar *su, __global const uchar *sv,
             __global const uchar *ry, __global const uchar *ru, __global const uchar *rv,
             __global const long *p, __global const SEEDT *seed, __global uint2 *out,
-            __global const OVT *overrides) {
+            __global const OVT *overrides
+#ifdef DEV
+            , int seed_off, int out_off
+#endif
+            ) {
+#ifdef DEV
+    seed += seed_off;
+    out += out_off;
+#endif
     long block = get_global_id(0);
     if (block >= p[17]) return;
     int fw = (int)p[18], fh = (int)p[19], blk_x = (int)p[20], step_x = (int)p[21], step_y = (int)p[22];

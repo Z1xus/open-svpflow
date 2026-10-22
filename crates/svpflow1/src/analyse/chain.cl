@@ -45,9 +45,9 @@ __kernel void reduce(__global const uchar *s0, __global const uchar *s1, __globa
 inline int comp(int4 v, int c) { return c ? HI(v.x) : LO(v.x); }
 
 __kernel __attribute__((reqd_work_group_size(256, 1, 1)))
-void gest(__global const int4 *v0, __global const int4 *v1, __global int *hist, __global int *res, int n) {
+void gest(__global const int4 *vs, int vstride, __global int *hist, __global int *res, int n) {
     const int lid = (int)get_local_id(0), dir = (int)get_group_id(0);
-    __global const int4 *v = dir ? v1 : v0;
+    __global const int4 *v = vs + dir * vstride;
     __global int *h = hist + dir * FREQ;
     __local int low, high, sumx, sumy, cnt, med[2];
     __local int bc[256], bi[256];
@@ -104,8 +104,10 @@ void gest(__global const int4 *v0, __global const int4 *v1, __global int *hist, 
     }
 }
 
-__kernel void gfin(__global const int *res, __global int *qf, __global int *qf2, __global int *qb,
-                   __global int *qb2, int pel, int both) {
+__kernel void gfin(__global const int *res, __global int *qf, __global int *qf2, int qstride, int pel,
+                   int both) {
+    __global int *qb = qf + qstride;
+    __global int *qb2 = qf2 + qstride;
     int fx = res[0], fy = res[1];
     if (both) {
         int bx = res[2], by = res[3];
@@ -142,10 +144,15 @@ inline int conv_sad(int sad, int flat, int norm_area, uint limit) {
     return ((int)((uint)sad * (16u * (uint)norm_area)) / norm_area) >> 4;
 }
 
-__kernel void pred1(__global const int4 *cout, __global int2 *pred, __global int *minsad, int8 g, int4 h) {
-    int idx = (int)get_global_id(0);
+__kernel void pred1(__global const int4 *cout, __global int2 *pred, __global int *minsad, int8 g, int4 h,
+                    int8 st) {
+    int gid = (int)get_global_id(0);
     int nx = PG_NX, ny = PG_NY, cx = PG_CX, cy = PG_CY;
-    if (idx >= nx * ny) return;
+    int d = gid / (nx * ny), idx = gid % (nx * ny);
+    if (d > st.s4) return;
+    cout += d * st.s0;
+    pred += d * st.s1;
+    minsad += d * st.s2;
     int i = idx % nx, j = idx / nx;
     int norm = h.y;
     if (i >= 2 * cx || j >= 2 * cy) {
@@ -169,10 +176,15 @@ __kernel void pred1(__global const int4 *cout, __global int2 *pred, __global int
     if (sad >= 0) atomic_min(&minsad[rby * nx + rbx], sad);
 }
 
-__kernel void pred2(__global const int2 *pred, __global const int *minsad, __global int *minidx, int8 g) {
-    int idx = (int)get_global_id(0);
+__kernel void pred2(__global const int2 *pred, __global const int *minsad, __global int *minidx, int8 g,
+                    int8 st) {
+    int gid = (int)get_global_id(0);
     int nx = PG_NX, ny = PG_NY, cx = PG_CX, cy = PG_CY;
-    if (idx >= nx * ny) return;
+    int d = gid / (nx * ny), idx = gid % (nx * ny);
+    if (d > st.s4) return;
+    pred += d * st.s1;
+    minsad += d * st.s2;
+    minidx += d * st.s2;
     int i = idx % nx, j = idx / nx;
     if (i >= 2 * cx || j >= 2 * cy) return;
     int2 p = pred[idx];
@@ -185,9 +197,15 @@ __kernel void pred2(__global const int2 *pred, __global const int *minsad, __glo
     if (sad == minsad[t]) atomic_min(&minidx[t], idx);
 }
 
-__kernel void pred3(__global const int2 *pred, __global int *minsad, __global int *minidx, __global int2 *rev, int nb) {
-    int i = (int)get_global_id(0);
-    if (i >= nb) return;
+__kernel void pred3(__global const int2 *pred, __global int *minsad, __global int *minidx, __global int2 *rev,
+                    int nb, int8 st) {
+    int gid = (int)get_global_id(0);
+    int d = gid / nb, i = gid % nb;
+    if (d > st.s4) return;
+    pred += d * st.s1;
+    minsad += d * st.s2;
+    minidx += d * st.s2;
+    rev += (st.s4 ? 1 - d : d) * st.s3;
     int m = minidx[i];
     if (m == IMAX) {
         rev[i] = (int2)(0, -1);
@@ -199,17 +217,22 @@ __kernel void pred3(__global const int2 *pred, __global int *minsad, __global in
     minidx[i] = IMAX;
 }
 
-__kernel void pinit(__global int *minsad, __global int *minidx, int nb) {
-    int i = (int)get_global_id(0);
-    if (i >= nb) return;
+__kernel void pinit(__global int *minsad, __global int *minidx, int nb, int stride, int dirs) {
+    int gid = (int)get_global_id(0);
+    int d = gid / nb, i = gid % nb;
+    if (d >= dirs) return;
+    minsad += d * stride;
+    minidx += d * stride;
     minsad[i] = IMAX;
     minidx[i] = IMAX;
 }
 
-__kernel void rank_serp(__global int2 *rev, int nb, int nx, int ny) {
+__kernel void rank_serp(__global int2 *rev, int nb, int nx, int ny, int8 st) {
+    int gid = (int)get_global_id(0);
+    int d = gid / nb, i = gid % nb;
+    if (d > st.s4) return;
+    rev += d * st.s3;
     __global int *rank = (__global int *)(rev + nb);
-    int i = (int)get_global_id(0);
-    if (i >= nx * ny) return;
     int bx = i % nx, by = i / nx;
     if (nx < 2 || ny < 2) {
         rank[i] = i;
@@ -264,7 +287,11 @@ inline int child_entries(int cxi, int cyi, int cx, int cy, int nx, int ny, int2 
 #define SR_MAX 8192
 
 __kernel __attribute__((reqd_work_group_size(SR_WG, 1, 1)))
-void srank(__global const int4 *cout, __global int2 *rev, __global int *scratch, int8 g, int4 h) {
+void srank(__global const int4 *cout, __global int2 *rev, __global int *scratch, int8 g, int4 h, int8 st) {
+    const int dir = (int)get_group_id(0);
+    cout += dir * st.s0;
+    rev += dir * st.s3;
+    scratch += dir * 2 * SR_MAX;
     __global int *rank = (__global int *)(rev + PG_NX * PG_NY);
     __local int bk[SR_MAX];
     __local int scan[SR_WG];
@@ -326,9 +353,12 @@ void srank(__global const int4 *cout, __global int2 *rev, __global int *scratch,
     }
 }
 
-__kernel void packout(__global const int4 *out, __global int2 *words, int nb) {
-    int i = (int)get_global_id(0);
-    if (i >= nb) return;
+__kernel void packout(__global const int4 *out, __global int2 *words, int nb, int8 st) {
+    int gid = (int)get_global_id(0);
+    int d = gid / nb, i = gid % nb;
+    if (d > st.s4) return;
+    out += d * st.s0;
+    words += d * st.s5;
     int4 o = out[i];
     words[i] = (int2)(o.z, o.w);
 }
@@ -384,6 +414,7 @@ inline void ovr_neighbours(__global const int4 *c, int cx, int cy, int k_x, int 
 
 __kernel void ovf(__global const int4 *c, __global uchar *flags, __global int *ovr, __global int *counter,
                   int8 a, int8 b, int4 d) {
+    c += d.y;
     int blk = (int)get_global_id(0);
     int nx = a.s0, ny = a.s1, step_x = a.s2, step_y = a.s3, cx = a.s4, cy = a.s5, flat = a.s6, norm = a.s7;
     int odd_x = b.s0, even_x = b.s1, odd_y = b.s2, even_y = b.s3, bad_sad = b.s4, fw = b.s5, fh = b.s6, pel = b.s7;

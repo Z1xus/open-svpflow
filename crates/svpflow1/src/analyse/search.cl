@@ -145,6 +145,26 @@ inline int wmin(int v, __local uint *s) {
 }
 #endif
 #define WGS (32 * BPW)
+#define MDIR_SETUP \
+    const int mgid = (int)get_group_id(0); \
+    const int mdv = mgid >= mdir.s0; \
+    const int GID = mdv ? mgid - mdir.s0 : mgid; \
+    __global const uchar *sY = mdv ? rY_ : sY_; \
+    __global const uchar *sU = mdv ? rU_ : sU_; \
+    __global const uchar *sV = mdv ? rV_ : sV_; \
+    __global const uchar *rY = mdv ? sY_ : rY_; \
+    __global const uchar *rU = mdv ? sU_ : rU_; \
+    __global const uchar *rV = mdv ? sV_ : rV_; \
+    __constant int *q = q_ + (mdv ? mdir.s1 : 0); \
+    __global const int2 *pred = pred_ + (mdv ? mdir.s2 : 0); \
+    __global const int2 *rev = rev_ + (mdv ? mdir.s3 : 0); \
+    __global const int4 *rin = rin_ + (mdv ? mdir.s4 : 0); \
+    __global int4 *rout = rout_ + (mdv ? mdir.s4 : 0); \
+    __global int4 *cen = cen_ + (mdv ? mdir.s4 : 0); \
+    __global int4 *aux = aux_ + (mdv ? mdir.s4 : 0); \
+    __global int4 *out = out_ + (mdv ? mdir.s4 : 0); \
+    __global const uchar *din = din_ + (mdv ? mdir.s5 : 0); \
+    __global uchar *dout = dout_ + (mdv ? mdir.s5 : 0);
 inline int wsum(int v, __local uint *s) { return (int)radd((uint)v, s); }
 
 #define LW (W / 4)
@@ -795,12 +815,13 @@ inline void finish_batch(const Batch *B, uint s0, uint s1, uint scw, uint rh, __
 
 #if DONTV == 1 && defined(LANEG)
 __kernel __attribute__((reqd_work_group_size(WGS, 1, 1)))
-void search(__global const uchar *sY, __global const uchar *sU, __global const uchar *sV,
-            __global const uchar *rY, __global const uchar *rU, __global const uchar *rV,
-            __constant int *q, __global const int2 *pred, __global const int2 *rev,
-            __global const int4 *rin, __global int4 *rout,
-            __global int4 *cen, __global int4 *aux, __global int4 *out,
-            __global const uchar *din, __global uchar *dout, int pass) {
+void search(__global const uchar *sY_, __global const uchar *sU_, __global const uchar *sV_,
+            __global const uchar *rY_, __global const uchar *rU_, __global const uchar *rV_,
+            __constant int *q_, __global const int2 *pred_, __global const int2 *rev_,
+            __global const int4 *rin_, __global int4 *rout_,
+            __global int4 *cen_, __global int4 *aux_, __global int4 *out_,
+            __global const uchar *din_, __global uchar *dout_, int pass, int8 mdir) {
+    MDIR_SETUP
     const int lid = get_local_id(0), l = lid & 31, sub = lid >> 5;
     __local uint scr_[BPW][32];
     __local uint *scr = scr_[sub];
@@ -808,7 +829,7 @@ void search(__global const uchar *sY, __global const uchar *sU, __global const u
     const int bxn = q[P_BLKX], byn = q[P_BLKY], nb = bxn * byn;
     const int border = BORDERV;
     const int nbt = border ? bxn + 1 + byn : nb;
-    const int bq = (int)(get_group_id(0) * BPW + sub) * 4 + (int)gg;
+    const int bq = (int)(GID * BPW + sub) * 4 + (int)gg;
     const bool act = bq < nbt;
     const int b = act ? bq : 0;
     int bi, bj, x0, y0, pidx;
@@ -857,12 +878,13 @@ void search(__global const uchar *sY, __global const uchar *sU, __global const u
 }
 #elif defined(LANEG)
 __kernel __attribute__((reqd_work_group_size(WGS, 1, 1)))
-void search(__global const uchar *sY, __global const uchar *sU, __global const uchar *sV,
-            __global const uchar *rY, __global const uchar *rU, __global const uchar *rV,
-            __constant int *q, __global const int2 *pred, __global const int2 *rev,
-            __global const int4 *rin, __global int4 *rout,
-            __global int4 *cen, __global int4 *aux, __global int4 *out,
-            __global const uchar *din, __global uchar *dout, int pass) {
+void search(__global const uchar *sY_, __global const uchar *sU_, __global const uchar *sV_,
+            __global const uchar *rY_, __global const uchar *rU_, __global const uchar *rV_,
+            __constant int *q_, __global const int2 *pred_, __global const int2 *rev_,
+            __global const int4 *rin_, __global int4 *rout_,
+            __global int4 *cen_, __global int4 *aux_, __global int4 *out_,
+            __global const uchar *din_, __global uchar *dout_, int pass, int8 mdir) {
+    MDIR_SETUP
     const int lid = get_local_id(0), l = lid & 31, sub = lid >> 5;
     __local uint scr_[BPW][32];
     __local uint ssg_[BPW][4][24];
@@ -876,7 +898,7 @@ void search(__global const uchar *sY, __global const uchar *sU, __global const u
     const int bxn = q[P_BLKX], byn = q[P_BLKY], nb = bxn * byn;
     const int border = BORDERV;
     const int nbt = border ? bxn + 1 + byn : nb;
-    const int bq = (int)(get_group_id(0) * BPW + sub) * 4 + (int)gg;
+    const int bq = (int)(GID * BPW + sub) * 4 + (int)gg;
     const bool act = bq < nbt;
     const int b = act ? bq : 0;
     int bi, bj, x0, y0, pidx;
@@ -1172,12 +1194,13 @@ void search(__global const uchar *sY, __global const uchar *sU, __global const u
 }
 #else
 __kernel __attribute__((reqd_work_group_size(WGS, 1, 1)))
-void search(__global const uchar *sY, __global const uchar *sU, __global const uchar *sV,
-            __global const uchar *rY, __global const uchar *rU, __global const uchar *rV,
-            __constant int *q, __global const int2 *pred, __global const int2 *rev,
-            __global const int4 *rin, __global int4 *rout,
-            __global int4 *cen, __global int4 *aux, __global int4 *out,
-            __global const uchar *din, __global uchar *dout, int pass) {
+void search(__global const uchar *sY_, __global const uchar *sU_, __global const uchar *sV_,
+            __global const uchar *rY_, __global const uchar *rU_, __global const uchar *rV_,
+            __constant int *q_, __global const int2 *pred_, __global const int2 *rev_,
+            __global const int4 *rin_, __global int4 *rout_,
+            __global int4 *cen_, __global int4 *aux_, __global int4 *out_,
+            __global const uchar *din_, __global uchar *dout_, int pass, int8 mdir) {
+    MDIR_SETUP
     const int lid = get_local_id(0), l = lid & 31, sub = lid >> 5;
     __local uint scr_[BPW][32];
     __local uint ss_[BPW][SSW] __attribute__((aligned(16)));
@@ -1196,7 +1219,7 @@ void search(__global const uchar *sY, __global const uchar *sU, __global const u
     __global const int *rk = (__global const int *)(rev + nb);
     const int border = BORDERV;
     const int nbt = border ? bxn + 1 + byn : nb;
-    const int b = get_group_id(0) * BPW + sub;
+    const int b = GID * BPW + sub;
     if (b >= nbt) return;
     int bi, bj, x0, y0, pidx;
     if (!border) {
@@ -1822,12 +1845,13 @@ void search(__global const uchar *sY, __global const uchar *sU, __global const u
 
 #if defined(LANEG) && DONTV == 0
 __kernel __attribute__((reqd_work_group_size(WGS, 1, 1)))
-void refine(__global const uchar *sY, __global const uchar *sU, __global const uchar *sV,
-            __global const uchar *rY, __global const uchar *rU, __global const uchar *rV,
-            __constant int *q, __global const int2 *pred, __global const int2 *rev,
-            __global const int4 *rin, __global int4 *rout,
-            __global int4 *cen, __global int4 *aux, __global int4 *out,
-            __global const uchar *din, __global uchar *dout, int pass) {
+void refine(__global const uchar *sY_, __global const uchar *sU_, __global const uchar *sV_,
+            __global const uchar *rY_, __global const uchar *rU_, __global const uchar *rV_,
+            __constant int *q_, __global const int2 *pred_, __global const int2 *rev_,
+            __global const int4 *rin_, __global int4 *rout_,
+            __global int4 *cen_, __global int4 *aux_, __global int4 *out_,
+            __global const uchar *din_, __global uchar *dout_, int pass, int8 mdir) {
+    MDIR_SETUP
     const int lid = get_local_id(0), l = lid & 31, sub = lid >> 5;
     __local uint scr_[BPW][32];
     __local int svk_[BPW][NSMAX];
@@ -1837,7 +1861,7 @@ void refine(__global const uchar *sY, __global const uchar *sU, __global const u
     __local int *svm = svm_[sub];
     const uint gr = l & 7u, gg = l >> 3, gs = gg * 8u, gm = 0xFFu << gs;
     const int bxn = q[P_BLKX], byn = q[P_BLKY], nb = bxn * byn;
-    const int bq = (int)(get_group_id(0) * BPW + sub) * 4 + (int)gg;
+    const int bq = (int)(GID * BPW + sub) * 4 + (int)gg;
     const bool act = bq < nb;
     const int b = act ? bq : 0;
     const int bi = b % bxn, bj = b / bxn;
