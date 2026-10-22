@@ -12,6 +12,7 @@ const FREQ: usize = 16384;
 const SORT_SCRATCH: usize = 2 * crate::analyse::chain::RANK_BLOCKS as usize;
 const BASE: usize = 64;
 const ROLES: usize = 16;
+const SCRATCH: usize = 512;
 const SHARED: usize = 40;
 const WORDS: usize = 48;
 const PINNED: usize = 32;
@@ -24,7 +25,7 @@ const RES0: usize = 4;
 const RES1: usize = 5;
 const AUX: usize = 6;
 const CEN: usize = 7;
-const OUT: usize = 8;
+const OUT: usize = 13;
 const D0: usize = 9;
 const D1: usize = 10;
 const MINSAD: usize = 11;
@@ -89,6 +90,14 @@ impl Slabs {
             0,
         ]
     }
+}
+
+struct Shared {
+    pred: usize,
+    res: usize,
+    dirty: usize,
+    min: usize,
+    out: [usize; 2],
 }
 
 #[derive(Clone, Copy)]
@@ -257,28 +266,42 @@ impl Session<'_, '_> {
         true
     }
 
-    unsafe fn level_bufs(&mut self, lp: &LevelPlan, dirs: usize) -> Option<(Lb, bool)> {
-        let slabs = Slabs::new(lp);
+    unsafe fn level_bufs(
+        &mut self,
+        lp: &LevelPlan,
+        slabs: Slabs,
+        shared: &Shared,
+        dirs: usize,
+    ) -> Option<Lb> {
         let at = |role: usize| BASE + lp.level as usize * ROLES + role;
-        let get = |this: &mut Self, role: usize, per: usize| unsafe {
-            this.cbuf(at(role), per * dirs).map(|b| b.0)
+        let get = |this: &mut Self, index: usize, size: usize| unsafe {
+            this.cbuf(index, size).map(|b| b.0)
         };
-        let fresh = unsafe { self.cbuf(at(MINSAD), slabs.min * dirs)?.1 };
-        let lb = Lb {
-            q: get(self, Q, slabs.q)?,
-            q2: get(self, Q2, slabs.q)?,
-            pred: get(self, PRED, slabs.pred)?,
-            rev: get(self, REV, slabs.rev)?,
-            res: [get(self, RES0, slabs.out)?, get(self, RES1, slabs.out)?],
-            aux: get(self, AUX, slabs.out)?,
-            cen: get(self, CEN, slabs.out)?,
-            out: get(self, OUT, slabs.out)?,
-            dirty: [get(self, D0, slabs.dirty)?, get(self, D1, slabs.dirty)?],
-            minsad: get(self, MINSAD, slabs.min)?,
-            minidx: get(self, MINIDX, slabs.min)?,
+        let scratch = |role: usize| SCRATCH + role;
+        Some(Lb {
+            q: get(self, at(Q), slabs.q * dirs)?,
+            q2: get(self, at(Q2), slabs.q * dirs)?,
+            pred: get(self, scratch(PRED), shared.pred)?,
+            rev: get(self, at(REV), slabs.rev * dirs)?,
+            res: [
+                get(self, scratch(RES0), shared.res)?,
+                get(self, scratch(RES1), shared.res)?,
+            ],
+            aux: get(self, scratch(AUX), shared.res)?,
+            cen: get(self, scratch(CEN), shared.res)?,
+            out: get(
+                self,
+                scratch(OUT + lp.level as usize % 2),
+                shared.out[lp.level as usize % 2],
+            )?,
+            dirty: [
+                get(self, scratch(D0), shared.dirty)?,
+                get(self, scratch(D1), shared.dirty)?,
+            ],
+            minsad: get(self, scratch(MINSAD), shared.min)?,
+            minidx: get(self, scratch(MINIDX), shared.min)?,
             slabs,
-        };
-        Some((lb, fresh))
+        })
     }
 
     pub(crate) fn chain(
@@ -319,28 +342,46 @@ impl Session<'_, '_> {
             .collect();
         let queue = self.unit.queue as Handle;
         let stale = std::mem::replace(&mut self.unit.chain_stale, true);
+        let all: Vec<Slabs> = plan.levels.iter().map(Slabs::new).collect();
+        let most = |size: fn(&Slabs) -> usize| all.iter().map(size).max().unwrap_or(0) * dirs;
+        let parity = |p: usize| {
+            all.iter()
+                .skip(p)
+                .step_by(2)
+                .map(|s| s.out)
+                .max()
+                .unwrap_or(0)
+                * dirs
+        };
+        let shared = Shared {
+            pred: most(|s| s.pred),
+            res: most(|s| s.out),
+            dirty: most(|s| s.dirty),
+            min: most(|s| s.min),
+            out: [parity(0), parity(1)],
+        };
+        let fresh = unsafe { self.cbuf(SCRATCH + MINSAD, shared.min)?.1 };
         let mut bufs: Vec<Lb> = Vec::new();
-        for lp in &plan.levels {
-            let (b, fresh) = unsafe { self.level_bufs(lp, dirs)? };
-            if fresh || stale {
-                let nb = lp.blk_x * lp.blk_y;
-                unsafe {
-                    self.launch(
-                        "pinit",
-                        &[
-                            Arg::Mem(b.minsad),
-                            Arg::Mem(b.minidx),
-                            Arg::Int(nb),
-                            Arg::Int((b.slabs.min / 4) as i32),
-                            Arg::Int(dirs as i32),
-                        ],
-                        nb as usize * dirs,
-                        Some(64),
-                        &[],
-                    )?;
-                }
+        for (lp, slabs) in plan.levels.iter().zip(&all) {
+            bufs.push(unsafe { self.level_bufs(lp, *slabs, &shared, dirs)? });
+        }
+        if fresh || stale {
+            let (lp, b) = (&plan.levels[0], bufs[0]);
+            unsafe {
+                self.launch(
+                    "pinit",
+                    &[
+                        Arg::Mem(b.minsad),
+                        Arg::Mem(b.minidx),
+                        Arg::Int(lp.blk_x * lp.blk_y),
+                        Arg::Int((b.slabs.min / 4) as i32),
+                        Arg::Int(dirs as i32),
+                    ],
+                    (lp.blk_x * lp.blk_y) as usize * dirs,
+                    Some(64),
+                    &[],
+                )?;
             }
-            bufs.push(b);
         }
         for (level, lp) in plan.levels.iter().enumerate() {
             let b = bufs[level];
