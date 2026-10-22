@@ -1,7 +1,7 @@
 use super::{
-    Arg, CL_DEVICE_LOCAL_MEM_SIZE, CL_DEVICE_MAX_WORK_GROUP_SIZE, CL_FALSE, CL_SUCCESS, CL_TRUE,
-    Frame, Handle, RefineGpu, SWEEPS, SearchMems, Session, Uploaded, Variant, bytes,
-    compact_params, recalc_args,
+    Arg, Buffer, CHAIN_PIN, CL_DEVICE_LOCAL_MEM_SIZE, CL_DEVICE_MAX_WORK_GROUP_SIZE, CL_FALSE,
+    CL_SUCCESS, CL_TRUE, Frame, Handle, RefineGpu, SWEEPS, SearchMems, Session, Uploaded, Variant,
+    bytes, compact_params, recalc_args,
 };
 use crate::analyse::chain::{ChainPlan, LevelPlan, Pyramid, RANK_BLOCKS, RefinePlan};
 use std::ptr::null_mut;
@@ -12,27 +12,6 @@ const FREQ: usize = 16384;
 const SORT_SCRATCH: usize = 2 * RANK_BLOCKS as usize;
 const SORT_GROUP: usize = 1024;
 const SORT_LOCAL_BYTES: usize = 4 * (RANK_BLOCKS as usize + SORT_GROUP + 2);
-const BASE: usize = 64;
-const ROLES: usize = 16;
-const SCRATCH: usize = 512;
-const SHARED: usize = 40;
-const WORDS: usize = 48;
-const PINNED: usize = 32;
-
-const Q: usize = 0;
-const Q2: usize = 1;
-const PRED: usize = 2;
-const REV: usize = 3;
-const RES0: usize = 4;
-const RES1: usize = 5;
-const AUX: usize = 6;
-const CEN: usize = 7;
-const OUT: usize = 13;
-const D0: usize = 9;
-const D1: usize = 10;
-const MINSAD: usize = 11;
-const MINIDX: usize = 12;
-
 fn slab(bytes: usize) -> usize {
     bytes.next_multiple_of(256)
 }
@@ -83,8 +62,36 @@ struct Shared {
     out: [usize; 2],
 }
 
+#[derive(Default)]
+struct LevelBuffers {
+    q: Buffer,
+    q2: Buffer,
+    rev: Buffer,
+}
+
+#[derive(Default)]
+pub(super) struct ChainBuffers {
+    levels: Vec<LevelBuffers>,
+    pred: Buffer,
+    res: [Buffer; 2],
+    aux: Buffer,
+    cen: Buffer,
+    out: [Buffer; 2],
+    dirty: [Buffer; 2],
+    minsad: Buffer,
+    minidx: Buffer,
+    hist: Buffer,
+    gest: Buffer,
+    sort: Buffer,
+    flags: Buffer,
+    overrides: Buffer,
+    counter: Buffer,
+    params: Buffer,
+    words: Buffer,
+}
+
 #[derive(Clone, Copy)]
-struct Lb {
+struct LevelMems {
     q: Handle,
     q2: Handle,
     pred: Handle,
@@ -119,10 +126,15 @@ impl RefineGpu {
 }
 
 impl Session<'_, '_> {
-    unsafe fn cbuf(&mut self, index: usize, size: usize) -> Option<(Handle, bool)> {
-        let before = self.unit.buffers.get(index).map_or(0, |b| b.capacity);
-        let mem = unsafe { self.gpu.buffer(&mut self.unit, index, size.max(16))? };
-        Some((mem, before < size.max(16)))
+    unsafe fn chain_buf(
+        &mut self,
+        buffer: impl FnOnce(&mut ChainBuffers) -> &mut Buffer,
+        size: usize,
+    ) -> Option<(Handle, bool)> {
+        let buffer = buffer(&mut self.unit.chain);
+        let fresh = buffer.capacity < size.max(16);
+        let mem = unsafe { self.gpu.buffer(buffer, size.max(16))? };
+        Some((mem, fresh))
     }
 
     pub(super) unsafe fn build_levels(&mut self, up: &mut Uploaded, pyramid: Pyramid) -> bool {
@@ -200,35 +212,38 @@ impl Session<'_, '_> {
         slabs: Slabs,
         shared: &Shared,
         dirs: usize,
-    ) -> Option<Lb> {
-        let at = |role: usize| BASE + lp.level as usize * ROLES + role;
-        let get = |this: &mut Self, index: usize, size: usize| unsafe {
-            this.cbuf(index, size).map(|b| b.0)
-        };
-        let scratch = |role: usize| SCRATCH + role;
-        Some(Lb {
-            q: get(self, at(Q), slabs.q * dirs)?,
-            q2: get(self, at(Q2), slabs.q * dirs)?,
-            pred: get(self, scratch(PRED), shared.pred)?,
-            rev: get(self, at(REV), slabs.rev * dirs)?,
-            res: [
-                get(self, scratch(RES0), shared.res)?,
-                get(self, scratch(RES1), shared.res)?,
-            ],
-            aux: get(self, scratch(AUX), shared.res)?,
-            cen: get(self, scratch(CEN), shared.res)?,
-            out: get(
-                self,
-                scratch(OUT + lp.level as usize % 2),
-                shared.out[lp.level as usize % 2],
-            )?,
-            dirty: [
-                get(self, scratch(D0), shared.dirty)?,
-                get(self, scratch(D1), shared.dirty)?,
-            ],
-            minsad: get(self, scratch(MINSAD), shared.min)?,
-            minidx: get(self, scratch(MINIDX), shared.min)?,
-            slabs,
+    ) -> Option<LevelMems> {
+        let level = lp.level as usize;
+        let parity = level % 2;
+        Some(unsafe {
+            LevelMems {
+                q: self
+                    .chain_buf(|c| &mut c.levels[level].q, slabs.q * dirs)?
+                    .0,
+                q2: self
+                    .chain_buf(|c| &mut c.levels[level].q2, slabs.q * dirs)?
+                    .0,
+                pred: self.chain_buf(|c| &mut c.pred, shared.pred)?.0,
+                rev: self
+                    .chain_buf(|c| &mut c.levels[level].rev, slabs.rev * dirs)?
+                    .0,
+                res: [
+                    self.chain_buf(|c| &mut c.res[0], shared.res)?.0,
+                    self.chain_buf(|c| &mut c.res[1], shared.res)?.0,
+                ],
+                aux: self.chain_buf(|c| &mut c.aux, shared.res)?.0,
+                cen: self.chain_buf(|c| &mut c.cen, shared.res)?.0,
+                out: self
+                    .chain_buf(|c| &mut c.out[parity], shared.out[parity])?
+                    .0,
+                dirty: [
+                    self.chain_buf(|c| &mut c.dirty[0], shared.dirty)?.0,
+                    self.chain_buf(|c| &mut c.dirty[1], shared.dirty)?.0,
+                ],
+                minsad: self.chain_buf(|c| &mut c.minsad, shared.min)?.0,
+                minidx: self.chain_buf(|c| &mut c.minidx, shared.min)?.0,
+                slabs,
+            }
         })
     }
 
@@ -244,12 +259,12 @@ impl Session<'_, '_> {
         let mut infos = Vec::new();
         for slot in 0..2 {
             let frame = self.frames[slot].as_ref()?;
-            let state = frame.0.state.lock().ok()?;
+            let state = frame.entry.state.lock().ok()?;
             let up = state.as_ref()?;
             if up.pyramid != Some(plan.pyramid) {
                 return None;
             }
-            infos.push((frame.1.map(|m| m as Handle), up.coarse));
+            infos.push((frame.mems.map(|m| m as Handle), up.coarse));
         }
         if infos[0].1 != infos[1].1 || infos[0].1[1] != infos[0].1[2] {
             return None;
@@ -275,11 +290,17 @@ impl Session<'_, '_> {
             min: most(|s| s.min),
             out: [parity(0), parity(1)],
         };
-        let mut bufs: Vec<Lb> = Vec::new();
+        if self.unit.chain.levels.len() < plan.levels.len() {
+            self.unit
+                .chain
+                .levels
+                .resize_with(plan.levels.len(), LevelBuffers::default);
+        }
+        let mut bufs: Vec<LevelMems> = Vec::new();
         for (lp, slabs) in plan.levels.iter().zip(&all) {
             bufs.push(unsafe { self.level_bufs(lp, *slabs, &shared, dirs)? });
         }
-        let ready = &mut self.unit.buffers[SCRATCH + MINSAD].tag;
+        let ready = &mut self.unit.chain.minsad.tag;
         let need = shared.min / 4;
         if stale || (*ready as usize) < need {
             *ready = need as u64;
@@ -342,8 +363,8 @@ impl Session<'_, '_> {
             let nb = (lp.blk_x * lp.blk_y) as i32;
             let coarse = &plan.levels[level + 1];
             let cnb = (coarse.blk_x * coarse.blk_y) as i32;
-            let (hist, _) = unsafe { self.cbuf(SHARED, 2 * FREQ * 4)? };
-            let (res, _) = unsafe { self.cbuf(SHARED + 1, 16)? };
+            let (hist, _) = unsafe { self.chain_buf(|c| &mut c.hist, 2 * FREQ * 4)? };
+            let (res, _) = unsafe { self.chain_buf(|c| &mut c.gest, 16)? };
             unsafe {
                 self.launch(
                     (chain, c"gest"),
@@ -441,7 +462,8 @@ impl Session<'_, '_> {
             }
             if lp.rmax > 0 {
                 if lp.sorted {
-                    let (scratch, _) = unsafe { self.cbuf(SHARED + 2, SORT_SCRATCH * 4 * dirs)? };
+                    let (scratch, _) =
+                        unsafe { self.chain_buf(|c| &mut c.sort, SORT_SCRATCH * 4 * dirs)? };
                     let mut st_sort = st;
                     st_sort[0] = (c.slabs.out / 16) as i32;
                     unsafe {
@@ -470,13 +492,12 @@ impl Session<'_, '_> {
                             null_mut(),
                         )?;
                     }
-                    self.unit.buffers[BASE + level * ROLES + REV].tag = 0;
+                    self.unit.chain.levels[level].rev.tag = 0;
                 } else {
-                    let at = BASE + level * ROLES + REV;
                     let tag = (u64::from(lp.blk_x as u32) << 32)
                         | u64::from(lp.blk_y as u32)
                         | (dirs as u64) << 62;
-                    if self.unit.buffers[at].tag != tag {
+                    if self.unit.chain.levels[level].rev.tag != tag {
                         unsafe {
                             self.launch(
                                 (chain, c"rank_serp"),
@@ -493,7 +514,7 @@ impl Session<'_, '_> {
                                 null_mut(),
                             )?;
                         }
-                        self.unit.buffers[at].tag = tag;
+                        self.unit.chain.levels[level].rev.tag = tag;
                     }
                 }
             }
@@ -525,7 +546,7 @@ impl Session<'_, '_> {
         }
         let blocks = plan.output_blocks();
         let words_slab = slab(blocks * 8);
-        let (words, _) = unsafe { self.cbuf(WORDS, words_slab * dirs)? };
+        let (words, _) = unsafe { self.chain_buf(|c| &mut c.words, words_slab * dirs)? };
         let out0 = bufs[0];
         let mut st = out0.slabs.stride();
         st[4] = both;
@@ -568,7 +589,13 @@ impl Session<'_, '_> {
         }
         let mut tickets = Vec::new();
         for d in 0..dirs {
-            let host = unsafe { self.gpu.pinned(&mut self.unit, PINNED + d, blocks * 8)? };
+            let host = unsafe {
+                self.gpu.pinned(
+                    self.unit.queue,
+                    &mut self.unit.pinned[CHAIN_PIN + d],
+                    blocks * 8,
+                )?
+            };
             let mut done: Handle = std::ptr::null_mut();
             if unsafe {
                 (self.gpu.cl.EnqueueReadBuffer)(
@@ -591,7 +618,7 @@ impl Session<'_, '_> {
             } else {
                 unsafe { (self.gpu.cl.ReleaseEvent)(done) };
             }
-            self.tickets.push((PINNED + d, blocks));
+            self.tickets.push((CHAIN_PIN + d, blocks));
             tickets.push(self.tickets.len() - 1);
         }
         self.unit.chain_stale = false;
@@ -629,9 +656,9 @@ impl Session<'_, '_> {
     ) -> Option<()> {
         let chain = self.gpu.chain_program()?;
         let blocks = (refine.blk_x * refine.blk_y) as usize;
-        let (flags, _) = unsafe { self.cbuf(SHARED + 3, blocks)? };
-        let (ovr, _) = unsafe { self.cbuf(SHARED + 4, blocks * 4)? };
-        let (counter, fresh) = unsafe { self.cbuf(SHARED + 5, 4)? };
+        let (flags, _) = unsafe { self.chain_buf(|c| &mut c.flags, blocks)? };
+        let (ovr, _) = unsafe { self.chain_buf(|c| &mut c.overrides, blocks * 4)? };
+        let (counter, fresh) = unsafe { self.chain_buf(|c| &mut c.counter, 4)? };
         if fresh || stale {
             let zero = self.hold(&[0u8; 4]);
             if !unsafe { self.transfer(counter, zero, null_mut()) } {
@@ -691,8 +718,8 @@ impl Session<'_, '_> {
             )?;
         }
         let (source, target) = (
-            self.frames[src_slot].as_ref()?.2,
-            self.frames[ref_slot].as_ref()?.2,
+            self.frames[src_slot].as_ref()?.frame,
+            self.frames[ref_slot].as_ref()?.frame,
         );
         let program = self.gpu.program(Variant {
             shift: r.shift,
@@ -702,7 +729,7 @@ impl Session<'_, '_> {
         let mut geometry = r.geometry;
         geometry[11] = 1;
         let params = self.hold(bytes(&compact_params(&source, &target, blocks, geometry)));
-        let (params_mem, _) = unsafe { self.cbuf(SHARED + 6, params.len())? };
+        let (params_mem, _) = unsafe { self.chain_buf(|c| &mut c.params, params.len())? };
         if !unsafe { self.transfer(params_mem, params, null_mut()) } {
             return None;
         }
@@ -737,7 +764,7 @@ impl Session<'_, '_> {
     ) -> Option<std::sync::Arc<[Vec<u8>; 3]>> {
         self.flush();
         let frame = self.frames[slot].as_ref()?;
-        let mut state = frame.0.state.lock().ok()?;
+        let mut state = frame.entry.state.lock().ok()?;
         let up = state.as_mut()?;
         if up.pyramid != Some(plan.pyramid) {
             return None;

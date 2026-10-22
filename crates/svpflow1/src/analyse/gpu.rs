@@ -39,6 +39,7 @@ use super::field::{GpuSearchParams, Mv};
 
 #[path = "gpu_chain.rs"]
 mod chain;
+use chain::ChainBuffers;
 
 const CL_DEVICE_MAX_WORK_GROUP_SIZE: ClUint = 0x1004;
 const CL_DEVICE_LOCAL_MEM_SIZE: ClUint = 0x1023;
@@ -88,6 +89,15 @@ struct Buffer {
 
 type SearchKey = (Variant, usize, [i32; 5]);
 
+struct SearchLaunch {
+    count: usize,
+    res: [Handle; 2],
+    dirty: [Handle; 2],
+    pass: i32,
+    q: Handle,
+    kernel: (usize, &'static CStr),
+}
+
 struct SearchMems {
     src: [Handle; 3],
     reference: [Handle; 3],
@@ -104,12 +114,42 @@ struct SearchMems {
     strides: [i32; 8],
 }
 
+struct Kernel {
+    program: usize,
+    name: &'static CStr,
+    handle: usize,
+    local: usize,
+}
+
+#[derive(Default)]
+struct SearchBuffers {
+    q: Buffer,
+    q2: Buffer,
+    pred: Buffer,
+    rev: Buffer,
+    res: [Buffer; 2],
+    aux: Buffer,
+    cen: Buffer,
+    out: Buffer,
+    dirty: [Buffer; 2],
+}
+
+const RECALC_PIN: usize = 0;
+const SEARCH_PIN: usize = 2;
+const CHAIN_PIN: usize = 4;
+
 #[derive(Default)]
 struct Unit {
     queue: usize,
-    kernels: Vec<(usize, &'static CStr, usize, usize)>,
-    buffers: Vec<Buffer>,
+    kernels: Vec<Kernel>,
     chain_stale: bool,
+    params: [Buffer; 2],
+    input: Buffer,
+    output: Buffer,
+    overrides: Buffer,
+    search: [SearchBuffers; 2],
+    pinned: [Buffer; 6],
+    chain: ChainBuffers,
 }
 
 pub(crate) struct RefineGpu {
@@ -493,11 +533,7 @@ impl RefineGpu {
         (unit, permit)
     }
 
-    unsafe fn buffer(&self, unit: &mut Unit, index: usize, size: usize) -> Option<Handle> {
-        if unit.buffers.len() <= index {
-            unit.buffers.resize_with(index + 1, Buffer::default);
-        }
-        let buffer = &mut unit.buffers[index];
+    unsafe fn buffer(&self, buffer: &mut Buffer, size: usize) -> Option<Handle> {
         if buffer.capacity < size {
             if buffer.mem != 0 {
                 unsafe { (self.cl.ReleaseMemObject)(buffer.mem as Handle) };
@@ -529,12 +565,9 @@ impl RefineGpu {
     }
 
     // pageable reads queue behind the other plugin's copies in a shared context
-    unsafe fn pinned(&self, unit: &mut Unit, index: usize, size: usize) -> Option<*mut u8> {
-        if unit.buffers.len() <= index {
-            unit.buffers.resize_with(index + 1, Buffer::default);
-        }
-        if unit.buffers[index].capacity < size {
-            let old = std::mem::take(&mut unit.buffers[index]);
+    unsafe fn pinned(&self, queue: usize, buffer: &mut Buffer, size: usize) -> Option<*mut u8> {
+        if buffer.capacity < size {
+            let old = std::mem::take(buffer);
             if old.mem != 0 {
                 unsafe { (self.cl.ReleaseMemObject)(old.mem as Handle) };
             }
@@ -554,7 +587,7 @@ impl RefineGpu {
             }
             let host = unsafe {
                 (self.cl.EnqueueMapBuffer)(
-                    unit.queue as Handle,
+                    queue as Handle,
                     mem,
                     CL_TRUE,
                     CL_MAP_READ,
@@ -570,14 +603,14 @@ impl RefineGpu {
                 unsafe { (self.cl.ReleaseMemObject)(mem) };
                 return None;
             }
-            unit.buffers[index] = Buffer {
+            *buffer = Buffer {
                 mem: mem as usize,
                 capacity,
                 host: host as usize,
                 tag: 0,
             };
         }
-        Some(unit.buffers[index].host as *mut u8)
+        Some(buffer.host as *mut u8)
     }
 }
 
@@ -590,7 +623,12 @@ struct Frame {
     pel: i64,
 }
 
-type SessionFrame = (std::sync::Arc<CachedFrame>, [usize; 3], Frame, usize);
+struct SessionFrame {
+    entry: std::sync::Arc<CachedFrame>,
+    mems: [usize; 3],
+    frame: Frame,
+    event: usize,
+}
 
 impl<'p> Session<'_, 'p> {
     pub(crate) fn defer(&mut self, slot: usize, key: (usize, i32), planes: Planes<'p>) {
@@ -658,20 +696,20 @@ impl Session<'_, '_> {
             .frames
             .iter()
             .flatten()
-            .map(|f| f.3 as Handle)
+            .map(|f| f.event as Handle)
             .collect();
         events.dedup();
         events
     }
 
     unsafe fn ckernel(&mut self, program: usize, name: &'static CStr) -> Option<(Handle, usize)> {
-        if let Some(&(.., kernel, local)) = self
+        if let Some(&Kernel { handle, local, .. }) = self
             .unit
             .kernels
             .iter()
-            .find(|k| k.0 == program && k.1 == name)
+            .find(|k| k.program == program && k.name == name)
         {
-            return Some((kernel as Handle, local));
+            return Some((handle as Handle, local));
         }
         let cl = &self.gpu.cl;
         let mut err = 0;
@@ -693,9 +731,12 @@ impl Session<'_, '_> {
         {
             size = [0; 3];
         }
-        self.unit
-            .kernels
-            .push((program, name, kernel as usize, size[0]));
+        self.unit.kernels.push(Kernel {
+            program,
+            name,
+            handle: kernel as usize,
+            local: size[0],
+        });
         Some((kernel, size[0]))
     }
 
@@ -761,8 +802,12 @@ impl Session<'_, '_> {
         held
     }
 
-    unsafe fn write(&mut self, index: usize, data: &[u8]) -> Option<Handle> {
-        let mem = unsafe { self.gpu.buffer(&mut self.unit, index, data.len().max(1))? };
+    unsafe fn write(
+        &mut self,
+        buffer: impl FnOnce(&mut Unit) -> &mut Buffer,
+        data: &[u8],
+    ) -> Option<Handle> {
+        let mem = unsafe { self.gpu.buffer(buffer(&mut self.unit), data.len().max(1))? };
         if !data.is_empty() && !unsafe { self.transfer(mem, data, std::ptr::null_mut()) } {
             return None;
         }
@@ -797,7 +842,12 @@ impl Session<'_, '_> {
                 };
                 let found = (uploaded.mems, uploaded.frame, uploaded.event);
                 drop(state);
-                self.frames[slot] = Some((entry, found.0, found.1, found.2));
+                self.frames[slot] = Some(SessionFrame {
+                    entry,
+                    mems: found.0,
+                    frame: found.1,
+                    event: found.2,
+                });
                 return true;
             }
             let entry = std::sync::Arc::new(CachedFrame {
@@ -837,7 +887,12 @@ impl Session<'_, '_> {
         *guard = uploaded;
         drop(guard);
         if let Some((mems, frame, event)) = result {
-            self.frames[slot] = Some((entry, mems, frame, event));
+            self.frames[slot] = Some(SessionFrame {
+                entry,
+                mems,
+                frame,
+                event,
+            });
             return true;
         }
         if let Ok(mut cache) = gpu.cache.lock() {
@@ -987,8 +1042,8 @@ impl Session<'_, '_> {
     ) -> Option<usize> {
         self.flush();
         let (source, target) = (
-            self.frames[src].as_ref()?.2,
-            self.frames[reference].as_ref()?.2,
+            self.frames[src].as_ref()?.frame,
+            self.frames[reference].as_ref()?.frame,
         );
         let program = self
             .gpu
@@ -1004,8 +1059,8 @@ impl Session<'_, '_> {
     ) -> Option<usize> {
         self.flush();
         let (source, target) = (
-            self.frames[src].as_ref()?.2,
-            self.frames[reference].as_ref()?.2,
+            self.frames[src].as_ref()?.frame,
+            self.frames[reference].as_ref()?.frame,
         );
         let program = self.gpu.program(Variant {
             shift: plan.shift,
@@ -1026,10 +1081,16 @@ impl Session<'_, '_> {
         let cl = &self.gpu.cl;
         let blocks = plan.blocks();
         let slot = self.tickets.len() % 2;
-        let results = unsafe { self.gpu.pinned(&mut self.unit, 4 + slot, blocks * 8)? };
+        let results = unsafe {
+            self.gpu.pinned(
+                self.unit.queue,
+                &mut self.unit.pinned[RECALC_PIN + slot],
+                blocks * 8,
+            )?
+        };
         let (source_mems, target_mems) = (
-            self.frames[src].as_ref()?.1,
-            self.frames[reference].as_ref()?.1,
+            self.frames[src].as_ref()?.mems,
+            self.frames[reference].as_ref()?.mems,
         );
         let events: Vec<Handle> = self.upload_events();
         let params = self.hold(bytes(&compact_params(
@@ -1040,10 +1101,10 @@ impl Session<'_, '_> {
         )));
         let overrides = self.hold(bytes(&plan.overrides));
         let seed = self.hold(bytes(&plan.seed));
-        let params_mem = unsafe { self.write(slot, params)? };
-        let seed_mem = unsafe { self.gpu.buffer(&mut self.unit, 2, seed.len())? };
-        let results_mem = unsafe { self.gpu.buffer(&mut self.unit, 3, blocks * 8)? };
-        let overrides_mem = unsafe { self.write(6, overrides)? };
+        let params_mem = unsafe { self.write(|u| &mut u.params[slot], params)? };
+        let seed_mem = unsafe { self.gpu.buffer(&mut self.unit.input, seed.len())? };
+        let results_mem = unsafe { self.gpu.buffer(&mut self.unit.output, blocks * 8)? };
+        let overrides_mem = unsafe { self.write(|u| &mut u.overrides, overrides)? };
         let args = recalc_args(
             source_mems.map(|m| m as Handle),
             target_mems.map(|m| m as Handle),
@@ -1086,13 +1147,13 @@ impl Session<'_, '_> {
             return None;
         }
         self.pending.push(done as usize);
-        self.tickets.push((4 + slot, blocks));
+        self.tickets.push((RECALC_PIN + slot, blocks));
         Some(self.tickets.len() - 1)
     }
 
     pub(crate) fn take_into(&mut self, ticket: usize, out: &mut [u32]) {
         let (index, blocks) = self.tickets[ticket];
-        let host = self.unit.buffers[index].host as *const u32;
+        let host = self.unit.pinned[index].host as *const u32;
         out[..2 * blocks].copy_from_slice(unsafe { std::slice::from_raw_parts(host, 2 * blocks) });
     }
 
@@ -1110,7 +1171,13 @@ impl Session<'_, '_> {
 
         let slot = self.tickets.len() % 2;
         if blocks > 0 {
-            let bests = unsafe { self.gpu.pinned(&mut self.unit, 4 + slot, blocks * 16)? };
+            let bests = unsafe {
+                self.gpu.pinned(
+                    self.unit.queue,
+                    &mut self.unit.pinned[RECALC_PIN + slot],
+                    blocks * 16,
+                )?
+            };
             let mut params = [0i64; 24];
             params[..16].copy_from_slice(&frame_params(&source, &target));
             params[16..21].copy_from_slice(&[
@@ -1121,16 +1188,19 @@ impl Session<'_, '_> {
                 i64::from(plan.pel),
             ]);
             let (source_mems, target_mems) = (
-                self.frames[src].as_ref()?.1,
-                self.frames[reference].as_ref()?.1,
+                self.frames[src].as_ref()?.mems,
+                self.frames[reference].as_ref()?.mems,
             );
             let events: Vec<Handle> = self.upload_events();
             let chunk = CHUNK.min(blocks);
             let params = self.hold(bytes(&params));
             let records = bytes(&plan.records);
-            let params_mem = unsafe { self.write(slot, params)? };
-            let records_mem = unsafe { self.gpu.buffer(&mut self.unit, 2, chunk * RECORD_BYTES)? };
-            let bests_mem = unsafe { self.gpu.buffer(&mut self.unit, 3, chunk * 16)? };
+            let params_mem = unsafe { self.write(|u| &mut u.params[slot], params)? };
+            let records_mem = unsafe {
+                self.gpu
+                    .buffer(&mut self.unit.input, chunk * RECORD_BYTES)?
+            };
+            let bests_mem = unsafe { self.gpu.buffer(&mut self.unit.output, chunk * 16)? };
             let args = recalc_args(
                 source_mems.map(|m| m as Handle),
                 target_mems.map(|m| m as Handle),
@@ -1189,7 +1259,7 @@ impl Session<'_, '_> {
             }
             self.pending.push(done as usize);
         }
-        self.tickets.push((4 + slot, blocks));
+        self.tickets.push((RECALC_PIN + slot, blocks));
         Some(self.tickets.len() - 1)
     }
 
@@ -1230,28 +1300,34 @@ impl Session<'_, '_> {
             } else {
                 c"search"
             };
-            launches.push((
-                blocks,
-                (m.res[(pass + 1) % 2], m.res[pass % 2]),
-                (m.dirty[(pass + 1) % 2], m.dirty[pass % 2]),
-                pass as i32,
-                m.q,
-                (program, name),
-            ));
+            launches.push(SearchLaunch {
+                count: blocks,
+                res: [m.res[(pass + 1) % 2], m.res[pass % 2]],
+                dirty: [m.dirty[(pass + 1) % 2], m.dirty[pass % 2]],
+                pass: pass as i32,
+                q: m.q,
+                kernel: (program, name),
+            });
         }
         if border > 0 {
-            launches.push((
-                border,
-                (m.res[passes % 2], m.res[(passes + 1) % 2]),
-                (m.dirty[0], m.dirty[1]),
-                0,
-                m.q2,
-                (border_program, c"search"),
-            ));
+            launches.push(SearchLaunch {
+                count: border,
+                res: [m.res[passes % 2], m.res[(passes + 1) % 2]],
+                dirty: m.dirty,
+                pass: 0,
+                q: m.q2,
+                kernel: (border_program, c"search"),
+            });
         }
-        for (index, (count, (rin, rout), (din, dout), pass, q, kernel)) in
-            launches.into_iter().enumerate()
-        {
+        for (index, launch) in launches.into_iter().enumerate() {
+            let SearchLaunch {
+                count,
+                res: [rin, rout],
+                dirty: [din, dout],
+                pass,
+                q,
+                kernel,
+            } = launch;
             let (_, local) = unsafe { self.ckernel(kernel.0, kernel.1)? };
             if local < 32 {
                 return None;
@@ -1306,35 +1382,41 @@ impl Session<'_, '_> {
         let cl = &self.gpu.cl;
         let blocks = pred.len();
         let total = blocks + params.border;
-        let base = 7 + 12 * src;
-        unsafe { self.gpu.pinned(&mut self.unit, base + 6, total * 16)? };
+        unsafe {
+            self.gpu.pinned(
+                self.unit.queue,
+                &mut self.unit.pinned[SEARCH_PIN + src],
+                total * 16,
+            )?
+        };
         let (source_mems, target_mems) = (
-            self.frames[src].as_ref()?.1,
-            self.frames[reference].as_ref()?.1,
+            self.frames[src].as_ref()?.mems,
+            self.frames[reference].as_ref()?.mems,
         );
         let events: Vec<Handle> = self.upload_events();
         let mut border_q = params.q;
         border_q[33] = 1;
         let q = self.hold(bytes(&params.q));
         let q2 = self.hold(bytes(&border_q));
-        let q_mem = unsafe { self.write(base, q)? };
-        let q2_mem = unsafe { self.write(base + 11, q2)? };
-        let pred_mem = unsafe { self.write(base + 1, bytes(pred))? };
+        let q_mem = unsafe { self.write(|u| &mut u.search[src].q, q)? };
+        let q2_mem = unsafe { self.write(|u| &mut u.search[src].q2, q2)? };
+        let pred_mem = unsafe { self.write(|u| &mut u.search[src].pred, bytes(pred))? };
         let mut rev_rank = Vec::with_capacity(size_of_val(rev) + size_of_val(&params.rank[..]));
         rev_rank.extend_from_slice(bytes(rev));
         rev_rank.extend_from_slice(bytes(&params.rank));
         let rev_rank = self.hold_boxed(rev_rank.into());
-        let rev_mem = unsafe { self.write(base + 2, rev_rank)? };
+        let rev_mem = unsafe { self.write(|u| &mut u.search[src].rev, rev_rank)? };
+        let buffers = &mut self.unit.search[src];
         let res = [
-            unsafe { self.gpu.buffer(&mut self.unit, base + 3, total * 16)? },
-            unsafe { self.gpu.buffer(&mut self.unit, base + 7, total * 16)? },
+            unsafe { self.gpu.buffer(&mut buffers.res[0], total * 16)? },
+            unsafe { self.gpu.buffer(&mut buffers.res[1], total * 16)? },
         ];
-        let aux = unsafe { self.gpu.buffer(&mut self.unit, base + 4, total * 16)? };
-        let cen = unsafe { self.gpu.buffer(&mut self.unit, base + 10, total * 16)? };
-        let out = unsafe { self.gpu.buffer(&mut self.unit, base + 5, total * 16)? };
+        let aux = unsafe { self.gpu.buffer(&mut buffers.aux, total * 16)? };
+        let cen = unsafe { self.gpu.buffer(&mut buffers.cen, total * 16)? };
+        let out = unsafe { self.gpu.buffer(&mut buffers.out, total * 16)? };
         let dirty = [
-            unsafe { self.gpu.buffer(&mut self.unit, base + 8, total)? },
-            unsafe { self.gpu.buffer(&mut self.unit, base + 9, total)? },
+            unsafe { self.gpu.buffer(&mut buffers.dirty[0], total)? },
+            unsafe { self.gpu.buffer(&mut buffers.dirty[1], total)? },
         ];
         let mems = SearchMems {
             src: source_mems.map(|m| m as Handle),
@@ -1363,7 +1445,7 @@ impl Session<'_, '_> {
                 &events,
             )?;
         }
-        let host = self.unit.buffers[base + 6].host;
+        let host = self.unit.pinned[SEARCH_PIN + src].host;
         if unsafe {
             (cl.EnqueueReadBuffer)(
                 queue,
@@ -1382,7 +1464,7 @@ impl Session<'_, '_> {
             return None;
         }
         self.pending.push(done as usize);
-        self.tickets.push((base + 6, total));
+        self.tickets.push((SEARCH_PIN + src, total));
         Some(self.tickets.len() - 1)
     }
 
@@ -1441,7 +1523,7 @@ impl Session<'_, '_> {
         if blocks == 0 {
             return &[];
         }
-        let host = self.unit.buffers[slot].host as *const [i32; 4];
+        let host = self.unit.pinned[slot].host as *const [i32; 4];
         unsafe { std::slice::from_raw_parts(host, blocks) }
     }
 }
@@ -1455,7 +1537,7 @@ impl Drop for Session<'_, '_> {
             unsafe { (self.gpu.cl.Finish)(self.unit.queue as Handle) };
         }
         if let Ok(mut cache) = self.gpu.cache.lock() {
-            for (entry, ..) in self.frames.iter().flatten() {
+            for SessionFrame { entry, .. } in self.frames.iter().flatten() {
                 let last = entry.uses.fetch_update(
                     std::sync::atomic::Ordering::AcqRel,
                     std::sync::atomic::Ordering::Acquire,
