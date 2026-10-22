@@ -369,6 +369,11 @@ unsafe fn collect_state(
     if let Some(g) = gpu.as_ref() {
         eprintln!("open-svpflow: GPU renderer active on {}", g.device_name());
     }
+    let render_mode = if mode <= 1 && render_mode == 2 && gpu.is_none() {
+        1
+    } else {
+        render_mode
+    };
     FilterData {
         mode: core::Mode::from_raw(mode),
         clips,
