@@ -106,7 +106,8 @@ pub(crate) fn analyse(
                         .any(|stage| stage.gpu_refinable(params))))
         .then(gpu::refine_gpu)
         .flatten();
-        let mut session = gpu.and_then(gpu::RefineGpu::session);
+        let order = keys.map_or(0, |k| k[0].1.min(k[1].1));
+        let mut session = gpu.map(|gpu| gpu.session(order));
         if let Some(session) = session.as_mut() {
             let keys = keys.unwrap_or_default();
             let main = &params.stages[0];
@@ -315,7 +316,8 @@ fn run_chain<'o>(
     mut outputs: [Option<&'o mut [u32]>; 2],
 ) -> Option<[Option<&'o mut [u32]>; 2]> {
     let done = (|| {
-        let mut session = gpu::refine_gpu()?.session()?;
+        let early = (!plan.lean).then(|| cpu_search(params, plan, frames));
+        let mut session = gpu::refine_gpu()?.session(keys[0].1.min(keys[1].1));
         for (slot, (frame, key)) in frames.into_iter().zip(keys).enumerate() {
             let level = frame.level(0);
             let planes = gpu::Planes {
@@ -331,8 +333,11 @@ fn run_chain<'o>(
             };
             session.defer(slot, (key.0, key.1), planes);
         }
-        let top = if plan.lean {
+        let top = if let Some(top) = early {
+            top
+        } else {
             let hosts = [session.host_levels(0, plan)?, session.host_levels(1, plan)?];
+            session.release();
             let frame = |index: usize| chain::HostFrame {
                 pyramid: plan.pyramid,
                 start: plan.top() as i32,
@@ -343,8 +348,6 @@ fn run_chain<'o>(
                 ],
             };
             cpu_search(params, plan, [&frame(0), &frame(1)])
-        } else {
-            cpu_search(params, plan, frames)
         };
         let tickets = session.chain(plan, &top)?;
         if !session.wait() {

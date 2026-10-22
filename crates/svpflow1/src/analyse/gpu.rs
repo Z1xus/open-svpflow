@@ -25,7 +25,7 @@ const RECORD: usize = 12;
 const RECORD_BYTES: usize = RECORD * size_of::<i32>();
 const CL_FALSE: ClUint = 0;
 const CL_EVENT_COMMAND_EXECUTION_STATUS: ClUint = 0x11D3;
-const UNITS: usize = 32;
+const UNITS: usize = 4;
 
 type FnGetPlatformIDs = unsafe extern "C" fn(ClUint, *mut Handle, *mut ClUint) -> ClInt;
 type FnGetDeviceIDs = unsafe extern "C" fn(Handle, u64, ClUint, *mut Handle, *mut ClUint) -> ClInt;
@@ -229,9 +229,27 @@ pub(crate) struct RefineGpu {
     expand: OnceLock<Option<usize>>,
     chain: OnceLock<Option<usize>>,
     pool: Mutex<Vec<(usize, usize)>>,
+    admission: Mutex<Admission>,
+    admitted: std::sync::Condvar,
 }
 
-const RECENT_FRAMES: usize = 2;
+struct Admission {
+    free: usize,
+    waiting: Vec<(i32, u64)>,
+    ticket: u64,
+}
+
+struct Permit<'g>(&'g RefineGpu);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut admission) = self.0.admission.lock() {
+            admission.free += 1;
+        }
+        self.0.admitted.notify_all();
+    }
+}
+
 const POOLED: usize = 3;
 
 struct Uploaded {
@@ -384,11 +402,17 @@ impl RefineGpu {
                 device: device as usize,
                 programs: Mutex::new(Vec::new()),
                 search_programs: Mutex::new(Vec::new()),
-                units,
                 cache: Mutex::new(Cache::default()),
                 expand: OnceLock::new(),
                 chain: OnceLock::new(),
                 pool: Mutex::new(Vec::new()),
+                admission: Mutex::new(Admission {
+                    free: units.len(),
+                    waiting: Vec::new(),
+                    ticket: 0,
+                }),
+                admitted: std::sync::Condvar::new(),
+                units,
             });
         }
         None
@@ -484,21 +508,48 @@ impl RefineGpu {
         Some(program as usize)
     }
 
-    pub(crate) fn session<'p>(&self) -> Option<Session<'_, 'p>> {
-        let unit = self
-            .units
-            .iter()
-            .find_map(|unit| unit.try_lock().ok())
-            .or_else(|| self.units[0].lock().ok())?;
-        Some(Session {
+    pub(crate) fn session<'p>(&self, order: i32) -> Session<'_, 'p> {
+        Session {
             gpu: self,
-            unit,
+            order,
+            unit: Lease(None),
             keep: Vec::new(),
             deferred: [None, None],
             frames: [None, None],
             tickets: Vec::new(),
             pending: Vec::new(),
-        })
+        }
+    }
+
+    fn admit(&self, order: i32) -> (std::sync::MutexGuard<'_, Unit>, Permit<'_>) {
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ticket = (order, admission.ticket);
+        admission.ticket += 1;
+        admission.waiting.push(ticket);
+        let mut admission = self
+            .admitted
+            .wait_while(admission, |a| {
+                a.free == 0 || a.waiting.iter().min() != Some(&ticket)
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admission.waiting.retain(|t| *t != ticket);
+        admission.free -= 1;
+        drop(admission);
+        self.admitted.notify_all();
+        let permit = Permit(self);
+        let unit = self
+            .units
+            .iter()
+            .find_map(|unit| unit.try_lock().ok())
+            .unwrap_or_else(|| {
+                self.units[0]
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
+        (unit, permit)
     }
 
     unsafe fn buffer(&self, unit: &mut Unit, index: usize, size: usize) -> Option<Handle> {
@@ -606,9 +657,26 @@ impl<'p> Session<'_, 'p> {
     }
 }
 
+struct Lease<'g>(Option<(std::sync::MutexGuard<'g, Unit>, Permit<'g>)>);
+
+impl std::ops::Deref for Lease<'_> {
+    type Target = Unit;
+
+    fn deref(&self) -> &Unit {
+        &self.0.as_ref().expect("unit held").0
+    }
+}
+
+impl std::ops::DerefMut for Lease<'_> {
+    fn deref_mut(&mut self) -> &mut Unit {
+        &mut self.0.as_mut().expect("unit held").0
+    }
+}
+
 pub(crate) struct Session<'g, 'p> {
     gpu: &'g RefineGpu,
-    unit: std::sync::MutexGuard<'g, Unit>,
+    order: i32,
+    unit: Lease<'g>,
     frames: [Option<SessionFrame>; 2],
     tickets: Vec<(usize, usize)>,
     pending: Vec<usize>,
@@ -664,6 +732,9 @@ impl Session<'_, '_> {
     }
 
     fn flush(&mut self) {
+        if self.unit.0.is_none() {
+            self.unit = Lease(Some(self.gpu.admit(self.order)));
+        }
         for slot in 0..2 {
             if let Some((key, planes)) = self.deferred[slot].take() {
                 self.upload(slot, key, &planes);
@@ -705,7 +776,7 @@ impl Session<'_, '_> {
             cache.live.retain(|e| e.strong_count() > 0);
             cache.live.push(std::sync::Arc::downgrade(&entry));
             cache.recent.push_back(entry.clone());
-            if cache.recent.len() > RECENT_FRAMES {
+            if cache.recent.len() > 2 * UNITS {
                 cache.recent.pop_front();
             }
             (entry, guard)
@@ -1517,7 +1588,18 @@ impl Session<'_, '_> {
         Some(self.tickets.len() - 1)
     }
 
+    pub(crate) fn release(&mut self) {
+        if self.unit.0.is_some() {
+            self.wait();
+            unsafe { (self.gpu.cl.Finish)(self.unit.queue as Handle) };
+            self.unit = Lease(None);
+        }
+    }
+
     pub(crate) fn wait(&mut self) -> bool {
+        if self.unit.0.is_none() {
+            return true;
+        }
         let cl = &self.gpu.cl;
         unsafe { (cl.Flush)(self.unit.queue as Handle) };
         let mut ok = true;
@@ -1571,9 +1653,9 @@ impl Drop for Session<'_, '_> {
         if !self.pending.is_empty() {
             self.wait();
         }
-        let cl = &self.gpu.cl;
-        let queue = self.unit.queue as Handle;
-        unsafe { (cl.Finish)(queue) };
+        if self.unit.0.is_some() {
+            unsafe { (self.gpu.cl.Finish)(self.unit.queue as Handle) };
+        }
         if let Ok(mut cache) = self.gpu.cache.lock() {
             for (entry, ..) in self.frames.iter().flatten() {
                 if entry.uses.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
