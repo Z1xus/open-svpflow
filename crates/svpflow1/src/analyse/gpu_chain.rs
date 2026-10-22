@@ -1,6 +1,7 @@
 use super::{
-    Arg, CL_FALSE, CL_SUCCESS, CL_TRUE, Frame, Handle, RefineGpu, SWEEPS, SearchMems, Session,
-    Uploaded, Variant, bytes, compact_params, recalc_args,
+    Arg, CL_DEVICE_LOCAL_MEM_SIZE, CL_DEVICE_MAX_WORK_GROUP_SIZE, CL_FALSE, CL_SUCCESS, CL_TRUE,
+    Frame, Handle, RefineGpu, SWEEPS, SearchMems, Session, Uploaded, Variant, bytes,
+    compact_params, recalc_args,
 };
 use crate::analyse::chain::{ChainPlan, LevelPlan, Pyramid, RANK_BLOCKS, RefinePlan};
 use std::ptr::null_mut;
@@ -9,6 +10,8 @@ pub(super) const CHAIN: &str = include_str!("chain.cl");
 
 const FREQ: usize = 16384;
 const SORT_SCRATCH: usize = 2 * RANK_BLOCKS as usize;
+const SORT_GROUP: usize = 1024;
+const SORT_LOCAL_BYTES: usize = 4 * (RANK_BLOCKS as usize + SORT_GROUP + 2);
 const BASE: usize = 64;
 const ROLES: usize = 16;
 const SCRATCH: usize = 512;
@@ -103,6 +106,11 @@ impl RefineGpu {
 
     fn chain_program(&self) -> Option<usize> {
         *self.chain.get_or_init(|| {
+            if self.device_limit(CL_DEVICE_MAX_WORK_GROUP_SIZE) < SORT_GROUP
+                || self.device_limit(CL_DEVICE_LOCAL_MEM_SIZE) < SORT_LOCAL_BYTES
+            {
+                return None;
+            }
             self.build(&format!(
                 "#define FREQ {FREQ}\n#define SR_MAX {RANK_BLOCKS}\n{CHAIN}"
             ))

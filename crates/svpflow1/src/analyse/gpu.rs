@@ -20,6 +20,8 @@ const CL_MEM_READ_WRITE: u64 = 1;
 const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
 const CL_MAP_READ: u64 = 1;
 const CL_TRUE: ClUint = 1;
+const CL_DEVICE_MAX_WORK_GROUP_SIZE: ClUint = 0x1004;
+const CL_DEVICE_LOCAL_MEM_SIZE: ClUint = 0x1023;
 const CL_KERNEL_COMPILE_WORK_GROUP_SIZE: ClUint = 0x11B1;
 const CHUNK: usize = 16384;
 const RECORD: usize = 12;
@@ -90,6 +92,7 @@ type FnRelease = unsafe extern "C" fn(Handle) -> ClInt;
 type FnFinish = unsafe extern "C" fn(Handle) -> ClInt;
 type FnWaitForEvents = unsafe extern "C" fn(ClUint, *const Handle) -> ClInt;
 type FnGetEventInfo = unsafe extern "C" fn(Handle, ClUint, usize, *mut c_void, *mut usize) -> ClInt;
+type FnDeviceInfo = unsafe extern "C" fn(Handle, ClUint, usize, *mut c_void, *mut usize) -> ClInt;
 type FnKernelInfo =
     unsafe extern "C" fn(Handle, Handle, ClUint, usize, *mut c_void, *mut usize) -> ClInt;
 
@@ -114,6 +117,7 @@ struct OpenCl {
     ReleaseEvent: FnRelease,
     WaitForEvents: FnWaitForEvents,
     GetEventInfo: FnGetEventInfo,
+    GetDeviceInfo: FnDeviceInfo,
     GetKernelWorkGroupInfo: FnKernelInfo,
     Flush: FnFinish,
 }
@@ -152,6 +156,7 @@ impl OpenCl {
             ReleaseEvent: sym!("clReleaseEvent"),
             WaitForEvents: sym!("clWaitForEvents"),
             GetEventInfo: sym!("clGetEventInfo"),
+            GetDeviceInfo: sym!("clGetDeviceInfo"),
             GetKernelWorkGroupInfo: sym!("clGetKernelWorkGroupInfo"),
             Flush: sym!("clFlush"),
             _lib: lib,
@@ -355,6 +360,24 @@ pub(crate) fn purge(id: usize) {
 }
 
 impl RefineGpu {
+    fn device_limit(&self, param: ClUint) -> usize {
+        let mut value = 0u64;
+        let status = unsafe {
+            (self.cl.GetDeviceInfo)(
+                self.device as Handle,
+                param,
+                size_of::<u64>(),
+                (&raw mut value).cast(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status == CL_SUCCESS {
+            usize::try_from(value).unwrap_or(usize::MAX)
+        } else {
+            0
+        }
+    }
+
     unsafe fn new() -> Option<Self> {
         let cl = unsafe { OpenCl::load()? };
         let mut count = 0;
