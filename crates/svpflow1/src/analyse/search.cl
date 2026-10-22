@@ -192,7 +192,7 @@ inline int wsum(int v, __local uint *s) { return (int)radd((uint)v, s); }
 #endif
 
 #ifndef NSLOT
-#define NSLOT 2
+#define NSLOT 1
 #endif
 #define VV (2 * NSLOT)
 
