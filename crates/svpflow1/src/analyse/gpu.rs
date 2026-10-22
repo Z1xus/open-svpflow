@@ -109,6 +109,7 @@ struct OpenCl {
     SetKernelArg: FnSetKernelArg,
     EnqueueNDRangeKernel: FnEnqueueNDRangeKernel,
     ReleaseMemObject: FnRelease,
+    ReleaseKernel: FnRelease,
     Finish: FnFinish,
     ReleaseEvent: FnRelease,
     WaitForEvents: FnWaitForEvents,
@@ -147,6 +148,7 @@ impl OpenCl {
             SetKernelArg: sym!("clSetKernelArg"),
             EnqueueNDRangeKernel: sym!("clEnqueueNDRangeKernel"),
             ReleaseMemObject: sym!("clReleaseMemObject"),
+            ReleaseKernel: sym!("clReleaseKernel"),
             Finish: sym!("clFinish"),
             ReleaseEvent: sym!("clReleaseEvent"),
             WaitForEvents: sym!("clWaitForEvents"),
@@ -788,6 +790,9 @@ impl Session<'_, '_> {
                 for m in u.mems {
                     unsafe { (self.gpu.cl.ReleaseMemObject)(m as Handle) };
                 }
+                if u.event != 0 {
+                    unsafe { (self.gpu.cl.ReleaseEvent)(u.event as Handle) };
+                }
                 None
             }
             _ => Some(u),
@@ -1370,6 +1375,7 @@ impl Session<'_, '_> {
         } != CL_SUCCESS
             || size[0] < 32
         {
+            unsafe { (cl.ReleaseKernel)(kernel) };
             return None;
         }
         self.unit
@@ -1658,7 +1664,12 @@ impl Drop for Session<'_, '_> {
         }
         if let Ok(mut cache) = self.gpu.cache.lock() {
             for (entry, ..) in self.frames.iter().flatten() {
-                if entry.uses.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                let last = entry.uses.fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |uses| uses.checked_sub(1),
+                );
+                if last == Ok(1) {
                     cache.recent.retain(|e| !std::sync::Arc::ptr_eq(e, entry));
                 }
             }
