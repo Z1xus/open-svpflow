@@ -1,13 +1,13 @@
 #![cfg_attr(not(feature = "blend"), allow(dead_code))]
 
-use core::ffi::c_void;
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Condvar, Mutex};
+use svpflow_host::opencl::ImageDesc;
 
 use super::{
-    CL_FALSE, CL_MEM_READ_WRITE, CL_RGBA, CL_SUCCESS, CL_UNORM_INT8, ClContext, ClEvent,
-    ClImageFormat, ClInt, ClKernel, ClMem, ClUint, GpuBuf, GpuContext, KernelParams, Layer,
-    StillMask, SuperEntry, SuperHandle, Unit, UploadPlane, layer::LAYER_VARIANT,
+    CL_FALSE, CL_MEM_READ_WRITE, CL_RGBA, CL_SUCCESS, CL_UNORM_INT8, ClEvent, ClImageFormat,
+    ClKernel, ClMem, ClUint, GpuBuf, GpuContext, KernelParams, Layer, StillMask, SuperEntry,
+    SuperHandle, Unit, UploadPlane, layer::LAYER_VARIANT,
 };
 
 pub(super) const BLEND_VARIANT: u32 = 1 << 13;
@@ -19,29 +19,6 @@ pub(super) const FUSED_ARG_BYTES: usize = (size_of::<ClMem>() + size_of::<i32>()
     + size_of::<KernelParams>();
 const CL_MEM_OBJECT_IMAGE2D_ARRAY: u32 = 0x10F3;
 const MAX_STEPS: usize = 16;
-
-pub(super) type FnCreateImage = unsafe extern "C" fn(
-    ClContext,
-    u64,
-    *const ClImageFormat,
-    *const ImageDesc,
-    *mut c_void,
-    *mut ClInt,
-) -> ClMem;
-
-#[repr(C)]
-pub(super) struct ImageDesc {
-    image_type: u32,
-    width: usize,
-    height: usize,
-    depth: usize,
-    array_size: usize,
-    row_pitch: usize,
-    slice_pitch: usize,
-    mip_levels: u32,
-    samples: u32,
-    buffer: ClMem,
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]

@@ -1,7 +1,52 @@
 #![allow(unsafe_code)]
 #![allow(clippy::missing_safety_doc)]
-use core::ffi::{c_char, c_void};
+use core::ffi::c_void;
 use std::ffi::CString;
+
+use svpflow_host::opencl::{
+    CL_DEVICE_TYPE_GPU, CL_EVENT_COMMAND_EXECUTION_STATUS, CL_FALSE, CL_MAP_READ,
+    CL_MEM_ALLOC_HOST_PTR, CL_MEM_READ_WRITE, CL_SUCCESS, CL_TRUE, ClImageFormat, ClInt, ClUint,
+    FnCreateImage, FnCreateImage2D, FnEnqueueReadBufferRect, FnEnqueueWriteImage,
+    FnGetProgramBuildInfo, FnRelease, FnWaitForEvents, OpenCl as CoreCl,
+};
+
+#[allow(non_snake_case)]
+struct OpenCl {
+    core: CoreCl,
+    GetProgramBuildInfo: FnGetProgramBuildInfo,
+    CreateImage2D: FnCreateImage2D,
+    CreateImage: Option<FnCreateImage>,
+    EnqueueReadBufferRect: FnEnqueueReadBufferRect,
+    EnqueueWriteImage: FnEnqueueWriteImage,
+    ReleaseKernel: FnRelease,
+    ReleaseProgram: FnRelease,
+    ReleaseCommandQueue: FnRelease,
+}
+
+impl std::ops::Deref for OpenCl {
+    type Target = CoreCl;
+
+    fn deref(&self) -> &CoreCl {
+        &self.core
+    }
+}
+
+impl OpenCl {
+    unsafe fn load() -> Result<Self, String> {
+        let core = unsafe { CoreCl::load()? };
+        Ok(Self {
+            GetProgramBuildInfo: unsafe { core.symbol("clGetProgramBuildInfo\0")? },
+            CreateImage2D: unsafe { core.symbol("clCreateImage2D\0")? },
+            CreateImage: unsafe { core.symbol("clCreateImage\0") }.ok(),
+            EnqueueReadBufferRect: unsafe { core.symbol("clEnqueueReadBufferRect\0")? },
+            EnqueueWriteImage: unsafe { core.symbol("clEnqueueWriteImage\0")? },
+            ReleaseKernel: unsafe { core.symbol("clReleaseKernel\0")? },
+            ReleaseProgram: unsafe { core.symbol("clReleaseProgram\0")? },
+            ReleaseCommandQueue: unsafe { core.symbol("clReleaseCommandQueue\0")? },
+            core,
+        })
+    }
+}
 
 mod blend;
 mod cover;
@@ -14,34 +59,18 @@ pub use blend::BlendJob;
 pub use blend::OutputPlane;
 pub use cover::Cover;
 
-type ClInt = i32;
-type ClUint = u32;
-type ClPlatformId = *mut c_void;
 type ClDeviceId = *mut c_void;
 type ClContext = *mut c_void;
 type ClCommandQueue = *mut c_void;
 type ClProgram = *mut c_void;
 type ClKernel = *mut c_void;
 type ClMem = *mut c_void;
+type ClEvent = *mut c_void;
 
-#[repr(C)]
-struct ClImageFormat {
-    channel_order: ClUint,
-    channel_data_type: ClUint,
-}
-
-const CL_SUCCESS: ClInt = 0;
-const CL_EVENT_COMMAND_EXECUTION_STATUS: ClUint = 0x11D3;
-const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
 const CL_DEVICE_NAME: ClUint = 0x102B;
 const CL_DEVICE_GLOBAL_MEM_SIZE: ClUint = 0x101F;
 const CL_DEVICE_MAX_PARAMETER_SIZE: ClUint = 0x1017;
-const CL_MEM_READ_WRITE: u64 = 1 << 0;
-const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
-const CL_MAP_READ: u64 = 1 << 0;
 const CL_MAP_WRITE: u64 = 1 << 1;
-const CL_FALSE: ClUint = 0;
-const CL_TRUE: ClUint = 1;
 const CL_PROGRAM_BUILD_LOG: ClUint = 0x1183;
 const CL_R: ClUint = 0x10B0;
 const CL_RGBA: ClUint = 0x10B5;
@@ -49,210 +78,6 @@ const CL_UNORM_INT8: ClUint = 0x10D2;
 const CL_UNORM_INT16: ClUint = 0x10D3;
 const CL_HALF_FLOAT: ClUint = 0x10DD;
 const CL_FLOAT: ClUint = 0x10DE;
-
-type FnGetPlatformIDs = unsafe extern "C" fn(ClUint, *mut ClPlatformId, *mut ClUint) -> ClInt;
-type FnGetDeviceIDs =
-    unsafe extern "C" fn(ClPlatformId, u64, ClUint, *mut ClDeviceId, *mut ClUint) -> ClInt;
-type FnGetDeviceInfo =
-    unsafe extern "C" fn(ClDeviceId, ClUint, usize, *mut c_void, *mut usize) -> ClInt;
-type FnCreateContext = unsafe extern "C" fn(
-    *const isize,
-    ClUint,
-    *const ClDeviceId,
-    *const c_void,
-    *mut c_void,
-    *mut ClInt,
-) -> ClContext;
-type FnCreateCommandQueue =
-    unsafe extern "C" fn(ClContext, ClDeviceId, u64, *mut ClInt) -> ClCommandQueue;
-type FnCreateProgramWithSource = unsafe extern "C" fn(
-    ClContext,
-    ClUint,
-    *const *const c_char,
-    *const usize,
-    *mut ClInt,
-) -> ClProgram;
-type FnBuildProgram = unsafe extern "C" fn(
-    ClProgram,
-    ClUint,
-    *const ClDeviceId,
-    *const c_char,
-    *const c_void,
-    *mut c_void,
-) -> ClInt;
-type FnGetProgramBuildInfo =
-    unsafe extern "C" fn(ClProgram, ClDeviceId, ClUint, usize, *mut c_void, *mut usize) -> ClInt;
-type FnCreateKernel = unsafe extern "C" fn(ClProgram, *const c_char, *mut ClInt) -> ClKernel;
-type FnCreateBuffer = unsafe extern "C" fn(ClContext, u64, usize, *mut c_void, *mut ClInt) -> ClMem;
-type FnCreateImage2D = unsafe extern "C" fn(
-    ClContext,
-    u64,
-    *const ClImageFormat,
-    usize,
-    usize,
-    usize,
-    *mut c_void,
-    *mut ClInt,
-) -> ClMem;
-type FnEnqueueMapBuffer = unsafe extern "C" fn(
-    ClCommandQueue,
-    ClMem,
-    ClUint,
-    u64,
-    usize,
-    usize,
-    ClUint,
-    *const c_void,
-    *mut c_void,
-    *mut ClInt,
-) -> *mut c_void;
-type FnEnqueueReadBuffer = unsafe extern "C" fn(
-    ClCommandQueue,
-    ClMem,
-    ClUint,
-    usize,
-    usize,
-    *mut c_void,
-    ClUint,
-    *const c_void,
-    *mut c_void,
-) -> ClInt;
-type FnEnqueueReadBufferRect = unsafe extern "C" fn(
-    ClCommandQueue,
-    ClMem,
-    ClUint,
-    *const usize,
-    *const usize,
-    *const usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    *mut c_void,
-    ClUint,
-    *const c_void,
-    *mut c_void,
-) -> ClInt;
-type FnEnqueueWriteImage = unsafe extern "C" fn(
-    ClCommandQueue,
-    ClMem,
-    ClUint,
-    *const usize,
-    *const usize,
-    usize,
-    usize,
-    *const c_void,
-    ClUint,
-    *const c_void,
-    *mut c_void,
-) -> ClInt;
-type FnSetKernelArg = unsafe extern "C" fn(ClKernel, ClUint, usize, *const c_void) -> ClInt;
-type FnEnqueueNDRangeKernel = unsafe extern "C" fn(
-    ClCommandQueue,
-    ClKernel,
-    ClUint,
-    *const usize,
-    *const usize,
-    *const usize,
-    ClUint,
-    *const c_void,
-    *mut c_void,
-) -> ClInt;
-type FnFinish = unsafe extern "C" fn(ClCommandQueue) -> ClInt;
-type ClEvent = *mut c_void;
-type FnWaitForEvents = unsafe extern "C" fn(ClUint, *const ClEvent) -> ClInt;
-type FnGetEventInfo =
-    unsafe extern "C" fn(ClEvent, ClUint, usize, *mut c_void, *mut usize) -> ClInt;
-type FnRelease = unsafe extern "C" fn(*mut c_void) -> ClInt;
-
-#[allow(non_snake_case)]
-struct OpenCl {
-    _lib: libloading::Library,
-    GetPlatformIDs: FnGetPlatformIDs,
-    GetDeviceIDs: FnGetDeviceIDs,
-    GetDeviceInfo: FnGetDeviceInfo,
-    CreateContext: FnCreateContext,
-    CreateCommandQueue: FnCreateCommandQueue,
-    CreateProgramWithSource: FnCreateProgramWithSource,
-    BuildProgram: FnBuildProgram,
-    GetProgramBuildInfo: FnGetProgramBuildInfo,
-    CreateKernel: FnCreateKernel,
-    CreateBuffer: FnCreateBuffer,
-    CreateImage2D: FnCreateImage2D,
-    CreateImage: Option<blend::FnCreateImage>,
-    EnqueueReadBuffer: FnEnqueueReadBuffer,
-    EnqueueMapBuffer: FnEnqueueMapBuffer,
-    EnqueueWriteBuffer: FnEnqueueReadBuffer,
-    EnqueueReadBufferRect: FnEnqueueReadBufferRect,
-    EnqueueWriteImage: FnEnqueueWriteImage,
-    SetKernelArg: FnSetKernelArg,
-    EnqueueNDRangeKernel: FnEnqueueNDRangeKernel,
-    Finish: FnFinish,
-    Flush: FnFinish,
-    WaitForEvents: FnWaitForEvents,
-    GetEventInfo: FnGetEventInfo,
-    ReleaseEvent: FnRelease,
-    ReleaseMemObject: FnRelease,
-    ReleaseKernel: FnRelease,
-    ReleaseProgram: FnRelease,
-    ReleaseCommandQueue: FnRelease,
-}
-
-impl OpenCl {
-    unsafe fn load() -> Result<Self, String> {
-        let name = if cfg!(target_os = "windows") {
-            "OpenCL.dll"
-        } else if cfg!(target_os = "macos") {
-            "/System/Library/Frameworks/OpenCL.framework/OpenCL"
-        } else {
-            "libOpenCL.so.1"
-        };
-        let lib = unsafe { libloading::Library::new(name) }
-            .map_err(|e| format!("{name} not loadable: {e}"))?;
-        macro_rules! sym {
-            ($name:literal) => {
-                *unsafe {
-                    lib.get(concat!($name, "\0").as_bytes())
-                        .map_err(|e| format!("missing {}: {e}", $name))?
-                }
-            };
-        }
-        let me = {
-            Self {
-                GetPlatformIDs: sym!("clGetPlatformIDs"),
-                GetDeviceIDs: sym!("clGetDeviceIDs"),
-                GetDeviceInfo: sym!("clGetDeviceInfo"),
-                CreateContext: sym!("clCreateContext"),
-                CreateCommandQueue: sym!("clCreateCommandQueue"),
-                CreateProgramWithSource: sym!("clCreateProgramWithSource"),
-                BuildProgram: sym!("clBuildProgram"),
-                GetProgramBuildInfo: sym!("clGetProgramBuildInfo"),
-                CreateKernel: sym!("clCreateKernel"),
-                CreateBuffer: sym!("clCreateBuffer"),
-                CreateImage2D: sym!("clCreateImage2D"),
-                CreateImage: unsafe { lib.get(b"clCreateImage\0") }.ok().map(|f| *f),
-                EnqueueReadBuffer: sym!("clEnqueueReadBuffer"),
-                EnqueueMapBuffer: sym!("clEnqueueMapBuffer"),
-                EnqueueWriteBuffer: sym!("clEnqueueWriteBuffer"),
-                EnqueueReadBufferRect: sym!("clEnqueueReadBufferRect"),
-                EnqueueWriteImage: sym!("clEnqueueWriteImage"),
-                SetKernelArg: sym!("clSetKernelArg"),
-                EnqueueNDRangeKernel: sym!("clEnqueueNDRangeKernel"),
-                Finish: sym!("clFinish"),
-                Flush: sym!("clFlush"),
-                WaitForEvents: sym!("clWaitForEvents"),
-                GetEventInfo: sym!("clGetEventInfo"),
-                ReleaseEvent: sym!("clReleaseEvent"),
-                ReleaseMemObject: sym!("clReleaseMemObject"),
-                ReleaseKernel: sym!("clReleaseKernel"),
-                ReleaseProgram: sym!("clReleaseProgram"),
-                ReleaseCommandQueue: sym!("clReleaseCommandQueue"),
-                _lib: lib,
-            }
-        };
-        Ok(me)
-    }
-}
 
 pub struct GpuContext {
     cl: OpenCl,

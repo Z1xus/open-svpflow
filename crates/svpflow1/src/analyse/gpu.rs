@@ -1,7 +1,37 @@
 #![allow(unsafe_code)]
-use core::ffi::{CStr, c_char, c_void};
+use core::ffi::{CStr, c_void};
 use std::ffi::CString;
 use std::sync::{Mutex, OnceLock};
+
+use svpflow_host::opencl::{
+    CL_DEVICE_TYPE_GPU, CL_EVENT_COMMAND_EXECUTION_STATUS, CL_FALSE, CL_MAP_READ,
+    CL_MEM_ALLOC_HOST_PTR, CL_MEM_READ_WRITE, CL_SUCCESS, CL_TRUE, ClInt, ClUint, FnKernelInfo,
+    Handle, OpenCl as CoreCl,
+};
+
+#[allow(non_snake_case)]
+struct OpenCl {
+    core: CoreCl,
+    GetKernelWorkGroupInfo: FnKernelInfo,
+}
+
+impl std::ops::Deref for OpenCl {
+    type Target = CoreCl;
+
+    fn deref(&self) -> &CoreCl {
+        &self.core
+    }
+}
+
+impl OpenCl {
+    unsafe fn load() -> Result<Self, String> {
+        let core = unsafe { CoreCl::load()? };
+        Ok(Self {
+            GetKernelWorkGroupInfo: unsafe { core.symbol("clGetKernelWorkGroupInfo\0")? },
+            core,
+        })
+    }
+}
 
 use super::chain::Pyramid;
 use super::field::recalc::{CompactPlan, RecalcPlan};
@@ -10,159 +40,13 @@ use super::field::{GpuSearchParams, Mv};
 #[path = "gpu_chain.rs"]
 mod chain;
 
-type ClInt = i32;
-type ClUint = u32;
-type Handle = *mut c_void;
-
-const CL_SUCCESS: ClInt = 0;
-const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
-const CL_MEM_READ_WRITE: u64 = 1;
-const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
-const CL_MAP_READ: u64 = 1;
-const CL_TRUE: ClUint = 1;
 const CL_DEVICE_MAX_WORK_GROUP_SIZE: ClUint = 0x1004;
 const CL_DEVICE_LOCAL_MEM_SIZE: ClUint = 0x1023;
 const CL_KERNEL_COMPILE_WORK_GROUP_SIZE: ClUint = 0x11B1;
 const CHUNK: usize = 16384;
 const RECORD: usize = 12;
 const RECORD_BYTES: usize = RECORD * size_of::<i32>();
-const CL_FALSE: ClUint = 0;
-const CL_EVENT_COMMAND_EXECUTION_STATUS: ClUint = 0x11D3;
 const UNITS: usize = 4;
-
-type FnGetPlatformIDs = unsafe extern "C" fn(ClUint, *mut Handle, *mut ClUint) -> ClInt;
-type FnGetDeviceIDs = unsafe extern "C" fn(Handle, u64, ClUint, *mut Handle, *mut ClUint) -> ClInt;
-type FnCreateContext = unsafe extern "C" fn(
-    *const isize,
-    ClUint,
-    *const Handle,
-    *const c_void,
-    *mut c_void,
-    *mut ClInt,
-) -> Handle;
-type FnCreateCommandQueue = unsafe extern "C" fn(Handle, Handle, u64, *mut ClInt) -> Handle;
-type FnCreateProgramWithSource =
-    unsafe extern "C" fn(Handle, ClUint, *const *const c_char, *const usize, *mut ClInt) -> Handle;
-type FnBuildProgram = unsafe extern "C" fn(
-    Handle,
-    ClUint,
-    *const Handle,
-    *const c_char,
-    *const c_void,
-    *mut c_void,
-) -> ClInt;
-type FnCreateKernel = unsafe extern "C" fn(Handle, *const c_char, *mut ClInt) -> Handle;
-type FnCreateBuffer = unsafe extern "C" fn(Handle, u64, usize, *mut c_void, *mut ClInt) -> Handle;
-type FnEnqueueBuffer = unsafe extern "C" fn(
-    Handle,
-    Handle,
-    ClUint,
-    usize,
-    usize,
-    *mut c_void,
-    ClUint,
-    *const c_void,
-    *mut c_void,
-) -> ClInt;
-type FnSetKernelArg = unsafe extern "C" fn(Handle, ClUint, usize, *const c_void) -> ClInt;
-type FnEnqueueNDRangeKernel = unsafe extern "C" fn(
-    Handle,
-    Handle,
-    ClUint,
-    *const usize,
-    *const usize,
-    *const usize,
-    ClUint,
-    *const c_void,
-    *mut c_void,
-) -> ClInt;
-type FnEnqueueMapBuffer = unsafe extern "C" fn(
-    Handle,
-    Handle,
-    ClUint,
-    u64,
-    usize,
-    usize,
-    ClUint,
-    *const c_void,
-    *mut c_void,
-    *mut ClInt,
-) -> *mut c_void;
-type FnRelease = unsafe extern "C" fn(Handle) -> ClInt;
-type FnFinish = unsafe extern "C" fn(Handle) -> ClInt;
-type FnWaitForEvents = unsafe extern "C" fn(ClUint, *const Handle) -> ClInt;
-type FnGetEventInfo = unsafe extern "C" fn(Handle, ClUint, usize, *mut c_void, *mut usize) -> ClInt;
-type FnDeviceInfo = unsafe extern "C" fn(Handle, ClUint, usize, *mut c_void, *mut usize) -> ClInt;
-type FnKernelInfo =
-    unsafe extern "C" fn(Handle, Handle, ClUint, usize, *mut c_void, *mut usize) -> ClInt;
-
-#[allow(non_snake_case)]
-struct OpenCl {
-    _lib: libloading::Library,
-    GetPlatformIDs: FnGetPlatformIDs,
-    GetDeviceIDs: FnGetDeviceIDs,
-    CreateContext: FnCreateContext,
-    CreateCommandQueue: FnCreateCommandQueue,
-    CreateProgramWithSource: FnCreateProgramWithSource,
-    BuildProgram: FnBuildProgram,
-    CreateKernel: FnCreateKernel,
-    CreateBuffer: FnCreateBuffer,
-    EnqueueReadBuffer: FnEnqueueBuffer,
-    EnqueueWriteBuffer: FnEnqueueBuffer,
-    EnqueueMapBuffer: FnEnqueueMapBuffer,
-    SetKernelArg: FnSetKernelArg,
-    EnqueueNDRangeKernel: FnEnqueueNDRangeKernel,
-    ReleaseMemObject: FnRelease,
-    Finish: FnFinish,
-    ReleaseEvent: FnRelease,
-    WaitForEvents: FnWaitForEvents,
-    GetEventInfo: FnGetEventInfo,
-    GetDeviceInfo: FnDeviceInfo,
-    GetKernelWorkGroupInfo: FnKernelInfo,
-    Flush: FnFinish,
-}
-
-impl OpenCl {
-    unsafe fn load() -> Option<Self> {
-        let name = if cfg!(target_os = "windows") {
-            "OpenCL.dll"
-        } else if cfg!(target_os = "macos") {
-            "/System/Library/Frameworks/OpenCL.framework/OpenCL"
-        } else {
-            "libOpenCL.so.1"
-        };
-        let lib = unsafe { libloading::Library::new(name) }.ok()?;
-        macro_rules! sym {
-            ($name:literal) => {
-                *unsafe { lib.get(concat!($name, "\0").as_bytes()).ok()? }
-            };
-        }
-        Some(Self {
-            GetPlatformIDs: sym!("clGetPlatformIDs"),
-            GetDeviceIDs: sym!("clGetDeviceIDs"),
-            CreateContext: sym!("clCreateContext"),
-            CreateCommandQueue: sym!("clCreateCommandQueue"),
-            CreateProgramWithSource: sym!("clCreateProgramWithSource"),
-            BuildProgram: sym!("clBuildProgram"),
-            CreateKernel: sym!("clCreateKernel"),
-            CreateBuffer: sym!("clCreateBuffer"),
-            EnqueueReadBuffer: sym!("clEnqueueReadBuffer"),
-            EnqueueWriteBuffer: sym!("clEnqueueWriteBuffer"),
-            EnqueueMapBuffer: sym!("clEnqueueMapBuffer"),
-            SetKernelArg: sym!("clSetKernelArg"),
-            EnqueueNDRangeKernel: sym!("clEnqueueNDRangeKernel"),
-            ReleaseMemObject: sym!("clReleaseMemObject"),
-            Finish: sym!("clFinish"),
-            ReleaseEvent: sym!("clReleaseEvent"),
-            WaitForEvents: sym!("clWaitForEvents"),
-            GetEventInfo: sym!("clGetEventInfo"),
-            GetDeviceInfo: sym!("clGetDeviceInfo"),
-            GetKernelWorkGroupInfo: sym!("clGetKernelWorkGroupInfo"),
-            Flush: sym!("clFlush"),
-            _lib: lib,
-        })
-    }
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Variant {
@@ -379,7 +263,7 @@ impl RefineGpu {
     }
 
     unsafe fn new() -> Option<Self> {
-        let cl = unsafe { OpenCl::load()? };
+        let cl = unsafe { OpenCl::load().ok()? };
         let mut count = 0;
         if unsafe { (cl.GetPlatformIDs)(0, std::ptr::null_mut(), &raw mut count) } != CL_SUCCESS {
             return None;
