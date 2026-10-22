@@ -16,6 +16,7 @@ pub(crate) struct Planes<'a> {
     pub(crate) expand: bool,
     pub(crate) tail: [usize; 3],
     pub(crate) pyramid: Option<()>,
+    pub(crate) uses: u32,
 }
 
 pub(crate) fn refine_gpu() -> Option<&'static RefineGpu> {

@@ -273,6 +273,7 @@ impl Cache {
 
 struct CachedFrame {
     key: (usize, i32),
+    uses: std::sync::atomic::AtomicU32,
     gpu: *const RefineGpu,
     state: Mutex<Option<Uploaded>>,
 }
@@ -310,6 +311,7 @@ pub(crate) struct Planes<'a> {
     pub(crate) expand: bool,
     pub(crate) tail: [usize; 3],
     pub(crate) pyramid: Option<Pyramid>,
+    pub(crate) uses: u32,
 }
 
 pub(crate) fn refine_gpu() -> Option<&'static RefineGpu> {
@@ -691,6 +693,7 @@ impl Session<'_, '_> {
             }
             let entry = std::sync::Arc::new(CachedFrame {
                 key,
+                uses: std::sync::atomic::AtomicU32::new(planes.uses),
                 gpu,
                 state: Mutex::new(None),
             });
@@ -1571,6 +1574,13 @@ impl Drop for Session<'_, '_> {
         let cl = &self.gpu.cl;
         let queue = self.unit.queue as Handle;
         unsafe { (cl.Finish)(queue) };
+        if let Ok(mut cache) = self.gpu.cache.lock() {
+            for (entry, ..) in self.frames.iter().flatten() {
+                if entry.uses.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                    cache.recent.retain(|e| !std::sync::Arc::ptr_eq(e, entry));
+                }
+            }
+        }
     }
 }
 

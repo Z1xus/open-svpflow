@@ -54,7 +54,7 @@ pub(crate) fn analyse(
     params: &AnalyseParams,
     current: &SuperFrameView<'_>,
     next: &SuperFrameView<'_>,
-    keys: Option<[(usize, i32); 2]>,
+    keys: Option<[(usize, i32, u32); 2]>,
 ) -> Vec<u32> {
     let count = params.output_count();
     let mut words = vec![0u32; frame_len(params) / 4];
@@ -128,8 +128,9 @@ pub(crate) fn analyse(
                     expand: params.super_params.gpu == 1 && params.super_params.flags & 2 == 0,
                     tail,
                     pyramid: None,
+                    uses: key.2,
                 };
-                session.defer(slot, key, planes);
+                session.defer(slot, (key.0, key.1), planes);
             }
         }
         search_stages(params, first, second, outputs, session.as_mut());
@@ -310,7 +311,7 @@ fn run_chain<'o>(
     params: &AnalyseParams,
     plan: &chain::ChainPlan,
     frames: [&SuperFrameView<'_>; 2],
-    keys: [(usize, i32); 2],
+    keys: [(usize, i32, u32); 2],
     mut outputs: [Option<&'o mut [u32]>; 2],
 ) -> Option<[Option<&'o mut [u32]>; 2]> {
     let done = (|| {
@@ -326,8 +327,9 @@ fn run_chain<'o>(
                 expand: params.super_params.gpu == 1 && params.super_params.flags & 2 == 0,
                 tail: [0; 3],
                 pyramid: Some(plan.pyramid),
+                uses: key.2,
             };
-            session.defer(slot, key, planes);
+            session.defer(slot, (key.0, key.1), planes);
         }
         let top = if plan.lean {
             let hosts = [session.host_levels(0, plan)?, session.host_levels(1, plan)?];

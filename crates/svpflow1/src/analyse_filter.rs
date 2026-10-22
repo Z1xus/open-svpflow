@@ -89,6 +89,13 @@ impl AnalyseState {
         [n, (n + self.params.delta).min(self.vi.num_frames - 1)]
     }
 
+    fn uses(&self, frame: i32) -> u32 {
+        let delta = self.params.delta;
+        ((frame - delta).max(0)..=frame)
+            .map(|n| self.pair(n).iter().filter(|&&f| f == frame).count() as u32)
+            .sum()
+    }
+
     fn lean(&self) -> bool {
         self.params.super_params.lean
     }
@@ -144,7 +151,7 @@ impl AnalyseState {
             chroma_shift: params.chroma_shift,
         };
         let level0 = if full { self.super_node } else { self.src_node } as usize;
-        let keys = self.pair(n).map(|frame| (level0, frame));
+        let keys = self.pair(n).map(|frame| (level0, frame, self.uses(frame)));
         analyse::analyse(params, &view(0), &view(1), Some(keys))
     }
 
