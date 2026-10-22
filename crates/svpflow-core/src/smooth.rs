@@ -2030,6 +2030,7 @@ mod row {
             }
 
             #[inline(always)]
+            #[allow(clippy::unused_self)]
             fn lane(&self, values: &[i32], c: usize) -> i32 {
                 values[c]
             }

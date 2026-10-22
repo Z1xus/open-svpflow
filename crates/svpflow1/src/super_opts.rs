@@ -101,6 +101,7 @@ impl SuperOpts {
         super_plane_height(self.width, self.height, self.pel, self.levels, self.full)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn super_width(&self) -> i32 {
         if self.full {
             self.width

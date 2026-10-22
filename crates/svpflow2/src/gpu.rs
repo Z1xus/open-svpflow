@@ -650,18 +650,18 @@ impl GpuContext {
                 let found = held.iter().find(|(k, _)| *k == key);
                 if let Some(entry) = found.and_then(|(_, entry)| entry.upgrade()) {
                     let _ = cell.set(Some(entry));
-                } else if let Ok(mut evicted) = self.super_evicted.lock() {
-                    if let Some(at) = evicted.iter().position(|k| *k == key) {
-                        evicted.remove(at);
-                        let bytes = self.frame_bytes.load(std::sync::atomic::Ordering::Relaxed);
-                        let most = (svpflow_core::threads::workers() + RECENT_FRAMES)
-                            .min((self.frame_budget / bytes.max(1)).max(RECENT_FRAMES));
-                        let _ = self.super_cap.fetch_update(
-                            std::sync::atomic::Ordering::Relaxed,
-                            std::sync::atomic::Ordering::Relaxed,
-                            |cap| (cap < most).then_some(cap + 1),
-                        );
-                    }
+                } else if let Ok(mut evicted) = self.super_evicted.lock()
+                    && let Some(at) = evicted.iter().position(|k| *k == key)
+                {
+                    evicted.remove(at);
+                    let bytes = self.frame_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                    let most = (svpflow_core::threads::workers() + RECENT_FRAMES)
+                        .min((self.frame_budget / bytes.max(1)).max(RECENT_FRAMES));
+                    let _ = self.super_cap.fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |cap| (cap < most).then_some(cap + 1),
+                    );
                 }
                 cache.push((key, std::sync::Arc::clone(&cell)));
                 cell

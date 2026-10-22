@@ -95,6 +95,7 @@ pub(crate) struct SearchGeom {
     pub(crate) ref_height: [i32; 2],
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) struct GpuSearchParams {
     pub(crate) q: [i32; 40],
     pub(crate) width: usize,
@@ -501,6 +502,7 @@ impl Field {
     }
 
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[allow(clippy::unused_self)]
     fn blend_wide_row(&mut self, _: &Self, _: &Interpolation, _: i32) -> i32 {
         1
     }

@@ -959,7 +959,7 @@ impl WasmRenderer {
                     interpolate,
                     output_y,
                     self.layout.width,
-                    input_y,
+                    &input_y,
                     false,
                 )
             },
@@ -970,7 +970,7 @@ impl WasmRenderer {
                         output_u,
                         output_v,
                         self.layout.chroma_width,
-                        input_u,
+                        &input_u,
                         [input_v.source0, input_v.source1],
                     )
                 } else {
@@ -981,7 +981,7 @@ impl WasmRenderer {
                                 interpolate,
                                 output_u,
                                 self.layout.chroma_width,
-                                input_u,
+                                &input_u,
                                 true,
                             )
                         },
@@ -991,7 +991,7 @@ impl WasmRenderer {
                                 interpolate,
                                 output_v,
                                 self.layout.chroma_width,
-                                input_v,
+                                &input_v,
                                 true,
                             )
                         },
@@ -1012,7 +1012,7 @@ impl WasmRenderer {
         output_u: &mut [u8],
         output_v: &mut [u8],
         stride: usize,
-        input_u: PlaneRenderInput<'_>,
+        input_u: &PlaneRenderInput<'_>,
         second: [Plane<'_>; 2],
     ) -> Result<(), String> {
         const BAND_ROWS: usize = 64;
@@ -1054,7 +1054,7 @@ impl WasmRenderer {
         output_u: &mut [u8],
         output_v: &mut [u8],
         stride: usize,
-        input_u: PlaneRenderInput<'_>,
+        input_u: &PlaneRenderInput<'_>,
         second: [Plane<'_>; 2],
         rows: std::ops::Range<usize>,
     ) -> Result<(), String> {
@@ -1073,7 +1073,7 @@ impl WasmRenderer {
                         stride,
                     },
                 ],
-                input_u,
+                *input_u,
                 second,
                 rows,
             )
@@ -1086,7 +1086,7 @@ impl WasmRenderer {
         interpolate: bool,
         output: &mut [u8],
         stride: usize,
-        input: PlaneRenderInput<'_>,
+        input: &PlaneRenderInput<'_>,
         chroma: bool,
     ) -> Result<(), String> {
         const BAND_ROWS: usize = 64;
@@ -1119,7 +1119,7 @@ impl WasmRenderer {
         interpolate: bool,
         output: &mut [u8],
         stride: usize,
-        input: PlaneRenderInput<'_>,
+        input: &PlaneRenderInput<'_>,
         chroma: bool,
     ) -> Result<(), String> {
         self.renderer
@@ -1130,7 +1130,7 @@ impl WasmRenderer {
                     data: output,
                     stride,
                 },
-                input,
+                *input,
                 chroma,
             )
             .map_err(|_| "invalid render inputs".into())
@@ -1142,7 +1142,7 @@ impl WasmRenderer {
         interpolate: bool,
         output: &mut [u8],
         stride: usize,
-        input: PlaneRenderInput<'_>,
+        input: &PlaneRenderInput<'_>,
         chroma: bool,
         rows: std::ops::Range<usize>,
     ) -> Result<(), String> {
@@ -1156,7 +1156,7 @@ impl WasmRenderer {
                     data: output,
                     stride,
                 },
-                input,
+                *input,
                 chroma,
                 rows,
             )

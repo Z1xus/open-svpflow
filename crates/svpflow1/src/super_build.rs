@@ -77,6 +77,7 @@ pub(crate) fn level_regions(
         .collect()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn written_end(regions: &[Region], pitch: usize, opts: &SuperOpts) -> usize {
     let pel = opts.pel as usize;
     regions.last().map_or(0, |last| {
@@ -89,6 +90,7 @@ pub(crate) fn written_end(regions: &[Region], pitch: usize, opts: &SuperOpts) ->
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn clear_margins(
     dst: &mut [u8],
     regions: &[Region],

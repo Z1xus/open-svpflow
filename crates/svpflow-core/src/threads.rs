@@ -8,7 +8,7 @@ static WANT: AtomicUsize = AtomicUsize::new(0);
 static POOL: Mutex<Option<Arc<Pool>>> = Mutex::new(None);
 
 struct Pool {
-    pool: Option<ThreadPool>,
+    threads: Option<ThreadPool>,
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
     size: usize,
     users: Mutex<usize>,
@@ -39,7 +39,7 @@ impl Pool {
             .build()
             .expect("thread pool");
         Self {
-            pool: Some(pool),
+            threads: Some(pool),
             handles,
             size,
             users: Mutex::new(0),
@@ -50,7 +50,7 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        self.pool = None;
+        self.threads = None;
         let handles =
             std::mem::take(&mut *self.handles.lock().unwrap_or_else(PoisonError::into_inner));
         let me = std::thread::current().id();
@@ -120,7 +120,7 @@ fn with<R>(f: impl FnOnce(&ThreadPool) -> R) -> R {
         (Use(pool), stale)
     };
     drop(stale);
-    f(used.0.pool.as_ref().expect("pool"))
+    f(used.0.threads.as_ref().expect("pool"))
 }
 
 pub fn run<R: Send>(f: impl FnOnce() -> R + Send) -> R {

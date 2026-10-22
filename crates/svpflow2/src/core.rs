@@ -3335,14 +3335,21 @@ fn expand_plane(
             };
             if pel == 2 {
                 let (a, b) = (sub(0)?, sub(1)?);
-                for ((chunk, &left), &right) in dst.chunks_exact_mut(2).zip(a).zip(b) {
+                for ((chunk, &left), &right) in dst.as_chunks_mut::<2>().0.iter_mut().zip(a).zip(b)
+                {
                     chunk[0] = left;
                     chunk[1] = right;
                 }
             } else {
                 let (a, b, c, d) = (sub(0)?, sub(1)?, sub(2)?, sub(3)?);
-                for ((((chunk, &s0), &s1), &s2), &s3) in
-                    dst.chunks_exact_mut(4).zip(a).zip(b).zip(c).zip(d)
+                for ((((chunk, &s0), &s1), &s2), &s3) in dst
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(a)
+                    .zip(b)
+                    .zip(c)
+                    .zip(d)
                 {
                     chunk[0] = s0;
                     chunk[1] = s1;

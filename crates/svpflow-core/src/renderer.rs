@@ -893,9 +893,9 @@ impl CpuRenderer {
         mask: Option<&[u8]>,
         interp: bool,
     ) {
-        let height = self.config.height / self.config.chroma_y_div;
         #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
         {
+            let height = self.config.height / self.config.chroma_y_div;
             let params = self.plane_params(true, !interp);
             let [dst_u, dst_v] = &dst;
             let fused = interp
@@ -1154,6 +1154,10 @@ impl CpuRenderer {
         chroma: bool,
         interp: bool,
         zero_origin: bool,
+        #[cfg_attr(
+            not(all(target_arch = "x86_64", target_feature = "sse2")),
+            allow(unused_variables)
+        )]
         needs_bases: bool,
         rows: Range<i32>,
         mut pixel: impl FnMut(u8, u8, u8, u8, Option<u8>, Option<u8>, Option<u8>) -> u8,

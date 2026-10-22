@@ -524,6 +524,7 @@ pub(crate) struct CompactPlan {
 }
 
 impl CompactPlan {
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn blocks(&self) -> usize {
         self.blocks
     }

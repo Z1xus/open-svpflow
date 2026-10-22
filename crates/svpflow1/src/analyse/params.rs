@@ -10,6 +10,7 @@ pub(crate) fn level_floor(flags: i32, mask: i32, shift: i32) -> i32 {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const SUPER_NO_FINEST_LEVEL: u8 = 2;
 const BLOCK_DIV: i32 = 64;
 const GPU_LEVEL_BLOCKS: i32 = 5000;
@@ -49,6 +50,7 @@ impl SuperParams {
         Ok(params)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) const fn has_finest_level(&self) -> bool {
         self.flags & SUPER_NO_FINEST_LEVEL == 0
     }

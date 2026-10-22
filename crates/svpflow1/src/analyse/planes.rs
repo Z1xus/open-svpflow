@@ -13,6 +13,7 @@ pub(crate) struct PlaneView<'a> {
 }
 
 impl<'a> PlaneView<'a> {
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) const fn new(
         data: &'a [u8],
         base: usize,

@@ -34,7 +34,7 @@ fn sibling(device: Handle) -> Handle {
         #[cfg(target_os = "linux")]
         let library = unsafe { libloading::os::unix::Library::open(Some(name), 0x1 | 0x4) };
         #[cfg(target_os = "windows")]
-        let library = unsafe { libloading::os::windows::Library::open_already_loaded(name) };
+        let library = libloading::os::windows::Library::open_already_loaded(name);
         let Ok(library) = library else {
             continue;
         };
