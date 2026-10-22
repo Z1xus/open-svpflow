@@ -282,8 +282,6 @@ inline int child_entries(int cxi, int cyi, int cx, int cy, int nx, int ny, int2 
     return n;
 }
 
-#define SR_WG 1024
-
 __kernel __attribute__((reqd_work_group_size(SR_WG, 1, 1)))
 void srank(__global const int4 *cout, __global int2 *rev, __global int *scratch, int8 g, int4 h, int8 st) {
     const int dir = (int)get_group_id(0);

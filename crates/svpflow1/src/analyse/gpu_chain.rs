@@ -112,7 +112,7 @@ impl RefineGpu {
                 return None;
             }
             self.build(&format!(
-                "#define FREQ {FREQ}\n#define SR_MAX {RANK_BLOCKS}\n{CHAIN}"
+                "#define FREQ {FREQ}\n#define SR_MAX {RANK_BLOCKS}\n#define SR_WG {SORT_GROUP}\n{CHAIN}"
             ))
         })
     }
@@ -464,8 +464,8 @@ impl Session<'_, '_> {
                                 Arg::V4([plan.sort_shift, plan.sort_buckets, 0, 0]),
                                 Arg::V8(st_sort),
                             ],
-                            1024 * dirs,
-                            Some(1024),
+                            SORT_GROUP * dirs,
+                            Some(SORT_GROUP),
                             &[],
                             null_mut(),
                         )?;
