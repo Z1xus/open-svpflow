@@ -91,6 +91,7 @@ pub(crate) struct GpuSearchParams {
     pub(crate) rmax: usize,
     pub(crate) border: usize,
     pub(crate) satd: bool,
+    pub(crate) rank: Vec<i32>,
 }
 
 const CHROMA_MUL: i32 = 1;
@@ -692,7 +693,18 @@ impl Field {
             0,
             0,
         ];
+        let mut rank = Vec::new();
+        if param > 0 {
+            rank.resize(self.vectors.len(), 0);
+            for (position, &(bx, by)) in self.order.iter().enumerate() {
+                let (bx, by) = (i32::from(bx), i32::from(by));
+                if bx < self.blk_x && by < self.blk_y {
+                    rank[(by * self.blk_x + bx) as usize] = position as i32;
+                }
+            }
+        }
         Some(GpuSearchParams {
+            rank,
             q,
             width: l.width as usize,
             height: l.height as usize,

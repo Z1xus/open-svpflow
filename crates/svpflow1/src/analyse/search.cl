@@ -614,6 +614,7 @@ void search(__global const uchar *sY, __global const uchar *sU, __global const u
     __local int *svm = svm_[sub];
 
     const int bxn = q[P_BLKX], byn = q[P_BLKY], nb = bxn * byn;
+    __global const int *rk = (__global const int *)(rev + nb);
     const int border = BORDERV;
     const int nbt = border ? bxn + 1 + byn : nb;
     const int b = get_group_id(0) * BPW + sub;
@@ -660,8 +661,11 @@ void search(__global const uchar *sY, __global const uchar *sU, __global const u
         if (!border) {
             int ii = l - 4;
             int nx = bi + nbx(ii), ny = bj + nby(ii);
-            inb = (uint)ii < 8u && nx >= 0 && nx < bxn && ny >= 0 && ny < byn;
-            pa = pred[inb ? ny * bxn + nx : pidx];
+            bool in_ = (uint)ii < 8u && nx >= 0 && nx < bxn && ny >= 0 && ny < byn;
+            int ni = in_ ? ny * bxn + nx : pidx;
+            pa = pred[ni];
+            int rn = DONTV ? 0 : rk[ni];
+            inb = in_ && (DONTV || rn < rk[b]);
             ra = rev[b];
         }
     }

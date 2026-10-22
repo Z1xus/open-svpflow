@@ -602,7 +602,10 @@ impl Session<'_, '_> {
 
     // writes do not block, so copies live until the session ends
     fn hold<'h>(&mut self, data: &[u8]) -> &'h [u8] {
-        let copy: Box<[u8]> = data.into();
+        self.hold_boxed(data.into())
+    }
+
+    fn hold_boxed<'h>(&mut self, copy: Box<[u8]>) -> &'h [u8] {
         let held = unsafe { std::slice::from_raw_parts(copy.as_ptr(), copy.len()) };
         self.keep.push(copy);
         held
@@ -1259,7 +1262,11 @@ impl Session<'_, '_> {
         let q_mem = unsafe { self.write(base, q)? };
         let q2_mem = unsafe { self.write(base + 11, q2)? };
         let pred_mem = unsafe { self.write(base + 1, bytes(pred))? };
-        let rev_mem = unsafe { self.write(base + 2, bytes(rev))? };
+        let mut rev_rank = Vec::with_capacity(size_of_val(rev) + size_of_val(&params.rank[..]));
+        rev_rank.extend_from_slice(bytes(rev));
+        rev_rank.extend_from_slice(bytes(&params.rank));
+        let rev_rank = self.hold_boxed(rev_rank.into());
+        let rev_mem = unsafe { self.write(base + 2, rev_rank)? };
         let res = [
             unsafe { self.gpu.buffer(&mut self.unit, base + 3, total * 16)? },
             unsafe { self.gpu.buffer(&mut self.unit, base + 7, total * 16)? },
