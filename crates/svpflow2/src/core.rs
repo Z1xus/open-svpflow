@@ -1235,6 +1235,33 @@ impl FilterState {
         .clone()
     }
 
+    pub(crate) fn cached_lean_expand(
+        &self,
+        key: i64,
+        planes: &renderer::FramePlanes<'_>,
+    ) -> Option<std::sync::Arc<SuperExpand>> {
+        let width = usize::try_from(self.video_info.width.max(0)).ok()?;
+        let height = usize::try_from(self.video_info.height.max(0)).ok()?;
+        let (chroma_x_div, chroma_y_div) = video_format::chroma_divisors(&self.video_info);
+        let chroma_x_div = usize::try_from(chroma_x_div).ok()?;
+        let chroma_y_div = usize::try_from(chroma_y_div).ok()?;
+        let cell = cache_cell(&self.expand_cache, key, EXPAND_CACHE_CAP)?;
+        cell.get_or_init(|| {
+            let (y, y_stride) = expand_source(planes.y, width, height)?;
+            let (u, uv_stride) =
+                expand_source(planes.u, width / chroma_x_div, height / chroma_y_div)?;
+            let (v, _) = expand_source(planes.v, width / chroma_x_div, height / chroma_y_div)?;
+            Some(std::sync::Arc::new(SuperExpand {
+                y,
+                u,
+                v,
+                y_stride,
+                uv_stride,
+            }))
+        })
+        .clone()
+    }
+
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     unsafe fn build_frame_prep(
         &self,
@@ -1643,7 +1670,8 @@ impl FilterState {
                 phase,
             );
         }
-        let source_step = if super0.is_some() || super1.is_some() {
+        let lean_pel = metadata::super_data(self.sdata).lean() && !vector_data.marker_is_one();
+        let source_step = if lean_pel || super0.is_some() || super1.is_some() {
             metadata::super_data(self.sdata).scale().max(1)
         } else {
             1
@@ -1691,12 +1719,23 @@ impl FilterState {
                 v: plane(src1_v, src1_v_stride, src1_v_len),
             }
         };
-        let expand0 = super0
-            .as_ref()
-            .and_then(|planes| self.cached_expand(i64::from(source_frame), planes));
-        let expand1 = super1
-            .as_ref()
-            .and_then(|planes| self.cached_expand(i64::from(source_frame) + 1, planes));
+        let expand0 = if lean_pel {
+            self.cached_lean_expand(i64::from(source_frame), &raw_sources0)
+        } else {
+            super0
+                .as_ref()
+                .and_then(|planes| self.cached_expand(i64::from(source_frame), planes))
+        };
+        let expand1 = if lean_pel {
+            self.cached_lean_expand(i64::from(source_frame) + 1, &raw_sources1)
+        } else {
+            super1
+                .as_ref()
+                .and_then(|planes| self.cached_expand(i64::from(source_frame) + 1, planes))
+        };
+        if lean_pel && (expand0.is_none() || expand1.is_none()) {
+            return None;
+        }
         let expanded = |expand: &Option<std::sync::Arc<SuperExpand>>| {
             expand.as_ref().map(|expand| renderer::FramePlanes {
                 y: unsafe { plane(expand.y.as_ptr(), expand.y_stride, expand.y.len()) },
@@ -3227,6 +3266,48 @@ fn fill_plane(
             }
         }
     }
+}
+
+fn expand_source(
+    plane: renderer::Plane<'_>,
+    width: usize,
+    height: usize,
+) -> Option<(Vec<u8>, usize)> {
+    let stride = plane.stride;
+    let size = stride.checked_mul(height)?;
+    if width == 0 || height < 2 || width > stride || plane.data.len() < size {
+        return None;
+    }
+    let mut base = vec![0u8; size + stride + 2];
+    for (dst, src) in base
+        .chunks_exact_mut(stride)
+        .zip(plane.data.chunks_exact(stride))
+    {
+        dst[..width].copy_from_slice(&src[..width]);
+    }
+    let mean = |a: u8, b: u8| ((u16::from(a) + u16::from(b) + 1) >> 1) as u8;
+    for j in size..base.len() {
+        base[j] = mean(base[j - size], base[j - size + 1]);
+    }
+    let out_stride = width.checked_mul(2)?;
+    let mut out = pooled_buffer(out_stride.checked_mul(height.checked_mul(2)?)?);
+    for (y, pair) in out.chunks_exact_mut(2 * out_stride).enumerate() {
+        let (even, odd) = pair.split_at_mut(out_stride);
+        let row = y * stride;
+        for x in 0..width {
+            let i = row + x;
+            even[2 * x] = base[i];
+            even[2 * x + 1] = mean(base[i], base[i + 1]);
+            if y == 0 {
+                odd[2 * x] = base[i];
+                odd[2 * x + 1] = base[i + 1];
+            } else {
+                odd[2 * x] = mean(base[i], base[i + stride]);
+                odd[2 * x + 1] = mean(base[i], base[i + stride + 1]);
+            }
+        }
+    }
+    Some((out, out_stride))
 }
 
 fn expand_plane(

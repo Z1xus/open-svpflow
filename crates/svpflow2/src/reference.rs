@@ -11,7 +11,7 @@ use svpflow_core::smooth_engine::{self as engine, Rates};
 
 use crate::core::{FilterState, Mode, drop_frame, get_node, request_node, super_frame_planes};
 use crate::vs::Source as _;
-use crate::{frame, metadata, options::ReferenceParams, vs};
+use crate::{frame, metadata, options::ReferenceParams, renderer, vs};
 
 fn cache_cap(bytes: usize) -> usize {
     // frames in flight share the entries, so a few per thread are enough
@@ -1107,18 +1107,34 @@ impl FilterState {
                     slack: 0,
                 });
             }
-            let sup = fetch.get(self.clips.super_clip, k);
-            let planes = unsafe {
-                super_frame_planes(
-                    api,
-                    sup,
-                    &self.video_info,
-                    self.super_info.as_ref(),
-                    self.sdata,
-                )
+            let expand = if metadata::super_data(self.sdata).lean() {
+                let h = usize::try_from(self.video_info.height).ok()?;
+                let (y, yp, yl) = unsafe { api.read_plane(raw, 0, h) }?;
+                let (u, up, ul) = unsafe { api.read_plane(raw, 1, h / chroma.1 as usize) }?;
+                let (v, vp, vl) = unsafe { api.read_plane(raw, 2, h / chroma.1 as usize) }?;
+                let planes = unsafe {
+                    renderer::FramePlanes {
+                        y: renderer::Plane::linear(slice::from_raw_parts(y, yl), yp),
+                        u: renderer::Plane::linear(slice::from_raw_parts(u, ul), up),
+                        v: renderer::Plane::linear(slice::from_raw_parts(v, vl), vp),
+                    }
+                };
+                self.cached_lean_expand(i64::from(k), &planes)
+            } else {
+                let sup = fetch.get(self.clips.super_clip, k);
+                let planes = unsafe {
+                    super_frame_planes(
+                        api,
+                        sup,
+                        &self.video_info,
+                        self.super_info.as_ref(),
+                        self.sdata,
+                    )
+                };
+                let expand = planes.and_then(|planes| self.cached_expand(i64::from(k), &planes));
+                fetch.drop(sup);
+                expand
             };
-            let expand = planes.and_then(|planes| self.cached_expand(i64::from(k), &planes));
-            fetch.drop(sup);
             let expand = expand?;
             let (y, u, v, y_pitch, uv_pitch) = expand.parts();
             let (y, u, v) = unsafe {
