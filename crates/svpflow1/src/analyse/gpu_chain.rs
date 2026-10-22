@@ -557,6 +557,7 @@ impl Session<'_, '_> {
                             offsets,
                             (infos[src_slot].0, infos[ref_slot].0),
                             (src_slot, ref_slot),
+                            stale,
                         )?;
                     }
                 }
@@ -621,13 +622,14 @@ impl Session<'_, '_> {
         (seed_off, words_off): (i32, i32),
         (src, reference): ([Handle; 3], [Handle; 3]),
         (src_slot, ref_slot): (usize, usize),
+        stale: bool,
     ) -> Option<()> {
         let chain = self.gpu.chain_program()?;
         let blocks = (refine.blk_x * refine.blk_y) as usize;
         let (flags, _) = unsafe { self.cbuf(SHARED + 3, blocks)? };
         let (ovr, _) = unsafe { self.cbuf(SHARED + 4, blocks * 4)? };
         let (counter, fresh) = unsafe { self.cbuf(SHARED + 5, 4)? };
-        if fresh {
+        if fresh || stale {
             let zero = self.hold(&[0u8; 4]);
             if !unsafe { self.transfer(counter, zero, null_mut()) } {
                 return None;
