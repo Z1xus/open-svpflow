@@ -104,6 +104,15 @@ impl Stage {
         )
     }
 
+    pub(crate) fn gpu_searchable(&self, params: &AnalyseParams) -> bool {
+        let l = self.layout;
+        params.gpu_mode == 1
+            && params.chroma_shift == (1, 1)
+            && self.settings(params, 0, false).search_type == SearchType::Exhaustive
+            && matches!(l.width, 8 | 16 | 32)
+            && matches!(l.height, 8 | 16 | 32)
+    }
+
     pub(crate) fn gpu_refinable(&self, params: &AnalyseParams) -> bool {
         let settings = self.settings(params, 0, true);
         let l = self.layout;

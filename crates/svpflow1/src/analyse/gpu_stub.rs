@@ -1,6 +1,7 @@
 #![allow(dead_code, clippy::unused_self)]
 
 use super::field::recalc::RecalcPlan;
+use super::field::{GpuSearchParams, Mv};
 
 pub(crate) struct RefineGpu;
 
@@ -35,6 +36,17 @@ impl<'p> Session<'_, 'p> {
     pub(crate) fn submit_compact(
         &mut self,
         _: &super::field::recalc::CompactPlan,
+        _: usize,
+        _: usize,
+    ) -> Option<usize> {
+        None
+    }
+
+    pub(crate) fn search(
+        &mut self,
+        _: &GpuSearchParams,
+        _: &[Mv],
+        _: &[Mv],
         _: usize,
         _: usize,
     ) -> Option<usize> {

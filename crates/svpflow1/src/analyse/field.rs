@@ -84,6 +84,15 @@ pub(crate) struct SearchSettings {
 
 pub(crate) type VectorOutput<'o> = &'o mut [u32];
 
+pub(crate) struct GpuSearchParams {
+    pub(crate) q: [i32; 40],
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) rmax: usize,
+    pub(crate) border: usize,
+    pub(crate) satd: bool,
+}
+
 const CHROMA_MUL: i32 = 1;
 const CHROMA_DIV: i32 = 3;
 const INT_MAX_OVER_100: f64 = i32::MAX as f64 / 100.0;
@@ -111,7 +120,7 @@ pub(crate) struct Field {
     pub(crate) blk_y: i32,
     layout: BlockLayout,
     pel: i32,
-    level: i32,
+    pub(crate) level: i32,
     levels_count: i32,
     smallest: bool,
     chroma_shift: (u32, u32),
@@ -120,7 +129,7 @@ pub(crate) struct Field {
     satd: bool,
     pub(crate) vectors: Vec<Mv>,
     pub(crate) reverse: Vec<Mv>,
-    border: Vec<Mv>,
+    pub(crate) border: Vec<Mv>,
     order: Vec<(i16, i16)>,
 }
 
@@ -482,6 +491,142 @@ impl Field {
             global.sad,
         );
         self.run(true, src, reference, &settings, global, lambda_out, output);
+    }
+
+    pub(crate) fn gpu_search_params(
+        &self,
+        src: &LevelFrame<'_>,
+        reference: &LevelFrame<'_>,
+        settings: &SearchSettings,
+        global: Mv,
+        lambda_out: Option<&mut i32>,
+    ) -> Option<GpuSearchParams> {
+        let l = self.layout;
+        let stp = settings.search_param;
+        let param = if stp != 0 {
+            stp.abs()
+        } else {
+            10 * i32::from(self.level != 0)
+        };
+        let try_many = {
+            let min = match (settings.flags & 0x60) >> 5 {
+                0 => 3,
+                m => m,
+            };
+            settings.try_many && self.level >= min
+        };
+        let bad_range = {
+            let min = match (settings.flags & 0x0C) >> 2 {
+                0 => 3,
+                m => m,
+            };
+            settings.bad_range && self.level >= min
+        };
+        if self.smallest
+            || self.chroma_shift != (1, 1)
+            || settings.search_type != SearchType::Exhaustive
+            || try_many
+            || bad_range
+            || param > 10
+            || (self.pel != 1 && param > 0)
+            || (self.level > 0 && settings.flags & CONTRAST_FLAG != 0)
+            || !matches!(l.width, 8 | 16 | 32)
+            || !matches!(l.height, 8 | 16 | 32)
+            || src.u.pitch != src.v.pitch
+            || reference.u.pitch != reference.v.pitch
+            || src.u.base() != src.v.base()
+            || reference.u.base() != reference.v.base()
+            || settings.pnew <= -256
+        {
+            return None;
+        }
+        let scale = settings.plevel.powi(self.levels_count - self.level - 1);
+        let scaled = f64::from(settings.lambda) / scale / f64::from(self.pel * self.pel);
+        let lambda = scaled.min(INT_MAX_OVER_100) as i32;
+        if let Some(out) = lambda_out {
+            *out = lambda;
+        }
+        let (w, h) = (src.y.width, src.y.height);
+        let diagonal = self.pel * f64::from(w * w + h * h).sqrt() as i32;
+        let blur = self.level > 0 && settings.flags & NO_CONTRAST_BLUR_FLAG == 0;
+        let q = [
+            self.blk_x,
+            self.blk_y,
+            l.step_x(),
+            l.step_y(),
+            w,
+            h,
+            self.pel,
+            src.y.pitch as i32,
+            src.u.pitch as i32,
+            0,
+            src.y.base() as i32,
+            src.u.base() as i32,
+            0,
+            reference.y.pitch as i32,
+            reference.u.pitch as i32,
+            reference.y.base() as i32,
+            reference.u.base() as i32,
+            reference.y.height,
+            reference.u.height,
+            lambda,
+            settings.lsad,
+            settings.pnew,
+            settings.pzero,
+            settings.pglobal,
+            settings.pnbour,
+            settings.preverse,
+            param,
+            i32::from(stp <= 0),
+            self.pel * i32::from(global.x),
+            self.pel * i32::from(global.y),
+            diagonal,
+            (l.width * l.height).trailing_zeros() as i32,
+            i32::from(param == 0),
+            0,
+            i32::from(blur),
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        Some(GpuSearchParams {
+            q,
+            width: l.width as usize,
+            height: l.height as usize,
+            rmax: param as usize,
+            satd: self.satd,
+            border: if self.level > 0 { self.border.len() } else { 0 },
+        })
+    }
+
+    pub(crate) fn finish_gpu_search(
+        &mut self,
+        results: &[[i32; 4]],
+        output: Option<VectorOutput<'_>>,
+    ) {
+        let count = self.vectors.len();
+        let mv = |r: &[i32; 4]| Mv::new((r[0] << 16) >> 16, r[0] >> 16, r[1]);
+        for (vector, r) in self.vectors.iter_mut().zip(results) {
+            *vector = mv(r);
+        }
+        let blk_x = self.blk_x as usize;
+        let blk_y = self.blk_y as usize;
+        for (id, r) in results[count..].iter().enumerate() {
+            let slot = if id <= blk_x {
+                id
+            } else {
+                blk_x + blk_y - (id - blk_x - 1)
+            };
+            self.border[slot] = mv(r);
+        }
+        if let Some(out) = output {
+            for (i, r) in results[..count].iter().enumerate() {
+                out[2 * i] = r[2] as u32;
+                out[2 * i + 1] = r[3] as u32;
+            }
+        }
     }
 
     pub(crate) fn recalculate(
@@ -986,7 +1131,7 @@ struct BlockSearch<'a> {
     src: LevelFrame<'a>,
     reference: LevelFrame<'a>,
     pel: i32,
-    level: i32,
+    pub(crate) level: i32,
     chroma_shift: (u32, u32),
     settings: SearchSettings,
     adaptive_radius: bool,

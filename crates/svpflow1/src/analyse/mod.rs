@@ -72,10 +72,11 @@ pub(crate) fn analyse(
             ]
         };
         let gpu = (keys.is_some()
-            && params.stages.len() > 1
-            && params.stages[1..]
-                .iter()
-                .any(|stage| stage.gpu_refinable(params)))
+            && (params.stages[0].gpu_searchable(params)
+                || params.stages.len() > 1
+                    && params.stages[1..]
+                        .iter()
+                        .any(|stage| stage.gpu_refinable(params))))
         .then(gpu::refine_gpu)
         .flatten();
         let mut session = gpu.and_then(gpu::RefineGpu::session);
@@ -136,7 +137,7 @@ fn search_stages(
             second,
             &mut lambda,
             [None, None],
-            |dir, field, now| {
+            |dir, field, now, sess| {
                 if dir == 0 {
                     settings.lambda = now;
                 }
@@ -151,11 +152,12 @@ fn search_stages(
                     field,
                     &settings,
                     [first, second],
-                    session,
+                    sess.expect("session"),
                     output,
                     lambda_out,
                 );
             },
+            Some(&mut *session),
         );
         refined.refine_finish(
             starts,
@@ -172,7 +174,8 @@ fn search_stages(
         second,
         &mut lambda,
         take(0),
-        |_, _, _| {},
+        |_, _, _, _| {},
+        session.as_deref_mut(),
     );
     for (index, stage) in params.stages.iter().enumerate().skip(1) {
         let mut refined = Pyramid::new(params, stage);

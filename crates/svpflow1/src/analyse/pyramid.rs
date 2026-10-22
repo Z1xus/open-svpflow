@@ -47,7 +47,8 @@ impl Pyramid {
         second: &SuperFrameView<'_>,
         lambda_out: &mut i32,
         outputs: [Option<VectorOutput<'_>>; 2],
-        mut on_finest: impl FnMut(usize, &Field, i32),
+        mut on_finest: impl FnMut(usize, &Field, i32, Option<&mut Session<'_, '_>>),
+        mut session: Option<&mut Session<'_, '_>>,
     ) {
         let [mut out_forward, mut out_backward] = outputs;
         let top = stage.levels - 1;
@@ -117,13 +118,13 @@ impl Pyramid {
                 std::mem::swap(&mut f.reverse, &mut b.reverse);
             }
             let (src, reference) = (first.level(level), second.level(level));
-            let lambda = Some(&mut *lambda_out);
             let out_f = if finest { out_forward.take() } else { None };
             let out_b = if finest { out_backward.take() } else { None };
             if cfg!(target_arch = "wasm32") {
                 let settings = &settings;
                 let (src_ref, reference_ref) = (&src, &reference);
                 let b_ref = b.as_deref_mut();
+                let lambda = Some(&mut *lambda_out);
                 both(
                     || {
                         f.search(
@@ -149,22 +150,70 @@ impl Pyramid {
                     },
                 );
                 if finest {
-                    on_finest(0, f, *lambda_out);
+                    on_finest(0, f, *lambda_out, session.as_deref_mut());
                     if let Some(b) = b {
-                        on_finest(1, b, *lambda_out);
+                        on_finest(1, b, *lambda_out, session.as_deref_mut());
                     }
                 }
                 continue;
             }
-            f.search(&src, &reference, &settings, global_forward, lambda, out_f);
+            let (mut out_f, mut out_b) = (out_f, out_b);
+            let mut on_gpu = [false, false];
+            if level == 0
+                && let Some(session) = session.as_deref_mut()
+            {
+                let pf = f.gpu_search_params(
+                    &src,
+                    &reference,
+                    &settings,
+                    global_forward,
+                    Some(&mut *lambda_out),
+                );
+                let pb = b.as_deref().map(|b| {
+                    b.gpu_search_params(&reference, &src, &settings, global_backward, None)
+                });
+                if let Some(pf) = pf
+                    && pb.as_ref().is_none_or(Option::is_some)
+                {
+                    let tf = session.search(&pf, &f.vectors, &f.reverse, 0, 1);
+                    let tb = match (b.as_deref(), pb) {
+                        (Some(b), Some(Some(pb))) => {
+                            session.search(&pb, &b.vectors, &b.reverse, 1, 0)
+                        }
+                        _ => None,
+                    };
+                    let waited = (tf.is_some() || tb.is_some()) && session.wait();
+                    if waited {
+                        if let Some(t) = tf {
+                            let r = session.take(t);
+                            if r.len() == f.vectors.len() + pf.border {
+                                f.finish_gpu_search(&r, out_f.take());
+                                on_gpu[0] = true;
+                            }
+                        }
+                        if let (Some(t), Some(b)) = (tb, b.as_deref_mut()) {
+                            let r = session.take(t);
+                            if r.len() == b.vectors.len() + pf.border {
+                                b.finish_gpu_search(&r, out_b.take());
+                                on_gpu[1] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !on_gpu[0] {
+                let lambda = Some(&mut *lambda_out);
+                f.search(&src, &reference, &settings, global_forward, lambda, out_f);
+            }
             if finest {
-                on_finest(0, f, *lambda_out);
+                on_finest(0, f, *lambda_out, session.as_deref_mut());
             }
             if let Some(b) = b {
-                let out = out_b;
-                b.search(&reference, &src, &settings, global_backward, None, out);
+                if !on_gpu[1] {
+                    b.search(&reference, &src, &settings, global_backward, None, out_b);
+                }
                 if finest {
-                    on_finest(1, b, *lambda_out);
+                    on_finest(1, b, *lambda_out, session.as_deref_mut());
                 }
             }
         }

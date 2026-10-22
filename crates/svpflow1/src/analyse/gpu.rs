@@ -4,6 +4,7 @@ use std::ffi::CString;
 use std::sync::{Mutex, OnceLock};
 
 use super::field::recalc::{CompactPlan, RecalcPlan};
+use super::field::{GpuSearchParams, Mv};
 
 type ClInt = i32;
 type ClUint = u32;
@@ -84,6 +85,8 @@ type FnRelease = unsafe extern "C" fn(Handle) -> ClInt;
 type FnFinish = unsafe extern "C" fn(Handle) -> ClInt;
 type FnWaitForEvents = unsafe extern "C" fn(ClUint, *const Handle) -> ClInt;
 type FnGetEventInfo = unsafe extern "C" fn(Handle, ClUint, usize, *mut c_void, *mut usize) -> ClInt;
+type FnKernelInfo =
+    unsafe extern "C" fn(Handle, Handle, ClUint, usize, *mut c_void, *mut usize) -> ClInt;
 
 #[allow(non_snake_case)]
 struct OpenCl {
@@ -106,6 +109,7 @@ struct OpenCl {
     ReleaseEvent: FnRelease,
     WaitForEvents: FnWaitForEvents,
     GetEventInfo: FnGetEventInfo,
+    GetKernelWorkGroupInfo: FnKernelInfo,
     Flush: FnFinish,
 }
 
@@ -143,6 +147,7 @@ impl OpenCl {
             ReleaseEvent: sym!("clReleaseEvent"),
             WaitForEvents: sym!("clWaitForEvents"),
             GetEventInfo: sym!("clGetEventInfo"),
+            GetKernelWorkGroupInfo: sym!("clGetKernelWorkGroupInfo"),
             Flush: sym!("clFlush"),
             _lib: lib,
         })
@@ -164,12 +169,26 @@ struct Buffer {
     host: usize,
 }
 
+type SearchKey = (Variant, usize, [i32; 5]);
+
+type Launch = (
+    usize,
+    Handle,
+    Handle,
+    Handle,
+    Handle,
+    i32,
+    Handle,
+    (Handle, usize),
+);
+
 #[derive(Default)]
 struct Unit {
     queue: usize,
     expand: usize,
     kernels: Vec<(usize, usize)>,
-    buffers: [Buffer; 7],
+    search: Vec<(usize, usize, usize)>,
+    buffers: [Buffer; 31],
 }
 
 pub(crate) struct RefineGpu {
@@ -177,6 +196,7 @@ pub(crate) struct RefineGpu {
     context: usize,
     device: usize,
     programs: Mutex<Vec<(Variant, usize)>>,
+    search_programs: Mutex<Vec<(SearchKey, usize)>>,
     units: Vec<Mutex<Unit>>,
     cache: Mutex<Cache>,
     expand: OnceLock<Option<usize>>,
@@ -328,6 +348,7 @@ impl RefineGpu {
                 context: context as usize,
                 device: device as usize,
                 programs: Mutex::new(Vec::new()),
+                search_programs: Mutex::new(Vec::new()),
                 units,
                 cache: Mutex::new(Cache::default()),
                 expand: OnceLock::new(),
@@ -358,7 +379,40 @@ impl RefineGpu {
         Some(program)
     }
 
+    fn search_program(&self, variant: Variant, rmax: usize, spec: [i32; 5]) -> Option<usize> {
+        let mut programs = self.search_programs.lock().ok()?;
+        if let Some(&(_, program)) = programs.iter().find(|(v, _)| *v == (variant, rmax, spec)) {
+            return Some(program);
+        }
+        let build = |portable: &str| {
+            self.build_with(
+                &format!(
+                    "#define W {}\n#define H {}\n#define RMAX {}\n{}#define PELV {}\n#define LOGAV {}\n#define DONTV {}\n#define BLURV {}\n#define BORDERV {}\n{portable}{SEARCH}",
+                    variant.width,
+                    variant.height,
+                    rmax,
+                    if variant.satd { "#define SATD 1\n" } else { "" },
+                    spec[0],
+                    spec[1],
+                    spec[2],
+                    spec[3],
+                    spec[4]
+                ),
+                c"-cl-fp32-correctly-rounded-divide-sqrt",
+            )
+        };
+        let program = build("")
+            .or_else(|| build("#define NO_REDUX 1\n"))
+            .or_else(|| build("#define NO_NV_ASM 1\n"))?;
+        programs.push(((variant, rmax, spec), program));
+        Some(program)
+    }
+
     fn build(&self, text: &str) -> Option<usize> {
+        self.build_with(text, c"")
+    }
+
+    fn build_with(&self, text: &str, options: &core::ffi::CStr) -> Option<usize> {
         let source = CString::new(text).ok()?;
         let cl = &self.cl;
         let mut err = 0;
@@ -382,7 +436,7 @@ impl RefineGpu {
                 program,
                 1,
                 &raw const device,
-                c"".as_ptr(),
+                options.as_ptr(),
                 std::ptr::null(),
                 std::ptr::null_mut(),
             )
@@ -650,7 +704,7 @@ impl Session<'_, '_> {
         let mut mems = [0usize; 3];
         let mut event: Handle = std::ptr::null_mut();
         for (plane, data) in planes.data.iter().enumerate() {
-            let size = lengths[plane].max(1);
+            let size = lengths[plane].max(1) + 64;
             let pooled = self.gpu.pool.lock().ok().and_then(|mut pool| {
                 let at = pool.iter().position(|&(_, s)| s == size)?;
                 Some(pool.swap_remove(at).0)
@@ -732,7 +786,7 @@ impl Session<'_, '_> {
         }
         Some(Uploaded {
             mems,
-            sizes: lengths.map(|length| length.max(1)),
+            sizes: lengths.map(|length| length.max(1) + 64),
             frame: Frame {
                 lengths: lengths.map(|length| length as i64),
                 pitches: planes.pitch.map(|p| p as i64),
@@ -1073,7 +1127,230 @@ impl Session<'_, '_> {
             }
             self.pending.push(done as usize);
         }
-        self.tickets.push((slot, blocks));
+        self.tickets.push((4 + slot, blocks));
+        Some(self.tickets.len() - 1)
+    }
+
+    pub(crate) fn search(
+        &mut self,
+        params: &GpuSearchParams,
+        pred: &[Mv],
+        rev: &[Mv],
+        src: usize,
+        reference: usize,
+    ) -> Option<usize> {
+        self.flush();
+        self.frames[src].as_ref()?;
+        self.frames[reference].as_ref()?;
+        let variant = Variant {
+            width: params.width,
+            height: params.height,
+            satd: params.satd,
+            shift: 1,
+        };
+        let spec = [params.q[6], params.q[31], params.q[32], params.q[34], 0];
+        let program = self.gpu.search_program(variant, params.rmax, spec)?;
+        let border_program = if params.border > 0 {
+            let mut spec = spec;
+            spec[4] = 1;
+            self.gpu.search_program(variant, params.rmax, spec)?
+        } else {
+            program
+        };
+        unsafe { self.enqueue_search(params, pred, rev, src, reference, program, border_program) }
+    }
+
+    unsafe fn search_kernel(&mut self, program: usize) -> Option<(Handle, usize)> {
+        if let Some(&(_, kernel, local)) = self.unit.search.iter().find(|(p, _, _)| *p == program) {
+            return Some((kernel as Handle, local));
+        }
+        let cl = &self.gpu.cl;
+        let mut err = 0;
+        let kernel =
+            unsafe { (cl.CreateKernel)(program as Handle, c"search".as_ptr(), &raw mut err) };
+        if err != CL_SUCCESS || kernel.is_null() {
+            return None;
+        }
+        let mut size = [0usize; 3];
+        if unsafe {
+            (cl.GetKernelWorkGroupInfo)(
+                kernel,
+                self.gpu.device as Handle,
+                0x11B1,
+                size_of_val(&size),
+                size.as_mut_ptr().cast(),
+                std::ptr::null_mut(),
+            )
+        } != CL_SUCCESS
+            || size[0] < 32
+        {
+            return None;
+        }
+        self.unit.search.push((program, kernel as usize, size[0]));
+        Some((kernel, size[0]))
+    }
+
+    unsafe fn enqueue_search(
+        &mut self,
+        params: &GpuSearchParams,
+        pred: &[Mv],
+        rev: &[Mv],
+        src: usize,
+        reference: usize,
+        program: usize,
+        border_program: usize,
+    ) -> Option<usize> {
+        let cl = &self.gpu.cl;
+        let blocks = pred.len();
+        let total = blocks + params.border;
+        let base = 7 + 12 * src;
+        let main_kernel = unsafe { self.search_kernel(program)? };
+        let border_kernel = unsafe { self.search_kernel(border_program)? };
+        unsafe { self.gpu.pinned(&mut self.unit, base + 6, total * 16)? };
+        let (source_mems, target_mems) = (
+            self.frames[src].as_ref()?.1,
+            self.frames[reference].as_ref()?.1,
+        );
+        let events: Vec<Handle> = self
+            .frames
+            .iter()
+            .flatten()
+            .map(|f| f.3 as Handle)
+            .collect();
+        let mut border_q = params.q;
+        border_q[33] = 1;
+        let q = self.hold(bytes(&params.q));
+        let q2 = self.hold(bytes(&border_q));
+        let pred = self.hold(bytes(pred));
+        let rev = self.hold(bytes(rev));
+        let q_mem = unsafe { self.write(base, q)? };
+        let q2_mem = unsafe { self.write(base + 11, q2)? };
+        let pred_mem = unsafe { self.write(base + 1, pred)? };
+        let rev_mem = unsafe { self.write(base + 2, rev)? };
+        let res = [
+            unsafe { self.gpu.buffer(&mut self.unit, base + 3, total * 16)? },
+            unsafe { self.gpu.buffer(&mut self.unit, base + 7, total * 16)? },
+        ];
+        let aux = unsafe { self.gpu.buffer(&mut self.unit, base + 4, total * 16)? };
+        let cen = unsafe { self.gpu.buffer(&mut self.unit, base + 10, total * 16)? };
+        let out = unsafe { self.gpu.buffer(&mut self.unit, base + 5, total * 16)? };
+        let dirty = [
+            unsafe { self.gpu.buffer(&mut self.unit, base + 8, total)? },
+            unsafe { self.gpu.buffer(&mut self.unit, base + 9, total)? },
+        ];
+        let passes: usize = if params.q[32] != 0 { 0 } else { SWEEPS };
+        let queue = self.unit.queue as Handle;
+        let mut done: Handle = std::ptr::null_mut();
+        let mut launches: Vec<Launch> = Vec::new();
+        for pass in 0..=passes {
+            let (rin, rout) = (res[(pass + 1) % 2], res[pass % 2]);
+            let (din, dout) = (dirty[(pass + 1) % 2], dirty[pass % 2]);
+            launches.push((
+                blocks,
+                rin,
+                rout,
+                din,
+                dout,
+                pass as i32,
+                q_mem,
+                main_kernel,
+            ));
+        }
+        if params.border > 0 {
+            let last = res[passes % 2];
+            let other = res[(passes + 1) % 2];
+            launches.push((
+                params.border,
+                last,
+                other,
+                dirty[0],
+                dirty[1],
+                0,
+                q2_mem,
+                border_kernel,
+            ));
+        }
+        for (index, &(count, rin, rout, din, dout, pass, qm, (kernel, local))) in
+            launches.iter().enumerate()
+        {
+            let mems: [Handle; 15] = [
+                source_mems[0] as Handle,
+                source_mems[1] as Handle,
+                source_mems[2] as Handle,
+                target_mems[0] as Handle,
+                target_mems[1] as Handle,
+                target_mems[2] as Handle,
+                qm,
+                pred_mem,
+                rev_mem,
+                rin,
+                rout,
+                cen,
+                aux,
+                out,
+                din,
+            ];
+            let mut set = mems.iter().enumerate().all(|(index, mem)| unsafe {
+                (cl.SetKernelArg)(
+                    kernel,
+                    index as ClUint,
+                    size_of::<Handle>(),
+                    (&raw const *mem).cast(),
+                ) == CL_SUCCESS
+            });
+            set = set
+                && unsafe {
+                    (cl.SetKernelArg)(kernel, 15, size_of::<Handle>(), (&raw const dout).cast())
+                        == CL_SUCCESS
+                        && (cl.SetKernelArg)(kernel, 16, 4, (&raw const pass).cast()) == CL_SUCCESS
+                };
+            if !set {
+                return None;
+            }
+            let global = count.div_ceil(local / 32) * local;
+            let waits: &[Handle] = if index == 0 { &events } else { &[] };
+            if unsafe {
+                (cl.EnqueueNDRangeKernel)(
+                    queue,
+                    kernel,
+                    1,
+                    std::ptr::null(),
+                    &raw const global,
+                    &raw const local,
+                    waits.len() as ClUint,
+                    if waits.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        waits.as_ptr().cast()
+                    },
+                    std::ptr::null_mut(),
+                )
+            } != CL_SUCCESS
+            {
+                unsafe { (cl.Finish)(queue) };
+                return None;
+            }
+        }
+        let host = self.unit.buffers[base + 6].host;
+        if unsafe {
+            (cl.EnqueueReadBuffer)(
+                queue,
+                out,
+                CL_FALSE,
+                0,
+                total * 16,
+                host as *mut c_void,
+                0,
+                std::ptr::null(),
+                (&raw mut done).cast(),
+            )
+        } != CL_SUCCESS
+        {
+            unsafe { (cl.Finish)(queue) };
+            return None;
+        }
+        self.pending.push(done as usize);
+        self.tickets.push((base + 6, total));
         Some(self.tickets.len() - 1)
     }
 
@@ -1116,7 +1393,7 @@ impl Session<'_, '_> {
         if blocks == 0 {
             return Vec::new();
         }
-        let host = self.unit.buffers[4 + slot].host as *const [i32; 4];
+        let host = self.unit.buffers[slot].host as *const [i32; 4];
         unsafe { std::slice::from_raw_parts(host, blocks) }.to_vec()
     }
 }
@@ -1138,6 +1415,10 @@ unsafe impl Sync for RefineGpu {}
 fn bytes<T: Copy>(values: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), size_of_val(values)) }
 }
+
+const SEARCH: &str = include_str!("search.cl");
+
+const SWEEPS: usize = 4;
 
 const EXPAND: &str = r"
 __kernel void expand(__global uchar *plane, long pitch, long height) {
