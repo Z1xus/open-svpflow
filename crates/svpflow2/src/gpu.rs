@@ -35,6 +35,7 @@ const CL_EVENT_COMMAND_EXECUTION_STATUS: ClUint = 0x11D3;
 const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
 const CL_DEVICE_NAME: ClUint = 0x102B;
 const CL_DEVICE_GLOBAL_MEM_SIZE: ClUint = 0x101F;
+const CL_DEVICE_MAX_PARAMETER_SIZE: ClUint = 0x1017;
 const CL_MEM_READ_WRITE: u64 = 1 << 0;
 const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
 const CL_MAP_READ: u64 = 1 << 0;
@@ -274,6 +275,7 @@ pub struct GpuContext {
     super_cap: std::sync::atomic::AtomicUsize,
     frame_bytes: std::sync::atomic::AtomicUsize,
     frame_budget: usize,
+    fuse_fits: bool,
     image_pool: std::sync::Arc<ImagePool>,
     still: std::sync::Mutex<StillState>,
     layer: std::sync::Mutex<layer::LayerState>,
@@ -399,8 +401,8 @@ struct Unit {
     kernel: ClKernel,
     queue: ClCommandQueue,
     dst: [(ClMem, usize); 3],
-    motion: [ImageSlot; 2],
-    motion_key: [i64; 2],
+    motion: [ImageSlot; MOTION_SLOTS],
+    motion_key: [i64; MOTION_SLOTS],
     mask: ImageSlot,
     packed_base: Vec<u16>,
     packed_ext: Vec<u16>,
@@ -437,8 +439,8 @@ impl Unit {
             kernel,
             queue,
             dst: [z; 3],
-            motion: [ImageSlot::EMPTY; 2],
-            motion_key: [i64::MIN; 2],
+            motion: [ImageSlot::EMPTY; MOTION_SLOTS],
+            motion_key: [i64::MIN; MOTION_SLOTS],
             mask: ImageSlot::EMPTY,
             packed_base: Vec::new(),
             packed_ext: Vec::new(),
@@ -479,6 +481,7 @@ struct StillState {
 unsafe impl Send for StillState {}
 
 const UPLOAD_QUEUES: usize = 4;
+const MOTION_SLOTS: usize = 8;
 
 unsafe impl Send for GpuContext {}
 unsafe impl Sync for GpuContext {}
@@ -700,7 +703,11 @@ impl GpuContext {
                 cache_resources.push(std::sync::Mutex::new(CacheResources { kernel, queue }));
             }
             let device_name = unsafe { device_name(&cl, device) };
-            let frame_budget = unsafe { device_memory(&cl, device) } / FRAME_BUDGET_SHARE;
+            let frame_budget = unsafe { device_size(&cl, device, CL_DEVICE_GLOBAL_MEM_SIZE) }
+                .unwrap_or(usize::MAX)
+                / FRAME_BUDGET_SHARE;
+            let fuse_fits = unsafe { device_size(&cl, device, CL_DEVICE_MAX_PARAMETER_SIZE) }
+                .is_some_and(|size| size >= blend::FUSED_ARG_BYTES);
             let blend_slots = std::sync::Arc::new(blend::Slots::new(units.len()));
             return Ok(Self {
                 cl,
@@ -721,6 +728,7 @@ impl GpuContext {
                 super_cap: std::sync::atomic::AtomicUsize::new(RECENT_FRAMES),
                 frame_bytes: std::sync::atomic::AtomicUsize::new(0),
                 frame_budget,
+                fuse_fits,
                 image_pool: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 still: std::sync::Mutex::new(StillState {
                     queue: std::ptr::null_mut(),
@@ -1099,7 +1107,7 @@ impl GpuContext {
                 program
             } else {
                 let source = format!(
-                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define STILL {}\n#define LAYER {}\n#define HI10P {}\n{}",
+                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define STILL {}\n#define LAYER {}\n#define FUSE {}\n#define HI10P {}\n{}",
                     variant & 0xFF,
                     (variant >> 8) & 1,
                     (variant >> 9) & 1,
@@ -1109,6 +1117,7 @@ impl GpuContext {
                     (variant >> 13) & 1,
                     (variant >> 14) & 1,
                     (variant >> 15) & 1,
+                    (variant >> 17) & 1,
                     u8::from(self.hi10),
                     KERNEL_SRC
                 );
@@ -1176,6 +1185,7 @@ impl GpuContext {
     unsafe fn upload_motion(
         &self,
         unit: &mut Unit,
+        slot: usize,
         algorithm: i32,
         motion_key: i64,
         motion_width: usize,
@@ -1203,9 +1213,13 @@ impl GpuContext {
         packed_base.clear();
         packed_ext.clear();
         unsafe {
-            let base_mem =
-                self.ensure_image(&mut motion[0], motion_width, motion_height, CL_UNORM_INT16)?;
-            if cached_motion_key[0] != motion_key {
+            let base_mem = self.ensure_image(
+                &mut motion[slot],
+                motion_width,
+                motion_height,
+                CL_UNORM_INT16,
+            )?;
+            if cached_motion_key[slot] != motion_key {
                 packed_base.reserve(count * 4);
                 for i in 0..count {
                     packed_base.extend_from_slice(&[
@@ -1223,12 +1237,16 @@ impl GpuContext {
                     motion_width * 8,
                     packed_base.as_ptr().cast(),
                 )?;
-                cached_motion_key[0] = motion_key;
+                cached_motion_key[slot] = motion_key;
             }
             let ext_mem = if algorithm == 23 {
-                let mem =
-                    self.ensure_image(&mut motion[1], motion_width, motion_height, CL_UNORM_INT16)?;
-                if cached_motion_key[1] != motion_key {
+                let mem = self.ensure_image(
+                    &mut motion[slot + 1],
+                    motion_width,
+                    motion_height,
+                    CL_UNORM_INT16,
+                )?;
+                if cached_motion_key[slot + 1] != motion_key {
                     packed_ext.reserve(count * 4);
                     for i in 0..count {
                         packed_ext.extend_from_slice(&[
@@ -1246,7 +1264,7 @@ impl GpuContext {
                         motion_width * 8,
                         packed_ext.as_ptr().cast(),
                     )?;
-                    cached_motion_key[1] = motion_key;
+                    cached_motion_key[slot + 1] = motion_key;
                 }
                 mem
             } else {
@@ -1305,6 +1323,7 @@ impl GpuContext {
         unsafe {
             let (base_mem, ext_mem) = self.upload_motion(
                 unit,
+                0,
                 py.algorithm,
                 motion_key,
                 motion_width,
@@ -1868,6 +1887,9 @@ pub(crate) const KERNEL_SRC: &str = r"
 #ifndef LAYER
 #define LAYER 0
 #endif
+#ifndef FUSE
+#define FUSE 0
+#endif
 #define LAYER_MIN 0.2f
 #define LAYER_GROUP 3
 #define LAYER_FILL 4.0f
@@ -1969,18 +1991,19 @@ inline float linear_source_sample(
     return REF_SCALE(p) * read_imagef(source, linear_sampler, position).x;
 }
 
-inline float base_sample(read_only image2d_t source, const Params *p) {
-    float2 position = ((float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f))
-        + (float2)(get_global_id(0), get_global_id(1));
-#if CUBIC_REF
-    return REF_SCALE(p) * cubic_sample(source, position).x;
-#else
-    return REF_SCALE(p) * read_imagef(source, linear_sampler, position).x;
-#endif
-}
-
 const sampler_t cell_sampler = CLK_NORMALIZED_COORDS_FALSE |
     CLK_ADDRESS_CLAMP_TO_EDGE | CLK_FILTER_NEAREST;
+
+inline float base_sample(read_only image2d_t source, const Params *p) {
+#if CUBIC_REF
+    float2 position = ((float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f))
+        + (float2)(get_global_id(0), get_global_id(1));
+    return REF_SCALE(p) * cubic_sample(source, position).x;
+#else
+    return REF_SCALE(p) * read_imagef(source, cell_sampler,
+        (int2)(p->offset_x + get_global_id(0), p->offset_y + get_global_id(1))).x;
+#endif
+}
 
 inline float2 full_step(const Params *p, float vx, float vy) {
     return native_divide(
@@ -2203,6 +2226,7 @@ typedef struct {
     float sad_blend[MAX_STEPS];
     float weight[MAX_STEPS];
     float gamma;
+    float source;
 } Steps;
 
 inline float4 layer_sample(read_only image2d_array_t image, float2 position, int layer) {
@@ -2233,6 +2257,87 @@ inline float4 layer_sample(read_only image2d_array_t image, float2 position, int
 #endif
 }
 
+#if FUSE
+inline float fuse_slot(
+    read_only image2d_t source, read_only image2d_t source_f, read_only image2d_t source_b,
+    read_only image2d_t vectors, Params p, Steps steps, float total, int x, int y)
+{
+    if (steps.source != 0.0f) {
+#pragma OPENCL FP_CONTRACT OFF
+        float value = round(255.0f *
+            read_imagef(source, nearest_sampler, (int2)(p.offset_x + x, p.offset_y + y)).x);
+        float term = steps.source * value;
+        total = term + total;
+    }
+    if (steps.count == 0) return total;
+    float2 field_position = native_divide(
+        (float2)(x*p.x_ratio-p.origin_x, y*p.y_ratio-p.origin_y),
+        (float2)(p.block_w, p.block_h));
+    float4 vector = field_sample(vectors, field_position, CUBIC);
+# if ALGO == 13
+    float ref_b0 = base_sample(source_b, &p);
+    float ref_f0 = base_sample(source_f, &p);
+# endif
+    for (int step = 0; step < steps.count; step++) {
+        p.phase = steps.phase[step];
+        p.sad_blend = steps.sad_blend[step];
+        float time = native_divide((float)p.phase, 256.0f);
+        float result;
+        float ref_b = source_sample(source_b, &p, vector.z, vector.y, 256-p.phase);
+        float ref_f = source_sample(source_f, &p, vector.x, vector.w, p.phase);
+# if ALGO == 1
+        result = ref_b + ref_f*0.00001f;
+# elif ALGO == 2
+        result = ref_f + ref_b*0.00001f;
+# elif ALGO == 11
+        result = mix(ref_f, ref_b, time);
+# else
+        result = median3(ref_f, ref_b, mix(ref_f0, ref_b0, p.sad_blend));
+# endif
+# if LINEAR_LUMA
+        if (p.linear_luma) {
+            result = native_divide(result, 255.0f);
+            if (result < 0.018f) result *= 4.5f;
+            else result = 1.099f*native_powr(result, 0.45f)-0.099f;
+            result *= 255.0f;
+        }
+# endif
+# if DITHER
+        result += native_divide((float)(bayer[x%8][y%8]-32), 65.0f);
+# endif
+        {
+#pragma OPENCL FP_CONTRACT OFF
+            float value = clamp(round(result), 0.0f, 255.0f);
+            float term = steps.weight[step] * value;
+            total = term + total;
+        }
+    }
+    return total;
+}
+
+kernel void blend_frame(
+    global float *sums, int stride,
+    read_only image2d_t source0, read_only image2d_t forward0, read_only image2d_t backward0,
+    read_only image2d_t vectors0,
+    read_only image2d_t source1, read_only image2d_t forward1, read_only image2d_t backward1,
+    read_only image2d_t vectors1,
+    read_only image2d_t source2, read_only image2d_t forward2, read_only image2d_t backward2,
+    read_only image2d_t vectors2,
+    read_only image2d_t source3, read_only image2d_t forward3, read_only image2d_t backward3,
+    read_only image2d_t vectors3,
+    Params p, Steps steps0, Steps steps1, Steps steps2, Steps steps3)
+{
+    int x = get_global_id(0), y = get_global_id(1);
+    if (x >= p.width || y >= p.height) return;
+    global float *sum = sums + (p.offset_y+y)*stride + p.offset_x + x;
+    float total = *sum;
+    total = fuse_slot(source0, forward0, backward0, vectors0, p, steps0, total, x, y);
+    total = fuse_slot(source1, forward1, backward1, vectors1, p, steps1, total, x, y);
+    total = fuse_slot(source2, forward2, backward2, vectors2, p, steps2, total, x, y);
+    total = fuse_slot(source3, forward3, backward3, vectors3, p, steps3, total, x, y);
+    *sum = total;
+}
+#else
 kernel void blend_frame(
     global float *sums, int stride,
     read_only image2d_t source_f, read_only image2d_t source_b,
@@ -2391,6 +2496,7 @@ kernel void blend_frame(
     *sum = total;
 }
 #endif
+#endif
 
 inline float detail(read_only image2d_t image, int2 at, float value) {
     return value - read_imagef(image, linear_sampler, (float2)(at.x + 1, at.y + 1)).x;
@@ -2433,6 +2539,25 @@ kernel void blend_source(
     float term = weight * value;
     global float *sum = sums + position.y*stride + position.x;
     *sum = term + *sum;
+}
+
+kernel void blend_resolve_source(
+    global float *sums, global uchar *destination, float divisor, float gamma, uint luma,
+    read_only image2d_t source, float weight, int width)
+{
+    size_t i = get_global_id(0);
+    float total;
+    {
+#pragma OPENCL FP_CONTRACT OFF
+        float value = round(255.0f *
+            read_imagef(source, nearest_sampler, (int2)(i % width, i / width)).x);
+        float term = weight * value;
+        total = term + sums[i];
+    }
+    float value = total / divisor;
+    if (gamma != 1.0f && i < luma) value = 255.0f * powr(value, 1.0f / gamma);
+    destination[i] = (uchar)clamp(rint(value), 0.0f, 255.0f);
+    sums[i] = 0.0f;
 }
 
 kernel void blend_resolve(
@@ -2624,19 +2749,18 @@ kernel void cover_finish(global const int *points, global const uchar *table, wr
 }
 ";
 
-unsafe fn device_memory(cl: &OpenCl, device: ClDeviceId) -> usize {
+unsafe fn device_size(cl: &OpenCl, device: ClDeviceId, param: ClUint) -> Option<usize> {
     let mut size = 0u64;
-    unsafe {
+    let status = unsafe {
         (cl.GetDeviceInfo)(
             device,
-            CL_DEVICE_GLOBAL_MEM_SIZE,
+            param,
             size_of::<u64>(),
             (&raw mut size).cast(),
             std::ptr::null_mut(),
-        );
-    }
+        )
+    };
     usize::try_from(size)
         .ok()
-        .filter(|&size| size > 0)
-        .unwrap_or(usize::MAX)
+        .filter(|&size| status == CL_SUCCESS && size > 0)
 }

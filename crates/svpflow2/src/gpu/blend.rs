@@ -11,6 +11,12 @@ use super::{
 };
 
 pub(super) const BLEND_VARIANT: u32 = 1 << 13;
+const FUSE_VARIANT: u32 = 1 << 17;
+const MAX_SLOTS: usize = 4;
+pub(super) const FUSED_ARG_BYTES: usize = (size_of::<ClMem>() + size_of::<i32>())
+    .next_multiple_of(align_of::<ClMem>())
+    + MAX_SLOTS * (4 * size_of::<ClMem>() + size_of::<Steps>())
+    + size_of::<KernelParams>();
 const CL_MEM_OBJECT_IMAGE2D_ARRAY: u32 = 0x10F3;
 const MAX_STEPS: usize = 16;
 
@@ -45,11 +51,12 @@ struct Steps {
     sad_blend: [f32; MAX_STEPS],
     weight: [f32; MAX_STEPS],
     gamma: f32,
+    source: f32,
 }
 
 #[derive(Default)]
 pub(super) struct UnitState {
-    pub(super) kernels: Option<[ClKernel; 2]>,
+    pub(super) kernels: Option<[ClKernel; 3]>,
     pub(super) masks: (ClMem, usize, usize),
 }
 
@@ -61,6 +68,7 @@ impl Default for Steps {
             sad_blend: [0.0; MAX_STEPS],
             weight: [0.0; MAX_STEPS],
             gamma: 1.0,
+            source: 0.0,
         }
     }
 }
@@ -75,6 +83,8 @@ unsafe impl Send for Buffers {}
 
 struct Group {
     kernel: ClKernel,
+    variant: u32,
+    fused: bool,
     frames: [Arc<SuperEntry>; 2],
     sources: [[GpuBuf; 3]; 2],
     fields: (ClMem, ClMem),
@@ -86,9 +96,15 @@ struct Group {
     masks: Vec<u8>,
 }
 
+struct FuseSlot {
+    source: Option<(Arc<SuperEntry>, f32)>,
+    group: Option<Group>,
+}
+
 #[derive(Default)]
 struct Pending {
     group: Option<Group>,
+    slots: Vec<FuseSlot>,
     frames: Vec<Arc<SuperEntry>>,
     layers: Vec<Arc<Layer>>,
     motion: Vec<Vec<u16>>,
@@ -131,6 +147,7 @@ pub struct BlendJob {
     rows: usize,
     luma: usize,
     gamma: f32,
+    fuse: bool,
     weight: Cell<f32>,
     taken: Cell<bool>,
     failed: Cell<bool>,
@@ -191,10 +208,14 @@ impl GpuContext {
         }
     }
 
-    fn blend_kernels(&self, unit: &mut Unit) -> Option<[ClKernel; 2]> {
+    fn blend_kernels(&self, unit: &mut Unit) -> Option<[ClKernel; 3]> {
         if unit.blend.kernels.is_none() {
-            let mut kernels = [std::ptr::null_mut(); 2];
-            for (kernel, name) in kernels.iter_mut().zip([c"blend_source", c"blend_resolve"]) {
+            let mut kernels = [std::ptr::null_mut(); 3];
+            for (kernel, name) in
+                kernels
+                    .iter_mut()
+                    .zip([c"blend_source", c"blend_resolve", c"blend_resolve_source"])
+            {
                 let mut err = 0;
                 *kernel =
                     unsafe { (self.cl.CreateKernel)(self.program, name.as_ptr(), &raw mut err) };
@@ -270,11 +291,25 @@ impl GpuContext {
         divisor: f32,
         gamma: f32,
         luma: usize,
+        tail: Option<(&SuperEntry, f32)>,
     ) -> Option<()> {
         let luma = u32::try_from(luma).ok()?;
-        let [_, resolve] = self.blend_kernels(unit)?;
+        let [_, plain, with_source] = self.blend_kernels(unit)?;
+        let resolve = if tail.is_some() { with_source } else { plain };
         unsafe {
             let set = self.cl.SetKernelArg;
+            let mut ready: ClEvent = std::ptr::null_mut();
+            if let Some((entry, weight)) = tail {
+                let image = entry.mems[1];
+                let width = i32::try_from(buffers.len / entry.dims.1).ok()?;
+                ready = entry.ready;
+                if set(resolve, 5, size_of::<ClMem>(), (&raw const image).cast()) != CL_SUCCESS
+                    || set(resolve, 6, size_of::<f32>(), (&raw const weight).cast()) != CL_SUCCESS
+                    || set(resolve, 7, size_of::<i32>(), (&raw const width).cast()) != CL_SUCCESS
+                {
+                    return None;
+                }
+            }
             if set(
                 resolve,
                 0,
@@ -300,8 +335,12 @@ impl GpuContext {
                 std::ptr::null(),
                 &raw const buffers.len,
                 std::ptr::null(),
-                0,
-                std::ptr::null(),
+                u32::from(!ready.is_null()),
+                if ready.is_null() {
+                    std::ptr::null()
+                } else {
+                    (&raw const ready).cast()
+                },
                 std::ptr::null_mut(),
             ) == CL_SUCCESS)
                 .then_some(())
@@ -362,7 +401,9 @@ impl GpuContext {
             unsafe { self.release_unit(&unit) };
             return None;
         };
-        if fresh && unsafe { self.enqueue_resolve(&mut unit, &buffers, 1.0, 1.0, 0) }.is_none() {
+        if fresh
+            && unsafe { self.enqueue_resolve(&mut unit, &buffers, 1.0, 1.0, 0, None) }.is_none()
+        {
             unsafe {
                 self.release_buffers(&buffers);
                 self.release_unit(&unit);
@@ -377,6 +418,7 @@ impl GpuContext {
             rows,
             luma: height,
             gamma,
+            fuse: self.fuse_fits && gamma.to_bits() == 1.0_f32.to_bits(),
             weight: Cell::new(0.0),
             taken: Cell::new(false),
             failed: Cell::new(false),
@@ -385,6 +427,159 @@ impl GpuContext {
     }
 
     fn flush(&self, job: &BlendJob) -> Option<()> {
+        self.retire(job)?;
+        self.launch_slots(job)
+    }
+
+    fn retire(&self, job: &BlendJob) -> Option<()> {
+        let fused = job.pending.borrow().group.as_ref().map(|group| group.fused);
+        match fused {
+            None => Some(()),
+            Some(true) => {
+                let full = {
+                    let mut pending = job.pending.borrow_mut();
+                    let group = pending.group.take()?;
+                    match pending.slots.last_mut() {
+                        Some(slot) if slot.group.is_none() => slot.group = Some(group),
+                        _ => pending.slots.push(FuseSlot {
+                            source: None,
+                            group: Some(group),
+                        }),
+                    }
+                    pending.slots.len() == MAX_SLOTS
+                };
+                if full {
+                    self.launch_slots(job)
+                } else {
+                    Some(())
+                }
+            }
+            Some(false) => {
+                self.launch_slots(job)?;
+                self.launch_current(job)
+            }
+        }
+    }
+
+    fn launch_slots(&self, job: &BlendJob) -> Option<()> {
+        let mut pending = job.pending.borrow_mut();
+        let slots = std::mem::take(&mut pending.slots);
+        let Some(first) = slots.iter().find_map(|slot| slot.group.as_ref()) else {
+            drop(pending);
+            for (entry, weight) in slots.iter().filter_map(|slot| slot.source.as_ref()) {
+                job.failed.set(true);
+                let mut unit = job.unit.borrow_mut();
+                unsafe { self.enqueue_source(job, &mut unit, entry, *weight) }?;
+                job.failed.set(false);
+            }
+            return Some(());
+        };
+        job.failed.set(true);
+        let mut unit = job.unit.borrow_mut();
+        let kernel =
+            self.variant_kernel(&mut unit.variant_kernels, first.variant | FUSE_VARIANT)?;
+        let stride = i32::try_from(job.width).ok()?;
+        let mut waits: Vec<ClEvent> = Vec::new();
+        let mut args = Vec::with_capacity(MAX_SLOTS);
+        for slot in 0..MAX_SLOTS {
+            let entry = slots.get(slot);
+            let group = entry.and_then(|slot| slot.group.as_ref());
+            let shape = group.unwrap_or(first);
+            let (source, weight) = match entry.and_then(|slot| slot.source.as_ref()) {
+                Some((frame, weight)) => (frame.mems[1], *weight),
+                None => (first.frames[0].mems[1], 0.0),
+            };
+            let mut steps = group.map_or_else(Steps::default, |group| group.steps);
+            steps.source = weight;
+            if let Some((frame, _)) = entry.and_then(|slot| slot.source.as_ref()) {
+                waits.push(frame.ready);
+            }
+            if group.is_some() {
+                waits.extend([shape.sources[0][0].1, shape.sources[1][0].1]);
+            }
+            args.push((source, shape.sources, shape.fields.0, steps));
+        }
+        waits.retain(|event| !event.is_null());
+        waits.dedup();
+        let queue = unit.queue;
+        unsafe {
+            let set = self.cl.SetKernelArg;
+            for plane in 0..3 {
+                let params = first.params[plane];
+                let set_mem = |index: ClUint, mem: ClMem| {
+                    set(kernel, index, size_of::<ClMem>(), (&raw const mem).cast()) == CL_SUCCESS
+                };
+                if !set_mem(0, job.buffers.sums)
+                    || set(kernel, 1, size_of::<i32>(), (&raw const stride).cast()) != CL_SUCCESS
+                {
+                    return None;
+                }
+                for (at, (source, sources, vectors, steps)) in args.iter().enumerate() {
+                    let base = 2 + 4 * at as ClUint;
+                    for (offset, image) in
+                        [*source, sources[0][plane].0, sources[1][plane].0, *vectors]
+                            .into_iter()
+                            .enumerate()
+                    {
+                        if !set_mem(base + offset as ClUint, image) {
+                            return None;
+                        }
+                    }
+                    if set(
+                        kernel,
+                        18 + 1 + at as ClUint,
+                        size_of::<Steps>(),
+                        (&raw const *steps).cast(),
+                    ) != CL_SUCCESS
+                    {
+                        return None;
+                    }
+                }
+                if set(
+                    kernel,
+                    18,
+                    size_of::<KernelParams>(),
+                    (&raw const params).cast(),
+                ) != CL_SUCCESS
+                {
+                    return None;
+                }
+                let global = [
+                    usize::try_from(params.width).ok()?,
+                    usize::try_from(params.height).ok()?,
+                ];
+                let wait = if plane == 0 { &waits[..] } else { &[] };
+                if (self.cl.EnqueueNDRangeKernel)(
+                    queue,
+                    kernel,
+                    2,
+                    std::ptr::null(),
+                    global.as_ptr(),
+                    std::ptr::null(),
+                    ClUint::try_from(wait.len()).ok()?,
+                    if wait.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        wait.as_ptr().cast()
+                    },
+                    std::ptr::null_mut(),
+                ) != CL_SUCCESS
+                {
+                    return None;
+                }
+            }
+            (self.cl.Flush)(queue);
+        }
+        for slot in slots {
+            if let Some(group) = slot.group {
+                pending.frames.extend(group.frames);
+            }
+        }
+        job.failed.set(false);
+        Some(())
+    }
+
+    fn launch_current(&self, job: &BlendJob) -> Option<()> {
         let mut pending = job.pending.borrow_mut();
         let Some(group) = pending.group.take() else {
             return Some(());
@@ -498,17 +693,53 @@ impl GpuContext {
                 && Arc::ptr_eq(&group.frames[1], &src1.entry)
         });
         if !joins {
-            self.flush(job)?;
-            let mut unit = job.unit.borrow_mut();
-            let unit = &mut *unit;
             let variant = Self::variant(&params[0], false)
                 | BLEND_VARIANT
                 | u32::from(still.is_some()) << 14
                 | if layer.is_some() { LAYER_VARIANT } else { 0 };
-            let kernel = self.variant_kernel(&mut unit.variant_kernels, variant);
+            let fused = job.fuse
+                && matches!(params[0].algorithm, 1 | 2 | 11 | 13)
+                && params[0].has_sad == 0
+                && still.is_none()
+                && layer.is_none();
+            self.retire(job)?;
+            let compatible = fused
+                && job
+                    .pending
+                    .borrow()
+                    .slots
+                    .iter()
+                    .find_map(|slot| slot.group.as_ref())
+                    .is_none_or(|group| {
+                        group.variant == variant
+                            && group.key.1 == linear
+                            && group.key.2 == motion_width
+                            && group.key.3 == motion_height
+                            && shared(group.params) == shared(params)
+                    });
+            if !compatible {
+                self.launch_slots(job)?;
+            }
+            let slot = if fused {
+                let pending = job.pending.borrow();
+                match pending.slots.last() {
+                    Some(last) if last.group.is_none() => pending.slots.len() - 1,
+                    _ => pending.slots.len(),
+                }
+            } else {
+                0
+            };
+            let mut unit = job.unit.borrow_mut();
+            let unit = &mut *unit;
+            let kernel = if fused {
+                Some(std::ptr::null_mut())
+            } else {
+                self.variant_kernel(&mut unit.variant_kernels, variant)
+            };
             let fields = unsafe {
                 self.upload_motion(
                     unit,
+                    2 * slot,
                     params[0].algorithm,
                     motion_key,
                     motion_width,
@@ -524,6 +755,8 @@ impl GpuContext {
             }
             pending.group = Some(Group {
                 kernel: kernel?,
+                variant,
+                fused,
                 frames: [Arc::clone(&src0.entry), Arc::clone(&src1.entry)],
                 sources: [src0.sources(linear), src1.sources(linear)],
                 fields: fields?,
@@ -562,7 +795,11 @@ impl GpuContext {
         key: Option<i64>,
         planes: [UploadPlane<'_>; 3],
     ) -> Option<()> {
-        self.flush(job)?;
+        if job.fuse {
+            self.retire(job)?;
+        } else {
+            self.flush(job)?;
+        }
         let entry = match key {
             Some(key) => self.cache_frame(key, planes)?.entry,
             None => Arc::new(self.upload_frame(planes)?),
@@ -570,15 +807,37 @@ impl GpuContext {
         if entry.dims != (job.width, job.rows) {
             return None;
         }
-        let mut unit = job.unit.borrow_mut();
-        let [source, _] = self.blend_kernels(&mut unit)?;
         let weight = job.weight.get();
+        job.pending.borrow_mut().frames.push(Arc::clone(&entry));
+        if job.fuse {
+            if job.pending.borrow().slots.len() == MAX_SLOTS {
+                self.launch_slots(job)?;
+            }
+            job.pending.borrow_mut().slots.push(FuseSlot {
+                source: Some((entry, weight)),
+                group: None,
+            });
+        } else {
+            let mut unit = job.unit.borrow_mut();
+            unsafe { self.enqueue_source(job, &mut unit, &entry, weight) }?;
+        }
+        job.taken.set(true);
+        Some(())
+    }
+
+    unsafe fn enqueue_source(
+        &self,
+        job: &BlendJob,
+        unit: &mut Unit,
+        entry: &SuperEntry,
+        weight: f32,
+    ) -> Option<()> {
+        let [source, _, _] = self.blend_kernels(unit)?;
         let stride = i32::try_from(job.width).ok()?;
         let luma = i32::try_from(job.luma).ok()?;
         let image = entry.mems[1];
         let ready: ClEvent = entry.ready;
         let global = [job.width, job.rows];
-        job.pending.borrow_mut().frames.push(Arc::clone(&entry));
         unsafe {
             let set = self.cl.SetKernelArg;
             if set(
@@ -616,7 +875,6 @@ impl GpuContext {
             }
             (self.cl.Flush)(unit.queue);
         }
-        job.taken.set(true);
         Some(())
     }
 
@@ -638,7 +896,22 @@ impl GpuContext {
                     && plane.height > 0
                     && plane.data.len() >= plane.stride * (plane.height - 1) + plane.width
             });
-        if !fits || self.flush(&job).is_none() || job.failed() {
+        let mut tail = None;
+        if !fits || self.retire(&job).is_none() {
+            self.blend_abort(job);
+            return None;
+        }
+        {
+            let mut pending = job.pending.borrow_mut();
+            match pending.slots.pop_if(|slot| slot.group.is_none()) {
+                Some(FuseSlot {
+                    source: Some(last), ..
+                }) => tail = Some(last),
+                Some(slot) => pending.slots.push(slot),
+                None => {}
+            }
+        }
+        if self.launch_slots(&job).is_none() || job.failed() {
             self.blend_abort(job);
             return None;
         }
@@ -654,6 +927,7 @@ impl GpuContext {
                 divisor,
                 job.gamma,
                 job.width * job.luma,
+                tail.as_ref().map(|(entry, weight)| (&**entry, *weight)),
             )
             .and_then(|()| {
                 for (index, plane) in planes.into_iter().enumerate() {
