@@ -1279,6 +1279,11 @@ impl Session<'_, '_> {
             unsafe { self.gpu.buffer(&mut self.unit, base + 9, total)? },
         ];
         let passes: usize = if params.q[32] != 0 { 0 } else { SWEEPS };
+        let per = if params.q[32] != 0 && params.width == 8 && params.height == 8 {
+            4
+        } else {
+            1
+        };
         let queue = self.unit.queue as Handle;
         let mut done: Handle = std::ptr::null_mut();
         let mut launches: Vec<Launch> = Vec::new();
@@ -1347,7 +1352,7 @@ impl Session<'_, '_> {
             if !set {
                 return None;
             }
-            let global = count.div_ceil(local / 32) * local;
+            let global = count.div_ceil(per * (local / 32)) * local;
             let waits: &[Handle] = if index == 0 { &events } else { &[] };
             if unsafe {
                 (cl.EnqueueNDRangeKernel)(
