@@ -1,6 +1,15 @@
 use super::field::{BlockLayout, Field, SearchSettings, SearchType};
 use crate::params::Value;
 
+const DEFAULT_LEVEL_FLOOR: i32 = 3;
+
+pub(crate) fn level_floor(flags: i32, mask: i32, shift: i32) -> i32 {
+    match (flags & mask) >> shift {
+        0 => DEFAULT_LEVEL_FLOOR,
+        floor => floor,
+    }
+}
+
 const SUPER_NO_FINEST_LEVEL: u8 = 2;
 const BLOCK_DIV: i32 = 64;
 const GPU_LEVEL_BLOCKS: i32 = 5000;
@@ -384,16 +393,12 @@ impl AnalyseParams {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn exact_floor(&self, top: i32) -> i32 {
-        let first = |mask: i32, shift: i32| match (self.flags & mask) >> shift {
-            0 => 3,
-            m => m,
-        };
         let mut floor = top;
         if self.try_many {
-            floor = floor.min(first(0x60, 5));
+            floor = floor.min(level_floor(self.flags, 0x60, 5));
         }
         if self.bad_range != 0 {
-            floor = floor.min(first(0x0C, 2));
+            floor = floor.min(level_floor(self.flags, 0x0C, 2));
         }
         floor.max(1)
     }

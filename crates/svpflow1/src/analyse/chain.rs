@@ -236,7 +236,7 @@ impl ChainPlan {
             let interp = refined.interpolation(&coarse);
             Some(RefinePlan {
                 geometry: refined.compact_geometry(&coarse, w, h, &settings),
-                satd: refined_satd(&refined),
+                satd: refined.uses_satd(),
                 shift: params.chroma_shift.0,
                 blk_x: refined.blk_x,
                 blk_y: refined.blk_y,
@@ -263,10 +263,6 @@ impl ChainPlan {
             sort_buckets: (area * 255) >> log,
         })
     }
-}
-
-fn refined_satd(field: &super::field::Field) -> bool {
-    field.uses_satd()
 }
 
 pub(crate) struct HostFrame<'a> {

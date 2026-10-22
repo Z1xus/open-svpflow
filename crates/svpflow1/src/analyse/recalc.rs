@@ -596,7 +596,6 @@ impl Field {
         ]
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn compact_eligible(&self, settings: &SearchSettings) -> bool {
         (self.layout.width, self.layout.height) == (4, 4)
             && matches!(self.chroma_shift, (0, 0) | (1, 1))
@@ -614,14 +613,8 @@ impl Field {
         plan: &mut CompactPlan,
     ) -> bool {
         let layout = self.layout;
-        let radius = settings.search_param.abs();
         let limit = (i32::MAX / 2) as usize;
-        if (layout.width, layout.height) != (4, 4)
-            || !matches!(self.chroma_shift, (0, 0) | (1, 1))
-            || settings.search_type != SearchType::Exhaustive
-            || radius > 3
-            || self.blk_x < 2
-            || self.blk_y < 2
+        if !self.compact_eligible(settings)
             || coarse.vectors.is_empty()
             || [src.y, src.u, src.v].iter().any(|p| p.data().len() > limit)
         {

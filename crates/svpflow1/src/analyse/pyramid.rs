@@ -13,11 +13,10 @@ pub(crate) struct Pyramid {
 
 impl Pyramid {
     pub(crate) fn new(params: &AnalyseParams, stage: &Stage, lean: bool, floor: i32) -> Self {
-        let min_level = floor;
         let build = || {
             (0..stage.levels)
                 .map(|level| {
-                    (level >= min_level).then(|| {
+                    (level >= floor).then(|| {
                         stage.field(level, params.super_params.pel, params.chroma_shift, lean)
                     })
                 })
@@ -186,9 +185,9 @@ impl Pyramid {
                     && pb.as_ref().is_none_or(Option::is_some)
                 {
                     let tf = session.search(&pf, &f.vectors, &f.reverse, 0, 1);
-                    let tb = match (b.as_deref(), pb) {
+                    let tb = match (b.as_deref(), &pb) {
                         (Some(b), Some(Some(pb))) => {
-                            session.search(&pb, &b.vectors, &b.reverse, 1, 0)
+                            session.search(pb, &b.vectors, &b.reverse, 1, 0)
                         }
                         _ => None,
                     };
@@ -201,9 +200,9 @@ impl Pyramid {
                                 on_gpu[0] = true;
                             }
                         }
-                        if let (Some(t), Some(b)) = (tb, b.as_deref_mut()) {
+                        if let (Some(t), Some(b), Some(Some(pb))) = (tb, b.as_deref_mut(), &pb) {
                             let r = session.view(t);
-                            if r.len() == b.vectors.len() + pf.border {
+                            if r.len() == b.vectors.len() + pb.border {
                                 b.finish_gpu_search(r, out_b.take());
                                 on_gpu[1] = true;
                             }
@@ -352,10 +351,11 @@ impl Pyramid {
         seed: &Field,
         settings: &super::field::SearchSettings,
         frames: [&SuperFrameView<'_>; 2],
-        session: &mut Session<'_, '_>,
+        session: Option<&mut Session<'_, '_>>,
         output: Option<VectorOutput<'_>>,
         lambda_out: Option<&mut i32>,
     ) -> Option<RefineStart> {
+        let session = session?;
         let field = if direction == 0 {
             self.forward[0].as_mut()?
         } else if self.both {

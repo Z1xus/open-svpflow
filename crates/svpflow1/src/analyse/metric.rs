@@ -164,7 +164,8 @@ fn sad<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usiz
     }
     #[cfg(target_arch = "x86_64")]
     if W >= 8 {
-        return unsafe { sad_sse2::<W, H>(src, reference, pitch) };
+        assert!(src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
+        return unsafe { sad_rows_pitched::<W>(src.as_ptr(), W, reference.as_ptr(), pitch, H) };
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     if W >= 4 {
@@ -261,34 +262,6 @@ fn sad_scalar(src: &[u8], reference: &[u8], pitch: usize, width: usize, height: 
             .sum::<u32>();
     }
     sum
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-unsafe fn sad_sse2<const W: usize, const H: usize>(
-    src: &[u8],
-    reference: &[u8],
-    pitch: usize,
-) -> u32 {
-    assert!(src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
-    let mut acc = _mm_setzero_si128();
-    for row in 0..H {
-        let s = unsafe { src.as_ptr().add(row * W) };
-        let r = unsafe { reference.as_ptr().add(row * pitch) };
-        if W == 8 {
-            let a = unsafe { _mm_loadl_epi64(s.cast()) };
-            let b = unsafe { _mm_loadl_epi64(r.cast()) };
-            acc = _mm_add_epi64(acc, _mm_sad_epu8(a, b));
-        } else {
-            for chunk in (0..W).step_by(16) {
-                let a = unsafe { _mm_loadu_si128(s.add(chunk).cast()) };
-                let b = unsafe { _mm_loadu_si128(r.add(chunk).cast()) };
-                acc = _mm_add_epi64(acc, _mm_sad_epu8(a, b));
-            }
-        }
-    }
-    let high = _mm_shuffle_epi32::<0b1110>(acc);
-    _mm_cvtsi128_si32(_mm_add_epi32(acc, high)) as u32
 }
 
 fn sad_2x2_swapped(src: &[u8], reference: &[u8], pitch: usize) -> u32 {

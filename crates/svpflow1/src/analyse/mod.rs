@@ -262,7 +262,7 @@ fn search_stages(
                     field,
                     &settings,
                     [first, second],
-                    sess.expect("session"),
+                    sess,
                     output,
                     lambda_out,
                 );
@@ -316,7 +316,11 @@ fn run_chain<'o>(
     mut outputs: [Option<&'o mut [u32]>; 2],
 ) -> Option<[Option<&'o mut [u32]>; 2]> {
     let done = (|| {
-        let early = (!plan.lean).then(|| cpu_search(params, plan, frames));
+        let early = if plan.lean {
+            None
+        } else {
+            Some(cpu_search(params, plan, frames)?)
+        };
         let mut session = gpu::refine_gpu()?.session(keys[0].1.min(keys[1].1));
         for (slot, (frame, key)) in frames.into_iter().zip(keys).enumerate() {
             let level = frame.level(0);
@@ -347,7 +351,7 @@ fn run_chain<'o>(
                     &hosts[index][2][..],
                 ],
             };
-            cpu_search(params, plan, [&frame(0), &frame(1)])
+            cpu_search(params, plan, [&frame(0), &frame(1)])?
         };
         let tickets = session.chain(plan, &top)?;
         if !session.wait() {
@@ -366,7 +370,7 @@ fn cpu_search<F: planes::LevelSource>(
     params: &AnalyseParams,
     plan: &chain::ChainPlan,
     frames: [&F; 2],
-) -> Vec<Vec<[i32; 4]>> {
+) -> Option<Vec<Vec<[i32; 4]>>> {
     let main = &params.stages[0];
     let start = plan.top() as i32;
     let mut cpu = Pyramid::new(params, main, false, start);
@@ -386,8 +390,7 @@ fn cpu_search<F: planes::LevelSource>(
         .map(|d| {
             cpu.fields(d == 1)[start as usize]
                 .as_ref()
-                .expect("start level")
-                .gpu_out()
+                .map(field::Field::gpu_out)
         })
         .collect()
 }

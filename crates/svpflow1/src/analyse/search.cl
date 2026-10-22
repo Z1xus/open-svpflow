@@ -36,12 +36,10 @@
 #define P_GY 29
 #define P_DIAG 30
 #define P_LOGA 31
-#define P_DONT 32
 #define P_MODE 33
 #define P_BLUR 34
 
 #if defined(__NV_CL_C_VERSION) && !defined(NO_NV_ASM)
-#define NVK 1
 #define BPW 2
 inline uint sad4(uint a, uint b, uint c) {
     uint r;

@@ -1,4 +1,5 @@
 use super::metric::{self, ChromaCost, Kernel, LumaCost, Shape};
+use super::params::level_floor;
 
 use super::planes::{LevelFrame, MAX_BLOCK_AREA, PlaneView};
 
@@ -119,10 +120,7 @@ struct Kernels {
     wide: Option<metric::Wide>,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     stacked: bool,
-    #[cfg_attr(
-        not(all(target_arch = "x86_64", target_feature = "avx2")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     satd: bool,
 }
 
@@ -456,57 +454,55 @@ impl Field {
             return;
         }
         let interp = self.interpolation(coarse);
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        let (norm, norm_area, odd_x, even_x, odd_y, even_y) = (
-            interp.norm,
-            interp.norm_area,
-            interp.odd_x,
-            interp.even_x,
-            interp.odd_y,
-            interp.even_y,
-        );
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        let l = self.layout;
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        let (cx, cy) = (coarse.blk_x, coarse.blk_y);
         for l_y in 0..self.blk_y {
-            #[allow(unused_mut)]
-            let mut done = 1;
-            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            if (1..2 * cy - 1).contains(&l_y) {
-                let odd = l_y % 2 != 0;
-                let ay1 = if odd { odd_y } else { even_y };
-                let ay2 = l.step_y() * 4 - ay1;
-                let weights = [odd_x, even_x].map(|ax1| {
-                    let ax2 = l.step_x() * 4 - ax1;
-                    if l.overlap_x == 0 && l.overlap_y == 0 {
-                        [9, 3, 3, 1]
-                    } else {
-                        [ax1 * ay1, ax2 * ay1, ax1 * ay2, ax2 * ay2]
-                    }
-                });
-                let (divisor, bias) = if l.overlap_x == 0 && l.overlap_y == 0 {
-                    (1, 8)
-                } else {
-                    (norm_area, 0)
-                };
-                let row = |y: i32| &coarse.vectors[(y * cx) as usize..][..cx as usize];
-                let far = l_y / 2 + if odd { 1 } else { -1 };
-                done = unsafe {
-                    wide::blend_row(
-                        &mut self.vectors[(l_y * self.blk_x) as usize..][..self.blk_x as usize],
-                        [row(l_y / 2), row(far)],
-                        weights,
-                        (divisor, bias, norm),
-                        self.blk_x.min(2 * cx - 1) as usize,
-                    )
-                } as i32;
-            }
+            let done = self.blend_wide_row(coarse, &interp, l_y);
             for k_x in (0..1).chain(done..self.blk_x) {
                 let index = (l_y * self.blk_x + k_x) as usize;
                 self.vectors[index] = interp.at(coarse, k_x, l_y);
             }
         }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    fn blend_wide_row(&mut self, coarse: &Self, interp: &Interpolation, l_y: i32) -> i32 {
+        let (cx, cy) = (coarse.blk_x, coarse.blk_y);
+        if !(1..2 * cy - 1).contains(&l_y) {
+            return 1;
+        }
+        let l = self.layout;
+        let odd = l_y % 2 != 0;
+        let ay1 = if odd { interp.odd_y } else { interp.even_y };
+        let ay2 = l.step_y() * 4 - ay1;
+        let weights = [interp.odd_x, interp.even_x].map(|ax1| {
+            let ax2 = l.step_x() * 4 - ax1;
+            if interp.flat {
+                [9, 3, 3, 1]
+            } else {
+                [ax1 * ay1, ax2 * ay1, ax1 * ay2, ax2 * ay2]
+            }
+        });
+        let (divisor, bias) = if interp.flat {
+            (1, 8)
+        } else {
+            (interp.norm_area, 0)
+        };
+        let row = |y: i32| &coarse.vectors[(y * cx) as usize..][..cx as usize];
+        let far = l_y / 2 + if odd { 1 } else { -1 };
+        let done = unsafe {
+            wide::blend_row(
+                &mut self.vectors[(l_y * self.blk_x) as usize..][..self.blk_x as usize],
+                [row(l_y / 2), row(far)],
+                weights,
+                (divisor, bias, interp.norm),
+                self.blk_x.min(2 * cx - 1) as usize,
+            )
+        };
+        done as i32
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    fn blend_wide_row(&mut self, _: &Self, _: &Interpolation, _: i32) -> i32 {
+        1
     }
 
     pub(crate) fn interpolation(&self, coarse: &Self) -> Interpolation {
@@ -582,13 +578,8 @@ impl Field {
         output: Option<VectorOutput<'_>>,
     ) {
         let mut settings = *settings;
-        let levels_ok = |mask: i32, shift: i32| {
-            let min = match (settings.flags & mask) >> shift {
-                0 => 3,
-                m => m,
-            };
-            self.level >= min
-        };
+        let levels_ok =
+            |mask: i32, shift: i32| self.level >= level_floor(settings.flags, mask, shift);
         settings.try_many = settings.try_many && levels_ok(0x60, 5);
         settings.bad_range = settings.bad_range && levels_ok(0x0C, 2);
         if self.smallest {
@@ -657,20 +648,8 @@ impl Field {
         } else {
             10 * i32::from(self.level != 0)
         };
-        let try_many = {
-            let min = match (settings.flags & 0x60) >> 5 {
-                0 => 3,
-                m => m,
-            };
-            settings.try_many && self.level >= min
-        };
-        let bad_range = {
-            let min = match (settings.flags & 0x0C) >> 2 {
-                0 => 3,
-                m => m,
-            };
-            settings.bad_range && self.level >= min
-        };
+        let try_many = settings.try_many && self.level >= level_floor(settings.flags, 0x60, 5);
+        let bad_range = settings.bad_range && self.level >= level_floor(settings.flags, 0x0C, 2);
         if (!relaxed && (self.smallest || try_many || bad_range))
             || self.chroma_shift != (1, 1)
             || settings.search_type != SearchType::Exhaustive
