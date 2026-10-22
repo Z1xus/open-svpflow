@@ -110,7 +110,6 @@ struct OpenCl {
     SetKernelArg: FnSetKernelArg,
     EnqueueNDRangeKernel: FnEnqueueNDRangeKernel,
     ReleaseMemObject: FnRelease,
-    ReleaseKernel: FnRelease,
     Finish: FnFinish,
     ReleaseEvent: FnRelease,
     WaitForEvents: FnWaitForEvents,
@@ -149,7 +148,6 @@ impl OpenCl {
             SetKernelArg: sym!("clSetKernelArg"),
             EnqueueNDRangeKernel: sym!("clEnqueueNDRangeKernel"),
             ReleaseMemObject: sym!("clReleaseMemObject"),
-            ReleaseKernel: sym!("clReleaseKernel"),
             Finish: sym!("clFinish"),
             ReleaseEvent: sym!("clReleaseEvent"),
             WaitForEvents: sym!("clWaitForEvents"),
@@ -775,8 +773,7 @@ impl Session<'_, '_> {
             )
         } != CL_SUCCESS
         {
-            unsafe { (cl.ReleaseKernel)(kernel) };
-            return None;
+            size = [0; 3];
         }
         self.unit
             .kernels
