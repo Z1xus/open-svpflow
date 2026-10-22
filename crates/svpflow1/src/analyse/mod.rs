@@ -11,6 +11,7 @@ mod params;
 mod planes;
 mod pyramid;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) use gpu::purge;
 pub(crate) use params::{AnalyseParams, SuperParams};
 pub(crate) use planes::{RawPlane, SuperFrameView, plane_size};
