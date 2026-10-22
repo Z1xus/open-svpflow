@@ -2195,6 +2195,68 @@ inline float4 layer_sample(read_only image2d_array_t image, float2 position, int
 #endif
 }
 
+inline float blend_value(
+    read_only image2d_t source_f, read_only image2d_t source_b, Params *p,
+    float4 vector, float4 mask, float4 ext, float ref_f0, float ref_b0, float time)
+{
+    float result;
+    float ref_b = source_sample(source_b, p, vector.z, vector.y, 256-p->phase);
+    float ref_f = source_sample(source_f, p, vector.x, vector.w, p->phase);
+#if ALGO == 23
+    float ref_bb = linear_source_sample(source_b, p, ext.z, ext.y, 256-p->phase);
+    float ref_ff = linear_source_sample(source_f, p, ext.x, ext.w, p->phase);
+#endif
+
+#if ALGO == 1
+    result = ref_b + ref_f*0.00001f;
+#elif ALGO == 2
+    result = ref_f + ref_b*0.00001f;
+#elif ALGO == 11
+    result = mix(ref_f, ref_b, time);
+#elif ALGO == 13
+    result = median3(ref_f, ref_b, mix(ref_f0, ref_b0, p->sad_blend));
+#elif ALGO == 21
+    result = mix(mix(ref_f, ref_b, mask.y), mix(ref_b, ref_f, mask.z), time);
+#elif ALGO == 22
+    result = median3(
+        mix(ref_f, ref_b, mask.y),
+        mix(ref_b, ref_f, mask.z),
+        mix(ref_f0, ref_b0, time));
+#else
+    result = mix(
+        mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y),
+        mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z),
+        time);
+#endif
+
+#if HAS_SAD
+# if ALGO == 1
+    result = mix(result, ref_b0, mask.x);
+# elif ALGO == 2
+    result = mix(result, ref_f0, mask.w);
+# else
+    result = mix(result, mix(ref_f0, ref_b0, p->sad_blend), fmax(mask.w, mask.x));
+# endif
+#endif
+    return result;
+}
+
+inline float blend_round(float result, const Params *p, int layered, int x, int y)
+{
+#if LINEAR_LUMA
+    if (p->linear_luma && !layered) {
+        result = native_divide(result, 255.0f);
+        if (result < 0.018f) result *= 4.5f;
+        else result = 1.099f*native_powr(result, 0.45f)-0.099f;
+        result *= 255.0f;
+    }
+#endif
+#if DITHER
+    result += native_divide((float)(bayer[x%8][y%8]-32), 65.0f);
+#endif
+    return clamp(round(result), 0.0f, 255.0f);
+}
+
 #if FUSE
 inline float fuse_slot(
     read_only image2d_t source, read_only image2d_t source_f, read_only image2d_t source_b,
@@ -2212,40 +2274,17 @@ inline float fuse_slot(
         (float2)(x*p.x_ratio-p.origin_x, y*p.y_ratio-p.origin_y),
         (float2)(p.block_w, p.block_h));
     float4 vector = field_sample(vectors, field_position, CUBIC);
-# if ALGO == 13
-    float ref_b0 = base_sample(source_b, &p);
-    float ref_f0 = base_sample(source_f, &p);
-# endif
+    float ref_b0 = ALGO == 13 ? base_sample(source_b, &p) : 0.0f;
+    float ref_f0 = ALGO == 13 ? base_sample(source_f, &p) : 0.0f;
     for (int step = 0; step < steps.count; step++) {
         p.phase = steps.phase[step];
         p.sad_blend = steps.sad_blend[step];
         float time = native_divide((float)p.phase, 256.0f);
-        float result;
-        float ref_b = source_sample(source_b, &p, vector.z, vector.y, 256-p.phase);
-        float ref_f = source_sample(source_f, &p, vector.x, vector.w, p.phase);
-# if ALGO == 1
-        result = ref_b + ref_f*0.00001f;
-# elif ALGO == 2
-        result = ref_f + ref_b*0.00001f;
-# elif ALGO == 11
-        result = mix(ref_f, ref_b, time);
-# else
-        result = median3(ref_f, ref_b, mix(ref_f0, ref_b0, p.sad_blend));
-# endif
-# if LINEAR_LUMA
-        if (p.linear_luma) {
-            result = native_divide(result, 255.0f);
-            if (result < 0.018f) result *= 4.5f;
-            else result = 1.099f*native_powr(result, 0.45f)-0.099f;
-            result *= 255.0f;
-        }
-# endif
-# if DITHER
-        result += native_divide((float)(bayer[x%8][y%8]-32), 65.0f);
-# endif
+        float result = blend_value(
+            source_f, source_b, &p, vector, (float4)(0.0f), (float4)(0.0f), ref_f0, ref_b0, time);
+        float value = blend_round(result, &p, 0, x, y);
         {
 #pragma OPENCL FP_CONTRACT OFF
-            float value = clamp(round(result), 0.0f, 255.0f);
             float term = steps.weight[step] * value;
             total = term + total;
         }
@@ -2304,13 +2343,10 @@ kernel void blend_frame(
         (float2)(x*p.x_ratio-p.origin_x, y*p.y_ratio-p.origin_y),
         (float2)(p.block_w, p.block_h));
     float4 vector = field_sample(vectors, field_position, CUBIC);
-#if ALGO == 13 || ALGO == 22 || HAS_SAD
-    float ref_b0 = base_sample(source_b, &p);
-    float ref_f0 = base_sample(source_f, &p);
-#endif
-#if ALGO == 23
-    float4 ext = field_sample(vectors_ext, field_position, CUBIC);
-#endif
+    int has_base = ALGO == 13 || ALGO == 22 || HAS_SAD;
+    float ref_b0 = has_base ? base_sample(source_b, &p) : 0.0f;
+    float ref_f0 = has_base ? base_sample(source_f, &p) : 0.0f;
+    float4 ext = ALGO == 23 ? field_sample(vectors_ext, field_position, CUBIC) : (float4)(0.0f);
     global float *sum = sums + (p.offset_y+y)*stride + p.offset_x + x;
     float total = *sum;
 #if STILL
@@ -2368,64 +2404,15 @@ kernel void blend_frame(
         } else
 #endif
         {
-#if ALGO >= 21 || HAS_SAD
-        float4 mask = layer_sample(masks, field_position, step);
-#endif
-
-        float ref_b = source_sample(source_b, &p, vector.z, vector.y, 256-p.phase);
-        float ref_f = source_sample(source_f, &p, vector.x, vector.w, p.phase);
-#if ALGO == 23
-        float ref_bb = linear_source_sample(source_b, &p, ext.z, ext.y, 256-p.phase);
-        float ref_ff = linear_source_sample(source_f, &p, ext.x, ext.w, p.phase);
-#endif
-
-#if ALGO == 1
-        result = ref_b + ref_f*0.00001f;
-#elif ALGO == 2
-        result = ref_f + ref_b*0.00001f;
-#elif ALGO == 11
-        result = mix(ref_f, ref_b, time);
-#elif ALGO == 13
-        result = median3(ref_f, ref_b, mix(ref_f0, ref_b0, p.sad_blend));
-#elif ALGO == 21
-        result = mix(mix(ref_f, ref_b, mask.y), mix(ref_b, ref_f, mask.z), time);
-#elif ALGO == 22
-        result = median3(
-            mix(ref_f, ref_b, mask.y),
-            mix(ref_b, ref_f, mask.z),
-            mix(ref_f0, ref_b0, time));
-#else
-        result = mix(
-            mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y),
-            mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z),
-            time);
-#endif
-
-#if HAS_SAD
-# if ALGO == 1
-        result = mix(result, ref_b0, mask.x);
-# elif ALGO == 2
-        result = mix(result, ref_f0, mask.w);
-# else
-        result = mix(result, mix(ref_f0, ref_b0, p.sad_blend), fmax(mask.w, mask.x));
-# endif
-#endif
+            float4 mask = ALGO >= 21 || HAS_SAD
+                ? layer_sample(masks, field_position, step) : (float4)(0.0f);
+            result = blend_value(
+                source_f, source_b, &p, vector, mask, ext, ref_f0, ref_b0, time);
         }
 
-#if LINEAR_LUMA
-        if (p.linear_luma && !layered) {
-            result = native_divide(result, 255.0f);
-            if (result < 0.018f) result *= 4.5f;
-            else result = 1.099f*native_powr(result, 0.45f)-0.099f;
-            result *= 255.0f;
-        }
-#endif
-#if DITHER
-        result += native_divide((float)(bayer[x%8][y%8]-32), 65.0f);
-#endif
+        float value = blend_round(result, &p, layered, x, y);
         {
 #pragma OPENCL FP_CONTRACT OFF
-            float value = clamp(round(result), 0.0f, 255.0f);
             if (steps.gamma != 1.0f) value = curve[(int)value];
             float term = steps.weight[step] * value;
             total = term + total;
