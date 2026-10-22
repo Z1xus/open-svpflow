@@ -250,7 +250,7 @@ impl Drop for Permit<'_> {
     }
 }
 
-const POOLED: usize = 3;
+const POOLED: usize = 12;
 
 struct Uploaded {
     mems: [usize; 3],
