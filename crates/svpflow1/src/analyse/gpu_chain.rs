@@ -272,24 +272,25 @@ impl Session<'_, '_> {
             min: most(|s| s.min),
             out: [parity(0), parity(1)],
         };
-        let fresh = unsafe { self.cbuf(SCRATCH + MINSAD, shared.min)?.1 };
         let mut bufs: Vec<Lb> = Vec::new();
         for (lp, slabs) in plan.levels.iter().zip(&all) {
             bufs.push(unsafe { self.level_bufs(lp, *slabs, &shared, dirs)? });
         }
-        if fresh || stale {
-            let (lp, b) = (&plan.levels[0], bufs[0]);
+        let ready = &mut self.unit.buffers[SCRATCH + MINSAD].tag;
+        let need = shared.min / 4;
+        if stale || (*ready as usize) < need {
+            *ready = need as u64;
             unsafe {
                 self.launch(
                     (chain, c"pinit"),
                     &[
-                        Arg::Mem(b.minsad),
-                        Arg::Mem(b.minidx),
-                        Arg::Int(lp.blk_x * lp.blk_y),
-                        Arg::Int((b.slabs.min / 4) as i32),
-                        Arg::Int(dirs as i32),
+                        Arg::Mem(bufs[0].minsad),
+                        Arg::Mem(bufs[0].minidx),
+                        Arg::Int(need as i32),
+                        Arg::Int(need as i32),
+                        Arg::Int(1),
                     ],
-                    (lp.blk_x * lp.blk_y) as usize * dirs,
+                    need,
                     Some(64),
                     &[],
                     null_mut(),
