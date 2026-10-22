@@ -89,8 +89,21 @@ pub(crate) fn written_end(regions: &[Region], pitch: usize, opts: &SuperOpts) ->
     })
 }
 
-pub(crate) fn clear_margins(dst: &mut [u8], regions: &[Region], pitch: usize) {
-    for region in regions.iter().skip(1) {
+pub(crate) fn clear_margins(
+    dst: &mut [u8],
+    regions: &[Region],
+    pitch: usize,
+    frame_len: usize,
+    opts: &SuperOpts,
+) {
+    let cubic = ReduceFilter::from_option(opts.scale_down) == Some(ReduceFilter::Cubic);
+    for (level, region) in regions.iter().enumerate().skip(1) {
+        let fused = cubic
+            && (level > 1 || opts.full)
+            && cubic_fits(regions[level - 1].offset, pitch, *region, frame_len);
+        if fused {
+            continue;
+        }
         for row in 0..region.height {
             let start = region.offset + row * pitch;
             if let Some(margin) = dst.get_mut(start + region.width..start + pitch) {
@@ -343,6 +356,17 @@ fn reduce(
     }
 }
 
+fn cubic_fits(base: usize, pitch: usize, target: Region, frame_len: usize) -> bool {
+    let (width, height) = (target.width, target.height);
+    let width2 = 2 * width;
+    width >= 8
+        && height >= 2
+        && width2 % 8 == 0
+        && width2 <= pitch
+        && base + (2 * height - 1) * pitch + width2 <= target.offset
+        && target.offset + (height - 1) * pitch + width2 <= frame_len
+}
+
 struct Level0<'a> {
     src: &'a [u8],
     src_pitch: usize,
@@ -357,17 +381,11 @@ fn reduce_cubic(
     target: Region,
     level0: Option<&Level0<'_>>,
 ) -> bool {
-    let (width, height) = (target.width, target.height);
-    let width2 = 2 * width;
-    if width < 8
-        || height < 2
-        || width2 % 8 != 0
-        || width2 > pitch
-        || base + (2 * height - 1) * pitch + width2 > target.offset
-        || target.offset + (height - 1) * pitch + width2 > frame.len()
-    {
+    if !cubic_fits(base, pitch, target, frame.len()) {
         return false;
     }
+    let (width, height) = (target.width, target.height);
+    let width2 = 2 * width;
     let (head, tail) = frame.split_at_mut(target.offset);
     let mut vertical = vec![0u8; width2];
     let mut copied = 0;
@@ -401,9 +419,22 @@ fn reduce_cubic(
                 ],
             );
         }
+        #[cfg(target_arch = "x86_64")]
+        if let Some(ahead) = tail.get((y + 8) * pitch..).and_then(|t| t.get(..pitch)) {
+            for line in ahead.chunks(64) {
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                        line.as_ptr().cast(),
+                    );
+                }
+            }
+        }
         let out = &mut tail[y * pitch..][..width2];
         out[width..].copy_from_slice(&vertical[width..]);
         cubic_row(&vertical, &mut out[..width]);
+        if let Some(margin) = tail.get_mut(y * pitch + width2..(y + 1) * pitch) {
+            margin.fill(0);
+        }
     }
     true
 }

@@ -245,7 +245,7 @@ unsafe extern "system" fn get_frame_super(
         }
         if !ptr.is_null() && untouched > 0 {
             let plane = unsafe { std::slice::from_raw_parts_mut(ptr, untouched) };
-            super_build::clear_margins(plane, &regions, stride);
+            super_build::clear_margins(plane, &regions, stride, stride * h, &state.opts);
         }
     }
 
