@@ -118,7 +118,23 @@ pub(crate) fn build_plane(
         frame: dst,
         spill: Vec::new(),
     };
-    if opts.full {
+    let filter = ReduceFilter::from_option(opts.scale_down);
+    let fused = opts.full
+        && filter == Some(ReduceFilter::Cubic)
+        && regions.len() > 1
+        && reduce_cubic(
+            canvas.frame,
+            level0.offset,
+            pitch,
+            regions[1],
+            Some(&Level0 {
+                src,
+                src_pitch,
+                width: level0.width,
+                height: level0.height,
+            }),
+        );
+    if opts.full && !fused {
         for row in 0..level0.height {
             canvas.store(
                 level0.offset + row * pitch,
@@ -126,8 +142,8 @@ pub(crate) fn build_plane(
             );
         }
     }
-    if let Some(filter) = ReduceFilter::from_option(opts.scale_down) {
-        for (level, pair) in regions.windows(2).enumerate() {
+    if let Some(filter) = filter {
+        for (level, pair) in regions.windows(2).enumerate().skip(usize::from(fused)) {
             let source = if level == 0 && !opts.full {
                 Source::Separate(src, src_pitch)
             } else {
@@ -253,7 +269,7 @@ fn reduce(
     if !compact
         && filter == ReduceFilter::Cubic
         && let Source::Within(base, _) = source
-        && reduce_cubic(canvas.frame, base, pitch, target)
+        && reduce_cubic(canvas.frame, base, pitch, target, None)
     {
         return;
     }
@@ -327,7 +343,20 @@ fn reduce(
     }
 }
 
-fn reduce_cubic(frame: &mut [u8], base: usize, pitch: usize, target: Region) -> bool {
+struct Level0<'a> {
+    src: &'a [u8],
+    src_pitch: usize,
+    width: usize,
+    height: usize,
+}
+
+fn reduce_cubic(
+    frame: &mut [u8],
+    base: usize,
+    pitch: usize,
+    target: Region,
+    level0: Option<&Level0<'_>>,
+) -> bool {
     let (width, height) = (target.width, target.height);
     let width2 = 2 * width;
     if width < 8
@@ -341,7 +370,20 @@ fn reduce_cubic(frame: &mut [u8], base: usize, pitch: usize, target: Region) -> 
     }
     let (head, tail) = frame.split_at_mut(target.offset);
     let mut vertical = vec![0u8; width2];
+    let mut copied = 0;
     for y in 0..height {
+        if let Some(level0) = level0 {
+            let upto = if y + 1 == height {
+                level0.height
+            } else {
+                (2 * y + 4).min(level0.height)
+            };
+            for r in copied..upto {
+                head[base + r * pitch..][..level0.width]
+                    .copy_from_slice(&level0.src[r * level0.src_pitch..][..level0.width]);
+            }
+            copied = copied.max(upto);
+        }
         let row = |r: usize| &head[base + r * pitch..][..width2];
         let center = 2 * y;
         if y == 0 || y + 1 >= height {
@@ -369,7 +411,11 @@ fn reduce_cubic(frame: &mut [u8], base: usize, pitch: usize, target: Region) -> 
 fn vertical_cubic(out: &mut [u8], rows: [&[u8]; 6]) {
     let n = out.len();
     let [m2, m1, c0, p1, p2, p3] = rows.map(|row| &row[..n]);
-    for i in 0..n {
+    #[cfg(target_feature = "avx2")]
+    let start = vertical_cubic_avx2(out, [m2, m1, c0, p1, p2, p3]);
+    #[cfg(not(target_feature = "avx2"))]
+    let start = 0;
+    for i in start..n {
         let sum = u16::from(m2[i])
             + 5 * (u16::from(m1[i]) + u16::from(p2[i]))
             + 10 * (u16::from(c0[i]) + u16::from(p1[i]))
@@ -378,17 +424,65 @@ fn vertical_cubic(out: &mut [u8], rows: [&[u8]; 6]) {
     }
 }
 
+#[cfg(target_feature = "avx2")]
+fn vertical_cubic_avx2(out: &mut [u8], rows: [&[u8]; 6]) -> usize {
+    use std::arch::x86_64::{
+        __m256i, _mm256_add_epi16, _mm256_loadu_si256, _mm256_maddubs_epi16, _mm256_packus_epi16,
+        _mm256_set1_epi16, _mm256_srli_epi16, _mm256_storeu_si256, _mm256_unpackhi_epi8,
+        _mm256_unpacklo_epi8,
+    };
+    let n = out.len();
+    let mut i = 0;
+    unsafe {
+        let (w0, w1, w2) = (
+            _mm256_set1_epi16(0x0501),
+            _mm256_set1_epi16(0x0a0a),
+            _mm256_set1_epi16(0x0105),
+        );
+        let round = _mm256_set1_epi16(16);
+        while n >= 32 && i < n {
+            let at = i.min(n - 32);
+            let [m2, m1, c0, p1, p2, p3] =
+                rows.map(|row| _mm256_loadu_si256(row[at..at + 32].as_ptr().cast()));
+            let sum = |a, b, c| {
+                let total = _mm256_add_epi16(
+                    _mm256_add_epi16(_mm256_maddubs_epi16(a, w0), _mm256_maddubs_epi16(b, w1)),
+                    _mm256_maddubs_epi16(c, w2),
+                );
+                _mm256_srli_epi16::<5>(_mm256_add_epi16(total, round))
+            };
+            let lo = sum(
+                _mm256_unpacklo_epi8(m2, m1),
+                _mm256_unpacklo_epi8(c0, p1),
+                _mm256_unpacklo_epi8(p2, p3),
+            );
+            let hi = sum(
+                _mm256_unpackhi_epi8(m2, m1),
+                _mm256_unpackhi_epi8(c0, p1),
+                _mm256_unpackhi_epi8(p2, p3),
+            );
+            let packed = _mm256_packus_epi16(lo, hi);
+            _mm256_storeu_si256(out[at..at + 32].as_mut_ptr().cast::<__m256i>(), packed);
+            i = at + 32;
+        }
+    }
+    i
+}
+
 fn cubic_row(src: &[u8], out: &mut [u8]) {
     let width = out.len();
-    let pairs = src.as_chunks::<2>().0;
     let mean = |a: u8, b: u8| ((u16::from(a) + u16::from(b) + 1) >> 1) as u8;
-    let taps = pairs.iter().zip(&pairs[1..]).zip(&pairs[2..]);
-    for (o, ((a, b), c)) in out[1..width - 1].iter_mut().zip(taps) {
-        let sum = u16::from(a[0])
-            + 5 * (u16::from(a[1]) + u16::from(c[0]))
-            + 10 * (u16::from(b[0]) + u16::from(b[1]))
-            + u16::from(c[1]);
-        *o = ((sum + 16) >> 5) as u8;
+    #[cfg(target_feature = "avx2")]
+    let start = cubic_interior_avx2(src, out);
+    #[cfg(not(target_feature = "avx2"))]
+    let start = 1;
+    for i in start..width - 1 {
+        let s = &src[2 * i - 2..2 * i + 4];
+        let sum = u16::from(s[0])
+            + 5 * (u16::from(s[1]) + u16::from(s[4]))
+            + 10 * (u16::from(s[2]) + u16::from(s[3]))
+            + u16::from(s[5]);
+        out[i] = ((sum + 16) >> 5) as u8;
     }
     let first = mean(src[0], src[1]);
     let sum = u16::from(first)
@@ -398,6 +492,43 @@ fn cubic_row(src: &[u8], out: &mut [u8]) {
     out[0] = first;
     out[1] = ((sum + 16) >> 5) as u8;
     out[width - 1] = mean(src[2 * width - 2], src[2 * width - 1]);
+}
+
+#[cfg(target_feature = "avx2")]
+fn cubic_interior_avx2(src: &[u8], out: &mut [u8]) -> usize {
+    use std::arch::x86_64::{
+        __m256i, _mm256_add_epi16, _mm256_loadu_si256, _mm256_maddubs_epi16, _mm256_packus_epi16,
+        _mm256_permute4x64_epi64, _mm256_set1_epi16, _mm256_srli_epi16, _mm256_storeu_si256,
+    };
+    let limit = out.len() - 1;
+    let mut i = 1;
+    unsafe {
+        let (w0, w1, w2) = (
+            _mm256_set1_epi16(0x0501),
+            _mm256_set1_epi16(0x0a0a),
+            _mm256_set1_epi16(0x0105),
+        );
+        let round = _mm256_set1_epi16(16);
+        let half = |p: *const u8| {
+            let sum = _mm256_add_epi16(
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(_mm256_loadu_si256(p.cast()), w0),
+                    _mm256_maddubs_epi16(_mm256_loadu_si256(p.add(2).cast()), w1),
+                ),
+                _mm256_maddubs_epi16(_mm256_loadu_si256(p.add(4).cast()), w2),
+            );
+            _mm256_srli_epi16::<5>(_mm256_add_epi16(sum, round))
+        };
+        while limit > 32 && i < limit {
+            let at = i.min(limit - 32);
+            let window = &src[2 * at - 2..2 * at + 66];
+            let (lo, hi) = (half(window.as_ptr()), half(window.as_ptr().add(32)));
+            let packed = _mm256_permute4x64_epi64::<0xd8>(_mm256_packus_epi16(lo, hi));
+            _mm256_storeu_si256(out[at..at + 32].as_mut_ptr().cast::<__m256i>(), packed);
+            i = at + 32;
+        }
+    }
+    i
 }
 
 fn vertical_average(out: &mut [u8], a: &[u8], b: &[u8]) {
