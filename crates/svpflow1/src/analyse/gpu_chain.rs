@@ -467,9 +467,12 @@ impl Session<'_, '_> {
                             null_mut(),
                         )?;
                     }
+                    self.unit.buffers[BASE + level * ROLES + REV].tag = 0;
                 } else {
                     let at = BASE + level * ROLES + REV;
-                    let tag = (u64::from(lp.blk_x as u32) << 32) | u64::from(lp.blk_y as u32);
+                    let tag = (u64::from(lp.blk_x as u32) << 32)
+                        | u64::from(lp.blk_y as u32)
+                        | (dirs as u64) << 62;
                     if self.unit.buffers[at].tag != tag {
                         unsafe {
                             self.launch(
