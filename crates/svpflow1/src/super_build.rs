@@ -250,6 +250,13 @@ fn reduce(
     pitch: usize,
     compact: bool,
 ) {
+    if !compact
+        && filter == ReduceFilter::Cubic
+        && let Source::Within(base, _) = source
+        && reduce_cubic(canvas.frame, base, pitch, target)
+    {
+        return;
+    }
     let src_pitch = match source {
         Source::Separate(_, p) | Source::Within(_, p) => p as isize,
     };
@@ -318,6 +325,79 @@ fn reduce(
             canvas.store(target.offset + y * pitch, &line);
         }
     }
+}
+
+fn reduce_cubic(frame: &mut [u8], base: usize, pitch: usize, target: Region) -> bool {
+    let (width, height) = (target.width, target.height);
+    let width2 = 2 * width;
+    if width < 8
+        || height < 2
+        || width2 % 8 != 0
+        || width2 > pitch
+        || base + (2 * height - 1) * pitch + width2 > target.offset
+        || target.offset + (height - 1) * pitch + width2 > frame.len()
+    {
+        return false;
+    }
+    let (head, tail) = frame.split_at_mut(target.offset);
+    let mut vertical = vec![0u8; width2];
+    for y in 0..height {
+        let row = |r: usize| &head[base + r * pitch..][..width2];
+        let center = 2 * y;
+        if y == 0 || y + 1 >= height {
+            vertical_average(&mut vertical, row(center), row(center + 1));
+        } else {
+            vertical_cubic(
+                &mut vertical,
+                [
+                    row(center - 2),
+                    row(center - 1),
+                    row(center),
+                    row(center + 1),
+                    row(center + 2),
+                    row(center + 3),
+                ],
+            );
+        }
+        let out = &mut tail[y * pitch..][..width2];
+        out[width..].copy_from_slice(&vertical[width..]);
+        cubic_row(&vertical, &mut out[..width]);
+    }
+    true
+}
+
+fn vertical_cubic(out: &mut [u8], rows: [&[u8]; 6]) {
+    let n = out.len();
+    let [m2, m1, c0, p1, p2, p3] = rows.map(|row| &row[..n]);
+    for i in 0..n {
+        let sum = u16::from(m2[i])
+            + 5 * (u16::from(m1[i]) + u16::from(p2[i]))
+            + 10 * (u16::from(c0[i]) + u16::from(p1[i]))
+            + u16::from(p3[i]);
+        out[i] = ((sum + 16) >> 5) as u8;
+    }
+}
+
+fn cubic_row(src: &[u8], out: &mut [u8]) {
+    let width = out.len();
+    let pairs = src.as_chunks::<2>().0;
+    let mean = |a: u8, b: u8| ((u16::from(a) + u16::from(b) + 1) >> 1) as u8;
+    let taps = pairs.iter().zip(&pairs[1..]).zip(&pairs[2..]);
+    for (o, ((a, b), c)) in out[1..width - 1].iter_mut().zip(taps) {
+        let sum = u16::from(a[0])
+            + 5 * (u16::from(a[1]) + u16::from(c[0]))
+            + 10 * (u16::from(b[0]) + u16::from(b[1]))
+            + u16::from(c[1]);
+        *o = ((sum + 16) >> 5) as u8;
+    }
+    let first = mean(src[0], src[1]);
+    let sum = u16::from(first)
+        + 5 * (u16::from(src[1]) + u16::from(src[4]))
+        + 10 * (u16::from(src[2]) + u16::from(src[3]))
+        + u16::from(src[5]);
+    out[0] = first;
+    out[1] = ((sum + 16) >> 5) as u8;
+    out[width - 1] = mean(src[2 * width - 2], src[2 * width - 1]);
 }
 
 fn vertical_average(out: &mut [u8], a: &[u8], b: &[u8]) {
@@ -437,7 +517,52 @@ fn reduce_row(filter: ReduceFilter, src: &[u8], out: &mut [u8], split: &mut Dein
     }
 }
 
+fn refine_bilinear2(canvas: &mut Canvas<'_>, level0: Region, pitch: usize) -> bool {
+    let (width, height) = (level0.width, level0.height);
+    let plane = width * height;
+    if pitch != width
+        || width % 16 != 0
+        || height < 2
+        || level0.offset + 4 * plane > canvas.frame.len()
+    {
+        return false;
+    }
+    let (p0, rest) = canvas.frame[level0.offset..].split_at_mut(plane);
+    let (hp, rest) = rest.split_at_mut(plane);
+    let (vp, rest) = rest.split_at_mut(plane);
+    let dp = &mut rest[..plane];
+    let n = plane - width - 1;
+    let mean = |a: u8, b: u8| ((u16::from(a) + u16::from(b) + 1) >> 1) as u8;
+    {
+        let (cur, right, below, diag) = (
+            &p0[..n],
+            &p0[1..=n],
+            &p0[width..width + n],
+            &p0[width + 1..=width + n],
+        );
+        let (hp, vp, dp) = (&mut hp[..n], &mut vp[..n], &mut dp[..n]);
+        for i in 0..n {
+            hp[i] = mean(cur[i], right[i]);
+            vp[i] = mean(cur[i], below[i]);
+            dp[i] = mean(cur[i], diag[i]);
+        }
+    }
+    for i in n..plane {
+        let at = |k: usize| if k < plane { p0[k] } else { hp[k - plane] };
+        let (cur, right, below, diag) = (at(i), at(i + 1), at(i + width), at(i + width + 1));
+        hp[i] = mean(cur, right);
+        vp[i] = mean(cur, below);
+        dp[i] = mean(cur, diag);
+    }
+    vp[..width].copy_from_slice(&p0[..width]);
+    dp[..width].copy_from_slice(&p0[1..=width]);
+    true
+}
+
 fn refine(canvas: &mut Canvas<'_>, level0: Region, pitch: usize, pel: usize, upscale: Upscale) {
+    if pel == 2 && matches!(upscale, Upscale::Bilinear) && refine_bilinear2(canvas, level0, pitch) {
+        return;
+    }
     let plane = |k: usize| level0.offset + k * pitch * level0.height;
     let (w, h) = (level0.width, level0.height);
     let full = Interp {
