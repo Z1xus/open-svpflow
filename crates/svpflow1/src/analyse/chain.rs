@@ -1,6 +1,6 @@
 use super::field::{Mv, SearchGeom};
 use super::params::AnalyseParams;
-use super::planes::{SuperFrameView, plane_size};
+use super::planes::{LevelFrame, LevelSource, PlaneView, SuperFrameView, plane_size};
 
 pub(crate) const RANK_BLOCKS: i32 = 8192;
 const PITCH_ALIGN: usize = 32;
@@ -97,6 +97,7 @@ pub(crate) struct ChainPlan {
     pub(crate) levels: Vec<LevelPlan>,
     pub(crate) pyramid: Pyramid,
     pub(crate) both: bool,
+    pub(crate) lean: bool,
     pub(crate) refine: Option<RefinePlan>,
     pub(crate) sort_shift: i32,
     pub(crate) sort_buckets: i32,
@@ -123,8 +124,8 @@ impl ChainPlan {
         let main = &params.stages[0];
         if params.min_level() != 0
             || params.stages.len() > 2
-            || first.source.is_some()
-            || second.source.is_some()
+            || sp.custom_scale
+            || (!sp.lean && (first.source.is_some() || second.source.is_some()))
             || !main.gpu_searchable(params)
             || main.levels < 2
             || sp.levels < main.levels
@@ -147,7 +148,7 @@ impl ChainPlan {
         let pyramid = Pyramid {
             width: sp.width,
             height: sp.height,
-            levels: top,
+            levels: if sp.lean { main.levels } else { top },
         };
         let mut levels = Vec::new();
         let mut lambda0 = 0;
@@ -256,6 +257,7 @@ impl ChainPlan {
             levels,
             pyramid,
             both: params.vectors == 3,
+            lean: sp.lean,
             refine,
             sort_shift: log + 1,
             sort_buckets: (area * 255) >> log,
@@ -265,4 +267,33 @@ impl ChainPlan {
 
 fn refined_satd(field: &super::field::Field) -> bool {
     field.uses_satd()
+}
+
+pub(crate) struct HostFrame<'a> {
+    pub(crate) pyramid: Pyramid,
+    pub(crate) start: i32,
+    pub(crate) planes: [&'a [u8]; 3],
+}
+
+impl LevelSource for HostFrame<'_> {
+    fn level(&self, level: i32) -> LevelFrame<'_> {
+        let g = self.pyramid.geom(level);
+        let (y, c) = self.pyramid.offsets(level);
+        let (first_y, first_c) = self.pyramid.offsets(self.start);
+        let chroma = |data| {
+            PlaneView::new(
+                data,
+                c - first_c,
+                g.chroma_pitch,
+                g.chroma_width,
+                g.chroma_height,
+                1,
+            )
+        };
+        LevelFrame {
+            y: PlaneView::new(self.planes[0], y - first_y, g.pitch, g.width, g.height, 1),
+            u: chroma(self.planes[1]),
+            v: chroma(self.planes[2]),
+        }
+    }
 }

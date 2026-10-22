@@ -1,5 +1,7 @@
 use crate::params::Value;
 
+const DEFAULT_SCALE_DOWN: i32 = 4;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SuperOpts {
     pub(crate) pel: i32,
@@ -8,6 +10,7 @@ pub(crate) struct SuperOpts {
     pub(crate) scale_up: i32,
     pub(crate) full: bool,
     pub(crate) rc: bool,
+    pub(crate) lean: bool,
     pub(crate) levels: i32,
     pub(crate) width: i32,
     pub(crate) height: i32,
@@ -23,7 +26,9 @@ impl SuperOpts {
         if !(0..=2).contains(&gpu) {
             return Err("SVSuper: gpu has to be 0 or 1 or 2".into());
         }
-        let scale_down = opt.and_then(|v| v.int_at(&["scale", "down"])).unwrap_or(4) as i32;
+        let scale_down = opt
+            .and_then(|v| v.int_at(&["scale", "down"]))
+            .unwrap_or(i64::from(DEFAULT_SCALE_DOWN)) as i32;
         let mut scale_up = opt.and_then(|v| v.int_at(&["scale", "up"])).unwrap_or(2) as i32;
 
         if gpu != 0 {
@@ -34,6 +39,12 @@ impl SuperOpts {
             return Err("SVSuper: can't ignore finest level with high pel value".into());
         }
         let rc = opt.and_then(|v| v.bool_at(&["rc"])).unwrap_or(false);
+        let lean = opt.and_then(|v| v.bool_at(&["lean"])).unwrap_or(false);
+        if lean && (pel != 1 || gpu != 1 || !full || scale_down != DEFAULT_SCALE_DOWN) {
+            return Err(
+                "SVSuper: lean needs pel 1, gpu 1, the finest level and the default scale".into(),
+            );
+        }
         let levels = auto_levels(width, height);
         Ok(Self {
             pel,
@@ -42,10 +53,26 @@ impl SuperOpts {
             scale_up,
             full,
             rc,
+            lean,
             levels,
             width,
             height,
         })
+    }
+
+    pub(crate) fn from_params(params: &crate::analyse::SuperParams) -> Self {
+        Self {
+            pel: params.pel,
+            gpu: params.gpu,
+            scale_down: DEFAULT_SCALE_DOWN,
+            scale_up: 0,
+            full: true,
+            rc: false,
+            lean: false,
+            levels: params.levels,
+            width: params.width,
+            height: params.height,
+        }
     }
 
     pub(crate) fn pack_data(&self) -> i64 {
@@ -56,13 +83,20 @@ impl SuperOpts {
         let raw = u64::from(self.height as u16)
             | (u64::from(self.width as u16) << 16)
             | (u64::from(self.pel as u8) << 32)
-            | (u64::from(self.levels as u8) << 40)
+            | (u64::from(self.levels as u8 | self.level_flags()) << 40)
             | (u64::from(self.gpu as u8) << 48)
             | (u64::from(flags) << 56);
         i64::from_ne_bytes(raw.to_ne_bytes())
     }
 
+    fn level_flags(&self) -> u8 {
+        (u8::from(self.scale_down != DEFAULT_SCALE_DOWN) << 6) | (u8::from(self.lean) << 7)
+    }
+
     pub(crate) fn super_height(&self) -> i32 {
+        if self.lean {
+            return 2;
+        }
         super_plane_height(self.width, self.height, self.pel, self.levels, self.full)
     }
 

@@ -39,8 +39,8 @@ impl SuperBuilder {
         }
         let options = params::parse(options.as_bytes())?;
         let opts = SuperOpts::from_opt(Some(&options), width, height)?;
-        if !opts.full {
-            return Err("full:false is not supported here".into());
+        if !opts.full || opts.lean {
+            return Err("full:false and lean are not supported here".into());
         }
         let width = usize::try_from(width).map_err(|_| "invalid width")?;
         let height = usize::try_from(height).map_err(|_| "invalid height")?;

@@ -239,6 +239,7 @@ struct Uploaded {
     event: usize,
     pyramid: Option<Pyramid>,
     coarse: [usize; 3],
+    host: Option<std::sync::Arc<[Vec<u8>; 3]>>,
 }
 
 #[derive(Default)]
@@ -876,6 +877,7 @@ impl Session<'_, '_> {
             sizes: caps,
             pyramid: planes.pyramid,
             coarse,
+            host: None,
             frame: Frame {
                 lengths: lengths.map(|length| length as i64),
                 pitches: planes.pitch.map(|p| p as i64),

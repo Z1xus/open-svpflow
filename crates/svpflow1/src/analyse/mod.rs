@@ -14,6 +14,7 @@ mod pyramid;
 pub(crate) use params::{AnalyseParams, SuperParams};
 pub(crate) use planes::{RawPlane, SuperFrameView, plane_size};
 
+use crate::{super_build, super_opts::SuperOpts};
 use pyramid::Pyramid;
 
 const MAGIC: i32 = 0xA0;
@@ -88,11 +89,15 @@ pub(crate) fn analyse(
         #[cfg(not(target_arch = "wasm32"))]
         if let (Some(plan), Some(keys)) = (&plan, keys) {
             if let Some(failed) = run_chain(params, plan, [first, second], keys, outputs) {
-                search_stages(params, first, second, failed, None);
+                cpu_search_stages(params, first, second, failed);
             }
             return words;
         }
         let _ = plan;
+        if params.super_params.lean {
+            cpu_search_stages(params, first, second, outputs);
+            return words;
+        }
         let gpu = (keys.is_some()
             && (params.stages[0].gpu_searchable(params)
                 || params.stages.len() > 1
@@ -130,6 +135,78 @@ pub(crate) fn analyse(
         search_stages(params, first, second, outputs, session.as_mut());
     }
     words
+}
+
+const STRIDE_ALIGN: usize = 32;
+
+struct Rebuilt {
+    planes: [Vec<u8>; 3],
+    pitches: [usize; 3],
+}
+
+impl Rebuilt {
+    fn new(params: &AnalyseParams, frame: &SuperFrameView<'_>) -> Self {
+        let sp = params.super_params;
+        let opts = SuperOpts::from_params(&sp);
+        let source = frame.source.expect("lean frames carry the source planes");
+        let rows = usize::try_from(opts.super_height()).unwrap_or(0);
+        let (sx, sy) = params.chroma_shift;
+        let pitches = std::array::from_fn(|index| {
+            let width = if index == 0 { sp.width } else { sp.width >> sx };
+            (width as usize).next_multiple_of(STRIDE_ALIGN)
+        });
+        let planes = std::array::from_fn(|index| {
+            let shift = if index == 0 { (0, 0) } else { (sx, sy) };
+            let mut plane = vec![0u8; pitches[index] * (rows >> shift.1)];
+            super_build::build_plane(
+                &mut plane,
+                pitches[index],
+                source[index].data,
+                source[index].pitch,
+                sp.width as usize,
+                sp.height as usize,
+                shift,
+                &opts,
+            );
+            plane
+        });
+        Self { planes, pitches }
+    }
+
+    fn view(&self, params: &AnalyseParams) -> SuperFrameView<'_> {
+        let sp = params.super_params;
+        SuperFrameView {
+            planes: std::array::from_fn(|index| RawPlane {
+                data: &self.planes[index],
+                pitch: self.pitches[index],
+            }),
+            source: None,
+            width: sp.width,
+            height: sp.height,
+            pel: sp.pel,
+            chroma_shift: params.chroma_shift,
+        }
+    }
+}
+
+fn cpu_search_stages(
+    params: &AnalyseParams,
+    first: &SuperFrameView<'_>,
+    second: &SuperFrameView<'_>,
+    outputs: [Option<&mut [u32]>; 2],
+) {
+    if params.super_params.lean {
+        let (first, second) = (Rebuilt::new(params, first), Rebuilt::new(params, second));
+        search_stages(
+            params,
+            &first.view(params),
+            &second.view(params),
+            outputs,
+            None,
+        );
+    } else {
+        search_stages(params, first, second, outputs, None);
+    }
 }
 
 fn search_stages(
@@ -252,7 +329,21 @@ fn run_chain<'o>(
             };
             session.defer(slot, key, planes);
         }
-        let top = cpu_search(params, plan, frames);
+        let top = if plan.lean {
+            let hosts = [session.host_levels(0, plan)?, session.host_levels(1, plan)?];
+            let frame = |index: usize| chain::HostFrame {
+                pyramid: plan.pyramid,
+                start: plan.top() as i32,
+                planes: [
+                    &hosts[index][0][..],
+                    &hosts[index][1][..],
+                    &hosts[index][2][..],
+                ],
+            };
+            cpu_search(params, plan, [&frame(0), &frame(1)])
+        } else {
+            cpu_search(params, plan, frames)
+        };
         let tickets = session.chain(plan, &top)?;
         if !session.wait() {
             return None;
@@ -266,10 +357,10 @@ fn run_chain<'o>(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn cpu_search(
+fn cpu_search<F: planes::LevelSource>(
     params: &AnalyseParams,
     plan: &chain::ChainPlan,
-    frames: [&SuperFrameView<'_>; 2],
+    frames: [&F; 2],
 ) -> Vec<Vec<[i32; 4]>> {
     let main = &params.stages[0];
     let start = plan.top() as i32;

@@ -29,6 +29,7 @@ pub struct SuperData {
     height: i32,
     selector: i32,
     limit: i32,
+    levels: i32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -123,12 +124,17 @@ pub fn super_data(handle: i64) -> SuperData {
         height: word(raw, 0),
         selector: byte(raw, 48),
         limit: byte(raw, 56),
+        levels: byte(raw, 40),
     }
 }
 
 impl SuperData {
     pub const fn full(&self) -> bool {
         self.limit & 2 == 0
+    }
+
+    pub const fn lean(&self) -> bool {
+        self.levels & 0x80 != 0
     }
 
     pub const fn scale(&self) -> i32 {

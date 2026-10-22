@@ -17,6 +17,8 @@ pub(crate) struct SuperParams {
     pub(crate) levels: i32,
     pub(crate) gpu: i32,
     pub(crate) flags: u8,
+    pub(crate) lean: bool,
+    pub(crate) custom_scale: bool,
 }
 
 impl SuperParams {
@@ -26,9 +28,11 @@ impl SuperParams {
             height: i32::from(u16::from_le_bytes([raw[0], raw[1]])),
             width: i32::from(u16::from_le_bytes([raw[2], raw[3]])),
             pel: i32::from(raw[4]),
-            levels: i32::from(raw[5]),
+            levels: i32::from(raw[5] & 0x3F),
             gpu: i32::from(raw[6]),
             flags: raw[7],
+            lean: raw[5] & 0x80 != 0,
+            custom_scale: raw[5] & 0x40 != 0,
         };
         if params.height <= 0 || !(1..=4).contains(&params.pel) || params.levels < 1 {
             return Err("SVAnalyse: wrong super clip (pseudoaudio) parameters".into());

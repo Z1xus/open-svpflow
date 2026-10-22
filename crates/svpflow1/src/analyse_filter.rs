@@ -89,8 +89,12 @@ impl AnalyseState {
         [n, (n + self.params.delta).min(self.vi.num_frames - 1)]
     }
 
+    fn lean(&self) -> bool {
+        self.params.super_params.lean
+    }
+
     fn full(&self) -> bool {
-        self.params.super_params.has_finest_level()
+        self.params.super_params.has_finest_level() && !self.lean()
     }
 
     unsafe fn fetch(&self, api: &FrameApi, n: i32, frame_ctx: vs::Raw) -> Option<Inputs> {
@@ -99,7 +103,11 @@ impl AnalyseState {
                 .map(|frame| unsafe { (api.get_frame)(frame, node, frame_ctx) })
         };
         let inputs = Inputs {
-            supers: fetch(self.super_node),
+            supers: if self.lean() {
+                [std::ptr::null(); 2]
+            } else {
+                fetch(self.super_node)
+            },
             sources: if self.full() {
                 [std::ptr::null(); 2]
             } else {
@@ -107,7 +115,7 @@ impl AnalyseState {
             },
         };
         let missing = |frames: &[vs::ConstRaw; 2]| frames.iter().any(|f| f.is_null());
-        if missing(&inputs.supers) || (!self.full() && missing(&inputs.sources)) {
+        if (!self.lean() && missing(&inputs.supers)) || (!self.full() && missing(&inputs.sources)) {
             unsafe { api.release(&inputs) };
             return None;
         }
@@ -120,7 +128,14 @@ impl AnalyseState {
         let y_shift = params.chroma_shift.1;
         let full = self.full();
         let view = |index: usize| SuperFrameView {
-            planes: unsafe { api.planes(inputs.supers[index], self.super_height, y_shift) },
+            planes: if self.lean() {
+                [RawPlane {
+                    data: &[],
+                    pitch: 0,
+                }; 3]
+            } else {
+                unsafe { api.planes(inputs.supers[index], self.super_height, y_shift) }
+            },
             source: (!full)
                 .then(|| unsafe { api.planes(inputs.sources[index], sp.height as usize, y_shift) }),
             width: sp.width,
@@ -268,10 +283,9 @@ unsafe fn create_analyse_inner(
             super_params.levels,
             full,
         );
-        if super_vi.width != expected_width
-            || super_vi.height != super_height
-            || super_vi.format != src_vi.format
-        {
+        let layout_ok = super_params.lean
+            || (super_vi.width == expected_width && super_vi.height == super_height);
+        if !layout_ok || super_vi.format != src_vi.format {
             return Err("SVAnalyse: invalid super clip layout".into());
         }
         let gray = unsafe { get_gray8_format(core, vsapi, super_vi.format) };
@@ -471,7 +485,9 @@ unsafe extern "system" fn get_frame_analyse(
             frames.sort_unstable();
             frames.dedup();
             for frame in frames {
-                unsafe { request(frame, state.super_node, frame_ctx) };
+                if !state.lean() {
+                    unsafe { request(frame, state.super_node, frame_ctx) };
+                }
                 if !state.full() {
                     unsafe { request(frame, state.src_node, frame_ctx) };
                 }
@@ -515,7 +531,11 @@ unsafe extern "system" fn get_frame_analyse(
             state.gray_format,
             (payload.len() * 4) as i32,
             1,
-            inputs.supers[0],
+            if state.lean() {
+                inputs.sources[0]
+            } else {
+                inputs.supers[0]
+            },
             core,
         )
     };

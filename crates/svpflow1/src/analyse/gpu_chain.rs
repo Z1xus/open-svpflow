@@ -794,6 +794,56 @@ impl Session<'_, '_> {
         (status == CL_SUCCESS).then_some(())
     }
 
+    pub(crate) fn host_levels(
+        &mut self,
+        slot: usize,
+        plan: &ChainPlan,
+    ) -> Option<std::sync::Arc<[Vec<u8>; 3]>> {
+        self.flush();
+        let frame = self.frames[slot].as_ref()?;
+        let mut state = frame.0.state.lock().ok()?;
+        let up = state.as_mut()?;
+        if up.pyramid != Some(plan.pyramid) {
+            return None;
+        }
+        if let Some(host) = &up.host {
+            return Some(host.clone());
+        }
+        let start = plan.top() as i32;
+        let (first_y, first_c) = plan.pyramid.offsets(start);
+        let (end_y, end_c) = plan.pyramid.totals();
+        let queue = self.unit.queue as Handle;
+        let wait = up.event as Handle;
+        let mut host: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (plane, data) in host.iter_mut().enumerate() {
+            let (from, to) = if plane == 0 {
+                (first_y, end_y)
+            } else {
+                (first_c, end_c)
+            };
+            *data = vec![0u8; to - from];
+            let status = unsafe {
+                (self.gpu.cl.EnqueueReadBuffer)(
+                    queue,
+                    up.mems[plane] as Handle,
+                    1,
+                    up.coarse[plane] + from,
+                    to - from,
+                    data.as_mut_ptr().cast(),
+                    1,
+                    (&raw const wait).cast(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if status != CL_SUCCESS {
+                return None;
+            }
+        }
+        let host = std::sync::Arc::new(host);
+        up.host = Some(host.clone());
+        Some(host)
+    }
+
     pub(crate) fn take_words(&self, ticket: usize, out: &mut [u32]) {
         let (index, blocks) = self.tickets[ticket];
         let host = self.unit.buffers[index].host as *const u32;

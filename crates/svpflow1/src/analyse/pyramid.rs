@@ -3,7 +3,7 @@ use super::field::{Field, Mv, VectorOutput};
 use super::gpu::Session;
 use super::params::{AnalyseParams, Stage};
 use super::planes::LevelFrame;
-use super::planes::SuperFrameView;
+use super::planes::{LevelSource, SuperFrameView};
 
 pub(crate) struct Pyramid {
     forward: Vec<Option<Field>>,
@@ -53,8 +53,8 @@ impl Pyramid {
         &mut self,
         params: &AnalyseParams,
         stage: &Stage,
-        first: &SuperFrameView<'_>,
-        second: &SuperFrameView<'_>,
+        first: &impl LevelSource,
+        second: &impl LevelSource,
         lambda_out: &mut i32,
         outputs: [Option<VectorOutput<'_>>; 2],
         mut on_finest: impl FnMut(usize, &Field, i32, Option<&mut Session<'_, '_>>),
@@ -234,8 +234,8 @@ impl Pyramid {
         params: &AnalyseParams,
         stage: &Stage,
         previous: &Self,
-        first: &SuperFrameView<'_>,
-        second: &SuperFrameView<'_>,
+        first: &impl LevelSource,
+        second: &impl LevelSource,
         lambda_out: &mut i32,
         outputs: [Option<VectorOutput<'_>>; 2],
         session: Option<&mut Session<'_, '_>>,

@@ -162,6 +162,27 @@ unsafe extern "system" fn get_frame_super(
 ) -> vs::ConstRaw {
     let state = unsafe { &*(*instance_data).cast::<SuperState>() };
 
+    if state.opts.lean {
+        let Some(new_frame) =
+            (unsafe { vs::table_fn::<vs::NewVideoFrame>(vsapi, vs::NEW_VIDEO_FRAME) })
+        else {
+            return std::ptr::null();
+        };
+        if activation != vs::AR_INITIAL {
+            return std::ptr::null();
+        }
+        return unsafe {
+            new_frame(
+                state.vi.format,
+                state.vi.width,
+                state.vi.height,
+                std::ptr::null(),
+                core,
+            )
+        }
+        .cast_const();
+    }
+
     if activation == vs::AR_INITIAL {
         if let Some(request) =
             unsafe { vs::table_fn::<vs::RequestFrameFilter>(vsapi, vs::REQUEST_FRAME_FILTER) }

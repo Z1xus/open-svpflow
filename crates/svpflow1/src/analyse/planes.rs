@@ -13,6 +13,24 @@ pub(crate) struct PlaneView<'a> {
 }
 
 impl<'a> PlaneView<'a> {
+    pub(crate) const fn new(
+        data: &'a [u8],
+        base: usize,
+        pitch: usize,
+        width: i32,
+        height: i32,
+        pel: i32,
+    ) -> Self {
+        Self {
+            data,
+            base,
+            pitch,
+            width,
+            height,
+            pel,
+        }
+    }
+
     pub(crate) fn pel1(&self, x: i32, y: i32) -> isize {
         self.base as isize + y as isize * self.pitch as isize + x as isize
     }
@@ -130,6 +148,16 @@ pub(crate) struct LevelFrame<'a> {
     pub(crate) y: PlaneView<'a>,
     pub(crate) u: PlaneView<'a>,
     pub(crate) v: PlaneView<'a>,
+}
+
+pub(crate) trait LevelSource {
+    fn level(&self, level: i32) -> LevelFrame<'_>;
+}
+
+impl LevelSource for SuperFrameView<'_> {
+    fn level(&self, level: i32) -> LevelFrame<'_> {
+        SuperFrameView::level(self, level)
+    }
 }
 
 #[derive(Clone, Copy)]
