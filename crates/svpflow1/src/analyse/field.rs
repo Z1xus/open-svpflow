@@ -341,10 +341,11 @@ impl Field {
     }
 
     pub(crate) fn interpolate_prediction(&mut self, coarse: &Self, for_recalc: bool) {
-        let norm = if for_recalc { 4 } else { 3 } - ilog2(self.pel) + ilog2(coarse.pel);
         if !for_recalc {
-            self.reverse.fill(Mv::UNSET);
+            self.predict_search(coarse);
+            return;
         }
+        let norm = 4 - ilog2(self.pel) + ilog2(coarse.pel);
         let l = self.layout;
         let norm_area = l.step_x() * l.step_y();
         let (odd_x, even_x) = (l.width * 3 - l.overlap_x * 2, l.width * 3 - l.overlap_x * 4);
@@ -358,7 +359,7 @@ impl Field {
             #[allow(unused_mut)]
             let mut done = 1;
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            if for_recalc && (1..2 * cy - 1).contains(&l_y) {
+            if (1..2 * cy - 1).contains(&l_y) {
                 let odd = l_y % 2 != 0;
                 let ay1 = if odd { odd_y } else { even_y };
                 let ay2 = l.step_y() * 4 - ay1;
@@ -389,25 +390,14 @@ impl Field {
             }
             for k_x in (0..1).chain(done..self.blk_x) {
                 let index = (l_y * self.blk_x + k_x) as usize;
-                let (mut i, mut j) = (k_x, l_y);
-                if for_recalc {
-                    i = i.min(2 * cx - 1);
-                    j = j.min(2 * cy - 1);
-                } else if i >= 2 * cx || j >= 2 * cy {
-                    let mut v = coarse.border[((i / 2).min(cx) + cy - (j / 2).min(cy)) as usize];
-                    v.x = (i32::from(v.x) << (4 - norm)) as i16;
-                    v.y = (i32::from(v.y) << (4 - norm)) as i16;
-                    self.vectors[index] = v;
-                    continue;
-                }
+                let i = k_x.min(2 * cx - 1);
+                let j = l_y.min(2 * cy - 1);
                 let off_x = -1 + 2 * (i % 2);
                 let off_y = -1 + 2 * (j % 2);
                 let edge_x = i == 0 || i >= 2 * cx - 1;
                 let edge_y = j == 0 || j >= 2 * cy - 1;
                 let v1 = at(i / 2, j / 2);
-                let (v2, v3, v4) = if !for_recalc {
-                    (v1, v1, v1)
-                } else if edge_x && edge_y {
+                let (v2, v3, v4) = if edge_x && edge_y {
                     (v1, v1, v1)
                 } else if edge_x {
                     let v = at(i / 2, j / 2 + off_y);
@@ -443,18 +433,55 @@ impl Field {
                 }
                 tx = i32::from(tx as i16) >> norm;
                 ty = i32::from(ty as i16) >> norm;
-                sad >>= if for_recalc { 6 } else { 4 };
-                let target = Mv::new(tx, ty, sad);
-                self.vectors[index] = target;
-                if !for_recalc {
-                    let rbx = ((i * l.step_x() + (l.width >> 1) + tx) / l.step_x())
-                        .clamp(0, self.blk_x - 1);
-                    let rby = ((j * l.step_y() + (l.height >> 1) + ty) / l.step_y())
-                        .clamp(0, self.blk_y - 1);
-                    let reverse = &mut self.reverse[(rby * self.blk_x + rbx) as usize];
-                    if reverse.sad < 0 || sad < reverse.sad {
-                        *reverse = Mv::new(-tx, -ty, sad);
-                    }
+                sad >>= 6;
+                self.vectors[index] = Mv::new(tx, ty, sad);
+            }
+        }
+    }
+
+    fn predict_search(&mut self, coarse: &Self) {
+        let norm = 3 - ilog2(self.pel) + ilog2(coarse.pel);
+        self.reverse.fill(Mv::UNSET);
+        let l = self.layout;
+        let (step_x, step_y) = (l.step_x(), l.step_y());
+        let norm_area = step_x * step_y;
+        let sad_limit = (i32::MAX / (16 * norm_area)) as u32;
+        let (cx, cy) = (coarse.blk_x, coarse.blk_y);
+        let mut cells = Vec::with_capacity(cx as usize);
+        for j in 0..self.blk_y {
+            if j < 2 * cy && (j % 2 == 0 || cells.is_empty()) {
+                cells.clear();
+                for &v in &coarse.vectors[((j / 2) * cx) as usize..][..cx as usize] {
+                    let tx = i32::from((i32::from(v.x) << 4) as i16) >> norm;
+                    let ty = i32::from((i32::from(v.y) << 4) as i16) >> norm;
+                    let sad = if v.sad.unsigned_abs() <= sad_limit {
+                        v.sad
+                    } else if l.overlap_x == 0 && l.overlap_y == 0 {
+                        v.sad.wrapping_mul(16).wrapping_add(8) >> 4
+                    } else {
+                        (v.sad.wrapping_mul(16 * norm_area) / norm_area) >> 4
+                    };
+                    let qx = ((l.width >> 1) + tx).div_euclid(step_x);
+                    let qy = ((l.height >> 1) + ty).div_euclid(step_y);
+                    cells.push((Mv::new(tx, ty, sad), qx, qy));
+                }
+            }
+            for i in 0..self.blk_x {
+                let index = (j * self.blk_x + i) as usize;
+                if i >= 2 * cx || j >= 2 * cy {
+                    let mut v = coarse.border[((i / 2).min(cx) + cy - (j / 2).min(cy)) as usize];
+                    v.x = (i32::from(v.x) << (4 - norm)) as i16;
+                    v.y = (i32::from(v.y) << (4 - norm)) as i16;
+                    self.vectors[index] = v;
+                    continue;
+                }
+                let (v, qx, qy) = cells[(i / 2) as usize];
+                self.vectors[index] = v;
+                let rbx = (i + qx).clamp(0, self.blk_x - 1);
+                let rby = (j + qy).clamp(0, self.blk_y - 1);
+                let reverse = &mut self.reverse[(rby * self.blk_x + rbx) as usize];
+                if reverse.sad < 0 || v.sad < reverse.sad {
+                    *reverse = Mv::new(-i32::from(v.x), -i32::from(v.y), v.sad);
                 }
             }
         }

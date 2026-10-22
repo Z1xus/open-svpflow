@@ -277,6 +277,7 @@ pub(crate) struct Planes<'a> {
     pub(crate) height: [i32; 3],
     pub(crate) pel: i32,
     pub(crate) expand: bool,
+    pub(crate) tail: [usize; 3],
 }
 
 pub(crate) fn refine_gpu() -> Option<&'static RefineGpu> {
@@ -573,12 +574,22 @@ pub(crate) struct Session<'g, 'p> {
 
 impl Session<'_, '_> {
     unsafe fn transfer(&mut self, mem: Handle, data: &[u8], event: *mut Handle) -> bool {
+        unsafe { self.transfer_at(mem, 0, data, event) }
+    }
+
+    unsafe fn transfer_at(
+        &mut self,
+        mem: Handle,
+        offset: usize,
+        data: &[u8],
+        event: *mut Handle,
+    ) -> bool {
         let status = unsafe {
             (self.gpu.cl.EnqueueWriteBuffer)(
                 self.unit.queue as Handle,
                 mem,
                 CL_FALSE,
-                0,
+                offset,
                 data.len(),
                 data.as_ptr().cast_mut().cast(),
                 0,
@@ -694,6 +705,11 @@ impl Session<'_, '_> {
         let lengths: [usize; 3] = std::array::from_fn(|plane| {
             (planes.base[plane] + pel * pel * regions[plane]).min(planes.data[plane].len())
         });
+        let totals: [usize; 3] = std::array::from_fn(|plane| {
+            planes.tail[plane]
+                .min(planes.data[plane].len())
+                .max(lengths[plane])
+        });
         let uploads: [usize; 3] = std::array::from_fn(|plane| {
             if expand.is_some() {
                 regions[plane].min(lengths[plane])
@@ -704,7 +720,7 @@ impl Session<'_, '_> {
         let mut mems = [0usize; 3];
         let mut event: Handle = std::ptr::null_mut();
         for (plane, data) in planes.data.iter().enumerate() {
-            let size = lengths[plane].max(1) + 64;
+            let size = totals[plane].max(1) + 64;
             let pooled = self.gpu.pool.lock().ok().and_then(|mut pool| {
                 let at = pool.iter().position(|&(_, s)| s == size)?;
                 Some(pool.swap_remove(at).0)
@@ -739,7 +755,18 @@ impl Session<'_, '_> {
             } else {
                 std::ptr::null_mut()
             };
-            let mut failed = !unsafe { self.transfer(mem, &data[..upload], target) };
+            let mut failed = false;
+            if totals[plane] > lengths[plane] {
+                failed = !unsafe {
+                    self.transfer_at(
+                        mem,
+                        lengths[plane],
+                        &data[lengths[plane]..totals[plane]],
+                        std::ptr::null_mut(),
+                    )
+                };
+            }
+            failed = failed || !unsafe { self.transfer(mem, &data[..upload], target) };
             if let Some(kernel) = expand
                 && !failed
             {
@@ -786,7 +813,7 @@ impl Session<'_, '_> {
         }
         Some(Uploaded {
             mems,
-            sizes: lengths.map(|length| length.max(1) + 64),
+            sizes: totals.map(|length| length.max(1) + 64),
             frame: Frame {
                 lengths: lengths.map(|length| length as i64),
                 pitches: planes.pitch.map(|p| p as i64),

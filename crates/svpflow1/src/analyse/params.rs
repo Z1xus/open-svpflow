@@ -3,6 +3,7 @@ use crate::params::Value;
 
 const SUPER_NO_FINEST_LEVEL: u8 = 2;
 const BLOCK_DIV: i32 = 64;
+const GPU_LEVEL_BLOCKS: i32 = 5000;
 
 const fn block_count(size: i32, overlap: i32, block: i32) -> i32 {
     (size - overlap) / (block - overlap)
@@ -85,10 +86,22 @@ impl Stage {
         (self.layout.height - self.layout.overlap_y) * self.blk_y + self.layout.overlap_y
     }
 
+    fn block_counts(&self, level: i32) -> (i32, i32) {
+        let l = self.layout;
+        (
+            block_count(self.covered_width() >> level, l.overlap_x, l.width),
+            block_count(self.covered_height() >> level, l.overlap_y, l.height),
+        )
+    }
+
+    pub(crate) fn gpu_level(&self, level: i32) -> bool {
+        let (blk_x, blk_y) = self.block_counts(level);
+        level == 0 || blk_x * blk_y >= GPU_LEVEL_BLOCKS
+    }
+
     pub(crate) fn field(&self, level: i32, pel: i32, chroma_shift: (u32, u32)) -> Field {
         let l = self.layout;
-        let blk_x = block_count(self.covered_width() >> level, l.overlap_x, l.width);
-        let blk_y = block_count(self.covered_height() >> level, l.overlap_y, l.height);
+        let (blk_x, blk_y) = self.block_counts(level);
         let fine = level < self.full_math_level;
         let satd = (fine && self.satd & 1 != 0) || (!fine && self.satd & 2 != 0);
         Field::new(

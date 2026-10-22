@@ -159,7 +159,7 @@ impl Pyramid {
             }
             let (mut out_f, mut out_b) = (out_f, out_b);
             let mut on_gpu = [false, false];
-            if level == 0
+            if stage.gpu_level(level)
                 && let Some(session) = session.as_deref_mut()
             {
                 let pf = f.gpu_search_params(

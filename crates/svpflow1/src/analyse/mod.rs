@@ -82,8 +82,16 @@ pub(crate) fn analyse(
         let mut session = gpu.and_then(gpu::RefineGpu::session);
         if let Some(session) = session.as_mut() {
             let keys = keys.unwrap_or_default();
+            let main = &params.stages[0];
+            let tail_levels = main.gpu_searchable(params) && main.gpu_level(1);
             for (slot, (frame, key)) in [first, second].into_iter().zip(keys).enumerate() {
                 let level = frame.level(0);
+                let tail = if tail_levels {
+                    let top = frame.level(params.stages[0].levels - 1);
+                    [top.y, top.u, top.v].map(|p| p.base() + p.pitch * p.height as usize)
+                } else {
+                    [0; 3]
+                };
                 let planes = gpu::Planes {
                     data: [level.y.data(), level.u.data(), level.v.data()],
                     pitch: [level.y.pitch, level.u.pitch, level.v.pitch],
@@ -91,6 +99,7 @@ pub(crate) fn analyse(
                     height: [level.y.height, level.u.height, level.v.height],
                     pel: level.y.pel(),
                     expand: params.super_params.gpu == 1 && params.super_params.flags & 2 == 0,
+                    tail,
                 };
                 session.defer(slot, key, planes);
             }
