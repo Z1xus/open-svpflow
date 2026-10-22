@@ -36,6 +36,9 @@ const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
 const CL_DEVICE_NAME: ClUint = 0x102B;
 const CL_DEVICE_GLOBAL_MEM_SIZE: ClUint = 0x101F;
 const CL_MEM_READ_WRITE: u64 = 1 << 0;
+const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
+const CL_MAP_READ: u64 = 1 << 0;
+const CL_MAP_WRITE: u64 = 1 << 1;
 const CL_FALSE: ClUint = 0;
 const CL_TRUE: ClUint = 1;
 const CL_PROGRAM_BUILD_LOG: ClUint = 0x1183;
@@ -90,6 +93,18 @@ type FnCreateImage2D = unsafe extern "C" fn(
     *mut c_void,
     *mut ClInt,
 ) -> ClMem;
+type FnEnqueueMapBuffer = unsafe extern "C" fn(
+    ClCommandQueue,
+    ClMem,
+    ClUint,
+    u64,
+    usize,
+    usize,
+    ClUint,
+    *const c_void,
+    *mut c_void,
+    *mut ClInt,
+) -> *mut c_void;
 type FnEnqueueReadBuffer = unsafe extern "C" fn(
     ClCommandQueue,
     ClMem,
@@ -165,6 +180,7 @@ struct OpenCl {
     CreateImage2D: FnCreateImage2D,
     CreateImage: Option<blend::FnCreateImage>,
     EnqueueReadBuffer: FnEnqueueReadBuffer,
+    EnqueueMapBuffer: FnEnqueueMapBuffer,
     EnqueueWriteBuffer: FnEnqueueReadBuffer,
     EnqueueReadBufferRect: FnEnqueueReadBufferRect,
     EnqueueWriteImage: FnEnqueueWriteImage,
@@ -215,6 +231,7 @@ impl OpenCl {
                 CreateImage2D: sym!("clCreateImage2D"),
                 CreateImage: unsafe { lib.get(b"clCreateImage\0") }.ok().map(|f| *f),
                 EnqueueReadBuffer: sym!("clEnqueueReadBuffer"),
+                EnqueueMapBuffer: sym!("clEnqueueMapBuffer"),
                 EnqueueWriteBuffer: sym!("clEnqueueWriteBuffer"),
                 EnqueueReadBufferRect: sym!("clEnqueueReadBufferRect"),
                 EnqueueWriteImage: sym!("clEnqueueWriteImage"),
@@ -263,7 +280,16 @@ pub struct GpuContext {
     blend_pool: std::sync::Mutex<Vec<blend::Buffers>>,
     blend_slots: std::sync::Arc<blend::Slots>,
     blend_units: std::sync::Mutex<Vec<Unit>>,
+    pins: std::sync::Mutex<Vec<Pin>>,
 }
+
+struct Pin {
+    mem: ClMem,
+    ptr: *mut u8,
+    size: usize,
+}
+
+unsafe impl Send for Pin {}
 
 type SuperCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<SuperEntry>>>>;
 
@@ -379,6 +405,7 @@ struct Unit {
     packed_base: Vec<u16>,
     packed_ext: Vec<u16>,
     packed_mask: Vec<u8>,
+    held: Vec<Box<dyn std::any::Any + Send>>,
     variant_kernels: Vec<(u32, ClKernel)>,
     blend: blend::UnitState,
     cover: cover::UnitCover,
@@ -416,6 +443,7 @@ impl Unit {
             packed_base: Vec::new(),
             packed_ext: Vec::new(),
             packed_mask: Vec::new(),
+            held: Vec::new(),
             variant_kernels: Vec::new(),
             blend: blend::UnitState::default(),
             cover: cover::UnitCover::default(),
@@ -464,6 +492,11 @@ impl Drop for GpuContext {
             for unit in &self.units {
                 if let Ok(u) = unit.lock() {
                     self.release_unit(&u);
+                }
+            }
+            if let Ok(mut pins) = self.pins.lock() {
+                for pin in pins.drain(..) {
+                    (self.cl.ReleaseMemObject)(pin.mem);
                 }
             }
             if let Ok(mut pool) = self.blend_units.lock() {
@@ -699,6 +732,7 @@ impl GpuContext {
                 blend_pool: std::sync::Mutex::new(Vec::new()),
                 blend_slots,
                 blend_units: std::sync::Mutex::new(Vec::new()),
+                pins: std::sync::Mutex::new(Vec::new()),
             });
         }
         Err("no usable GPU device".into())
@@ -1476,6 +1510,58 @@ impl GpuContext {
         waits
     }
 
+    unsafe fn take_pin(&self, q: ClCommandQueue, size: usize) -> Option<Pin> {
+        let pooled = self.pins.lock().ok()?.pop();
+        if let Some(pin) = pooled {
+            if pin.size >= size {
+                return Some(pin);
+            }
+            unsafe { (self.cl.ReleaseMemObject)(pin.mem) };
+        }
+        let mut err = 0;
+        unsafe {
+            let mem = (self.cl.CreateBuffer)(
+                self.context,
+                CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
+                size,
+                std::ptr::null_mut(),
+                &raw mut err,
+            );
+            if err != CL_SUCCESS || mem.is_null() {
+                return None;
+            }
+            let ptr = (self.cl.EnqueueMapBuffer)(
+                q,
+                mem,
+                CL_TRUE,
+                CL_MAP_READ | CL_MAP_WRITE,
+                0,
+                size,
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &raw mut err,
+            );
+            if err != CL_SUCCESS || ptr.is_null() {
+                (self.cl.ReleaseMemObject)(mem);
+                return None;
+            }
+            Some(Pin {
+                mem,
+                ptr: ptr.cast(),
+                size,
+            })
+        }
+    }
+
+    fn put_pin(&self, pin: Pin) {
+        if let Ok(mut pins) = self.pins.lock() {
+            pins.push(pin);
+        } else {
+            unsafe { (self.cl.ReleaseMemObject)(pin.mem) };
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &self,
@@ -1549,17 +1635,29 @@ impl GpuContext {
             let v_mem = self.ensure_buffer(&mut unit.dst[2], dst_v.len())?;
             self.enqueue_plane(q, k, v_mem, sv / depth, pv, src0[2], src1[2], &[])?;
             let mut done: ClEvent = std::ptr::null_mut();
-            for (index, (dmem, output)) in [(y_mem, dst_y), (u_mem, dst_u), (v_mem, dst_v)]
-                .into_iter()
-                .enumerate()
+            let total = dst_y.len() + dst_u.len() + dst_v.len();
+            let pin = self.take_pin(q, total);
+            let mut offset = 0;
+            for (index, (dmem, output)) in [
+                (y_mem, &mut *dst_y),
+                (u_mem, &mut *dst_u),
+                (v_mem, &mut *dst_v),
+            ]
+            .into_iter()
+            .enumerate()
             {
+                let target = match &pin {
+                    Some(pin) => pin.ptr.add(offset),
+                    None => output.as_mut_ptr(),
+                };
+                offset += output.len();
                 if (self.cl.EnqueueReadBuffer)(
                     q,
                     dmem,
                     CL_FALSE,
                     0,
                     output.len(),
-                    output.as_mut_ptr().cast(),
+                    target.cast(),
                     0,
                     std::ptr::null(),
                     if index == 2 {
@@ -1573,10 +1671,32 @@ impl GpuContext {
                         (self.cl.ReleaseEvent)(done);
                     }
                     (self.cl.Finish)(q);
+                    if let Some(pin) = pin {
+                        self.put_pin(pin);
+                    }
                     return None;
                 }
             }
-            self.wait_event(q, done).then_some(())?;
+            let held = (
+                std::mem::take(&mut unit.held),
+                std::mem::take(&mut unit.packed_base),
+                std::mem::take(&mut unit.packed_ext),
+                std::mem::take(&mut unit.packed_mask),
+            );
+            drop(unit);
+            let finished = self.wait_event(q, done);
+            drop(held);
+            if let Some(pin) = pin {
+                if finished {
+                    let mut at = pin.ptr.cast_const();
+                    for output in [dst_y, dst_u, dst_v] {
+                        std::ptr::copy_nonoverlapping(at, output.as_mut_ptr(), output.len());
+                        at = at.add(output.len());
+                    }
+                }
+                self.put_pin(pin);
+            }
+            finished.then_some(())?;
         }
         Some(())
     }

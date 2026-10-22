@@ -142,20 +142,16 @@ impl GpuContext {
             unsafe {
                 self.write_buffer(queue, vectors, state.host.as_ptr().cast(), vectors_bytes)
             }?;
+            unit.held.push(Box::new(std::mem::take(&mut state.host)));
             state.key = Some(cover.key);
         }
         let table_old = state.table.0;
         let table = unsafe { self.ensure_buffer(&mut state.table, layout.table.len()) }?;
         if state.table_host != layout.table || table != table_old {
             state.table_host.clone_from(&layout.table);
-            unsafe {
-                self.write_buffer(
-                    queue,
-                    table,
-                    state.table_host.as_ptr().cast(),
-                    state.table_host.len(),
-                )
-            }?;
+            let staged = layout.table.clone();
+            unsafe { self.write_buffer(queue, table, staged.as_ptr().cast(), staged.len()) }?;
+            unit.held.push(Box::new(staged));
         }
         let stride = width + 2;
         let plane = stride * (height + 2);
