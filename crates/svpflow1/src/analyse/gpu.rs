@@ -263,6 +263,7 @@ pub(crate) struct Planes<'a> {
     pub(crate) expand: bool,
     pub(crate) tail: [usize; 3],
     pub(crate) pyramid: Option<Pyramid>,
+    pub(crate) lean: bool,
     pub(crate) uses: u32,
 }
 
@@ -912,7 +913,12 @@ impl Session<'_, '_> {
         let regions: [usize; 3] =
             std::array::from_fn(|plane| planes.pitch[plane] * planes.height[plane].max(0) as usize);
         let lengths: [usize; 3] = std::array::from_fn(|plane| {
-            (planes.base[plane] + pel * pel * regions[plane]).min(planes.data[plane].len())
+            let end = planes.base[plane] + pel * pel * regions[plane];
+            if planes.lean {
+                end
+            } else {
+                end.min(planes.data[plane].len())
+            }
         });
         let totals: [usize; 3] = std::array::from_fn(|plane| {
             planes.tail[plane]

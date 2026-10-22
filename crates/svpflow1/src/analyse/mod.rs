@@ -96,10 +96,14 @@ pub(crate) fn analyse(
             return words;
         }
         let _ = plan;
-        if params.super_params.lean {
-            cpu_search_stages(params, first, second, outputs);
-            return words;
-        }
+        let rebuilt = params
+            .super_params
+            .lean
+            .then(|| [Rebuilt::new(params, first), Rebuilt::new(params, second)]);
+        let views = rebuilt
+            .as_ref()
+            .map(|r| [r[0].view(params), r[1].view(params)]);
+        let [first, second] = views.as_ref().map_or([first, second], |v| [&v[0], &v[1]]);
         let gpu = (keys.is_some()
             && (params.stages[0].gpu_searchable(params)
                 || params.stages.len() > 1
@@ -131,6 +135,7 @@ pub(crate) fn analyse(
                     expand: params.super_params.gpu == 1 && params.super_params.flags & 2 == 0,
                     tail,
                     pyramid: None,
+                    lean: false,
                     uses: key.2,
                 };
                 session.defer(slot, (key.0, key.1), planes);
@@ -140,8 +145,6 @@ pub(crate) fn analyse(
     }
     words
 }
-
-const STRIDE_ALIGN: usize = 32;
 
 struct Rebuilt {
     planes: [Vec<u8>; 3],
@@ -155,10 +158,7 @@ impl Rebuilt {
         let source = frame.source.expect("lean frames carry the source planes");
         let rows = usize::try_from(opts.super_height()).unwrap_or(0);
         let (sx, sy) = params.chroma_shift;
-        let pitches = std::array::from_fn(|index| {
-            let width = if index == 0 { sp.width } else { sp.width >> sx };
-            (width as usize).next_multiple_of(STRIDE_ALIGN)
-        });
+        let pitches = source.map(|plane| plane.pitch);
         let planes = std::array::from_fn(|index| {
             let shift = if index == 0 { (0, 0) } else { (sx, sy) };
             let mut plane = vec![0u8; pitches[index] * (rows >> shift.1)];
@@ -193,6 +193,7 @@ impl Rebuilt {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn cpu_search_stages(
     params: &AnalyseParams,
     first: &SuperFrameView<'_>,
@@ -323,11 +324,15 @@ fn run_chain<'o>(
         } else {
             Some(cpu_search(params, plan, frames)?)
         };
+        let staged = frames.map(zero_pads);
         let mut session = gpu::refine_gpu()?.session(keys[0].1.min(keys[1].1));
         for (slot, (frame, key)) in frames.into_iter().zip(keys).enumerate() {
             let level = frame.level(0);
             let planes = gpu::Planes {
-                data: [level.y.data(), level.u.data(), level.v.data()],
+                data: match &staged[slot] {
+                    Some([y, u, v]) => [y, u, v],
+                    None => [level.y.data(), level.u.data(), level.v.data()],
+                },
                 pitch: [level.y.pitch, level.u.pitch, level.v.pitch],
                 base: [level.y.base(), level.u.base(), level.v.base()],
                 height: [level.y.height, level.u.height, level.v.height],
@@ -335,6 +340,7 @@ fn run_chain<'o>(
                 expand: params.super_params.gpu == 1 && params.super_params.flags & 2 == 0,
                 tail: [0; 3],
                 pyramid: Some(plan.pyramid),
+                lean: plan.lean,
                 uses: key.2,
             };
             session.defer(slot, (key.0, key.1), planes);
@@ -365,6 +371,31 @@ fn run_chain<'o>(
         Some(())
     })();
     if done.is_some() { None } else { Some(outputs) }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn zero_pads(frame: &SuperFrameView<'_>) -> Option<[Vec<u8>; 3]> {
+    let source = frame.source?;
+    let widths = [
+        frame.width,
+        frame.width >> frame.chroma_shift.0,
+        frame.width >> frame.chroma_shift.0,
+    ];
+    if source
+        .iter()
+        .zip(widths)
+        .all(|(plane, width)| plane.pitch == width as usize)
+    {
+        return None;
+    }
+    Some(std::array::from_fn(|index| {
+        let (plane, width) = (source[index], widths[index] as usize);
+        let mut data = plane.data.to_vec();
+        for row in data.chunks_exact_mut(plane.pitch) {
+            row[width..].fill(0);
+        }
+        data
+    }))
 }
 
 #[cfg(not(target_arch = "wasm32"))]

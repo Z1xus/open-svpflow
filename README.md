@@ -35,7 +35,7 @@ The speedup mainly comes from AVX2/AVX-512 motion search, running part of that s
 - Native I444 input and output.
 - SmoothFpsBlend, which interpolates and frame-blends on the GPU in one go, so it's about 2x faster than blending separately (build with --no-default-features if you don't want it).
 - Halve and DoubleVectors, which let the motion search run on a half-size frame, a lot faster for a small quality loss.
-- SVSuper("{pel:1,gpu:1,lean:true}") skips the reduced levels when the GPU analyse chain builds them itself, which frees a lot of CPU. Only SVAnalyse and the SmoothFps GPU path can use such a super clip.
+- SVSuper("{pel:2,gpu:1,lean:true}") (pel 1 or 2) skips the subpel and reduced levels when the GPU analyse chain builds them itself, which frees a lot of CPU and memory. Only SVAnalyse and the SmoothFps filters here can use such a super clip.
 - A [C API](crates/svpflow-capi/include/open_svpflow.h) for running it without VapourSynth or AviSynth (cargo build --release -p svpflow-capi).
 
 ### SmoothFps options

@@ -40,9 +40,10 @@ impl SuperOpts {
         }
         let rc = opt.and_then(|v| v.bool_at(&["rc"])).unwrap_or(false);
         let lean = opt.and_then(|v| v.bool_at(&["lean"])).unwrap_or(false);
-        if lean && (pel != 1 || gpu != 1 || !full || scale_down != DEFAULT_SCALE_DOWN) {
+        if lean && (pel > 2 || gpu != 1 || !full || scale_down != DEFAULT_SCALE_DOWN) {
             return Err(
-                "SVSuper: lean needs pel 1, gpu 1, the finest level and the default scale".into(),
+                "SVSuper: lean needs pel 1 or 2, gpu 1, the finest level and the default scale"
+                    .into(),
             );
         }
         let levels = auto_levels(width, height);
