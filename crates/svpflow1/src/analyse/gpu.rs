@@ -180,6 +180,7 @@ type Launch = (
     i32,
     Handle,
     (Handle, usize),
+    usize,
 );
 
 #[derive(Default)]
@@ -187,7 +188,7 @@ struct Unit {
     queue: usize,
     expand: usize,
     kernels: Vec<(usize, usize)>,
-    search: Vec<(usize, usize, usize)>,
+    search: Vec<(usize, bool, usize, usize)>,
     buffers: [Buffer; 31],
 }
 
@@ -1198,15 +1199,23 @@ impl Session<'_, '_> {
         unsafe { self.enqueue_search(params, pred, rev, src, reference, program, border_program) }
     }
 
-    unsafe fn search_kernel(&mut self, program: usize) -> Option<(Handle, usize)> {
-        if let Some(&(_, kernel, local)) = self.unit.search.iter().find(|(p, _, _)| *p == program) {
-            return Some((kernel as Handle, local));
+    unsafe fn search_kernel(&mut self, program: usize, refine: bool) -> Option<(Handle, usize)> {
+        if let Some(&(_, _, kernel, local)) = self
+            .unit
+            .search
+            .iter()
+            .find(|(p, r, _, _)| *p == program && *r == refine)
+        {
+            return (kernel != 0).then_some((kernel as Handle, local));
         }
         let cl = &self.gpu.cl;
         let mut err = 0;
-        let kernel =
-            unsafe { (cl.CreateKernel)(program as Handle, c"search".as_ptr(), &raw mut err) };
+        let name = if refine { c"refine" } else { c"search" };
+        let kernel = unsafe { (cl.CreateKernel)(program as Handle, name.as_ptr(), &raw mut err) };
         if err != CL_SUCCESS || kernel.is_null() {
+            if refine {
+                self.unit.search.push((program, refine, 0, 0));
+            }
             return None;
         }
         let mut size = [0usize; 3];
@@ -1224,7 +1233,9 @@ impl Session<'_, '_> {
         {
             return None;
         }
-        self.unit.search.push((program, kernel as usize, size[0]));
+        self.unit
+            .search
+            .push((program, refine, kernel as usize, size[0]));
         Some((kernel, size[0]))
     }
 
@@ -1242,8 +1253,13 @@ impl Session<'_, '_> {
         let blocks = pred.len();
         let total = blocks + params.border;
         let base = 7 + 12 * src;
-        let main_kernel = unsafe { self.search_kernel(program)? };
-        let border_kernel = unsafe { self.search_kernel(border_program)? };
+        let main_kernel = unsafe { self.search_kernel(program, false)? };
+        let border_kernel = unsafe { self.search_kernel(border_program, false)? };
+        let refine_kernel = if params.width == 8 && params.height == 8 {
+            unsafe { self.search_kernel(program, true) }
+        } else {
+            None
+        };
         unsafe { self.gpu.pinned(&mut self.unit, base + 6, total * 16)? };
         let (source_mems, target_mems) = (
             self.frames[src].as_ref()?.1,
@@ -1290,6 +1306,10 @@ impl Session<'_, '_> {
         for pass in 0..=passes {
             let (rin, rout) = (res[(pass + 1) % 2], res[pass % 2]);
             let (din, dout) = (dirty[(pass + 1) % 2], dirty[pass % 2]);
+            let (kernel, per) = match refine_kernel {
+                Some(kernel) if pass > 0 => (kernel, 4),
+                _ => (main_kernel, per),
+            };
             launches.push((
                 blocks,
                 rin,
@@ -1298,7 +1318,8 @@ impl Session<'_, '_> {
                 dout,
                 pass as i32,
                 q_mem,
-                main_kernel,
+                kernel,
+                per,
             ));
         }
         if params.border > 0 {
@@ -1313,9 +1334,10 @@ impl Session<'_, '_> {
                 0,
                 q2_mem,
                 border_kernel,
+                per,
             ));
         }
-        for (index, &(count, rin, rout, din, dout, pass, qm, (kernel, local))) in
+        for (index, &(count, rin, rout, din, dout, pass, qm, (kernel, local), per)) in
             launches.iter().enumerate()
         {
             let mems: [Handle; 15] = [

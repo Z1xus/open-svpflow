@@ -897,10 +897,12 @@ void search(__global const uchar *sY, __global const uchar *sU, __global const u
     uint pl = 0, pb = 0, pu = 0, pw = 0;
 
 #define SUMS_REDUCE() \
-    pl = radd(pl, scr); \
-    pu = radd(pu, scr); \
-    pw = radd(pw, scr); \
-    pb = radd(pb, scr);
+    if (pass == 0) { \
+        pl = radd(pl, scr); \
+        pu = radd(pu, scr); \
+        pw = radd(pw, scr); \
+        pb = radd(pb, scr); \
+    }
 
 #ifdef FASTREG
     uint bl, bc;
@@ -973,6 +975,9 @@ void search(__global const uchar *sY, __global const uchar *sU, __global const u
         if (t.px != x0 || t.py != y0) sad_slow(sY, sU, sV, rY, rU, rV, q, &t, pel, vx, vy, &mls, &mlc);
     }
 #else
+#ifdef LANEG
+    if (pass == 0)
+#endif
     {
         wsync();
         uint off0 = (uint)q[P_SBY] + (uint)y0 * (uint)q[P_SPY] + (uint)x0;
@@ -1029,12 +1034,16 @@ void search(__global const uchar *sY, __global const uchar *sU, __global const u
 #ifdef LANEG
     const uint gr = l & 7u, gg = l >> 3;
     uint sr[4];
+    if (pass == 0) {
 #ifdef SATD
-    #pragma unroll
-    for (int rr = 0; rr < 4; rr++) sr[rr] = gr < 4 ? ss[((gr >> 1) * 4 + rr) * 2 + (gr & 1)] : ss[16 + (gr & 1) * 4 + rr];
+        #pragma unroll
+        for (int rr = 0; rr < 4; rr++) sr[rr] = gr < 4 ? ss[((gr >> 1) * 4 + rr) * 2 + (gr & 1)] : ss[16 + (gr & 1) * 4 + rr];
 #else
-    sr[0] = ss[2 * gr]; sr[1] = ss[2 * gr + 1]; sr[2] = ss[16 + gr]; sr[3] = 0;
+        sr[0] = ss[2 * gr]; sr[1] = ss[2 * gr + 1]; sr[2] = ss[16 + gr]; sr[3] = 0;
 #endif
+    } else {
+        grp_src(sY, sU, sV, q, x0, y0, gr, sr);
+    }
     {
         const uint omall = om;
         const uint slot = popcount(omall & ((1u << l) - 1u));
@@ -1087,7 +1096,7 @@ void search(__global const uchar *sY, __global const uchar *sU, __global const u
     }
 #endif
 #endif
-    const int avg_l = (int)pl >> LOGAV;
+    const int avg_l = pass == 0 ? (int)pl >> LOGAV : ax.w;
     {
         uint from = dupi >= 0 ? (uint)dupi : (uint)l;
         mls = (int)shfl_i((uint)mls, from, scr);
@@ -1487,11 +1496,253 @@ void search(__global const uchar *sY, __global const uchar *sU, __global const u
         dout[ob] = PK(rx, ry) != prevxy;
         if (pass == 0) {
             cen[ob] = (int4)(PK(cvx, cvy), craw, cmin, 0);
-            aux[ob] = (int4)(PK(cxp, cyp), lambda, radius, 0);
+            aux[ob] = (int4)(PK(cxp, cyp), lambda, radius, avg_l);
         } else if (do_ex) {
             cen[ob] = (int4)(PK(cvx, cvy), craw, cmin, 0);
         }
         if (wrote) emit(out, ob, rx, ry, rsad, avg_l, q[P_DIAG]);
+    }
+}
+#endif
+
+#if defined(LANEG) && DONTV == 0
+inline int gmin(int v, __local uint *scr) {
+    v = min(v, (int)shfl_x((uint)v, 4, scr));
+    v = min(v, (int)shfl_x((uint)v, 2, scr));
+    return min(v, (int)shfl_x((uint)v, 1, scr));
+}
+
+__kernel __attribute__((reqd_work_group_size(WGS, 1, 1)))
+void refine(__global const uchar *sY, __global const uchar *sU, __global const uchar *sV,
+            __global const uchar *rY, __global const uchar *rU, __global const uchar *rV,
+            __constant int *q, __global const int2 *pred, __global const int2 *rev,
+            __global const int4 *rin, __global int4 *rout,
+            __global int4 *cen, __global int4 *aux, __global int4 *out,
+            __global const uchar *din, __global uchar *dout, int pass) {
+    const int lid = get_local_id(0), l = lid & 31, sub = lid >> 5;
+    __local uint scr_[BPW][32];
+    __local int svk_[BPW][NSMAX];
+    __local int svm_[BPW][NSMAX];
+    __local uint *scr = scr_[sub];
+    __local int *svk = svk_[sub];
+    __local int *svm = svm_[sub];
+    const uint gr = l & 7u, gg = l >> 3, gs = gg * 8u, gm = 0xFFu << gs;
+    const int bxn = q[P_BLKX], byn = q[P_BLKY], nb = bxn * byn;
+    const int bq = (int)(get_group_id(0) * BPW + sub) * 4 + (int)gg;
+    const bool act = bq < nb;
+    const int b = act ? bq : 0;
+    const int bi = b % bxn, bj = b / bxn;
+    const int x0 = bi * q[P_STEPX], y0 = bj * q[P_STEPY];
+    const int pel = PELV;
+    const int PW = q[P_W], PH = q[P_H];
+    const int nx = bi + nbx(gr), ny = bj + nby(gr);
+    const bool inb = act && nx >= 0 && nx < bxn && ny >= 0 && ny < byn;
+    const int ni = inb ? ny * bxn + nx : b;
+    const int nd = inb ? din[ni] : 0;
+    const uint dm = ballot(nd != 0, scr);
+    if (!dm) {
+        if (act && gr == 0) {
+            rout[b] = rin[b];
+            dout[b] = 0;
+        }
+        return;
+    }
+    const bool gact = act && ((dm & gm) != 0);
+    const int nvec = nd != 0 ? rin[ni].x : 0;
+    const int4 cn = cen[b];
+    const int4 ax = aux[b];
+    uint sr[4];
+    grp_src(sY, sU, sV, q, x0, y0, gr, sr);
+    const int omin_x = -pel * x0, omin_y = -pel * y0;
+    const int omax_x = pel * (PW - x0 - W), omax_y = pel * (PH - y0 - H);
+    const int vx = LO(nvec), vy = HI(nvec);
+    bool valid = gact && nd != 0 && nvec != cn.x;
+    const bool inside = vx >= omin_x && vx < omax_x && vy >= omin_y && vy < omax_y;
+    if (valid && !inside) {
+        Sh t = make_sh(x0, y0, pel, PW, PH, vx, vy, 0);
+        if (!sh_fits(&t, pel, PW, PH, vx, vy)) valid = false;
+    }
+    int dupi = -1;
+    {
+        const uint vmask = ballot(valid, scr);
+        uint mm = match_any((uint)PK(vx, vy), scr) & vmask & gm;
+        if (valid) {
+            int first = 31 - (int)clz(mm & (0u - mm));
+            if (first != l) dupi = first;
+        }
+    }
+    uint rds = (ballot(valid && dupi < 0, scr) >> gs) & 0xFFu;
+    int mls = 0, mlc = 0;
+    while (ballot(rds != 0, scr)) {
+        const bool pick = rds != 0;
+        uint j = 0;
+        if (pick) {
+            j = 31u - clz(rds & (0u - rds));
+            rds &= rds - 1;
+        }
+        int jx = (int)shfl_i((uint)vx, gs + j, scr), jy = (int)shfl_i((uint)vy, gs + j, scr);
+        bool ok = pick;
+        if (ok && !(jx >= omin_x && jx < omax_x && jy >= omin_y && jy < omax_y)) {
+            Sh t = make_sh(x0, y0, pel, PW, PH, jx, jy, 0);
+            ok = t.px == x0 && t.py == y0;
+        }
+        int sl, sc;
+        grp_eval(rY, rU, rV, q, x0, y0, pel, sr, gr, ok ? jx : 0, ok ? jy : 0, scr, &sl, &sc);
+        if (pick && gr == j) { mls = sl; mlc = sc; }
+    }
+    if (valid && dupi < 0 && !inside) {
+        Sh t = make_sh(x0, y0, pel, PW, PH, vx, vy, 0);
+        if (t.px != x0 || t.py != y0) SLOWFN(sY, sU, sV, rY, rU, rV, q, &t, pel, vx, vy, &mls, &mlc);
+    }
+    {
+        uint from = dupi >= 0 ? (uint)dupi : (uint)l;
+        mls = (int)shfl_i((uint)mls, from, scr);
+        mlc = (int)shfl_i((uint)mlc, from, scr);
+    }
+    int p = IMAX;
+    if (valid) p = pen(mls + mlc, q[P_PNBOUR]);
+    const int pmin = gmin(p, scr);
+    const uint wmask = ballot(valid && p == pmin, scr) & gm;
+    const int widx = wmask ? 31 - (int)clz(wmask & (0u - wmask)) : IMAX;
+    const bool found = widx != IMAX && pmin < cn.z;
+    const uint ws = found ? (uint)widx : (uint)l;
+    const int fx = (int)shfl_i((uint)vx, ws, scr), fy = (int)shfl_i((uint)vy, ws, scr);
+    const int fl = (int)shfl_i((uint)mls, ws, scr), fc = (int)shfl_i((uint)mlc, ws, scr);
+    const int fp = (int)shfl_i((uint)p, ws, scr);
+    const int cvx = found ? fx : LO(cn.x), cvy = found ? fy : HI(cn.x);
+    const int craw = found ? fl + fc : cn.y, cmin = found ? fp : cn.z;
+    const int cvl = found ? fl : 0, cvc = found ? fc : 0;
+    const int cxp = LO(ax.x), cyp = HI(ax.x), lambda = ax.y;
+    const bool do_ex = found;
+    int rst = 0;
+    if (do_ex) {
+        rst = min(ax.z, RMAX);
+        if (lambda > 0) {
+            ulong x = (ulong)((uint)(min(craw, 8000000) * 256 + 255));
+            while (rst > 0 && x < (ulong)(rst * rst) * (ulong)lambda) rst--;
+        }
+    }
+    int bcost = IMAX, bk = IMAX, bsl = 0, bsc = 0;
+    const int pnew = q[P_PNEW];
+    for (int t = 0; t < 4; t++) {
+        if (!ballot(do_ex && (int)gg == t, scr)) continue;
+        const uint tg = (uint)t * 8u;
+        const int ebx = (int)shfl_i((uint)cvx, tg, scr), eby = (int)shfl_i((uint)cvy, tg, scr);
+        const int ecraw = (int)shfl_i((uint)craw, tg, scr);
+        const int ecvl = (int)shfl_i((uint)cvl, tg, scr), ecvc = (int)shfl_i((uint)cvc, tg, scr);
+        const int elam = (int)shfl_i((uint)lambda, tg, scr);
+        const int ecxp = (int)shfl_i((uint)cxp, tg, scr), ecyp = (int)shfl_i((uint)cyp, tg, scr);
+        const int erst = (int)shfl_i((uint)rst, tg, scr);
+        const int ex0 = (int)shfl_i((uint)x0, tg, scr), ey0 = (int)shfl_i((uint)y0, tg, scr);
+        uint esr[4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) esr[i] = shfl_i(sr[i], tg + gr, scr);
+        const int n = 2 * erst + 1, nk = n * n;
+        const Sh cs = make_sh(ex0, ey0, pel, PW, PH, ebx, eby, 2);
+        const bool shifted = cs.px != ex0 || cs.py != ey0;
+        const int kc = shifted ? -1 : erst * n + erst;
+        int ns = 0;
+        if (erst > 0 || shifted) {
+            for (int kb = 0; kb < nk; kb += 32) {
+                int k = kb + l;
+                bool ok = false;
+                int mot = 0;
+                if (k < nk) {
+                    int ex_vx = ebx + k % n - erst, ex_vy = eby + k / n - erst;
+                    if (sh_inside(&cs, ex_vx, ex_vy)) {
+                        mot = motion(elam, ecxp, ecyp, ex_vx, ex_vy);
+                        ok = mot < ecraw;
+                    }
+                }
+                uint m = ballot(ok && k != kc, scr);
+                if (ok && k != kc) {
+                    int pos = ns + (int)popcount(m & ((1u << l) - 1u));
+                    svk[pos] = k;
+                    svm[pos] = mot;
+                }
+                ns += (int)popcount(m);
+            }
+            wsync();
+        }
+        int tb = IMAX, tk = IMAX, tl = 0, tc = 0;
+        if (kc >= 0 && sh_inside(&cs, ebx, eby)) {
+            int mot = motion(elam, ecxp, ecyp, ebx, eby);
+            if (mot < ecraw) {
+                int tt = (int)((uint)mot + (uint)pen(ecvl, pnew));
+                tt = (int)((uint)tt + (uint)pen(ecvc, pnew));
+                if (tt < ecraw) { tb = tt; tk = kc; tl = ecvl; tc = ecvc; }
+            }
+        }
+        int rb = IMAX, rk = IMAX, rl = 0, rc = 0;
+        if (shifted) {
+            for (int i0 = 0; i0 < ns; i0 += 32) {
+                int i = i0 + l;
+                int cst = IMAX, sl = 0, sc = 0, kk = 0;
+                if (i < ns) {
+                    kk = svk[i];
+                    SLOWFN(sY, sU, sV, rY, rU, rV, q, &cs, pel, ebx + kk % n - erst, eby + kk / n - erst, &sl, &sc);
+                    int tt = (int)((uint)svm[i] + (uint)pen(sl, pnew));
+                    tt = (int)((uint)tt + (uint)pen(sc, pnew));
+                    if (tt < ecraw) cst = tt;
+                }
+                int mn = wmin(cst, scr);
+                if (mn != IMAX && mn < rb) {
+                    uint msk = ballot(cst == mn, scr);
+                    int w = 31 - (int)clz(msk & (0u - msk));
+                    rb = mn;
+                    rk = (int)shfl_i((uint)kk, w, scr);
+                    rl = (int)shfl_i((uint)sl, w, scr);
+                    rc = (int)shfl_i((uint)sc, w, scr);
+                }
+            }
+        } else {
+            for (int base = 0; base < ns; base += 4) {
+                int i = base + (int)gg;
+                bool vld = i < ns;
+                int k = svk[vld ? i : 0];
+                int sl, sc;
+                grp_eval(rY, rU, rV, q, ex0, ey0, pel, esr, gr, ebx + k % n - erst, eby + k / n - erst, scr, &sl, &sc);
+                int cst = IMAX;
+                if (vld && gr == 0) {
+                    int tt = (int)((uint)svm[i] + (uint)pen(sl, pnew));
+                    tt = (int)((uint)tt + (uint)pen(sc, pnew));
+                    if (tt < ecraw) cst = tt;
+                }
+                int mn = wmin(cst, scr);
+                if (mn != IMAX && mn < rb) {
+                    uint msk = ballot(cst == mn, scr);
+                    int w = 31 - (int)clz(msk & (0u - msk));
+                    rb = mn;
+                    rk = (int)shfl_i((uint)k, w, scr);
+                    rl = (int)shfl_i((uint)sl, w, scr);
+                    rc = (int)shfl_i((uint)sc, w, scr);
+                }
+            }
+        }
+        if (tb < rb || (tb == rb && tb != IMAX && tk < rk)) { rb = tb; rk = tk; rl = tl; rc = tc; }
+        if ((int)gg == t) { bcost = rb; bk = rk; bsl = rl; bsc = rc; }
+    }
+    if (act && gr == 0) {
+        int rx, ry, rsad, rmin;
+        bool wrote = false;
+        const int4 old = rin[b];
+        if (do_ex) {
+            if (bk != IMAX) {
+                rx = cvx + bk % (2 * rst + 1) - rst;
+                ry = cvy + bk / (2 * rst + 1) - rst;
+                rsad = bsl + bsc;
+                rmin = bcost;
+            } else {
+                rx = cvx; ry = cvy; rsad = craw; rmin = craw;
+            }
+            wrote = true;
+        } else {
+            rx = LO(old.x); ry = HI(old.x); rsad = old.y; rmin = old.z;
+        }
+        rout[b] = (int4)(PK(rx, ry), rsad, rmin, 0);
+        dout[b] = PK(rx, ry) != old.x;
+        if (do_ex) cen[b] = (int4)(PK(cvx, cvy), craw, cmin, 0);
+        if (wrote) emit(out, b, rx, ry, rsad, ax.w, q[P_DIAG]);
     }
 }
 #endif
