@@ -115,6 +115,90 @@ struct Kernels {
     satd: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct Interpolation {
+    pub(crate) norm: i32,
+    pub(crate) norm_area: i32,
+    pub(crate) step_x: i32,
+    pub(crate) step_y: i32,
+    pub(crate) odd_x: i32,
+    pub(crate) even_x: i32,
+    pub(crate) odd_y: i32,
+    pub(crate) even_y: i32,
+    pub(crate) flat: bool,
+}
+
+impl Interpolation {
+    fn neighbours(coarse: &Field, k_x: i32, l_y: i32) -> ([Mv; 4], i32, i32) {
+        let (cx, cy) = (coarse.blk_x, coarse.blk_y);
+        let at = |i: i32, j: i32| coarse.vectors[(i + j * cx) as usize];
+        let i = k_x.min(2 * cx - 1);
+        let j = l_y.min(2 * cy - 1);
+        let off_x = -1 + 2 * (i % 2);
+        let off_y = -1 + 2 * (j % 2);
+        let edge_x = i == 0 || i >= 2 * cx - 1;
+        let edge_y = j == 0 || j >= 2 * cy - 1;
+        let v1 = at(i / 2, j / 2);
+        let (v2, v3, v4) = if edge_x && edge_y {
+            (v1, v1, v1)
+        } else if edge_x {
+            let v = at(i / 2, j / 2 + off_y);
+            (v1, v, v)
+        } else if edge_y {
+            let v = at(i / 2 + off_x, j / 2);
+            (v1, v, v)
+        } else {
+            (
+                at(i / 2 + off_x, j / 2),
+                at(i / 2, j / 2 + off_y),
+                at(i / 2 + off_x, j / 2 + off_y),
+            )
+        };
+        ([v1, v2, v3, v4], off_x, off_y)
+    }
+
+    fn weights(&self, off_x: i32, off_y: i32) -> [i32; 4] {
+        let ax1 = if off_x > 0 { self.odd_x } else { self.even_x };
+        let ax2 = self.step_x * 4 - ax1;
+        let ay1 = if off_y > 0 { self.odd_y } else { self.even_y };
+        let ay2 = self.step_y * 4 - ay1;
+        [ax1 * ay1, ax2 * ay1, ax1 * ay2, ax2 * ay2]
+    }
+
+    pub(crate) fn sad_at(&self, coarse: &Field, k_x: i32, l_y: i32) -> i32 {
+        let ([v1, v2, v3, v4], off_x, off_y) = Self::neighbours(coarse, k_x, l_y);
+        if self.flat {
+            (9 * v1.sad + 3 * v2.sad + 3 * v3.sad + v4.sad + 8) >> 6
+        } else {
+            let [a11, a21, a12, a22] = self.weights(off_x, off_y);
+            ((a11 * v1.sad + a21 * v2.sad + a12 * v3.sad + a22 * v4.sad) / self.norm_area) >> 6
+        }
+    }
+
+    pub(crate) fn at(&self, coarse: &Field, k_x: i32, l_y: i32) -> Mv {
+        let ([v1, v2, v3, v4], off_x, off_y) = Self::neighbours(coarse, k_x, l_y);
+        let (mut tx, mut ty, mut sad);
+        if self.flat {
+            let blend = |a: i32, b: i32, c: i32, d: i32| 9 * a + 3 * b + 3 * c + d;
+            tx = blend(v1.x.into(), v2.x.into(), v3.x.into(), v4.x.into());
+            ty = blend(v1.y.into(), v2.y.into(), v3.y.into(), v4.y.into());
+            sad = blend(v1.sad, v2.sad, v3.sad, v4.sad) + 8;
+        } else {
+            let [a11, a21, a12, a22] = self.weights(off_x, off_y);
+            let blend = |a: i32, b: i32, c: i32, d: i32| {
+                (a11 * a + a21 * b + a12 * c + a22 * d) / self.norm_area
+            };
+            tx = blend(v1.x.into(), v2.x.into(), v3.x.into(), v4.x.into());
+            ty = blend(v1.y.into(), v2.y.into(), v3.y.into(), v4.y.into());
+            sad = blend(v1.sad, v2.sad, v3.sad, v4.sad);
+        }
+        tx = i32::from(tx as i16) >> self.norm;
+        ty = i32::from(ty as i16) >> self.norm;
+        sad >>= 6;
+        Mv::new(tx, ty, sad)
+    }
+}
+
 pub(crate) struct Field {
     pub(crate) blk_x: i32,
     pub(crate) blk_y: i32,
@@ -145,16 +229,15 @@ impl Field {
         smallest: bool,
         satd: bool,
         chroma_shift: (u32, u32),
+        lean: bool,
     ) -> Self {
-        let count = (blk_x * blk_y) as usize;
-        let extended = ((blk_x + 1) * (blk_y + 1)) as usize;
         let shape = Shape::new(layout.width as usize, layout.height as usize);
         let chroma = if chroma_shift == (0, 0) {
             metric::luma_kernel(shape, satd)
         } else {
             metric::chroma420_kernel(shape, satd)
         };
-        Self {
+        let mut field = Self {
             blk_x,
             blk_y,
             layout,
@@ -182,15 +265,31 @@ impl Field {
                 satd,
             },
             satd,
-            vectors: vec![Mv::default(); count],
-            reverse: vec![Mv::default(); count],
-            border: vec![Mv::default(); (blk_x + blk_y + 1) as usize],
-            order: vec![(0, 0); if level > 0 { extended } else { count }],
+            vectors: Vec::new(),
+            reverse: Vec::new(),
+            border: Vec::new(),
+            order: Vec::new(),
+        };
+        if !lean {
+            field.materialize();
         }
+        field
+    }
+
+    pub(crate) fn materialize(&mut self) {
+        if !self.vectors.is_empty() {
+            return;
+        }
+        let count = self.count();
+        let extended = ((self.blk_x + 1) * (self.blk_y + 1)) as usize;
+        self.vectors = vec![Mv::default(); count];
+        self.reverse = vec![Mv::default(); count];
+        self.border = vec![Mv::default(); (self.blk_x + self.blk_y + 1) as usize];
+        self.order = vec![(0, 0); if self.level > 0 { extended } else { count }];
     }
 
     fn count(&self) -> usize {
-        self.vectors.len()
+        (self.blk_x * self.blk_y) as usize
     }
 
     pub(crate) fn estimate_global_doubled(&self, global: &mut Mv) {
@@ -345,16 +444,20 @@ impl Field {
             self.predict_search(coarse);
             return;
         }
-        let norm = 4 - ilog2(self.pel) + ilog2(coarse.pel);
-        let l = self.layout;
-        let norm_area = l.step_x() * l.step_y();
-        let (odd_x, even_x) = (l.width * 3 - l.overlap_x * 2, l.width * 3 - l.overlap_x * 4);
-        let (odd_y, even_y) = (
-            l.height * 3 - l.overlap_y * 2,
-            l.height * 3 - l.overlap_y * 4,
+        let interp = self.interpolation(coarse);
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        let (norm, norm_area, odd_x, even_x, odd_y, even_y) = (
+            interp.norm,
+            interp.norm_area,
+            interp.odd_x,
+            interp.even_x,
+            interp.odd_y,
+            interp.even_y,
         );
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        let l = self.layout;
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         let (cx, cy) = (coarse.blk_x, coarse.blk_y);
-        let at = |i: i32, j: i32| coarse.vectors[(i + j * cx) as usize];
         for l_y in 0..self.blk_y {
             #[allow(unused_mut)]
             let mut done = 1;
@@ -390,52 +493,23 @@ impl Field {
             }
             for k_x in (0..1).chain(done..self.blk_x) {
                 let index = (l_y * self.blk_x + k_x) as usize;
-                let i = k_x.min(2 * cx - 1);
-                let j = l_y.min(2 * cy - 1);
-                let off_x = -1 + 2 * (i % 2);
-                let off_y = -1 + 2 * (j % 2);
-                let edge_x = i == 0 || i >= 2 * cx - 1;
-                let edge_y = j == 0 || j >= 2 * cy - 1;
-                let v1 = at(i / 2, j / 2);
-                let (v2, v3, v4) = if edge_x && edge_y {
-                    (v1, v1, v1)
-                } else if edge_x {
-                    let v = at(i / 2, j / 2 + off_y);
-                    (v1, v, v)
-                } else if edge_y {
-                    let v = at(i / 2 + off_x, j / 2);
-                    (v1, v, v)
-                } else {
-                    (
-                        at(i / 2 + off_x, j / 2),
-                        at(i / 2, j / 2 + off_y),
-                        at(i / 2 + off_x, j / 2 + off_y),
-                    )
-                };
-                let (mut tx, mut ty, mut sad);
-                if l.overlap_x == 0 && l.overlap_y == 0 {
-                    let blend = |a: i32, b: i32, c: i32, d: i32| 9 * a + 3 * b + 3 * c + d;
-                    tx = blend(v1.x.into(), v2.x.into(), v3.x.into(), v4.x.into());
-                    ty = blend(v1.y.into(), v2.y.into(), v3.y.into(), v4.y.into());
-                    sad = blend(v1.sad, v2.sad, v3.sad, v4.sad) + 8;
-                } else {
-                    let ax1 = if off_x > 0 { odd_x } else { even_x };
-                    let ax2 = l.step_x() * 4 - ax1;
-                    let ay1 = if off_y > 0 { odd_y } else { even_y };
-                    let ay2 = l.step_y() * 4 - ay1;
-                    let (a11, a12, a21, a22) = (ax1 * ay1, ax1 * ay2, ax2 * ay1, ax2 * ay2);
-                    let blend = |a: i32, b: i32, c: i32, d: i32| {
-                        (a11 * a + a21 * b + a12 * c + a22 * d) / norm_area
-                    };
-                    tx = blend(v1.x.into(), v2.x.into(), v3.x.into(), v4.x.into());
-                    ty = blend(v1.y.into(), v2.y.into(), v3.y.into(), v4.y.into());
-                    sad = blend(v1.sad, v2.sad, v3.sad, v4.sad);
-                }
-                tx = i32::from(tx as i16) >> norm;
-                ty = i32::from(ty as i16) >> norm;
-                sad >>= 6;
-                self.vectors[index] = Mv::new(tx, ty, sad);
+                self.vectors[index] = interp.at(coarse, k_x, l_y);
             }
+        }
+    }
+
+    pub(crate) fn interpolation(&self, coarse: &Self) -> Interpolation {
+        let l = self.layout;
+        Interpolation {
+            norm: 4 - ilog2(self.pel) + ilog2(coarse.pel),
+            norm_area: l.step_x() * l.step_y(),
+            step_x: l.step_x(),
+            step_y: l.step_y(),
+            odd_x: l.width * 3 - l.overlap_x * 2,
+            even_x: l.width * 3 - l.overlap_x * 4,
+            odd_y: l.height * 3 - l.overlap_y * 2,
+            even_y: l.height * 3 - l.overlap_y * 4,
+            flat: l.overlap_x == 0 && l.overlap_y == 0,
         }
     }
 

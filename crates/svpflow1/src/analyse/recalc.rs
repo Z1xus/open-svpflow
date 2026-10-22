@@ -515,22 +515,56 @@ fn cost(
 
 #[derive(Default)]
 pub(crate) struct CompactPlan {
-    pub(crate) vectors: Vec<i32>,
+    pub(crate) seed: Vec<i32>,
     pub(crate) overrides: Vec<i32>,
-    pub(crate) geometry: [i32; 12],
+    pub(crate) geometry: [i32; 20],
+    pub(crate) blocks: usize,
     pub(crate) satd: bool,
     pub(crate) shift: u32,
 }
 
 impl CompactPlan {
     pub(crate) fn blocks(&self) -> usize {
-        self.vectors.len() / 2
+        self.blocks
     }
 }
 
 impl Field {
+    fn serpentine_position(&self, bx: i32, by: i32) -> i32 {
+        let (nx, ny) = (self.blk_x, self.blk_y);
+        let interior = (ny - 2) * (nx - 2);
+        if by == 0 {
+            interior + 2 * bx
+        } else if by == ny - 1 {
+            interior + 2 * bx + 1
+        } else if bx == 0 {
+            interior + 2 * nx + 2 * (by - 1)
+        } else if bx == nx - 1 {
+            interior + 2 * nx + 2 * (by - 1) + 1
+        } else {
+            (by - 1) * (nx - 2) + if by % 2 == 0 { bx - 1 } else { nx - 2 - bx }
+        }
+    }
+
+    fn serpentine_block(&self, position: i32) -> (i32, i32) {
+        let (nx, ny) = (self.blk_x, self.blk_y);
+        let interior = (ny - 2) * (nx - 2);
+        if position < interior {
+            let by = 1 + position / (nx - 2);
+            let i = position % (nx - 2);
+            (if by % 2 == 0 { 1 + i } else { nx - 2 - i }, by)
+        } else if position < interior + 2 * nx {
+            let t = position - interior;
+            (t / 2, if t % 2 == 0 { 0 } else { ny - 1 })
+        } else {
+            let t = position - interior - 2 * nx;
+            (if t % 2 == 0 { 0 } else { nx - 1 }, 1 + t / 2)
+        }
+    }
+
     pub(crate) fn plan_compact(
         &self,
+        coarse: &Field,
         src: &LevelFrame<'_>,
         settings: &SearchSettings,
         plan: &mut CompactPlan,
@@ -542,46 +576,96 @@ impl Field {
             || !matches!(self.chroma_shift, (0, 0) | (1, 1))
             || settings.search_type != SearchType::Exhaustive
             || radius > 3
-            || self.order.len() != self.count()
             || self.blk_x < 2
             || self.blk_y < 2
+            || coarse.vectors.is_empty()
             || [src.y, src.u, src.v].iter().any(|p| p.data().len() > limit)
         {
             return false;
         }
         let (frame_w, frame_h) = (src.y.width, src.y.height);
         let pel = self.pel;
-        plan.vectors.clear();
-        plan.vectors.reserve(2 * self.vectors.len());
-        for mv in &self.vectors {
+        let interp = self.interpolation(coarse);
+        plan.seed.clear();
+        plan.seed.reserve(2 * coarse.vectors.len());
+        for mv in &coarse.vectors {
             let xy = u32::from(mv.x as u16) | (u32::from(mv.y as u16) << 16);
-            plan.vectors.extend([xy as i32, mv.sad]);
+            plan.seed.extend([xy as i32, mv.sad]);
         }
         let margin = |v: i32| if v < 0 { v - 2 } else { v + 2 };
         let outside = |v: i32, min: i32, max: i32| v < min || v >= max;
         let (step_x, step_y) = (layout.step_x(), layout.step_y());
-        let (mut moved, mut first) = (false, 0);
-        let mut overrides = Vec::new();
-        for &(bx, by) in &self.order {
-            let (bx, by) = (i32::from(bx), i32::from(by));
-            let index = by * self.blk_x + bx;
-            let mv = self.vectors[index as usize];
-            if mv.sad <= settings.bad_sad {
-                continue;
+        let (cx, cy) = (coarse.blk_x, coarse.blk_y);
+        let peak = coarse
+            .vectors
+            .iter()
+            .map(|mv| i32::from(mv.x).abs().max(i32::from(mv.y).abs()))
+            .max()
+            .unwrap_or(0);
+        let reach = ((16 * peak).min(32768) >> interp.norm) + 3;
+        let bound = |sad: i32| (16 * i64::from(sad) + if interp.flat { 8 } else { 0 }) >> 6;
+        let high: Vec<u8> = coarse
+            .vectors
+            .iter()
+            .map(|mv| u8::from(bound(mv.sad) > i64::from(settings.bad_sad)))
+            .collect();
+        let windows: Vec<u8> = (0..cy - 1)
+            .flat_map(|wy| (0..cx - 1).map(move |wx| (wy * cx + wx) as usize))
+            .map(|at| high[at] + high[at + 1] + high[at + cx as usize] + high[at + cx as usize + 1])
+            .collect();
+        let is_bad = |bx: i32, by: i32| {
+            let inside = bx > 0 && by > 0 && bx < 2 * cx - 1 && by < 2 * cy - 1;
+            match inside.then(|| windows[(((by - 1) >> 1) * (cx - 1) + ((bx - 1) >> 1)) as usize]) {
+                Some(0) => false,
+                Some(4) => true,
+                _ => interp.sad_at(coarse, bx, by) > settings.bad_sad,
             }
-            let (x0, y0) = (bx * step_x, by * step_y);
-            let out_x = outside(margin(i32::from(mv.x)), -pel * x0, pel * (frame_w - x0 - 4));
-            let out_y = outside(margin(i32::from(mv.y)), -pel * y0, pel * (frame_h - y0 - 4));
-            if out_x || out_y {
-                if !moved {
-                    first = index;
+        };
+        let near_x = |bx: i32| {
+            let x0 = bx * step_x;
+            pel * x0 < reach || pel * (frame_w - x0 - 4) <= reach
+        };
+        let near_y = |by: i32| {
+            let y0 = by * step_y;
+            pel * y0 < reach || pel * (frame_h - y0 - 4) <= reach
+        };
+        let mut outs = Vec::new();
+        let strip: Vec<i32> = (0..self.blk_x).filter(|&bx| near_x(bx)).collect();
+        let all: Vec<i32> = (0..self.blk_x).collect();
+        for by in 0..self.blk_y {
+            for &bx in if near_y(by) { &all } else { &strip } {
+                if !is_bad(bx, by) {
+                    continue;
                 }
-                moved = true;
-            } else {
-                if moved {
-                    overrides.push([index, first]);
+                let (x0, y0) = (bx * step_x, by * step_y);
+                let mv = interp.at(coarse, bx, by);
+                if outside(margin(i32::from(mv.x)), -pel * x0, pel * (frame_w - x0 - 4))
+                    || outside(margin(i32::from(mv.y)), -pel * y0, pel * (frame_h - y0 - 4))
+                {
+                    outs.push(self.serpentine_position(bx, by));
                 }
-                moved = false;
+            }
+        }
+        outs.sort_unstable();
+        let count = self.blk_x * self.blk_y;
+        let mut overrides = Vec::new();
+        let mut next = 0;
+        while next < outs.len() {
+            let (bx, by) = self.serpentine_block(outs[next]);
+            let first = by * self.blk_x + bx;
+            let mut position = outs[next] + 1;
+            next += 1;
+            while position < count {
+                if next < outs.len() && outs[next] == position {
+                    next += 1;
+                } else {
+                    let (bx, by) = self.serpentine_block(position);
+                    if is_bad(bx, by) {
+                        overrides.push([by * self.blk_x + bx, first]);
+                        break;
+                    }
+                }
+                position += 1;
             }
         }
         overrides.sort_unstable();
@@ -601,7 +685,16 @@ impl Field {
             settings.pnew,
             pel,
             overrides.len() as i32,
+            cx,
+            cy,
+            interp.norm,
+            interp.odd_x,
+            interp.even_x,
+            interp.odd_y,
+            interp.even_y,
+            i32::from(interp.flat),
         ];
+        plan.blocks = self.count();
         plan.satd = self.satd;
         plan.shift = self.chroma_shift.0;
         true

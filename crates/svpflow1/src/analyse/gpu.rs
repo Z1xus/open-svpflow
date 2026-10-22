@@ -895,7 +895,7 @@ impl Session<'_, '_> {
             kernel
         };
         let g = plan.geometry.map(i64::from);
-        let params: [i64; 33] = [
+        let params: [i64; 41] = [
             source.lengths[0],
             source.lengths[1],
             source.lengths[2],
@@ -929,6 +929,14 @@ impl Session<'_, '_> {
             source.bases[0],
             source.bases[1],
             source.bases[2],
+            g[12],
+            g[13],
+            g[14],
+            g[15],
+            g[16],
+            g[17],
+            g[18],
+            g[19],
         ];
         let (source_mems, target_mems) = (
             self.frames[src].as_ref()?.1,
@@ -948,7 +956,7 @@ impl Session<'_, '_> {
         let params = self.hold(bytes(&params));
         let overrides = self.hold(bytes(&plan.overrides));
         mems[6] = unsafe { self.write(slot, params)? };
-        mems[7] = unsafe { self.gpu.buffer(&mut self.unit, 2, blocks * 8)? };
+        mems[7] = unsafe { self.gpu.buffer(&mut self.unit, 2, plan.seed.len() * 4)? };
         mems[8] = unsafe { self.gpu.buffer(&mut self.unit, 3, blocks * 8)? };
         mems[9] = unsafe { self.write(6, overrides)? };
         let set = mems.iter().enumerate().all(|(index, mem)| unsafe {
@@ -960,7 +968,7 @@ impl Session<'_, '_> {
             ) == CL_SUCCESS
         });
         let queue = self.unit.queue as Handle;
-        if !set || !unsafe { self.transfer(mems[7], bytes(&plan.vectors), std::ptr::null_mut()) } {
+        if !set || !unsafe { self.transfer(mems[7], bytes(&plan.seed), std::ptr::null_mut()) } {
             unsafe { (cl.Finish)(queue) };
             return None;
         }
@@ -1248,12 +1256,10 @@ impl Session<'_, '_> {
         border_q[33] = 1;
         let q = self.hold(bytes(&params.q));
         let q2 = self.hold(bytes(&border_q));
-        let pred = self.hold(bytes(pred));
-        let rev = self.hold(bytes(rev));
         let q_mem = unsafe { self.write(base, q)? };
         let q2_mem = unsafe { self.write(base + 11, q2)? };
-        let pred_mem = unsafe { self.write(base + 1, pred)? };
-        let rev_mem = unsafe { self.write(base + 2, rev)? };
+        let pred_mem = unsafe { self.write(base + 1, bytes(pred))? };
+        let rev_mem = unsafe { self.write(base + 2, bytes(rev))? };
         let res = [
             unsafe { self.gpu.buffer(&mut self.unit, base + 3, total * 16)? },
             unsafe { self.gpu.buffer(&mut self.unit, base + 7, total * 16)? },
@@ -1416,12 +1422,16 @@ impl Session<'_, '_> {
     }
 
     pub(crate) fn take(&mut self, ticket: usize) -> Vec<[i32; 4]> {
+        self.view(ticket).to_vec()
+    }
+
+    pub(crate) fn view(&self, ticket: usize) -> &[[i32; 4]] {
         let (slot, blocks) = self.tickets[ticket];
         if blocks == 0 {
-            return Vec::new();
+            return &[];
         }
         let host = self.unit.buffers[slot].host as *const [i32; 4];
-        unsafe { std::slice::from_raw_parts(host, blocks) }.to_vec()
+        unsafe { std::slice::from_raw_parts(host, blocks) }
     }
 }
 
@@ -1546,7 +1556,7 @@ inline int outside(int v, int low, int high) {
 __kernel __attribute__((reqd_work_group_size(64, 1, 1)))
 void recalc(__global const uchar *sy, __global const uchar *su, __global const uchar *sv,
             __global const uchar *ry, __global const uchar *ru, __global const uchar *rv,
-            __global const long *p, __global const int2 *vectors, __global uint2 *out,
+            __global const long *p, __global const int2 *seed, __global uint2 *out,
             __global const int2 *overrides) {
     long block = get_global_id(0);
     if (block >= p[17]) return;
@@ -1556,13 +1566,45 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
     long lsy = p[0], lsu = p[1], lsv = p[2], psy = p[3], psu = p[4], psv = p[5];
     long lry = p[6], lru = p[7], lrv = p[8], pry = p[9], pru = p[10], prv = p[11];
     int x0 = (int)(block % blk_x) * step_x, y0 = (int)(block / blk_x) * step_y;
-    int2 vector = vectors[block];
-    int px = LO(vector.x), py = HI(vector.x);
+    int cx = (int)p[33], cy = (int)p[34], norm = (int)p[35];
+    int odd_x = (int)p[36], even_x = (int)p[37], odd_y = (int)p[38], even_y = (int)p[39], flat = (int)p[40];
+    int ki = min((int)(block % blk_x), 2 * cx - 1), kj = min((int)(block / blk_x), 2 * cy - 1);
+    int off_x = -1 + 2 * (ki & 1), off_y = -1 + 2 * (kj & 1);
+    int edge_x = ki == 0 || ki >= 2 * cx - 1, edge_y = kj == 0 || kj >= 2 * cy - 1;
+    int near_x = ki / 2 + off_x, near_y = kj / 2 + off_y;
+    int2 v1 = seed[ki / 2 + (kj / 2) * cx], v2 = v1, v3 = v1, v4 = v1;
+    if (edge_x && !edge_y) {
+        v3 = v4 = seed[ki / 2 + near_y * cx];
+    } else if (!edge_x && edge_y) {
+        v3 = v4 = seed[near_x + (kj / 2) * cx];
+    } else if (!edge_x && !edge_y) {
+        v2 = seed[near_x + (kj / 2) * cx];
+        v3 = seed[ki / 2 + near_y * cx];
+        v4 = seed[near_x + near_y * cx];
+    }
+    int tx, ty, vsad;
+    if (flat) {
+        tx = 9 * LO(v1.x) + 3 * LO(v2.x) + 3 * LO(v3.x) + LO(v4.x);
+        ty = 9 * HI(v1.x) + 3 * HI(v2.x) + 3 * HI(v3.x) + HI(v4.x);
+        vsad = 9 * v1.y + 3 * v2.y + 3 * v3.y + v4.y + 8;
+    } else {
+        int ax1 = off_x > 0 ? odd_x : even_x, ax2 = step_x * 4 - ax1;
+        int ay1 = off_y > 0 ? odd_y : even_y, ay2 = step_y * 4 - ay1;
+        int a11 = ax1 * ay1, a12 = ax1 * ay2, a21 = ax2 * ay1, a22 = ax2 * ay2;
+        int norm_area = step_x * step_y;
+        tx = (a11 * LO(v1.x) + a21 * LO(v2.x) + a12 * LO(v3.x) + a22 * LO(v4.x)) / norm_area;
+        ty = (a11 * HI(v1.x) + a21 * HI(v2.x) + a12 * HI(v3.x) + a22 * HI(v4.x)) / norm_area;
+        vsad = (a11 * v1.y + a21 * v2.y + a12 * v3.y + a22 * v4.y) / norm_area;
+    }
+    int px = ((int)(short)tx) >> norm, py = ((int)(short)ty) >> norm;
+    px = (int)(short)px;
+    py = (int)(short)py;
+    vsad >>= 6;
     int sum = 0;
     for (int y = 0; y < 4; y++)
         for (int x = 0; x < 4; x++) sum += fetch(sy, lsy, p[30] + (long)(y0 + y) * psy + x0 + x);
     int average = sum >> 4;
-    int best_x = px, best_y = py, bsad = vector.y;
+    int best_x = px, best_y = py, bsad = vsad;
     if (bsad > bad_sad) {
         int min_x0 = -pel * x0, min_y0 = -pel * y0;
         int max_x0 = pel * (fw - x0 - 4), max_y0 = pel * (fh - y0 - 4);

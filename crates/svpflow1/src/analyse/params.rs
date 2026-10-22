@@ -99,7 +99,13 @@ impl Stage {
         level == 0 || blk_x * blk_y >= GPU_LEVEL_BLOCKS
     }
 
-    pub(crate) fn field(&self, level: i32, pel: i32, chroma_shift: (u32, u32)) -> Field {
+    pub(crate) fn field(
+        &self,
+        level: i32,
+        pel: i32,
+        chroma_shift: (u32, u32),
+        lean: bool,
+    ) -> Field {
         let l = self.layout;
         let (blk_x, blk_y) = self.block_counts(level);
         let fine = level < self.full_math_level;
@@ -114,6 +120,7 @@ impl Stage {
             level == self.levels - 1,
             satd,
             chroma_shift,
+            lean,
         )
     }
 

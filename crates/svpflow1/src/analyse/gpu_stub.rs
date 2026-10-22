@@ -63,4 +63,8 @@ impl<'p> Session<'_, 'p> {
     pub(crate) fn take(&mut self, _: usize) -> Vec<[i32; 4]> {
         Vec::new()
     }
+
+    pub(crate) fn view(&self, _: usize) -> &[[i32; 4]] {
+        &[]
+    }
 }

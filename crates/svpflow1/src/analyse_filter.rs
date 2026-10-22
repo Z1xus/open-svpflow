@@ -29,7 +29,7 @@ unsafe impl Send for Inputs {}
 enum Ahead {
     Queued(Inputs),
     Running,
-    Done(Vec<u8>),
+    Done(Vec<u32>),
     Taken,
 }
 
@@ -67,7 +67,7 @@ impl Slot {
         self.done.notify_all();
     }
 
-    fn take(&self) -> Option<Vec<u8>> {
+    fn take(&self) -> Option<Vec<u32>> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let mut state = self
             .done
@@ -114,7 +114,7 @@ impl AnalyseState {
         Some(inputs)
     }
 
-    unsafe fn compute(&self, api: &FrameApi, n: i32, inputs: &Inputs) -> Vec<u8> {
+    unsafe fn compute(&self, api: &FrameApi, n: i32, inputs: &Inputs) -> Vec<u32> {
         let params = &self.params;
         let sp = params.super_params;
         let y_shift = params.chroma_shift.1;
@@ -513,7 +513,7 @@ unsafe extern "system" fn get_frame_analyse(
     let out = unsafe {
         new_frame(
             state.gray_format,
-            payload.len() as i32,
+            (payload.len() * 4) as i32,
             1,
             inputs.supers[0],
             core,
@@ -522,7 +522,13 @@ unsafe extern "system" fn get_frame_analyse(
     if !out.is_null() {
         let dst = unsafe { get_write(out, 0) };
         if !dst.is_null() {
-            unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), dst, payload.len()) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    payload.as_ptr().cast::<u8>(),
+                    dst,
+                    payload.len() * 4,
+                );
+            }
         }
     }
     unsafe { api.release(&inputs) };

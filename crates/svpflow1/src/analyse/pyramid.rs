@@ -12,13 +12,14 @@ pub(crate) struct Pyramid {
 }
 
 impl Pyramid {
-    pub(crate) fn new(params: &AnalyseParams, stage: &Stage) -> Self {
+    pub(crate) fn new(params: &AnalyseParams, stage: &Stage, lean: bool) -> Self {
         let min_level = params.min_level();
         let build = || {
             (0..stage.levels)
                 .map(|level| {
-                    (level >= min_level)
-                        .then(|| stage.field(level, params.super_params.pel, params.chroma_shift))
+                    (level >= min_level).then(|| {
+                        stage.field(level, params.super_params.pel, params.chroma_shift, lean)
+                    })
                 })
                 .collect()
         };
@@ -185,16 +186,16 @@ impl Pyramid {
                     let waited = (tf.is_some() || tb.is_some()) && session.wait();
                     if waited {
                         if let Some(t) = tf {
-                            let r = session.take(t);
+                            let r = session.view(t);
                             if r.len() == f.vectors.len() + pf.border {
-                                f.finish_gpu_search(&r, out_f.take());
+                                f.finish_gpu_search(r, out_f.take());
                                 on_gpu[0] = true;
                             }
                         }
                         if let (Some(t), Some(b)) = (tb, b.as_deref_mut()) {
-                            let r = session.take(t);
+                            let r = session.view(t);
                             if r.len() == b.vectors.len() + pf.border {
-                                b.finish_gpu_search(&r, out_b.take());
+                                b.finish_gpu_search(r, out_b.take());
                                 on_gpu[1] = true;
                             }
                         }
@@ -354,15 +355,13 @@ impl Pyramid {
         } else {
             return None;
         };
-        field.interpolate_prediction(seed, true);
-        field.set_order(None);
         let (src, reference) = if direction == 0 {
             (frames[0].level(0), frames[1].level(0))
         } else {
             (frames[1].level(0), frames[0].level(0))
         };
         let mut compact = CompactPlan::default();
-        if output.is_some() && field.plan_compact(&src, settings, &mut compact) {
+        if output.is_some() && field.plan_compact(seed, &src, settings, &mut compact) {
             if let Some(lambda) = lambda_out {
                 *lambda = settings.lambda >> 2;
             }
@@ -373,6 +372,9 @@ impl Pyramid {
                 ticket,
             });
         }
+        field.materialize();
+        field.interpolate_prediction(seed, true);
+        field.set_order(None);
         let mut plan = RecalcPlan::default();
         if !field.plan_recalculate(&src, settings, output.is_some(), &mut plan) {
             field.recalculate(&src, &reference, settings, lambda_out, output);
@@ -391,6 +393,8 @@ impl Pyramid {
         frames: [&SuperFrameView<'_>; 2],
         session: &mut Session<'_, '_>,
         outputs: [Option<VectorOutput<'_>>; 2],
+        previous: &Self,
+        level: usize,
     ) {
         let waited = starts.iter().flatten().any(|s| s.ticket().is_some()) && session.wait();
         for (direction, (start, output)) in starts.into_iter().zip(outputs).enumerate() {
@@ -421,7 +425,19 @@ impl Pyramid {
                 }
                 RefineStart::Compact { settings, .. } => match (ticket, output) {
                     (Some(ticket), Some(out)) => session.take_into(ticket, out),
-                    (_, output) => field.recalculate(&src, &reference, &settings, None, output),
+                    (_, output) => {
+                        let seeds = if direction == 0 {
+                            &previous.forward
+                        } else {
+                            &previous.backward
+                        };
+                        if let Some(seed) = seeds[level].as_ref() {
+                            field.materialize();
+                            field.interpolate_prediction(seed, true);
+                            field.set_order(None);
+                        }
+                        field.recalculate(&src, &reference, &settings, None, output);
+                    }
                 },
             }
         }

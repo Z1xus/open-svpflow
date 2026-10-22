@@ -245,11 +245,11 @@ impl Analyser {
         {
             return Err("super frame configuration mismatch".into());
         }
-        Ok(analyse::analyse(
-            &self.params,
-            &current.view(),
-            &reference.view(),
-            None,
-        ))
+        Ok(
+            analyse::analyse(&self.params, &current.view(), &reference.view(), None)
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+        )
     }
 }

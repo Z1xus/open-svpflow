@@ -52,9 +52,9 @@ pub(crate) fn analyse(
     current: &SuperFrameView<'_>,
     next: &SuperFrameView<'_>,
     keys: Option<[(usize, i32); 2]>,
-) -> Vec<u8> {
+) -> Vec<u32> {
     let count = params.output_count();
-    let mut regions = [vec![0u32; 2 * count], vec![0u32; 2 * count]];
+    let mut words = vec![0u32; frame_len(params) / 4];
     let backward_only = params.vectors == 2;
     let (first, second, keys) = if backward_only {
         (current, next, keys)
@@ -62,14 +62,20 @@ pub(crate) fn analyse(
         (next, current, keys.map(|[a, b]| [b, a]))
     };
     {
-        let [region0, region1] = &mut regions;
+        let (head, regions) = words.split_at_mut(16);
+        head[0] = 16;
+        for (word, value) in head[1..].iter_mut().zip(analysis_header(params)) {
+            *word = value as u32;
+        }
+        let marker = (2 * params.written_count() + 1) as u32;
+        let (region0, region1) = regions.split_at_mut(1 + 2 * count);
+        region0[0] = if backward_only { 0 } else { marker };
+        region1[0] = marker;
+        let (region0, region1) = (&mut region0[1..], &mut region1[1..]);
         let outputs = if backward_only {
-            [Some(&mut region1[..]), None]
+            [Some(region1), None]
         } else {
-            [
-                Some(&mut region0[..]),
-                (params.vectors == 3).then_some(&mut region1[..]),
-            ]
+            [Some(region0), (params.vectors == 3).then_some(region1)]
         };
         let gpu = (keys.is_some()
             && (params.stages[0].gpu_searchable(params)
@@ -106,8 +112,7 @@ pub(crate) fn analyse(
         }
         search_stages(params, first, second, outputs, session.as_mut());
     }
-    let written = [!backward_only, true];
-    pack_frame(params, &regions, written)
+    words
 }
 
 fn search_stages(
@@ -128,13 +133,13 @@ fn search_stages(
     };
     let mut lambda = 0;
     let main = &params.stages[0];
-    let mut previous = Pyramid::new(params, main);
+    let mut previous = Pyramid::new(params, main, false);
     if let Some(session) = session.as_deref_mut()
         && last == 1
         && params.min_level() < main.levels - 1
     {
         let stage = &params.stages[1];
-        let mut refined = Pyramid::new(params, stage);
+        let mut refined = Pyramid::new(params, stage, true);
         let mut settings = stage.settings(params, 0, true);
         let [mut out_forward, mut out_backward] = take(1);
         let mut starts = [None, None];
@@ -173,6 +178,8 @@ fn search_stages(
             [first, second],
             session,
             [out_forward, out_backward],
+            &previous,
+            params.min_level() as usize,
         );
         return;
     }
@@ -187,7 +194,7 @@ fn search_stages(
         session.as_deref_mut(),
     );
     for (index, stage) in params.stages.iter().enumerate().skip(1) {
-        let mut refined = Pyramid::new(params, stage);
+        let mut refined = Pyramid::new(params, stage, false);
         refined.recalculate(
             params,
             stage,
@@ -200,18 +207,4 @@ fn search_stages(
         );
         previous = refined;
     }
-}
-
-fn pack_frame(params: &AnalyseParams, regions: &[Vec<u32>; 2], written: [bool; 2]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(frame_len(params));
-    out.extend_from_slice(&16i32.to_le_bytes());
-    for value in analysis_header(params) {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-    let marker = (2 * params.written_count() + 1) as i32;
-    for (region, written) in regions.iter().zip(written) {
-        out.extend_from_slice(&if written { marker } else { 0 }.to_le_bytes());
-        out.extend(region.iter().flat_map(|value| value.to_le_bytes()));
-    }
-    out
 }
