@@ -132,7 +132,7 @@ impl Slots {
         true
     }
 
-    fn take(self: &Arc<Self>) -> Option<Slot> {
+    pub(super) fn take(self: &Arc<Self>) -> Option<Slot> {
         let mut counts = self.counts();
         while counts.free == 0 {
             counts = self.1.wait(counts).ok()?;

@@ -108,6 +108,7 @@ pub struct GpuContext {
     layer: std::sync::Mutex<layer::LayerState>,
     blend_pool: std::sync::Mutex<Vec<blend::Buffers>>,
     blend_slots: std::sync::Arc<blend::Slots>,
+    readbacks: std::sync::Arc<blend::Slots>,
     blend_units: std::sync::Mutex<Vec<Unit>>,
     pins: std::sync::Mutex<Vec<Pin>>,
     dst_pool: std::sync::Mutex<Vec<[(ClMem, usize); 3]>>,
@@ -578,6 +579,7 @@ impl GpuContext {
             let fuse_fits = unsafe { device_size(&cl, device, CL_DEVICE_MAX_PARAMETER_SIZE) }
                 .is_some_and(|size| size >= blend::FUSED_ARG_BYTES);
             let blend_slots = std::sync::Arc::new(blend::Slots::new(units.len()));
+            let readbacks = std::sync::Arc::new(blend::Slots::new(2 * units.len()));
             return Ok(Self {
                 cl,
                 context,
@@ -608,6 +610,7 @@ impl GpuContext {
                 }),
                 layer: std::sync::Mutex::new(layer::LayerState::new()),
                 blend_pool: std::sync::Mutex::new(Vec::new()),
+                readbacks,
                 blend_slots,
                 blend_units: std::sync::Mutex::new(Vec::new()),
                 pins: std::sync::Mutex::new(Vec::new()),
@@ -1592,6 +1595,7 @@ impl GpuContext {
         layer: Option<&Layer>,
         cover: Option<&Cover<'_>>,
     ) -> Option<()> {
+        let _readback = self.readbacks.take()?;
         let mut unit = self.acquire();
         unsafe {
             let k = self.bind_fields(
