@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+mod chain;
 mod field;
 #[cfg(not(target_arch = "wasm32"))]
 mod gpu;
@@ -77,6 +79,20 @@ pub(crate) fn analyse(
         } else {
             [Some(region0), (params.vectors == 3).then_some(region1)]
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        let plan = keys
+            .filter(|_| gpu::refine_gpu().is_some_and(gpu::RefineGpu::chain_ready))
+            .and_then(|_| chain::ChainPlan::new(params, first, second));
+        #[cfg(target_arch = "wasm32")]
+        let plan: Option<()> = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let (Some(plan), Some(keys)) = (&plan, keys) {
+            if let Some(failed) = run_chain(params, plan, [first, second], keys, outputs) {
+                search_stages(params, first, second, failed, None);
+            }
+            return words;
+        }
+        let _ = plan;
         let gpu = (keys.is_some()
             && (params.stages[0].gpu_searchable(params)
                 || params.stages.len() > 1
@@ -106,6 +122,7 @@ pub(crate) fn analyse(
                     pel: level.y.pel(),
                     expand: params.super_params.gpu == 1 && params.super_params.flags & 2 == 0,
                     tail,
+                    pyramid: None,
                 };
                 session.defer(slot, key, planes);
             }
@@ -133,13 +150,13 @@ fn search_stages(
     };
     let mut lambda = 0;
     let main = &params.stages[0];
-    let mut previous = Pyramid::new(params, main, false);
+    let mut previous = Pyramid::new(params, main, false, params.min_level());
     if let Some(session) = session.as_deref_mut()
         && last == 1
         && params.min_level() < main.levels - 1
     {
         let stage = &params.stages[1];
-        let mut refined = Pyramid::new(params, stage, true);
+        let mut refined = Pyramid::new(params, stage, true, params.min_level());
         let mut settings = stage.settings(params, 0, true);
         let [mut out_forward, mut out_backward] = take(1);
         let mut starts = [None, None];
@@ -172,6 +189,7 @@ fn search_stages(
                 );
             },
             Some(&mut *session),
+            params.min_level(),
         );
         refined.refine_finish(
             starts,
@@ -192,9 +210,10 @@ fn search_stages(
         take(0),
         |_, _, _, _| {},
         session.as_deref_mut(),
+        params.min_level(),
     );
     for (index, stage) in params.stages.iter().enumerate().skip(1) {
-        let mut refined = Pyramid::new(params, stage, false);
+        let mut refined = Pyramid::new(params, stage, false, params.min_level());
         refined.recalculate(
             params,
             stage,
@@ -207,4 +226,72 @@ fn search_stages(
         );
         previous = refined;
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_chain<'o>(
+    params: &AnalyseParams,
+    plan: &chain::ChainPlan,
+    frames: [&SuperFrameView<'_>; 2],
+    keys: [(usize, i32); 2],
+    mut outputs: [Option<&'o mut [u32]>; 2],
+) -> Option<[Option<&'o mut [u32]>; 2]> {
+    let done = (|| {
+        let mut session = gpu::refine_gpu()?.session()?;
+        for (slot, (frame, key)) in frames.into_iter().zip(keys).enumerate() {
+            let level = frame.level(0);
+            let planes = gpu::Planes {
+                data: [level.y.data(), level.u.data(), level.v.data()],
+                pitch: [level.y.pitch, level.u.pitch, level.v.pitch],
+                base: [level.y.base(), level.u.base(), level.v.base()],
+                height: [level.y.height, level.u.height, level.v.height],
+                pel: level.y.pel(),
+                expand: params.super_params.gpu == 1 && params.super_params.flags & 2 == 0,
+                tail: [0; 3],
+                pyramid: Some(plan.pyramid),
+            };
+            session.defer(slot, key, planes);
+        }
+        let top = cpu_search(params, plan, frames);
+        let tickets = session.chain(plan, &top)?;
+        if !session.wait() {
+            return None;
+        }
+        for (ticket, out) in tickets.into_iter().zip(outputs.iter_mut()) {
+            session.take_words(ticket, out.as_deref_mut()?);
+        }
+        Some(())
+    })();
+    if done.is_some() { None } else { Some(outputs) }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cpu_search(
+    params: &AnalyseParams,
+    plan: &chain::ChainPlan,
+    frames: [&SuperFrameView<'_>; 2],
+) -> Vec<Vec<[i32; 4]>> {
+    let main = &params.stages[0];
+    let start = plan.top() as i32;
+    let mut cpu = Pyramid::new(params, main, false, start);
+    let mut lambda = 0;
+    cpu.search(
+        params,
+        main,
+        frames[0],
+        frames[1],
+        &mut lambda,
+        [None, None],
+        |_, _, _, _| {},
+        None,
+        start,
+    );
+    (0..=usize::from(plan.both))
+        .map(|d| {
+            cpu.fields(d == 1)[start as usize]
+                .as_ref()
+                .expect("start level")
+                .gpu_out()
+        })
+        .collect()
 }

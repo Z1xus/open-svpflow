@@ -562,6 +562,50 @@ impl Field {
         }
     }
 
+    pub(crate) fn compact_geometry(
+        &self,
+        coarse: &Field,
+        frame_w: i32,
+        frame_h: i32,
+        settings: &SearchSettings,
+    ) -> [i32; 20] {
+        let pel = self.pel;
+        let interp = self.interpolation(coarse);
+        let diagonal = pel * f64::from(frame_w * frame_w + frame_h * frame_h).sqrt() as i32;
+        [
+            frame_w,
+            frame_h,
+            self.blk_x,
+            self.layout.step_x(),
+            self.layout.step_y(),
+            settings.search_param.abs(),
+            settings.bad_sad,
+            settings.lambda >> 2,
+            diagonal,
+            settings.pnew,
+            pel,
+            0,
+            coarse.blk_x,
+            coarse.blk_y,
+            interp.norm,
+            interp.odd_x,
+            interp.even_x,
+            interp.odd_y,
+            interp.even_y,
+            i32::from(interp.flat),
+        ]
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn compact_eligible(&self, settings: &SearchSettings) -> bool {
+        (self.layout.width, self.layout.height) == (4, 4)
+            && matches!(self.chroma_shift, (0, 0) | (1, 1))
+            && settings.search_type == SearchType::Exhaustive
+            && settings.search_param.abs() <= 3
+            && self.blk_x >= 2
+            && self.blk_y >= 2
+    }
+
     pub(crate) fn plan_compact(
         &self,
         coarse: &Field,
@@ -671,29 +715,8 @@ impl Field {
         overrides.sort_unstable();
         plan.overrides.clear();
         plan.overrides.extend(overrides.iter().flatten());
-        let diagonal = pel * f64::from(frame_w * frame_w + frame_h * frame_h).sqrt() as i32;
-        plan.geometry = [
-            frame_w,
-            frame_h,
-            self.blk_x,
-            step_x,
-            step_y,
-            radius,
-            settings.bad_sad,
-            settings.lambda >> 2,
-            diagonal,
-            settings.pnew,
-            pel,
-            overrides.len() as i32,
-            cx,
-            cy,
-            interp.norm,
-            interp.odd_x,
-            interp.even_x,
-            interp.odd_y,
-            interp.even_y,
-            i32::from(interp.flat),
-        ];
+        plan.geometry = self.compact_geometry(coarse, frame_w, frame_h, settings);
+        plan.geometry[11] = overrides.len() as i32;
         plan.blocks = self.count();
         plan.satd = self.satd;
         plan.shift = self.chroma_shift.0;

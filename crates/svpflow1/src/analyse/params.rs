@@ -378,6 +378,22 @@ impl AnalyseParams {
         })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn exact_floor(&self, top: i32) -> i32 {
+        let first = |mask: i32, shift: i32| match (self.flags & mask) >> shift {
+            0 => 3,
+            m => m,
+        };
+        let mut floor = top;
+        if self.try_many {
+            floor = floor.min(first(0x60, 5));
+        }
+        if self.bad_range != 0 {
+            floor = floor.min(first(0x0C, 2));
+        }
+        floor.max(1)
+    }
+
     pub(crate) fn min_level(&self) -> i32 {
         i32::from(self.gpu_mode == 2)
     }

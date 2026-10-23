@@ -84,6 +84,16 @@ pub(crate) struct SearchSettings {
 
 pub(crate) type VectorOutput<'o> = &'o mut [u32];
 
+pub(crate) struct SearchGeom {
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) src_pitch: [i32; 2],
+    pub(crate) src_base: [i32; 2],
+    pub(crate) ref_pitch: [i32; 2],
+    pub(crate) ref_base: [i32; 2],
+    pub(crate) ref_height: [i32; 2],
+}
+
 pub(crate) struct GpuSearchParams {
     pub(crate) q: [i32; 40],
     pub(crate) width: usize,
@@ -603,6 +613,43 @@ impl Field {
         global: Mv,
         lambda_out: Option<&mut i32>,
     ) -> Option<GpuSearchParams> {
+        if src.u.pitch != src.v.pitch
+            || reference.u.pitch != reference.v.pitch
+            || src.u.base() != src.v.base()
+            || reference.u.base() != reference.v.base()
+        {
+            return None;
+        }
+        let geom = SearchGeom {
+            width: src.y.width,
+            height: src.y.height,
+            src_pitch: [src.y.pitch as i32, src.u.pitch as i32],
+            src_base: [src.y.base() as i32, src.u.base() as i32],
+            ref_pitch: [reference.y.pitch as i32, reference.u.pitch as i32],
+            ref_base: [reference.y.base() as i32, reference.u.base() as i32],
+            ref_height: [reference.y.height, reference.u.height],
+        };
+        let mut params = self.gpu_search_q(&geom, settings, global, lambda_out, false)?;
+        if params.rmax > 0 {
+            params.rank.resize(self.vectors.len(), 0);
+            for (position, &(bx, by)) in self.order.iter().enumerate() {
+                let (bx, by) = (i32::from(bx), i32::from(by));
+                if bx < self.blk_x && by < self.blk_y {
+                    params.rank[(by * self.blk_x + bx) as usize] = position as i32;
+                }
+            }
+        }
+        Some(params)
+    }
+
+    pub(crate) fn gpu_search_q(
+        &self,
+        geom: &SearchGeom,
+        settings: &SearchSettings,
+        global: Mv,
+        lambda_out: Option<&mut i32>,
+        relaxed: bool,
+    ) -> Option<GpuSearchParams> {
         let l = self.layout;
         let stp = settings.search_param;
         let param = if stp != 0 {
@@ -624,20 +671,14 @@ impl Field {
             };
             settings.bad_range && self.level >= min
         };
-        if self.smallest
+        if (!relaxed && (self.smallest || try_many || bad_range))
             || self.chroma_shift != (1, 1)
             || settings.search_type != SearchType::Exhaustive
-            || try_many
-            || bad_range
             || param > 10
             || (self.pel != 1 && param > 0)
             || (self.level > 0 && settings.flags & CONTRAST_FLAG != 0)
             || !matches!(l.width, 8 | 16 | 32)
             || !matches!(l.height, 8 | 16 | 32)
-            || src.u.pitch != src.v.pitch
-            || reference.u.pitch != reference.v.pitch
-            || src.u.base() != src.v.base()
-            || reference.u.base() != reference.v.base()
             || settings.pnew <= -256
         {
             return None;
@@ -648,7 +689,7 @@ impl Field {
         if let Some(out) = lambda_out {
             *out = lambda;
         }
-        let (w, h) = (src.y.width, src.y.height);
+        let (w, h) = (geom.width, geom.height);
         let diagonal = self.pel * f64::from(w * w + h * h).sqrt() as i32;
         let blur = self.level > 0 && settings.flags & NO_CONTRAST_BLUR_FLAG == 0;
         let q = [
@@ -659,18 +700,18 @@ impl Field {
             w,
             h,
             self.pel,
-            src.y.pitch as i32,
-            src.u.pitch as i32,
+            geom.src_pitch[0],
+            geom.src_pitch[1],
             0,
-            src.y.base() as i32,
-            src.u.base() as i32,
+            geom.src_base[0],
+            geom.src_base[1],
             0,
-            reference.y.pitch as i32,
-            reference.u.pitch as i32,
-            reference.y.base() as i32,
-            reference.u.base() as i32,
-            reference.y.height,
-            reference.u.height,
+            geom.ref_pitch[0],
+            geom.ref_pitch[1],
+            geom.ref_base[0],
+            geom.ref_base[1],
+            geom.ref_height[0],
+            geom.ref_height[1],
             lambda,
             settings.lsad,
             settings.pnew,
@@ -693,25 +734,40 @@ impl Field {
             0,
             0,
         ];
-        let mut rank = Vec::new();
-        if param > 0 {
-            rank.resize(self.vectors.len(), 0);
-            for (position, &(bx, by)) in self.order.iter().enumerate() {
-                let (bx, by) = (i32::from(bx), i32::from(by));
-                if bx < self.blk_x && by < self.blk_y {
-                    rank[(by * self.blk_x + bx) as usize] = position as i32;
-                }
-            }
-        }
         Some(GpuSearchParams {
-            rank,
+            rank: Vec::new(),
             q,
             width: l.width as usize,
             height: l.height as usize,
             rmax: param as usize,
             satd: self.satd,
-            border: if self.level > 0 { self.border.len() } else { 0 },
+            border: if self.level > 0 { self.border_len() } else { 0 },
         })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn gpu_out(&self) -> Vec<[i32; 4]> {
+        let pack = |v: &Mv| [i32::from(v.x as u16) | (i32::from(v.y) << 16), v.sad, 0, 0];
+        let (bx, by) = (self.blk_x as usize, self.blk_y as usize);
+        let mut out: Vec<[i32; 4]> = self.vectors.iter().map(pack).collect();
+        out.extend((0..=bx + by).map(|id| {
+            let slot = if id <= bx {
+                id
+            } else {
+                bx + by - (id - bx - 1)
+            };
+            pack(&self.border[slot])
+        }));
+        out
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn uses_satd(&self) -> bool {
+        self.satd
+    }
+
+    pub(crate) fn border_len(&self) -> usize {
+        (self.blk_x + self.blk_y + 1) as usize
     }
 
     pub(crate) fn finish_gpu_search(

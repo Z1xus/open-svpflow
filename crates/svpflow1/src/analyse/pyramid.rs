@@ -12,8 +12,8 @@ pub(crate) struct Pyramid {
 }
 
 impl Pyramid {
-    pub(crate) fn new(params: &AnalyseParams, stage: &Stage, lean: bool) -> Self {
-        let min_level = params.min_level();
+    pub(crate) fn new(params: &AnalyseParams, stage: &Stage, lean: bool, floor: i32) -> Self {
+        let min_level = floor;
         let build = || {
             (0..stage.levels)
                 .map(|level| {
@@ -27,6 +27,15 @@ impl Pyramid {
             forward: build(),
             backward: build(),
             both: params.vectors == 3,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn fields(&self, backward: bool) -> &[Option<Field>] {
+        if backward {
+            &self.backward
+        } else {
+            &self.forward
         }
     }
 
@@ -50,10 +59,10 @@ impl Pyramid {
         outputs: [Option<VectorOutput<'_>>; 2],
         mut on_finest: impl FnMut(usize, &Field, i32, Option<&mut Session<'_, '_>>),
         mut session: Option<&mut Session<'_, '_>>,
+        min_level: i32,
     ) {
         let [mut out_forward, mut out_backward] = outputs;
         let top = stage.levels - 1;
-        let min_level = params.min_level();
         let (mut global_forward, mut global_backward) = (Mv::UNSET, Mv::UNSET);
         let top_settings = stage.settings(params, top, true);
         {
