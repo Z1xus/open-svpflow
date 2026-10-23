@@ -99,6 +99,7 @@ pub struct GpuContext {
     super_held: std::sync::Mutex<Vec<(i64, std::sync::Weak<SuperEntry>)>>,
     super_evicted: std::sync::Mutex<std::collections::VecDeque<i64>>,
     super_cap: std::sync::atomic::AtomicUsize,
+    frame_floor: std::sync::atomic::AtomicUsize,
     frame_bytes: std::sync::atomic::AtomicUsize,
     frame_budget: usize,
     fuse_fits: bool,
@@ -594,6 +595,7 @@ impl GpuContext {
                 super_held: std::sync::Mutex::new(Vec::new()),
                 super_evicted: std::sync::Mutex::new(std::collections::VecDeque::new()),
                 super_cap: std::sync::atomic::AtomicUsize::new(RECENT_FRAMES),
+                frame_floor: std::sync::atomic::AtomicUsize::new(0),
                 frame_bytes: std::sync::atomic::AtomicUsize::new(0),
                 frame_budget,
                 fuse_fits,
@@ -660,6 +662,11 @@ impl GpuContext {
         self.linear
     }
 
+    pub fn keep_frames(&self, count: usize) {
+        self.frame_floor
+            .fetch_max(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn cache_frame(&self, key: i64, planes: [UploadPlane<'_>; 3]) -> Option<SuperHandle> {
         let cell = {
             let mut cache = self.super_cache.lock().ok()?;
@@ -693,7 +700,11 @@ impl GpuContext {
                 {
                     evicted.remove(at);
                     let bytes = self.frame_bytes.load(std::sync::atomic::Ordering::Relaxed);
-                    let most = (svpflow_core::threads::workers() + RECENT_FRAMES)
+                    let floor = self.frame_floor.load(std::sync::atomic::Ordering::Relaxed);
+                    let most = (svpflow_core::threads::workers()
+                        .min(2 * self.units.len())
+                        .max(floor)
+                        + RECENT_FRAMES)
                         .min((self.frame_budget / bytes.max(1)).max(RECENT_FRAMES));
                     let _ = self.super_cap.fetch_update(
                         std::sync::atomic::Ordering::Relaxed,

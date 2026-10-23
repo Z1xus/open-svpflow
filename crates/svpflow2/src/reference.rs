@@ -351,6 +351,7 @@ impl FilterState {
                     .collect();
                 let fields = &self.field_cache;
                 let workers = svpflow_core::threads::workers();
+                gpu.keep_frames(planes.len());
                 svpflow_core::threads::scope(|scope| {
                     for worker in 0..workers {
                         let (planes, payloads, handles, moved) =
