@@ -39,6 +39,10 @@ typedef int32_t (*osvp_render)(void *user, int32_t n, const osvp_frame *const *i
 
 const char *osvp_error(void);
 
+/* after a call failed on this thread: 1 if the cause was a failing osvp_read or osvp_render
+   callback, 0 for any other error */
+int32_t osvp_error_callback(void);
+
 /* caps all library threads, 0 uses the cores. free all clips before the last context is destroyed */
 void osvp_set_threads(int32_t count);
 

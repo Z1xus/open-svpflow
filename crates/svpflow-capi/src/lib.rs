@@ -2,7 +2,7 @@
 
 mod host;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
@@ -39,10 +39,14 @@ pub struct Clip {
 
 thread_local! {
     static ERROR: RefCell<CString> = RefCell::default();
+    static CALLBACK: Cell<bool> = const { Cell::new(false) };
 }
 
 fn fail<T>(message: impl Into<Vec<u8>>) -> *mut T {
     let message = CString::new(message).unwrap_or_default();
+    CALLBACK.set(
+        message.as_c_str() == host::SOURCE_FAILED || message.as_c_str() == host::RENDER_FAILED,
+    );
     ERROR.with(|error| *error.borrow_mut() = message);
     std::ptr::null_mut()
 }
@@ -67,6 +71,11 @@ unsafe fn text(value: *const c_char) -> CString {
 #[unsafe(no_mangle)]
 pub extern "C" fn osvp_error() -> *const c_char {
     ERROR.with(|error| error.borrow().as_ptr())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn osvp_error_callback() -> i32 {
+    i32::from(CALLBACK.get())
 }
 
 static CONTEXTS: AtomicUsize = AtomicUsize::new(0);

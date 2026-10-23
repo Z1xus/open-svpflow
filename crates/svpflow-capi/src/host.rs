@@ -83,6 +83,9 @@ pub type Render = unsafe extern "C" fn(
     *const isize,
 ) -> i32;
 
+pub const SOURCE_FAILED: &CStr = c"the source callback failed";
+pub const RENDER_FAILED: &CStr = c"the render callback failed";
+
 const NEEDED: usize = 8;
 
 struct Buffer {
@@ -646,7 +649,7 @@ impl Node {
     fn fill(&self, source: &Source, n: i32) -> Produced {
         let (frame, planes, strides) = self.blank();
         if unsafe { (source.read)(source.user, n, planes.as_ptr(), strides.as_ptr()) } != 0 {
-            return Err(Arc::from(c"the source callback failed"));
+            return Err(Arc::from(SOURCE_FAILED));
         }
         Ok(Arc::new(frame))
     }
@@ -667,7 +670,7 @@ impl Node {
         let (planes, strides) = (planes.as_ptr(), strides.as_ptr());
         let user = mapped.user;
         if unsafe { (mapped.render)(user, n, pointers.as_ptr(), count, planes, strides) } != 0 {
-            return Err(Arc::from(c"the render callback failed"));
+            return Err(Arc::from(RENDER_FAILED));
         }
         Ok(Arc::new(frame))
     }
@@ -694,7 +697,7 @@ impl Node {
             }
         }
         state.next = state.next.max(n + 1);
-        wanted.ok_or_else(|| Arc::from(c"the source callback failed"))
+        wanted.ok_or_else(|| Arc::from(SOURCE_FAILED))
     }
 }
 
