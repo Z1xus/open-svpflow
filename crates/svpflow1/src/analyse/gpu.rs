@@ -9,10 +9,23 @@ use svpflow_host::opencl::{
     Handle, OpenCl as CoreCl,
 };
 
+type FnFillBuffer = unsafe extern "C" fn(
+    Handle,
+    Handle,
+    *const c_void,
+    usize,
+    usize,
+    usize,
+    ClUint,
+    *const Handle,
+    *mut Handle,
+) -> ClInt;
+
 #[allow(non_snake_case)]
 struct OpenCl {
     core: CoreCl,
     GetKernelWorkGroupInfo: FnKernelInfo,
+    EnqueueFillBuffer: FnFillBuffer,
 }
 
 impl std::ops::Deref for OpenCl {
@@ -28,6 +41,7 @@ impl OpenCl {
         let core = unsafe { CoreCl::load()? };
         Ok(Self {
             GetKernelWorkGroupInfo: unsafe { core.symbol("clGetKernelWorkGroupInfo\0")? },
+            EnqueueFillBuffer: unsafe { core.symbol("clEnqueueFillBuffer\0")? },
             core,
         })
     }
@@ -48,6 +62,7 @@ const CHUNK: usize = 16384;
 const RECORD: usize = 12;
 const RECORD_BYTES: usize = RECORD * size_of::<i32>();
 const UNITS: usize = 4;
+static ZERO: u8 = 0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Variant {
@@ -967,6 +982,28 @@ impl Session<'_, '_> {
                         unsafe { (cl.ReleaseMemObject)(m as Handle) };
                     }
                     return None;
+                }
+                if planes.lean {
+                    let cleared = unsafe {
+                        (cl.EnqueueFillBuffer)(
+                            self.unit.queue as Handle,
+                            mem,
+                            (&raw const ZERO).cast(),
+                            size_of_val(&ZERO),
+                            coarse[plane],
+                            size - coarse[plane],
+                            0,
+                            std::ptr::null(),
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if cleared != CL_SUCCESS {
+                        unsafe { (cl.ReleaseMemObject)(mem) };
+                        for &m in mems.iter().filter(|&&m| m != 0) {
+                            unsafe { (cl.ReleaseMemObject)(m as Handle) };
+                        }
+                        return None;
+                    }
                 }
                 mem
             };
