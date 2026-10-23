@@ -352,7 +352,14 @@ unsafe extern "system" fn get_frame(
                 unsafe { *frame_data = Box::into_raw(held).cast() };
                 return std::ptr::null();
             }
-            let output = unsafe { state.render(n, frame_ctx, core, vsapi, &held) };
+            let gpu = state.inner.gpu.as_ref();
+            let output = loop {
+                let mark = gpu.map(GpuContext::mark);
+                let output = unsafe { state.render(n, frame_ctx, core, vsapi, &held) };
+                if output.is_some() || !gpu.zip(mark).is_some_and(|(gpu, mark)| gpu.recover(mark)) {
+                    break output;
+                }
+            };
             if output.is_none()
                 && let Some(set_error) =
                     unsafe { vs::table_fn::<vs::SetFilterError>(vsapi, vs::SET_FILTER_ERROR) }

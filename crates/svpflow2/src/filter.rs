@@ -401,6 +401,7 @@ unsafe fn collect_state(
         repeat_cache: std::sync::Mutex::new(Vec::new()),
         still_cache: std::sync::Mutex::default(),
         layers: std::sync::Mutex::default(),
+        fallback_notice: std::sync::Once::new(),
     }
 }
 

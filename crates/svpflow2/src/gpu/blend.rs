@@ -7,7 +7,7 @@ use svpflow_host::opencl::ImageDesc;
 use super::{
     CL_FALSE, CL_MEM_READ_WRITE, CL_RGBA, CL_SUCCESS, CL_UNORM_INT8, ClEvent, ClImageFormat,
     ClKernel, ClMem, ClUint, GpuBuf, GpuContext, KernelParams, Layer, StillMask, SuperEntry,
-    SuperHandle, Unit, UploadPlane, layer::LAYER_VARIANT,
+    SuperHandle, Unit, UploadPlane, layer::LAYER_VARIANT, note,
 };
 
 pub(super) const BLEND_VARIANT: u32 = 1 << 13;
@@ -88,29 +88,69 @@ struct Pending {
     masks: Vec<Vec<u8>>,
 }
 
-pub(super) struct Slots(Mutex<usize>, Condvar);
+struct Counts {
+    free: usize,
+    total: usize,
+    debt: usize,
+}
+
+pub(super) struct Slots(Mutex<Counts>, Condvar);
 
 impl Slots {
     pub(super) fn new(count: usize) -> Self {
-        Self(Mutex::new(count), Condvar::new())
+        Self(
+            Mutex::new(Counts {
+                free: count,
+                total: count,
+                debt: 0,
+            }),
+            Condvar::new(),
+        )
+    }
+
+    fn counts(&self) -> std::sync::MutexGuard<'_, Counts> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(super) fn total(&self) -> usize {
+        self.counts().total
+    }
+
+    pub(super) fn shrink(&self) -> bool {
+        let mut counts = self.counts();
+        if counts.total == 1 {
+            return false;
+        }
+        counts.total -= 1;
+        if counts.free > 0 {
+            counts.free -= 1;
+        } else {
+            counts.debt += 1;
+        }
+        true
     }
 
     fn take(self: &Arc<Self>) -> Option<Slot> {
-        let mut free = self.0.lock().ok()?;
-        while *free == 0 {
-            free = self.1.wait(free).ok()?;
+        let mut counts = self.counts();
+        while counts.free == 0 {
+            counts = self.1.wait(counts).ok()?;
         }
-        *free -= 1;
+        counts.free -= 1;
         Some(Slot(Arc::clone(self)))
     }
 }
 
-struct Slot(Arc<Slots>);
+pub struct Slot(Arc<Slots>);
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        if let Ok(mut free) = self.0.0.lock() {
-            *free += 1;
+        let mut counts = self.0.counts();
+        if counts.debt > 0 {
+            counts.debt -= 1;
+        } else {
+            counts.free += 1;
             self.0.1.notify_one();
         }
     }
@@ -205,20 +245,6 @@ impl GpuContext {
         unit.blend.kernels
     }
 
-    unsafe fn blend_buffer(&self, bytes: usize) -> Option<ClMem> {
-        let mut err = 0;
-        let mem = unsafe {
-            (self.cl.CreateBuffer)(
-                self.context,
-                CL_MEM_READ_WRITE,
-                bytes,
-                std::ptr::null_mut(),
-                &raw mut err,
-            )
-        };
-        (err == CL_SUCCESS && !mem.is_null()).then_some(mem)
-    }
-
     unsafe fn mask_layers(&self, unit: &mut Unit, width: usize, height: usize) -> Option<ClMem> {
         let (mem, w, h) = unit.blend.masks;
         if !mem.is_null() && (w, h) == (width, height) {
@@ -252,7 +278,7 @@ impl GpuContext {
             )
         };
         if err != CL_SUCCESS || created.is_null() {
-            return None;
+            return super::exhausted();
         }
         if !mem.is_null() {
             unsafe { (self.cl.ReleaseMemObject)(mem) };
@@ -305,7 +331,7 @@ impl GpuContext {
             {
                 return None;
             }
-            ((self.cl.EnqueueNDRangeKernel)(
+            (note((self.cl.EnqueueNDRangeKernel)(
                 unit.queue,
                 resolve,
                 1,
@@ -319,12 +345,12 @@ impl GpuContext {
                     (&raw const ready).cast()
                 },
                 std::ptr::null_mut(),
-            ) == CL_SUCCESS)
+            )) == CL_SUCCESS)
                 .then_some(())
         }
     }
 
-    unsafe fn release_buffers(&self, buffers: &Buffers) {
+    pub(super) unsafe fn release_buffers(&self, buffers: &Buffers) {
         unsafe {
             (self.cl.ReleaseMemObject)(buffers.sums);
             (self.cl.ReleaseMemObject)(buffers.bytes);
@@ -334,15 +360,15 @@ impl GpuContext {
     fn release_job(&self, job: BlendJob, keep: bool) {
         let unit = job.unit.into_inner();
         if !keep {
-            unsafe { (self.cl.Finish)(unit.queue) };
+            unsafe { note((self.cl.Finish)(unit.queue)) };
         }
         drop(job.pending);
         match self.blend_pool.lock() {
-            Ok(mut pool) if keep && pool.len() < self.units.len() => pool.push(job.buffers),
+            Ok(mut pool) if keep && pool.len() < self.blend_slots.total() => pool.push(job.buffers),
             _ => unsafe { self.release_buffers(&job.buffers) },
         }
         match self.blend_units.lock() {
-            Ok(mut pool) if pool.len() < self.units.len() => pool.push(unit),
+            Ok(mut pool) if pool.len() < self.blend_slots.total() => pool.push(unit),
             _ => unsafe { self.release_unit(&unit) },
         }
     }
@@ -360,24 +386,25 @@ impl GpuContext {
         let rows = height + chroma_height;
         let len = width.checked_mul(rows).filter(|&len| len > 0)?;
         let slot = self.blend_slots.take()?;
-        let mut unit = self.blend_unit()?;
+        let unit = self.blend_unit()?;
         let reused = self.blend_pool.lock().ok().and_then(|mut pool| {
             let index = pool.iter().position(|buffers| buffers.len == len)?;
             Some(pool.swap_remove(index))
         });
+        let fresh = reused.is_none();
         let created = || {
-            let sums = unsafe { self.blend_buffer(len * size_of::<f32>()) }?;
-            let Some(bytes) = (unsafe { self.blend_buffer(len) }) else {
+            let sums = unsafe { self.create_buffer(len * size_of::<f32>()) }?;
+            let Some(bytes) = (unsafe { self.create_buffer(len) }) else {
                 unsafe { (self.cl.ReleaseMemObject)(sums) };
                 return None;
             };
             Some(Buffers { sums, bytes, len })
         };
-        let fresh = reused.is_none();
         let Some(buffers) = reused.or_else(created) else {
             unsafe { self.release_unit(&unit) };
             return None;
         };
+        let mut unit = unit;
         if fresh
             && unsafe { self.enqueue_resolve(&mut unit, &buffers, 1.0, 1.0, 0, None) }.is_none()
         {
@@ -526,7 +553,7 @@ impl GpuContext {
                     usize::try_from(params.height).ok()?,
                 ];
                 let wait = if plane == 0 { &waits[..] } else { &[] };
-                if (self.cl.EnqueueNDRangeKernel)(
+                if note((self.cl.EnqueueNDRangeKernel)(
                     queue,
                     kernel,
                     2,
@@ -540,7 +567,7 @@ impl GpuContext {
                         wait.as_ptr().cast()
                     },
                     std::ptr::null_mut(),
-                ) != CL_SUCCESS
+                )) != CL_SUCCESS
                 {
                     return None;
                 }
@@ -576,7 +603,7 @@ impl GpuContext {
             if filled {
                 let origin = [0usize; 3];
                 let region = [width, height, group.steps.count as usize];
-                if (self.cl.EnqueueWriteImage)(
+                if note((self.cl.EnqueueWriteImage)(
                     unit.queue,
                     layers,
                     CL_FALSE,
@@ -588,7 +615,7 @@ impl GpuContext {
                     0,
                     std::ptr::null(),
                     std::ptr::null_mut(),
-                ) != CL_SUCCESS
+                )) != CL_SUCCESS
                 {
                     return None;
                 }
@@ -799,6 +826,17 @@ impl GpuContext {
             let mut unit = job.unit.borrow_mut();
             unsafe { self.enqueue_source(job, &mut unit, &entry, weight) }?;
         }
+        if key.is_none() {
+            self.flush(job)?;
+            let queue = job.unit.borrow().queue;
+            if unsafe { note((self.cl.Finish)(queue)) } != CL_SUCCESS {
+                return None;
+            }
+            let mut pending = job.pending.borrow_mut();
+            pending.frames.clear();
+            pending.motion.clear();
+            pending.masks.clear();
+        }
         job.taken.set(true);
         Some(())
     }
@@ -832,7 +870,7 @@ impl GpuContext {
             {
                 return None;
             }
-            if (self.cl.EnqueueNDRangeKernel)(
+            if note((self.cl.EnqueueNDRangeKernel)(
                 unit.queue,
                 source,
                 2,
@@ -846,7 +884,7 @@ impl GpuContext {
                     (&raw const ready).cast()
                 },
                 std::ptr::null_mut(),
-            ) != CL_SUCCESS
+            )) != CL_SUCCESS
             {
                 job.failed.set(true);
                 return None;
@@ -854,6 +892,12 @@ impl GpuContext {
             (self.cl.Flush)(unit.queue);
         }
         Some(())
+    }
+
+    pub fn admit(&self) -> Option<Slot> {
+        (self.mark().epoch > 0)
+            .then(|| self.blend_slots.take())
+            .flatten()
     }
 
     pub fn blend_abort(&self, job: BlendJob) {
@@ -915,7 +959,7 @@ impl GpuContext {
                         _ => [chroma_width, luma_rows, 0],
                     };
                     let region = [plane.width, plane.height, 1];
-                    if (self.cl.EnqueueReadBufferRect)(
+                    if note((self.cl.EnqueueReadBufferRect)(
                         queue,
                         job.buffers.bytes,
                         CL_FALSE,
@@ -934,9 +978,9 @@ impl GpuContext {
                         } else {
                             std::ptr::null_mut()
                         },
-                    ) != CL_SUCCESS
+                    )) != CL_SUCCESS
                     {
-                        (self.cl.Finish)(queue);
+                        note((self.cl.Finish)(queue));
                         return None;
                     }
                 }

@@ -5,6 +5,9 @@ pub type ClUint = u32;
 pub type Handle = *mut c_void;
 
 pub const CL_SUCCESS: ClInt = 0;
+pub const CL_MEM_OBJECT_ALLOCATION_FAILURE: ClInt = -4;
+pub const CL_OUT_OF_RESOURCES: ClInt = -5;
+pub const CL_OUT_OF_HOST_MEMORY: ClInt = -6;
 pub const CL_FALSE: ClUint = 0;
 pub const CL_TRUE: ClUint = 1;
 pub const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;

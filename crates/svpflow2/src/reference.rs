@@ -10,6 +10,7 @@ use svpflow_core::smooth::{
 use svpflow_core::smooth_engine::{self as engine, Rates};
 
 use crate::core::{FilterState, Mode, drop_frame, get_node, request_node, super_frame_planes};
+use crate::gpu::GpuContext;
 use crate::vs::Source as _;
 use crate::{frame, metadata, options::ReferenceParams, renderer, vs};
 
@@ -286,14 +287,19 @@ impl FilterState {
         vector_data: &metadata::VectorData,
         field: &VectorField,
         held: &Held,
-    ) -> Option<std::sync::Arc<crate::gpu::Layer>> {
-        let (last, limit) = self.layer_plan()?;
+    ) -> Result<Option<std::sync::Arc<crate::gpu::Layer>>, crate::gpu::Failed> {
+        let Some((last, limit)) = self.layer_plan() else {
+            return Ok(None);
+        };
         let shape = *field.shape();
         let (width, height) = (self.video_info.width, self.video_info.height);
-        let cells = (
-            usize::try_from(shape.packed_width()).ok()?,
-            usize::try_from(shape.packed_height()).ok()?,
-        );
+        let (Ok(cells_x), Ok(cells_y)) = (
+            usize::try_from(shape.packed_width()),
+            usize::try_from(shape.packed_height()),
+        ) else {
+            return Err(crate::gpu::Failed);
+        };
+        let cells = (cells_x, cells_y);
         let motion = |k: i32, field: &VectorField| {
             let none = |_| None::<std::sync::Arc<VectorField>>;
             engine::motions(field, true, true, true, false, (false, false), none, k)
@@ -907,7 +913,8 @@ impl FilterState {
         }
         let (use_fwd, use_bwd, force13) = engine::directions(&params, phase, class);
         let field = field();
-        let output = unsafe {
+        let gpu_failed = std::cell::Cell::new(false);
+        let calculate = |cpu| unsafe {
             self.reference_calculate(
                 &api,
                 &fetch,
@@ -928,7 +935,35 @@ impl FilterState {
                 blend,
                 held,
                 core,
+                cpu,
+                &gpu_failed,
             )
+        };
+        let output = if let Some(gpu) = self.gpu.as_ref() {
+            let mut output;
+            let mut mark;
+            loop {
+                mark = gpu.mark();
+                let admitted = blend.is_none().then(|| gpu.admit());
+                output = calculate(gpu.cpu_render());
+                drop(admitted);
+                if !output.is_null() || blend.is_some() || !gpu.recover(mark) {
+                    break;
+                }
+            }
+            let retry = output.is_null()
+                && gpu_failed.get()
+                && !gpu.cpu_render()
+                && blend.is_none_or(|job| !job.taken() && !GpuContext::exhausted_since(mark));
+            if retry {
+                self.fallback_notice.call_once(|| {
+                    eprintln!("open-svpflow: GPU render failed, using the CPU render");
+                });
+                output = calculate(true);
+            }
+            output
+        } else {
+            calculate(false)
         };
         fetch.drop(source);
         fetch.drop(next_source);
@@ -961,6 +996,8 @@ impl FilterState {
         blend: Option<&crate::gpu::BlendJob>,
         held: &Held,
         core: vs::Raw,
+        cpu: bool,
+        gpu_failed: &std::cell::Cell<bool>,
     ) -> vs::ConstRaw {
         let shape = *field.shape();
         let width = shape.packed_width();
@@ -968,7 +1005,8 @@ impl FilterState {
         let time = engine::render_time(phase, use_fwd, use_bwd);
         let neither = !use_fwd && !use_bwd;
         let algo = params.algo;
-        let gpu_cover = self.render_mode == 2
+        let gpu_cover = !cpu
+            && self.render_mode == 2
             && self.gpu.is_some()
             && blend.is_none()
             && algo > 20
@@ -985,7 +1023,7 @@ impl FilterState {
         let compute = || {
             std::sync::Arc::new(engine::motions(
                 field,
-                self.render_mode == 2,
+                self.render_mode == 2 && !cpu,
                 use_fwd,
                 use_bwd,
                 want_extended,
@@ -995,7 +1033,7 @@ impl FilterState {
             ))
         };
         let cap = cache_cap(usize::try_from(width * height).unwrap_or(0) * 16);
-        let motions = if self.options.debug_qmap() || self.options.debug_vectors() {
+        let motions = if cpu || self.options.debug_qmap() || self.options.debug_vectors() {
             compute()
         } else if let Some(cell) = crate::core::cache_cell(&self.motion_cache, motion_key, cap) {
             cell.get_or_init(|| Some(compute()))
@@ -1028,6 +1066,7 @@ impl FilterState {
         ));
         renderer.set_time(time);
         if self.render_mode == 2
+            && !cpu
             && let Some(gpu) = self.gpu.as_ref()
         {
             let linear = engine::gpu_linear(params, self.video_info.width);
@@ -1049,7 +1088,11 @@ impl FilterState {
                 layout,
                 times: [256 - time, time],
             });
-            let layer = unsafe { self.layer(api, fetch, gpu, n, params, vector_data, field, held) };
+            let Ok(layer) =
+                (unsafe { self.layer(api, fetch, gpu, n, params, vector_data, field, held) })
+            else {
+                return std::ptr::null();
+            };
             let output = unsafe {
                 self.reference_gpu(
                     api,
@@ -1079,6 +1122,7 @@ impl FilterState {
                     core,
                 )
             };
+            gpu_failed.set(output.is_null());
             if !output.is_null() {
                 unsafe {
                     self.reference_overlays(

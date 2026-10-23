@@ -5,7 +5,8 @@ use std::ffi::CString;
 
 use svpflow_host::opencl::{
     CL_DEVICE_TYPE_GPU, CL_EVENT_COMMAND_EXECUTION_STATUS, CL_FALSE, CL_MAP_READ,
-    CL_MEM_ALLOC_HOST_PTR, CL_MEM_READ_WRITE, CL_SUCCESS, CL_TRUE, ClImageFormat, ClInt, ClUint,
+    CL_MEM_ALLOC_HOST_PTR, CL_MEM_OBJECT_ALLOCATION_FAILURE, CL_MEM_READ_WRITE,
+    CL_OUT_OF_HOST_MEMORY, CL_OUT_OF_RESOURCES, CL_SUCCESS, CL_TRUE, ClImageFormat, ClInt, ClUint,
     FnCreateImage, FnCreateImage2D, FnEnqueueReadBufferRect, FnEnqueueWriteImage,
     FnGetProgramBuildInfo, FnRelease, FnWaitForEvents, OpenCl as CoreCl,
 };
@@ -52,7 +53,7 @@ mod blend;
 mod cover;
 mod layer;
 
-pub use layer::{Layer, LayerHeld, LayerPair};
+pub use layer::{Failed, Layer, LayerHeld, LayerPair};
 
 pub use blend::BlendJob;
 #[cfg(feature = "blend")]
@@ -109,6 +110,7 @@ pub struct GpuContext {
     blend_units: std::sync::Mutex<Vec<Unit>>,
     pins: std::sync::Mutex<Vec<Pin>>,
     dst_pool: std::sync::Mutex<Vec<[(ClMem, usize); 3]>>,
+    pressure: Pressure,
 }
 
 struct Pin {
@@ -304,6 +306,36 @@ struct StillState {
 }
 
 unsafe impl Send for StillState {}
+
+static EXHAUSTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn exhausted<T>() -> Option<T> {
+    EXHAUSTIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    None
+}
+
+fn note(code: ClInt) -> ClInt {
+    if matches!(
+        code,
+        CL_MEM_OBJECT_ALLOCATION_FAILURE | CL_OUT_OF_RESOURCES | CL_OUT_OF_HOST_MEMORY
+    ) {
+        EXHAUSTIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    code
+}
+
+#[derive(Clone, Copy)]
+pub struct Mark {
+    epoch: usize,
+    events: usize,
+}
+
+struct Pressure {
+    epoch: std::sync::atomic::AtomicUsize,
+    cpu: std::sync::atomic::AtomicBool,
+    escalate: std::sync::Mutex<()>,
+    notice: std::sync::Once,
+}
 
 const UPLOAD_QUEUES: usize = 4;
 const MOTION_SLOTS: usize = 8;
@@ -578,6 +610,12 @@ impl GpuContext {
                 blend_units: std::sync::Mutex::new(Vec::new()),
                 pins: std::sync::Mutex::new(Vec::new()),
                 dst_pool: std::sync::Mutex::new(Vec::new()),
+                pressure: Pressure {
+                    epoch: std::sync::atomic::AtomicUsize::new(0),
+                    cpu: std::sync::atomic::AtomicBool::new(false),
+                    escalate: std::sync::Mutex::new(()),
+                    notice: std::sync::Once::new(),
+                },
             });
         }
         Err("no usable GPU device".into())
@@ -588,7 +626,7 @@ impl GpuContext {
     }
 
     fn acquire(&self) -> std::sync::MutexGuard<'_, Unit> {
-        let n = self.units.len();
+        let n = self.blend_slots.total().min(self.units.len());
         let start = self
             .next_unit
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -660,7 +698,7 @@ impl GpuContext {
                     let _ = self.super_cap.fetch_update(
                         std::sync::atomic::Ordering::Relaxed,
                         std::sync::atomic::Ordering::Relaxed,
-                        |cap| (cap < most).then_some(cap + 1),
+                        |cap| (cap < most && self.mark().epoch == 0).then_some(cap + 1),
                     );
                 }
                 cache.push((key, std::sync::Arc::clone(&cell)));
@@ -753,7 +791,7 @@ impl GpuContext {
                 return None;
             }
             let global = [width, height];
-            if (self.cl.EnqueueNDRangeKernel)(
+            if note((self.cl.EnqueueNDRangeKernel)(
                 resources.queue,
                 resources.kernel,
                 2,
@@ -763,7 +801,7 @@ impl GpuContext {
                 0,
                 std::ptr::null(),
                 (&raw mut entry.ready).cast(),
-            ) != CL_SUCCESS
+            )) != CL_SUCCESS
                 || (self.cl.Flush)(resources.queue) != CL_SUCCESS
             {
                 return None;
@@ -792,7 +830,7 @@ impl GpuContext {
         let origin = [x, y, 0];
         let region = [plane.width, plane.height, 1];
         let rc = unsafe {
-            (self.cl.EnqueueWriteImage)(
+            note((self.cl.EnqueueWriteImage)(
                 q,
                 mem,
                 CL_TRUE,
@@ -804,7 +842,7 @@ impl GpuContext {
                 0,
                 std::ptr::null(),
                 std::ptr::null_mut(),
-            )
+            ))
         };
         (rc == CL_SUCCESS).then_some(())
     }
@@ -823,20 +861,130 @@ impl GpuContext {
             channel_order: order,
             channel_data_type: data_type,
         };
-        let mut err = 0;
-        let mem = unsafe {
-            (self.cl.CreateImage2D)(
-                self.context,
-                CL_MEM_READ_WRITE,
-                &raw const format,
-                width,
-                height,
-                0,
-                std::ptr::null_mut(),
-                &raw mut err,
-            )
+        let make = || {
+            let mut err = 0;
+            let mem = unsafe {
+                (self.cl.CreateImage2D)(
+                    self.context,
+                    CL_MEM_READ_WRITE,
+                    &raw const format,
+                    width,
+                    height,
+                    0,
+                    std::ptr::null_mut(),
+                    &raw mut err,
+                )
+            };
+            (err == CL_SUCCESS && !mem.is_null()).then_some(Buf { ctx: self, mem })
         };
-        (err == CL_SUCCESS && !mem.is_null()).then_some(Buf { ctx: self, mem })
+        make().or_else(|| {
+            self.relieve();
+            make().or_else(exhausted)
+        })
+    }
+
+    unsafe fn create_buffer(&self, bytes: usize) -> Option<ClMem> {
+        let make = || {
+            let mut err = 0;
+            let mem = unsafe {
+                (self.cl.CreateBuffer)(
+                    self.context,
+                    CL_MEM_READ_WRITE,
+                    bytes,
+                    std::ptr::null_mut(),
+                    &raw mut err,
+                )
+            };
+            (err == CL_SUCCESS && !mem.is_null()).then_some(mem)
+        };
+        make().or_else(|| {
+            self.relieve();
+            make().or_else(exhausted)
+        })
+    }
+
+    pub fn mark(&self) -> Mark {
+        Mark {
+            epoch: self
+                .pressure
+                .epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+            events: EXHAUSTIONS.load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
+    pub fn cpu_render(&self) -> bool {
+        self.pressure.cpu.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn exhausted_since(mark: Mark) -> bool {
+        EXHAUSTIONS.load(std::sync::atomic::Ordering::Acquire) != mark.events
+    }
+
+    pub fn recover(&self, mark: Mark) -> bool {
+        if !Self::exhausted_since(mark) {
+            return false;
+        }
+        let _guard = self
+            .pressure
+            .escalate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.mark().epoch != mark.epoch {
+            return true;
+        }
+        self.relieve();
+        self.super_cap
+            .store(RECENT_FRAMES, std::sync::atomic::Ordering::Relaxed);
+        if !self.blend_slots.shrink() {
+            if self
+                .pressure
+                .cpu
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                return false;
+            }
+            self.pressure.notice.call_once(|| {
+                eprintln!("open-svpflow: not enough GPU memory, using the CPU render");
+            });
+        }
+        self.pressure
+            .epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        true
+    }
+
+    fn relieve(&self) {
+        if let Ok(mut state) = self.layer.try_lock() {
+            state.release_cached();
+        }
+        let frames = self
+            .super_cache
+            .lock()
+            .map(|mut cache| std::mem::take(&mut *cache));
+        drop(frames);
+        if let Ok(mut held) = self.super_held.lock() {
+            held.clear();
+        }
+        let images = self
+            .image_pool
+            .lock()
+            .map(|mut pool| std::mem::take(&mut *pool));
+        for images in images.into_iter().flatten() {
+            unsafe {
+                if !images.linear.is_null() {
+                    (self.cl.ReleaseMemObject)(images.linear);
+                }
+                (self.cl.ReleaseMemObject)(images.packed);
+            }
+        }
+        let buffers = self
+            .blend_pool
+            .lock()
+            .map(|mut pool| std::mem::take(&mut *pool));
+        for buffers in buffers.into_iter().flatten() {
+            unsafe { self.release_buffers(&buffers) };
+        }
     }
 
     unsafe fn enqueue_image_raw(
@@ -851,7 +999,7 @@ impl GpuContext {
         let origin = [0usize; 3];
         let region = [width, height, 1];
         let rc = unsafe {
-            (self.cl.EnqueueWriteImage)(
+            note((self.cl.EnqueueWriteImage)(
                 q,
                 mem,
                 CL_FALSE,
@@ -863,7 +1011,7 @@ impl GpuContext {
                 0,
                 std::ptr::null(),
                 std::ptr::null_mut(),
-            )
+            ))
         };
         (rc == CL_SUCCESS).then_some(())
     }
@@ -901,21 +1049,11 @@ impl GpuContext {
             if !slot.0.is_null() {
                 unsafe { (self.cl.ReleaseMemObject)(slot.0) };
             }
-            let mut err = 0;
-            let mem = unsafe {
-                (self.cl.CreateBuffer)(
-                    self.context,
-                    CL_MEM_READ_WRITE,
-                    bytes,
-                    std::ptr::null_mut(),
-                    &raw mut err,
-                )
-            };
-            if err != CL_SUCCESS || mem.is_null() {
+            let Some(mem) = (unsafe { self.create_buffer(bytes) }) else {
                 slot.1 = 0;
                 slot.0 = std::ptr::null_mut();
                 return None;
-            }
+            };
             *slot = (mem, bytes);
         }
         Some(slot.0)
@@ -1000,7 +1138,7 @@ impl GpuContext {
             std::thread::sleep(std::time::Duration::from_micros(50));
         };
         if !done {
-            unsafe { (self.cl.Finish)(queue) };
+            unsafe { note((self.cl.Finish)(queue)) };
         }
         unsafe { (self.cl.ReleaseEvent)(event) };
         done
@@ -1227,7 +1365,7 @@ impl GpuContext {
                 usize::try_from(p.width).ok()?,
                 usize::try_from(p.height).ok()?,
             ];
-            if (self.cl.EnqueueNDRangeKernel)(
+            if note((self.cl.EnqueueNDRangeKernel)(
                 q,
                 k,
                 2,
@@ -1241,7 +1379,7 @@ impl GpuContext {
                     waits.as_ptr().cast()
                 },
                 event.cast(),
-            ) != CL_SUCCESS
+            )) != CL_SUCCESS
             {
                 return None;
             }
@@ -1310,7 +1448,7 @@ impl GpuContext {
                     ) == CL_SUCCESS
                 };
                 let run = |kernel, waits: &[ClEvent], done: *mut ClEvent| {
-                    (self.cl.EnqueueNDRangeKernel)(
+                    note((self.cl.EnqueueNDRangeKernel)(
                         queue,
                         kernel,
                         2,
@@ -1324,7 +1462,7 @@ impl GpuContext {
                             waits.as_ptr().cast()
                         },
                         done.cast(),
-                    ) == CL_SUCCESS
+                    )) == CL_SUCCESS
                 };
                 for (index, limit) in (3..).zip(limits) {
                     (self.cl.SetKernelArg)(
@@ -1541,7 +1679,7 @@ impl GpuContext {
                     )
                 });
             if queued.is_none() {
-                (self.cl.Finish)(q);
+                note((self.cl.Finish)(q));
                 self.put_dst(dst);
                 return None;
             }
@@ -1568,7 +1706,7 @@ impl GpuContext {
                 } else {
                     (0, std::ptr::null())
                 };
-                if (self.cl.EnqueueReadBuffer)(
+                if note((self.cl.EnqueueReadBuffer)(
                     xq,
                     dmem,
                     CL_FALSE,
@@ -1582,13 +1720,13 @@ impl GpuContext {
                     } else {
                         std::ptr::null_mut()
                     },
-                ) != CL_SUCCESS
+                )) != CL_SUCCESS
                 {
                     if !done.is_null() {
                         (self.cl.ReleaseEvent)(done);
                     }
-                    (self.cl.Finish)(xq);
-                    (self.cl.Finish)(q);
+                    note((self.cl.Finish)(xq));
+                    note((self.cl.Finish)(q));
                     (self.cl.ReleaseEvent)(kernel_done);
                     self.put_dst(dst);
                     if let Some(pin) = pin {
