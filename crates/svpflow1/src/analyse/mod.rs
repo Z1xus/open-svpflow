@@ -354,7 +354,7 @@ fn run_chain<'o>(
             session.release();
             let frame = |index: usize| chain::HostFrame {
                 pyramid: plan.pyramid,
-                start: plan.top() as i32,
+                first: plan.host_first(),
                 planes: [
                     &hosts[index][0][..],
                     &hosts[index][1][..],

@@ -5,19 +5,25 @@
 
 inline int tapv(__global const uchar *s, int sp, int r, int c) { return (int)s[(long)r * sp + c]; }
 
-inline int vert(__global const uchar *s, int sp, int th, int y, int c) {
+inline int vert(__global const uchar *s, int sp, int tw, int th, int y, int c) {
     int r = 2 * y;
     if (y == 0 || y + 1 >= max(th, 2)) return (tapv(s, sp, r, c) + tapv(s, sp, r + 1, c) + 1) >> 1;
+    int w2 = 2 * tw;
+    if (w2 % 8 != 0 && c >= (w2 >= 8 ? w2 / 8 * 8 : 0)) {
+        long at = (long)r * sp + c;
+        return ((int)s[at - sp / 2] + 5 * tapv(s, sp, r - 1, c) + 10 * (tapv(s, sp, r, c) + tapv(s, sp, r + 1, c)) +
+                5 * (int)s[at + sp / 2] + (int)s[at + 3 * (sp / 2)] + 16) >> 5;
+    }
     return (tapv(s, sp, r - 2, c) + 5 * (tapv(s, sp, r - 1, c) + tapv(s, sp, r + 2, c)) +
             10 * (tapv(s, sp, r, c) + tapv(s, sp, r + 1, c)) + tapv(s, sp, r + 3, c) + 16) >> 5;
 }
 
 inline uchar reduce_px(__global const uchar *s, int sp, int tw, int th, int x, int y) {
-    if (x == 0) return (uchar)((vert(s, sp, th, y, 0) + vert(s, sp, th, y, 1) + 1) >> 1);
-    if (x == tw - 1) return (uchar)((vert(s, sp, th, y, 2 * x) + vert(s, sp, th, y, 2 * x + 1) + 1) >> 1);
-    int a = x == 1 ? (vert(s, sp, th, y, 0) + vert(s, sp, th, y, 1) + 1) >> 1 : vert(s, sp, th, y, 2 * x - 2);
-    int sum = a + 5 * (vert(s, sp, th, y, 2 * x - 1) + vert(s, sp, th, y, 2 * x + 2)) +
-              10 * (vert(s, sp, th, y, 2 * x) + vert(s, sp, th, y, 2 * x + 1)) + vert(s, sp, th, y, 2 * x + 3);
+    if (x == 0) return (uchar)((vert(s, sp, tw, th, y, 0) + vert(s, sp, tw, th, y, 1) + 1) >> 1);
+    if (x == tw - 1) return (uchar)((vert(s, sp, tw, th, y, 2 * x) + vert(s, sp, tw, th, y, 2 * x + 1) + 1) >> 1);
+    int a = x == 1 ? (vert(s, sp, tw, th, y, 0) + vert(s, sp, tw, th, y, 1) + 1) >> 1 : vert(s, sp, tw, th, y, 2 * x - 2);
+    int sum = a + 5 * (vert(s, sp, tw, th, y, 2 * x - 1) + vert(s, sp, tw, th, y, 2 * x + 2)) +
+              10 * (vert(s, sp, tw, th, y, 2 * x) + vert(s, sp, tw, th, y, 2 * x + 1)) + vert(s, sp, tw, th, y, 2 * x + 3);
     return (uchar)((sum + 16) >> 5);
 }
 

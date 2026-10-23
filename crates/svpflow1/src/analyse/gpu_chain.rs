@@ -772,35 +772,43 @@ impl Session<'_, '_> {
         if let Some(host) = &up.host {
             return Some(host.clone());
         }
-        let start = plan.top() as i32;
-        let (first_y, first_c) = plan.pyramid.offsets(start);
-        let (end_y, end_c) = plan.pyramid.totals();
+        let first = plan.host_first();
         let queue = self.unit.queue as Handle;
         let wait = up.event as Handle;
         let mut host: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         for (plane, data) in host.iter_mut().enumerate() {
-            let (from, to) = if plane == 0 {
-                (first_y, end_y)
-            } else {
-                (first_c, end_c)
-            };
-            *data = vec![0u8; to - from];
-            let status = unsafe {
-                (self.gpu.cl.EnqueueReadBuffer)(
-                    queue,
-                    up.mems[plane] as Handle,
-                    CL_TRUE,
-                    up.coarse[plane] + from,
-                    to - from,
-                    data.as_mut_ptr().cast(),
-                    1,
-                    (&raw const wait).cast(),
-                    std::ptr::null_mut(),
-                )
-            };
-            if status != CL_SUCCESS {
-                return None;
+            for level in first..plan.pyramid.levels {
+                let g = plan.pyramid.geom(level);
+                let (y, c) = plan.pyramid.offsets(level);
+                let (rows, pitch, offset) = if plane == 0 {
+                    (g.height, g.pitch, y)
+                } else {
+                    (g.chroma_height, g.chroma_pitch, c)
+                };
+                let at = data.len();
+                let bytes = rows.max(0) as usize * pitch;
+                data.resize(at + bytes, 0);
+                let status = unsafe {
+                    (self.gpu.cl.EnqueueReadBuffer)(
+                        queue,
+                        up.mems[plane] as Handle,
+                        CL_TRUE,
+                        up.coarse[plane] + offset,
+                        bytes,
+                        data[at..].as_mut_ptr().cast(),
+                        1,
+                        (&raw const wait).cast(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if status != CL_SUCCESS {
+                    return None;
+                }
             }
+            data.resize(
+                data.len() + plan.pyramid.slack(plan.pyramid.levels - 1, plane == 0),
+                0,
+            );
         }
         let host = std::sync::Arc::new(host);
         up.host = Some(host.clone());

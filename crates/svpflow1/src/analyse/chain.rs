@@ -3,7 +3,6 @@ use super::params::AnalyseParams;
 use super::planes::{LevelFrame, LevelSource, PlaneView, SuperFrameView, plane_size};
 
 pub(crate) const RANK_BLOCKS: i32 = 8192;
-const PITCH_ALIGN: usize = 32;
 const LEVEL_ALIGN: usize = 256;
 const LEVEL_SLACK: usize = 128;
 
@@ -12,6 +11,8 @@ pub(crate) struct Pyramid {
     pub(crate) width: i32,
     pub(crate) height: i32,
     pub(crate) levels: i32,
+    pub(crate) pitch: usize,
+    pub(crate) chroma_pitch: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -31,10 +32,10 @@ impl Pyramid {
         LevelGeom {
             width,
             height,
-            pitch: (width.max(1) as usize).next_multiple_of(PITCH_ALIGN),
+            pitch: self.pitch,
             chroma_width: width >> 1,
             chroma_height: height >> 1,
-            chroma_pitch: ((width >> 1).max(1) as usize).next_multiple_of(PITCH_ALIGN),
+            chroma_pitch: self.chroma_pitch,
         }
     }
 
@@ -45,6 +46,16 @@ impl Pyramid {
             (g.chroma_pitch * g.chroma_height.max(1) as usize + LEVEL_SLACK)
                 .next_multiple_of(LEVEL_ALIGN),
         )
+    }
+
+    pub(crate) fn slack(&self, level: i32, luma: bool) -> usize {
+        let g = self.geom(level);
+        let (y, c) = self.sizes(level);
+        if luma {
+            y - g.pitch * g.height.max(1) as usize
+        } else {
+            c - g.chroma_pitch * g.chroma_height.max(1) as usize
+        }
     }
 
     pub(crate) fn offsets(&self, level: i32) -> (usize, usize) {
@@ -108,6 +119,10 @@ impl ChainPlan {
         self.levels.len() - 1
     }
 
+    pub(crate) fn host_first(&self) -> i32 {
+        (self.top() as i32 - 1).max(1)
+    }
+
     pub(crate) fn output_blocks(&self) -> usize {
         match &self.refine {
             Some(r) => (r.blk_x * r.blk_y) as usize,
@@ -149,6 +164,8 @@ impl ChainPlan {
             width: sp.width,
             height: sp.height,
             levels: if sp.lean { main.levels } else { top },
+            pitch: l0.y.pitch,
+            chroma_pitch: l0.u.pitch,
         };
         let mut levels = Vec::new();
         let mut lambda0 = 0;
@@ -267,29 +284,43 @@ impl ChainPlan {
 
 pub(crate) struct HostFrame<'a> {
     pub(crate) pyramid: Pyramid,
-    pub(crate) start: i32,
+    pub(crate) first: i32,
     pub(crate) planes: [&'a [u8]; 3],
 }
 
 impl LevelSource for HostFrame<'_> {
     fn level(&self, level: i32) -> LevelFrame<'_> {
         let g = self.pyramid.geom(level);
-        let (y, c) = self.pyramid.offsets(level);
-        let (first_y, first_c) = self.pyramid.offsets(self.start);
-        let chroma = |data| {
-            PlaneView::new(
-                data,
-                c - first_c,
+        let rows = |shift: u32| -> usize {
+            (self.first..level)
+                .map(|l| (plane_size(self.pyramid.height, l) >> shift) as usize)
+                .sum()
+        };
+        LevelFrame {
+            y: PlaneView::new(
+                self.planes[0],
+                rows(0) * g.pitch,
+                g.pitch,
+                g.width,
+                g.height,
+                1,
+            ),
+            u: PlaneView::new(
+                self.planes[1],
+                rows(1) * g.chroma_pitch,
                 g.chroma_pitch,
                 g.chroma_width,
                 g.chroma_height,
                 1,
-            )
-        };
-        LevelFrame {
-            y: PlaneView::new(self.planes[0], y - first_y, g.pitch, g.width, g.height, 1),
-            u: chroma(self.planes[1]),
-            v: chroma(self.planes[2]),
+            ),
+            v: PlaneView::new(
+                self.planes[2],
+                rows(1) * g.chroma_pitch,
+                g.chroma_pitch,
+                g.chroma_width,
+                g.chroma_height,
+                1,
+            ),
         }
     }
 }
