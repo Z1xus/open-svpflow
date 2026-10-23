@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::{
-    CL_HALF_FLOAT, CL_MEM_READ_WRITE, CL_R, CL_RGBA, CL_SUCCESS, CL_TRUE, CL_UNORM_INT8,
+    CL_FALSE, CL_HALF_FLOAT, CL_MEM_READ_WRITE, CL_R, CL_RGBA, CL_SUCCESS, CL_TRUE, CL_UNORM_INT8,
     CL_UNORM_INT16, ClCommandQueue, ClKernel, ClMem, ClUint, FnRelease, GpuContext, ImageSlot,
     KernelParams, SuperHandle,
 };
@@ -28,7 +28,7 @@ pub struct Layer {
 pub struct LayerPair {
     pub first: SuperHandle,
     pub second: SuperHandle,
-    pub motions: [Vec<u16>; 8],
+    pub packed: Vec<u16>,
 }
 
 #[derive(Default)]
@@ -41,7 +41,7 @@ pub(super) struct LayerState {
     queue: ClCommandQueue,
     kernels: [ClKernel; 4],
     rough: ImageSlot,
-    vectors: ImageSlot,
+    vectors: [ImageSlot; 4],
     found: (ClMem, usize),
     stats: Vec<(i64, Arc<Owned>, i32)>,
     fits: Vec<(i64, Arc<Layer>)>,
@@ -66,7 +66,7 @@ impl LayerState {
             queue: std::ptr::null_mut(),
             kernels: [std::ptr::null_mut(); 4],
             rough: ImageSlot::EMPTY,
-            vectors: ImageSlot::EMPTY,
+            vectors: [ImageSlot::EMPTY; 4],
             found: (std::ptr::null_mut(), 0),
             stats: Vec::new(),
             fits: Vec::new(),
@@ -137,7 +137,12 @@ impl GpuContext {
                         (self.cl.ReleaseKernel)(kernel);
                     }
                 }
-                for mem in [state.vectors.mem, state.rough.mem, state.found.0] {
+                for mem in state
+                    .vectors
+                    .iter()
+                    .map(|slot| slot.mem)
+                    .chain([state.rough.mem, state.found.0])
+                {
                     if !mem.is_null() {
                         (self.cl.ReleaseMemObject)(mem);
                     }
@@ -237,47 +242,63 @@ impl GpuContext {
         Some(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     unsafe fn layer_stats(
         &self,
         state: &mut LayerState,
         sums: ClMem,
-        pair: &LayerPair,
+        group: &[LayerPair],
         params: &[KernelParams; 3],
         grid: (usize, usize),
         reset: bool,
     ) -> Option<()> {
         let count = grid.0 * grid.1;
-        let m = &pair.motions;
-        if m[..4].iter().any(|field| field.len() < count) {
+        if group.iter().any(|pair| pair.packed.len() < count * 4) {
             return None;
         }
-        let packed: Vec<u16> = (0..count)
-            .flat_map(|i| [m[2][i], m[1][i], m[0][i], m[3][i]])
-            .collect();
         let (queue, kernel) = (state.queue, state.kernels[0]);
+        let mut frames: Vec<ClMem> = group.iter().map(|pair| pair.first.bufs()[1].0).collect();
+        frames.push(group[group.len() - 1].second.bufs()[1].0);
+        frames.resize(5, frames[0]);
         unsafe {
-            let vectors = self.ensure_image(&mut state.vectors, grid.0, grid.1, CL_UNORM_INT16)?;
-            let origin = [0usize; 3];
-            let region = [grid.0, grid.1, 1];
-            if (self.cl.EnqueueWriteImage)(
-                queue,
-                vectors,
-                CL_TRUE,
-                origin.as_ptr(),
-                region.as_ptr(),
-                grid.0 * 8,
-                0,
-                packed.as_ptr().cast(),
-                0,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-            ) != CL_SUCCESS
-            {
-                return None;
+            let mut vectors = [std::ptr::null_mut(); 4];
+            for (index, pair) in group.iter().enumerate() {
+                let image =
+                    self.ensure_image(&mut state.vectors[index], grid.0, grid.1, CL_UNORM_INT16)?;
+                let origin = [0usize; 3];
+                let region = [grid.0, grid.1, 1];
+                if (self.cl.EnqueueWriteImage)(
+                    queue,
+                    image,
+                    CL_FALSE,
+                    origin.as_ptr(),
+                    region.as_ptr(),
+                    grid.0 * 8,
+                    0,
+                    pair.packed.as_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                ) != CL_SUCCESS
+                {
+                    return None;
+                }
+                vectors[index] = image;
             }
-            let (first, second) = (pair.first.bufs()[1], pair.second.bufs()[1]);
-            let waits = Self::source_waits(first, second);
+            let spare = vectors[0];
+            for image in &mut vectors {
+                if image.is_null() {
+                    *image = spare;
+                }
+            }
+            let mut waits = Vec::with_capacity(5);
+            for pair in group {
+                for handle in [&pair.first, &pair.second] {
+                    let event = handle.bufs()[1].1;
+                    if !event.is_null() && !waits.contains(&event) {
+                        waits.push(event);
+                    }
+                }
+            }
             if !waits.is_empty()
                 && (self.cl.WaitForEvents)(waits.len() as ClUint, waits.as_ptr().cast())
                     != CL_SUCCESS
@@ -286,14 +307,14 @@ impl GpuContext {
             }
             let luma = usize::try_from(params[0].width * params[0].height).ok()?;
             let chroma = usize::try_from(params[1].width * params[1].height).ok()?;
-            let ready = self.set(kernel, 0, &sums)
-                && self.set(kernel, 1, &first.0)
-                && self.set(kernel, 2, &second.0)
-                && self.set(kernel, 3, &vectors)
-                && self.set(kernel, 7, &i32::from(reset));
+            let mut ready = self.set(kernel, 0, &sums);
+            for (index, image) in frames.iter().chain(&vectors).enumerate() {
+                ready &= self.set(kernel, 1 + index as ClUint, image);
+            }
             if !ready {
                 return None;
             }
+            let (pairs, reset) = (i32::try_from(group.len()).ok()?, i32::from(reset));
             for (plane, base, channels) in [
                 (0, 0, 5i32),
                 (1, luma * 5, 2),
@@ -304,9 +325,11 @@ impl GpuContext {
                     usize::try_from(p.width).ok()?,
                     usize::try_from(p.height).ok()?,
                 ];
-                let ok = self.set(kernel, 4, &p)
-                    && self.set(kernel, 5, &i32::try_from(base).ok()?)
-                    && self.set(kernel, 6, &channels)
+                let ok = self.set(kernel, 10, &p)
+                    && self.set(kernel, 11, &i32::try_from(base).ok()?)
+                    && self.set(kernel, 12, &channels)
+                    && self.set(kernel, 13, &reset)
+                    && self.set(kernel, 14, &pairs)
                     && self.run(queue, kernel, size);
                 if !ok {
                     return None;
@@ -378,10 +401,13 @@ impl GpuContext {
                 return None;
             }
             let sums = Arc::new(Owned(mem, self.cl.ReleaseMemObject));
-            for (index, pair) in pairs.iter().enumerate() {
-                unsafe { self.layer_stats(&mut state, mem, pair, params, grid, index == 0) }?;
-            }
-            if unsafe { (self.cl.Finish)(state.queue) } != CL_SUCCESS {
+            let stats = pairs
+                .chunks(4)
+                .enumerate()
+                .try_for_each(|(index, group)| unsafe {
+                    self.layer_stats(&mut state, mem, group, params, grid, index == 0)
+                });
+            if unsafe { (self.cl.Finish)(state.queue) } != CL_SUCCESS || stats.is_none() {
                 return None;
             }
             let count = i32::try_from(pairs.len() * 2).ok()?;

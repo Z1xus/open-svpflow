@@ -309,6 +309,7 @@ impl FilterState {
             false,
         );
         let cap = self.field_cap(shape);
+        let count = cells.0 * cells.1;
         let pairs = |chunk: i64| {
             let pairs: Vec<i32> = layer::pairs(i32::try_from(chunk).ok()?, last).collect();
             let needed: Vec<i32> = (pairs[0]..=pairs[pairs.len() - 1] + 1).collect();
@@ -369,7 +370,12 @@ impl FilterState {
                                         .clone()
                                     });
                                 if let (Some(field), Ok(mut slot)) = (field, moved[index].lock()) {
-                                    *slot = Some(motion(k, &field));
+                                    let m = motion(k, &field);
+                                    *slot = m[..4].iter().all(|v| v.len() >= count).then(|| {
+                                        (0..count)
+                                            .flat_map(|i| [m[2][i], m[1][i], m[0][i], m[3][i]])
+                                            .collect::<Vec<u16>>()
+                                    });
                                 }
                             }
                         });
@@ -390,11 +396,11 @@ impl FilterState {
                 .iter()
                 .zip(moved)
                 .map(|(&k, slot)| {
-                    let motions = slot.into_inner().ok().flatten()?;
+                    let packed = slot.into_inner().ok().flatten()?;
                     Some(crate::gpu::LayerPair {
                         first: frame(k)?,
                         second: frame(k + 1)?,
-                        motions,
+                        packed,
                     })
                 })
                 .collect()

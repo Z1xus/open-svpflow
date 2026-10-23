@@ -2511,25 +2511,23 @@ inline float layer_error(const float *t, float n, float2 m) {
         + m.y*m.y;
 }
 
-kernel void layer_stats(
-    global float *sums, read_only image2d_t first, read_only image2d_t second,
-    read_only image2d_t vectors, Params p, int base, int channels, int reset)
+inline void layer_terms(
+    float *v, read_only image2d_t first, read_only image2d_t second,
+    read_only image2d_t vectors, const Params *p, int channels)
 {
     int x = get_global_id(0), y = get_global_id(1);
-    if (x >= p.width || y >= p.height) return;
-    float2 at = (float2)(x, y), top = (float2)(p.width-1, p.height-1);
+    float2 at = (float2)(x, y), top = (float2)(p->width-1, p->height-1);
     float2 field_position = native_divide(
-        (float2)(x*p.x_ratio-p.origin_x, y*p.y_ratio-p.origin_y),
-        (float2)(p.block_w, p.block_h));
-    float4 vector = p.cubic ? cubic_sample(vectors, field_position)
+        (float2)(x*p->x_ratio-p->origin_x, y*p->y_ratio-p->origin_y),
+        (float2)(p->block_w, p->block_h));
+    float4 vector = p->cubic ? cubic_sample(vectors, field_position)
         : read_imagef(vectors, field_sampler, field_position);
-    float2 step_f = full_step(&p, vector.x, vector.w);
-    float2 step_b = full_step(&p, vector.z, vector.y);
+    float2 step_f = full_step(p, vector.x, vector.w);
+    float2 step_b = full_step(p, vector.z, vector.y);
     float2 zero = (float2)(0.0f, 0.0f);
-    float ia = layer_raw(first, &p, at), ib = layer_raw(second, &p, at);
-    float pb = layer_raw(first, &p, clamp(at+step_f, zero, top));
-    float pa = layer_raw(second, &p, clamp(at+step_b, zero, top));
-    float v[5];
+    float ia = layer_raw(first, p, at), ib = layer_raw(second, p, at);
+    float pb = layer_raw(first, p, clamp(at+step_f, zero, top));
+    float pa = layer_raw(second, p, clamp(at+step_b, zero, top));
     v[0] = pb + pa;
     v[1] = ib + ia;
     if (channels == 5) {
@@ -2537,8 +2535,34 @@ kernel void layer_stats(
         v[3] = pb*ib + pa*ia;
         v[4] = ib*ib + ia*ia;
     }
+}
+
+kernel void layer_stats(
+    global float *sums,
+    read_only image2d_t f0, read_only image2d_t f1, read_only image2d_t f2,
+    read_only image2d_t f3, read_only image2d_t f4,
+    read_only image2d_t m0, read_only image2d_t m1, read_only image2d_t m2,
+    read_only image2d_t m3, Params p, int base, int channels, int reset, int pairs)
+{
+    int x = get_global_id(0), y = get_global_id(1);
+    if (x >= p.width || y >= p.height) return;
     global float *sum = sums + base + (y*p.width+x)*channels;
-    for (int c = 0; c < channels; c++) sum[c] = reset ? v[c] : sum[c] + v[c];
+    float v[5], total[5];
+    layer_terms(v, f0, f1, m0, &p, channels);
+    for (int c = 0; c < channels; c++) total[c] = reset ? v[c] : sum[c] + v[c];
+    if (pairs > 1) {
+        layer_terms(v, f1, f2, m1, &p, channels);
+        for (int c = 0; c < channels; c++) total[c] += v[c];
+    }
+    if (pairs > 2) {
+        layer_terms(v, f2, f3, m2, &p, channels);
+        for (int c = 0; c < channels; c++) total[c] += v[c];
+    }
+    if (pairs > 3) {
+        layer_terms(v, f3, f4, m3, &p, channels);
+        for (int c = 0; c < channels; c++) total[c] += v[c];
+    }
+    for (int c = 0; c < channels; c++) sum[c] = total[c];
 }
 
 kernel void layer_fit(
