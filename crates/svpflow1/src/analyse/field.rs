@@ -80,6 +80,7 @@ pub(crate) struct SearchSettings {
     pub(crate) bad_sad: i32,
     pub(crate) bad_range: bool,
     pub(crate) try_many: bool,
+    pub(crate) exact: bool,
     pub(crate) flags: i32,
 }
 
@@ -2038,7 +2039,7 @@ impl BlockSearch<'_> {
                 self.state.predictor = reverse;
             }
         }
-        let early = !self.settings.try_many && !negative;
+        let early = !self.settings.exact && !self.settings.try_many && !negative;
         if early && self.settled() {
             return;
         }

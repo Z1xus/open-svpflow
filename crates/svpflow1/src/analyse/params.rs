@@ -141,7 +141,8 @@ impl Stage {
 
     pub(crate) fn gpu_searchable(&self, params: &AnalyseParams) -> bool {
         let l = self.layout;
-        params.gpu_mode == 1
+        !params.exact
+            && params.gpu_mode == 1
             && params.chroma_shift == (1, 1)
             && self.settings(params, 0, false).search_type == SearchType::Exhaustive
             && matches!(l.width, 8 | 16 | 32)
@@ -182,6 +183,7 @@ impl Stage {
             bad_sad: self.bad_sad,
             bad_range: params.bad_range != 0,
             try_many: params.try_many && (top || level > self.full_math_level),
+            exact: params.exact,
             flags: params.flags,
         }
     }
@@ -191,6 +193,7 @@ impl Stage {
 pub(crate) struct AnalyseParams {
     pub(crate) super_params: SuperParams,
     pub(crate) gpu_mode: i32,
+    pub(crate) exact: bool,
     pub(crate) vectors: i32,
     pub(crate) delta: i32,
     pub(crate) flags: i32,
@@ -375,6 +378,7 @@ impl AnalyseParams {
         Ok(Self {
             super_params: sp,
             gpu_mode,
+            exact: flag(&["exact"], true),
             vectors,
             delta: (int(&["special", "delta"], 1) as i32).max(1),
             flags,
