@@ -13,6 +13,7 @@ pub(crate) struct Pyramid {
     pub(crate) levels: i32,
     pub(crate) pitch: usize,
     pub(crate) chroma_pitch: usize,
+    pub(crate) shift: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -33,8 +34,8 @@ impl Pyramid {
             width,
             height,
             pitch: self.pitch,
-            chroma_width: width >> 1,
-            chroma_height: height >> 1,
+            chroma_width: width >> self.shift,
+            chroma_height: height >> self.shift,
             chroma_pitch: self.chroma_pitch,
         }
     }
@@ -85,6 +86,7 @@ pub(crate) struct LevelPlan {
     pub(crate) step_y: i32,
     pub(crate) flat: bool,
     pub(crate) sorted: bool,
+    pub(crate) shift: u32,
 }
 
 pub(crate) struct RefinePlan {
@@ -166,6 +168,7 @@ impl ChainPlan {
             levels: if sp.lean { main.levels } else { top },
             pitch: l0.y.pitch,
             chroma_pitch: l0.u.pitch,
+            shift: params.chroma_shift.0,
         };
         let mut levels = Vec::new();
         let mut lambda0 = 0;
@@ -221,6 +224,7 @@ impl ChainPlan {
                 step_y: layout.height - layout.overlap_y,
                 flat: layout.overlap_x == 0 && layout.overlap_y == 0,
                 sorted,
+                shift: params.chroma_shift.0,
             });
         }
         for pair in levels.windows(2) {
@@ -307,7 +311,7 @@ impl LevelSource for HostFrame<'_> {
             ),
             u: PlaneView::new(
                 self.planes[1],
-                rows(1) * g.chroma_pitch,
+                rows(self.pyramid.shift) * g.chroma_pitch,
                 g.chroma_pitch,
                 g.chroma_width,
                 g.chroma_height,
@@ -315,7 +319,7 @@ impl LevelSource for HostFrame<'_> {
             ),
             v: PlaneView::new(
                 self.planes[2],
-                rows(1) * g.chroma_pitch,
+                rows(self.pyramid.shift) * g.chroma_pitch,
                 g.chroma_pitch,
                 g.chroma_width,
                 g.chroma_height,

@@ -428,9 +428,10 @@ impl RefineGpu {
         let build = |portable: &str| {
             self.build_with(
                 &format!(
-                    "#define W {}\n#define H {}\n#define RMAX {}\n{}#define PELV {}\n#define LOGAV {}\n#define DONTV {}\n#define BLURV {}\n#define BORDERV {}\n{portable}{SEARCH}",
+                    "#define W {}\n#define H {}\n#define CS {}\n#define RMAX {}\n{}#define PELV {}\n#define LOGAV {}\n#define DONTV {}\n#define BLURV {}\n#define BORDERV {}\n{portable}{SEARCH}",
                     variant.width,
                     variant.height,
+                    variant.shift,
                     rmax,
                     if variant.satd { "#define SATD 1\n" } else { "" },
                     spec[0],
@@ -1088,9 +1089,10 @@ impl Session<'_, '_> {
             self.frames[src].as_ref()?.frame,
             self.frames[reference].as_ref()?.frame,
         );
-        let program = self
-            .gpu
-            .program(Variant::new(plan.width, plan.height, plan.satd))?;
+        let program = self.gpu.program(Variant {
+            shift: plan.shift,
+            ..Variant::new(plan.width, plan.height, plan.satd)
+        })?;
         unsafe { self.enqueue(plan, src, reference, program, source, target) }
     }
 
@@ -1318,7 +1320,10 @@ impl Session<'_, '_> {
         self.frames[src].as_ref()?;
         self.frames[reference].as_ref()?;
         let programs = self.gpu.search_pair(
-            Variant::new(params.width, params.height, params.satd),
+            Variant {
+                shift: params.shift,
+                ..Variant::new(params.width, params.height, params.satd)
+            },
             params.rmax,
             &params.q,
             params.border,
@@ -1951,8 +1956,8 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
             __global const uchar *ry, __global const uchar *ru, __global const uchar *rv,
             __global const long *p, __global const int *records, __global int4 *bests) {
     __local uchar src_luma[W * H];
-    __local uchar src_u[(W / 2) * (H / 2)];
-    __local uchar src_v[(W / 2) * (H / 2)];
+    __local uchar src_u[(W >> S) * (H >> S)];
+    __local uchar src_v[(W >> S) * (H >> S)];
     __local uint acc_luma[MAX_SLOTS], acc_u[MAX_SLOTS], acc_v[MAX_SLOTS];
     __local int sum_average;
     long block = get_group_id(0);
@@ -1965,7 +1970,7 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
     int flags = r[11] & 3;
     int negative = (flags & 2) != 0, bad = (flags & 1) != 0;
     int bw = negative ? W / 2 : W, bh = negative ? H / 2 : H;
-    int cw = W / 2, ch = H / 2;
+    int cw = W >> S, ch = H >> S;
     if (lid == 0) sum_average = 0;
     for (int i = lid; i < MAX_SLOTS; i += 64) {
         acc_luma[i] = 0;
@@ -2026,7 +2031,7 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
                 int plane = k / chroma_tiles;
                 k %= chroma_tiles;
                 int tx = (k % (cw / 4)) * 4, ty = (k / (cw / 4)) * 4;
-                long off = subpel(p[13], pru, p[15], pel, LO(r[6]) + (vx >> 1), HI(r[6]) + (vy >> 1));
+                long off = subpel(p[13], pru, p[15], pel, LO(r[6]) + (vx >> S), HI(r[6]) + (vy >> S));
                 if (plane == 0) {
                     atomic_add(&acc_u[slot], tile_cost(src_u + ty * cw + tx, cw, ru, lru,
                                                        off + (long)ty * pru + tx, pru));
@@ -2045,10 +2050,10 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
     if (bad) {
 #if SATD
 #define LUMA(s) ((int)(acc_luma[s] / 2))
-#define CHROMA(s) ((int)((acc_u[s] / 2 + acc_v[s] / 2) << 2))
+#define CHROMA(s) ((int)((acc_u[s] / 2 + acc_v[s] / 2) << (2 * S)))
 #else
 #define LUMA(s) ((int)acc_luma[s])
-#define CHROMA(s) ((int)((acc_u[s] + acc_v[s]) << 2))
+#define CHROMA(s) ((int)((acc_u[s] + acc_v[s]) << (2 * S)))
 #endif
         bsad = (int)((uint)LUMA(0) + (uint)CHROMA(0));
         int min_cost = bsad;

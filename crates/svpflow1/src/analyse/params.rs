@@ -143,7 +143,6 @@ impl Stage {
         let l = self.layout;
         !params.exact
             && params.gpu_mode == 1
-            && params.chroma_shift == (1, 1)
             && self.settings(params, 0, false).search_type == SearchType::Exhaustive
             && matches!(l.width, 8 | 16 | 32)
             && matches!(l.height, 8 | 16 | 32)
@@ -155,11 +154,7 @@ impl Stage {
         params.gpu_mode == 1
             && settings.search_type == SearchType::Exhaustive
             && settings.search_param.abs() <= 3
-            && match (l.width, l.height) {
-                (4, 4) => matches!(params.chroma_shift, (0, 0) | (1, 1)),
-                (8, 8) | (16, 8 | 16) => params.chroma_shift == (1, 1),
-                _ => false,
-            }
+            && matches!((l.width, l.height), (4, 4) | (8, 8) | (16, 8 | 16))
     }
 
     pub(crate) fn settings(&self, params: &AnalyseParams, level: i32, top: bool) -> SearchSettings {

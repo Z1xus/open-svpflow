@@ -104,6 +104,7 @@ pub(crate) struct GpuSearchParams {
     pub(crate) rmax: usize,
     pub(crate) border: usize,
     pub(crate) satd: bool,
+    pub(crate) shift: u32,
     pub(crate) rank: Vec<i32>,
 }
 
@@ -654,7 +655,6 @@ impl Field {
         let try_many = settings.try_many && self.level >= level_floor(settings.flags, 0x60, 5);
         let bad_range = settings.bad_range && self.level >= level_floor(settings.flags, 0x0C, 2);
         if (!relaxed && (self.smallest || try_many || bad_range))
-            || self.chroma_shift != (1, 1)
             || settings.search_type != SearchType::Exhaustive
             || param > 10
             || (self.pel != 1 && param > 0)
@@ -723,6 +723,7 @@ impl Field {
             height: l.height as usize,
             rmax: param as usize,
             satd: self.satd,
+            shift: self.chroma_shift.0,
             border: if self.level > 0 { self.border_len() } else { 0 },
         })
     }

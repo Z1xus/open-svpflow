@@ -627,7 +627,10 @@ impl Session<'_, '_> {
 
     unsafe fn chain_search(&mut self, lp: &LevelPlan, mems: &SearchMems) -> Option<()> {
         let programs = self.gpu.search_pair(
-            Variant::new(lp.width, lp.height, lp.satd),
+            Variant {
+                shift: lp.shift,
+                ..Variant::new(lp.width, lp.height, lp.satd)
+            },
             lp.rmax,
             &lp.q,
             lp.border,

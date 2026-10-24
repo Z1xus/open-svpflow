@@ -115,6 +115,7 @@ pub(crate) struct RecalcPlan {
     pub(crate) width: usize,
     pub(crate) height: usize,
     pub(crate) satd: bool,
+    pub(crate) shift: u32,
     diagonal: i32,
     pub(crate) pnew: i32,
     pub(crate) pel: i32,
@@ -135,8 +136,7 @@ impl Field {
         plan: &mut RecalcPlan,
     ) -> bool {
         let layout = self.layout;
-        if self.chroma_shift != (1, 1)
-            || settings.search_type != SearchType::Exhaustive
+        if settings.search_type != SearchType::Exhaustive
             || !matches!((layout.width, layout.height), (8, 8) | (16, 8 | 16))
             || self.order.len() != self.count()
             || self.blk_x < 2
@@ -165,6 +165,7 @@ impl Field {
         plan.width = layout.width as usize;
         plan.height = layout.height as usize;
         plan.satd = self.satd;
+        plan.shift = self.chroma_shift.0;
         plan.diagonal = pel * f64::from(frame_w * frame_w + frame_h * frame_h).sqrt() as i32;
         plan.pnew = settings.pnew;
         plan.pel = pel;
@@ -371,11 +372,11 @@ impl Field {
                 if negative {
                     continue;
                 }
-                let (cw, ch) = (fw / 2, fh / 2);
-                let coffset = reference
-                    .u
-                    .subpel(record.cpos.0 + (vx >> 1), record.cpos.1 + (vy >> 1))
-                    as i64;
+                let (cw, ch) = (fw >> plan.shift, fh >> plan.shift);
+                let coffset = reference.u.subpel(
+                    record.cpos.0 + (vx >> plan.shift),
+                    record.cpos.1 + (vy >> plan.shift),
+                ) as i64;
                 let mut sum = 0;
                 for (plane, source, own) in [
                     (reference.u, record.u, src.u),
@@ -427,7 +428,12 @@ fn select(plan: &RecalcPlan, block: usize, luma: &[u32], chroma: &[u32], average
     let (mut bx, mut by, mut bsad) = (px, py, record.sad);
     if record.flags & BAD != 0 {
         let base = block * plan.slots;
-        let value = |slot: usize| (luma[base + slot] as i32, (chroma[base + slot] as i32) << 2);
+        let value = |slot: usize| {
+            (
+                luma[base + slot] as i32,
+                (chroma[base + slot] as i32) << (2 * plan.shift),
+            )
+        };
         let (l0, c0) = value(0);
         bsad = l0 + c0;
         let mut min_cost = bsad;
@@ -599,7 +605,6 @@ impl Field {
 
     pub(crate) fn compact_eligible(&self, settings: &SearchSettings) -> bool {
         (self.layout.width, self.layout.height) == (4, 4)
-            && matches!(self.chroma_shift, (0, 0) | (1, 1))
             && settings.search_type == SearchType::Exhaustive
             && settings.search_param.abs() <= 3
             && self.blk_x >= 2
