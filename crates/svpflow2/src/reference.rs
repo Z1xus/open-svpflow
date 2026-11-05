@@ -10,7 +10,6 @@ use svpflow_core::smooth::{
 use svpflow_core::smooth_engine::{self as engine, Rates};
 
 use crate::core::{FilterState, Mode, drop_frame, get_node, request_node, super_frame_planes};
-use crate::gpu::GpuContext;
 use crate::vs::Source as _;
 use crate::{frame, metadata, options::ReferenceParams, renderer, vs};
 
@@ -158,14 +157,18 @@ impl FilterState {
             return;
         };
         let (chunk, chunks) = (n / layer::CHUNK, last / layer::CHUNK);
-        let missing = if let Some(gpu) = self.gpu.as_ref() {
-            gpu.layer_hold(chunk, chunks, &mut held.gpu)
-        } else {
-            let Ok(layers) = self.layers.lock() else {
-                return;
-            };
-            layers.hold(chunk, chunks, &mut held.cpu)
-        };
+        let mut missing = self
+            .gpu
+            .as_ref()
+            .map(|gpu| gpu.layer_hold(chunk, chunks, &mut held.gpu))
+            .unwrap_or_default();
+        if crate::video_format::is_cpu_source(&self.video_info)
+            && let Ok(layers) = self.layers.lock()
+        {
+            missing.extend(layers.hold(chunk, chunks, &mut held.cpu));
+        }
+        missing.sort_unstable();
+        missing.dedup();
         for c in missing {
             let (sources, vectors) = crate::peel::frames(c, last);
             wanted.extend(sources.map(|k| (self.clips.source, k)));
@@ -940,22 +943,27 @@ impl FilterState {
                 &gpu_failed,
             )
         };
+        let fits_cpu = crate::video_format::is_cpu_source(&self.video_info);
         let output = if let Some(gpu) = self.gpu.as_ref() {
+            if blend.is_none() {
+                gpu.retry();
+            }
             let mut output;
             let mut mark;
             loop {
                 mark = gpu.mark();
                 let admitted = blend.is_none().then(|| gpu.admit());
-                output = calculate(gpu.cpu_render());
+                output = calculate(gpu.cpu_render() && fits_cpu);
                 drop(admitted);
                 if !output.is_null() || blend.is_some() || !gpu.recover(mark) {
                     break;
                 }
             }
             let retry = output.is_null()
+                && fits_cpu
                 && gpu_failed.get()
                 && !gpu.cpu_render()
-                && blend.is_none_or(|job| !job.taken() && !GpuContext::exhausted_since(mark));
+                && blend.is_none_or(|job| !job.taken() && !gpu.exhausted_since(mark));
             if retry {
                 self.fallback_notice.call_once(|| {
                     eprintln!("open-svpflow: GPU render failed, using the CPU render");
@@ -1092,6 +1100,7 @@ impl FilterState {
             let Ok(layer) =
                 (unsafe { self.layer(api, fetch, gpu, n, params, vector_data, field, held) })
             else {
+                gpu_failed.set(true);
                 return std::ptr::null();
             };
             let output = unsafe {
@@ -1290,9 +1299,13 @@ impl FilterState {
                 }
             }
         }
-        if let (Some(fit), (Some(first), Some(second))) =
-            (self.layer_cpu(api, fetch, n, vector_data, held), raw)
-        {
+        let fit = self.layer_cpu(api, fetch, n, vector_data, held);
+        let peeled = crate::video_format::is_cpu_source(&self.video_info);
+        if fit.is_none() && peeled && self.layer_plan().is_some() {
+            unsafe { api.free(output.cast_const()) };
+            return std::ptr::null();
+        }
+        if let (Some(fit), (Some(first), Some(second))) = (fit, raw) {
             let fit = fit.layer((w, h), cx);
             let frames = layer::Frames {
                 first,

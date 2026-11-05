@@ -52,6 +52,7 @@ impl OpenCl {
 mod blend;
 mod cover;
 mod layer;
+mod vram;
 
 pub use layer::{Failed, Layer, LayerHeld, LayerPair};
 
@@ -113,6 +114,8 @@ pub struct GpuContext {
     pins: std::sync::Mutex<Vec<Pin>>,
     dst_pool: std::sync::Mutex<Vec<[(ClMem, usize); 3]>>,
     pressure: Pressure,
+    vram: vram::Vram,
+    reserve: usize,
 }
 
 struct Pin {
@@ -309,23 +312,6 @@ struct StillState {
 
 unsafe impl Send for StillState {}
 
-static EXHAUSTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-fn exhausted<T>() -> Option<T> {
-    EXHAUSTIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    None
-}
-
-fn note(code: ClInt) -> ClInt {
-    if matches!(
-        code,
-        CL_MEM_OBJECT_ALLOCATION_FAILURE | CL_OUT_OF_RESOURCES | CL_OUT_OF_HOST_MEMORY
-    ) {
-        EXHAUSTIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    }
-    code
-}
-
 #[derive(Clone, Copy)]
 pub struct Mark {
     epoch: usize,
@@ -334,10 +320,21 @@ pub struct Mark {
 
 struct Pressure {
     epoch: std::sync::atomic::AtomicUsize,
+    events: std::sync::atomic::AtomicUsize,
+    strained: std::sync::atomic::AtomicBool,
     cpu: std::sync::atomic::AtomicBool,
-    escalate: std::sync::Mutex<()>,
-    notice: std::sync::Once,
+    fallback: std::sync::Mutex<Fallback>,
 }
+
+struct Fallback {
+    since: std::time::Instant,
+    wait: std::time::Duration,
+    free: Option<usize>,
+}
+
+const RESERVE_SHARE: usize = 16;
+const RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
+const RETRY_MOST: std::time::Duration = std::time::Duration::from_secs(32);
 
 const UPLOAD_QUEUES: usize = 4;
 const MOTION_SLOTS: usize = 8;
@@ -511,17 +508,27 @@ impl GpuContext {
             let mut units = Vec::with_capacity(num_units);
             for _ in 0..num_units {
                 let name = CString::new("render_frame").map_err(|_| "nul")?;
-                let mut kerr = 0;
-                let kernel = unsafe { (cl.CreateKernel)(program, name.as_ptr(), &raw mut kerr) };
-                let queue = unsafe { (cl.CreateCommandQueue)(context, device, 0, &raw mut err) };
-                if kerr != CL_SUCCESS || kernel.is_null() || err != CL_SUCCESS || queue.is_null() {
+                let mut errs = [0; 3];
+                let kernel = unsafe { (cl.CreateKernel)(program, name.as_ptr(), &raw mut errs[0]) };
+                let queue =
+                    unsafe { (cl.CreateCommandQueue)(context, device, 0, &raw mut errs[1]) };
+                let xfer = unsafe { (cl.CreateCommandQueue)(context, device, 0, &raw mut errs[2]) };
+                if errs == [CL_SUCCESS; 3]
+                    && !kernel.is_null()
+                    && !queue.is_null()
+                    && !xfer.is_null()
+                {
+                    units.push(std::sync::Mutex::new(Unit::new(kernel, queue, xfer)));
                     continue;
                 }
-                let xfer = unsafe { (cl.CreateCommandQueue)(context, device, 0, &raw mut err) };
-                if err != CL_SUCCESS || xfer.is_null() {
-                    continue;
+                unsafe {
+                    if !kernel.is_null() {
+                        (cl.ReleaseKernel)(kernel);
+                    }
+                    for queue in [queue, xfer].into_iter().filter(|queue| !queue.is_null()) {
+                        (cl.ReleaseCommandQueue)(queue);
+                    }
                 }
-                units.push(std::sync::Mutex::new(Unit::new(kernel, queue, xfer)));
             }
             if units.is_empty() {
                 return Err("no render units".into());
@@ -547,6 +554,7 @@ impl GpuContext {
                         if let Ok(unit) = unit.lock() {
                             (cl.ReleaseKernel)(unit.kernel);
                             (cl.ReleaseCommandQueue)(unit.queue);
+                            (cl.ReleaseCommandQueue)(unit.xfer);
                         }
                     }
                 }
@@ -575,9 +583,9 @@ impl GpuContext {
                 cache_resources.push(std::sync::Mutex::new(CacheResources { kernel, queue }));
             }
             let device_name = unsafe { device_name(&cl, device) };
-            let frame_budget = unsafe { device_size(&cl, device, CL_DEVICE_GLOBAL_MEM_SIZE) }
-                .unwrap_or(usize::MAX)
-                / FRAME_BUDGET_SHARE;
+            let total = unsafe { device_size(&cl, device, CL_DEVICE_GLOBAL_MEM_SIZE) };
+            let frame_budget = total.unwrap_or(usize::MAX) / FRAME_BUDGET_SHARE;
+            let vram = unsafe { vram::Vram::open(&cl, device) };
             let fuse_fits = unsafe { device_size(&cl, device, CL_DEVICE_MAX_PARAMETER_SIZE) }
                 .is_some_and(|size| size >= blend::FUSED_ARG_BYTES);
             let blend_slots = std::sync::Arc::new(blend::Slots::new(units.len()));
@@ -619,10 +627,17 @@ impl GpuContext {
                 dst_pool: std::sync::Mutex::new(Vec::new()),
                 pressure: Pressure {
                     epoch: std::sync::atomic::AtomicUsize::new(0),
+                    events: std::sync::atomic::AtomicUsize::new(0),
+                    strained: std::sync::atomic::AtomicBool::new(false),
                     cpu: std::sync::atomic::AtomicBool::new(false),
-                    escalate: std::sync::Mutex::new(()),
-                    notice: std::sync::Once::new(),
+                    fallback: std::sync::Mutex::new(Fallback {
+                        since: std::time::Instant::now(),
+                        wait: std::time::Duration::ZERO,
+                        free: None,
+                    }),
                 },
+                vram,
+                reserve: total.unwrap_or(0) / RESERVE_SHARE,
             });
         }
         Err("no usable GPU device".into())
@@ -714,7 +729,9 @@ impl GpuContext {
                     let _ = self.super_cap.fetch_update(
                         std::sync::atomic::Ordering::Relaxed,
                         std::sync::atomic::Ordering::Relaxed,
-                        |cap| (cap < most && self.mark().epoch == 0).then_some(cap + 1),
+                        |cap| {
+                            (cap < most && !self.strained() && self.room(bytes)).then_some(cap + 1)
+                        },
                     );
                 }
                 cache.push((key, std::sync::Arc::clone(&cell)));
@@ -807,7 +824,7 @@ impl GpuContext {
                 return None;
             }
             let global = [width, height];
-            if note((self.cl.EnqueueNDRangeKernel)(
+            if self.note((self.cl.EnqueueNDRangeKernel)(
                 resources.queue,
                 resources.kernel,
                 2,
@@ -846,7 +863,7 @@ impl GpuContext {
         let origin = [x, y, 0];
         let region = [plane.width, plane.height, 1];
         let rc = unsafe {
-            note((self.cl.EnqueueWriteImage)(
+            self.note((self.cl.EnqueueWriteImage)(
                 q,
                 mem,
                 CL_TRUE,
@@ -895,7 +912,7 @@ impl GpuContext {
         };
         make().or_else(|| {
             self.relieve();
-            make().or_else(exhausted)
+            make().or_else(|| self.exhausted())
         })
     }
 
@@ -915,7 +932,7 @@ impl GpuContext {
         };
         make().or_else(|| {
             self.relieve();
-            make().or_else(exhausted)
+            make().or_else(|| self.exhausted())
         })
     }
 
@@ -925,7 +942,10 @@ impl GpuContext {
                 .pressure
                 .epoch
                 .load(std::sync::atomic::Ordering::Acquire),
-            events: EXHAUSTIONS.load(std::sync::atomic::Ordering::Acquire),
+            events: self
+                .pressure
+                .events
+                .load(std::sync::atomic::Ordering::Acquire),
         }
     }
 
@@ -933,17 +953,79 @@ impl GpuContext {
         self.pressure.cpu.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub fn exhausted_since(mark: Mark) -> bool {
-        EXHAUSTIONS.load(std::sync::atomic::Ordering::Acquire) != mark.events
+    pub fn retry(&self) {
+        if !self.cpu_render() {
+            return;
+        }
+        let Ok(fallback) = self.pressure.fallback.try_lock() else {
+            return;
+        };
+        let waited = fallback.since.elapsed();
+        if waited < fallback.wait {
+            return;
+        }
+        let freed = match (fallback.free, self.free()) {
+            (Some(then), Some(now)) => now >= then.saturating_add(self.reserve),
+            _ => true,
+        };
+        if (freed || waited >= RETRY_MOST) && self.cpu_render() {
+            self.blend_slots.restore(self.units.len());
+            self.pressure
+                .strained
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.pressure
+                .cpu
+                .store(false, std::sync::atomic::Ordering::Release);
+            eprintln!("open-svpflow: GPU memory is free again, using the GPU render");
+        }
+    }
+
+    pub fn strained(&self) -> bool {
+        self.pressure
+            .strained
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn free(&self) -> Option<usize> {
+        unsafe { self.vram.free(&self.cl, self.device) }
+    }
+
+    fn room(&self, bytes: usize) -> bool {
+        self.free()
+            .is_none_or(|free| free >= bytes.saturating_add(self.reserve))
+    }
+
+    pub fn exhausted_since(&self, mark: Mark) -> bool {
+        self.pressure
+            .events
+            .load(std::sync::atomic::Ordering::Acquire)
+            != mark.events
+    }
+
+    fn exhausted<T>(&self) -> Option<T> {
+        self.pressure
+            .events
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        None
+    }
+
+    fn note(&self, code: ClInt) -> ClInt {
+        if matches!(
+            code,
+            CL_MEM_OBJECT_ALLOCATION_FAILURE | CL_OUT_OF_RESOURCES | CL_OUT_OF_HOST_MEMORY
+        ) {
+            self.exhausted::<()>();
+        }
+        code
     }
 
     pub fn recover(&self, mark: Mark) -> bool {
-        if !Self::exhausted_since(mark) {
+        if !self.exhausted_since(mark) {
             return false;
         }
-        let _guard = self
+        let mut fallback = self
             .pressure
-            .escalate
+            .fallback
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.mark().epoch != mark.epoch {
@@ -953,17 +1035,20 @@ impl GpuContext {
         self.super_cap
             .store(RECENT_FRAMES, std::sync::atomic::Ordering::Relaxed);
         if !self.blend_slots.shrink() {
-            if self
-                .pressure
-                .cpu
-                .swap(true, std::sync::atomic::Ordering::AcqRel)
-            {
+            if self.pressure.cpu.load(std::sync::atomic::Ordering::Acquire) {
                 return false;
             }
-            self.pressure.notice.call_once(|| {
-                eprintln!("open-svpflow: not enough GPU memory, using the CPU render");
-            });
+            fallback.wait = (fallback.wait * 2).clamp(RETRY_FIRST, RETRY_MOST);
+            fallback.since = std::time::Instant::now();
+            fallback.free = self.free();
+            self.pressure
+                .cpu
+                .store(true, std::sync::atomic::Ordering::Release);
+            eprintln!("open-svpflow: not enough GPU memory, using the CPU render");
         }
+        self.pressure
+            .strained
+            .store(true, std::sync::atomic::Ordering::Release);
         self.pressure
             .epoch
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -1015,7 +1100,7 @@ impl GpuContext {
         let origin = [0usize; 3];
         let region = [width, height, 1];
         let rc = unsafe {
-            note((self.cl.EnqueueWriteImage)(
+            self.note((self.cl.EnqueueWriteImage)(
                 q,
                 mem,
                 CL_FALSE,
@@ -1046,6 +1131,7 @@ impl GpuContext {
         {
             if !slot.mem.is_null() {
                 unsafe { (self.cl.ReleaseMemObject)(slot.mem) };
+                *slot = ImageSlot::EMPTY;
             }
             let image = unsafe { self.create_image(CL_RGBA, data_type, width, height) }?;
             *slot = ImageSlot {
@@ -1154,7 +1240,7 @@ impl GpuContext {
             std::thread::sleep(std::time::Duration::from_micros(50));
         };
         if !done {
-            unsafe { note((self.cl.Finish)(queue)) };
+            unsafe { self.note((self.cl.Finish)(queue)) };
         }
         unsafe { (self.cl.ReleaseEvent)(event) };
         done
@@ -1381,7 +1467,7 @@ impl GpuContext {
                 usize::try_from(p.width).ok()?,
                 usize::try_from(p.height).ok()?,
             ];
-            if note((self.cl.EnqueueNDRangeKernel)(
+            if self.note((self.cl.EnqueueNDRangeKernel)(
                 q,
                 k,
                 2,
@@ -1464,7 +1550,7 @@ impl GpuContext {
                     ) == CL_SUCCESS
                 };
                 let run = |kernel, waits: &[ClEvent], done: *mut ClEvent| {
-                    note((self.cl.EnqueueNDRangeKernel)(
+                    self.note((self.cl.EnqueueNDRangeKernel)(
                         queue,
                         kernel,
                         2,
@@ -1710,7 +1796,7 @@ impl GpuContext {
                     )
                 });
             if queued.is_none() {
-                note((self.cl.Finish)(q));
+                self.note((self.cl.Finish)(q));
                 self.put_dst(dst);
                 return None;
             }
@@ -1737,7 +1823,7 @@ impl GpuContext {
                 } else {
                     (0, std::ptr::null())
                 };
-                if note((self.cl.EnqueueReadBuffer)(
+                if self.note((self.cl.EnqueueReadBuffer)(
                     xq,
                     dmem,
                     CL_FALSE,
@@ -1756,8 +1842,8 @@ impl GpuContext {
                     if !done.is_null() {
                         (self.cl.ReleaseEvent)(done);
                     }
-                    note((self.cl.Finish)(xq));
-                    note((self.cl.Finish)(q));
+                    self.note((self.cl.Finish)(xq));
+                    self.note((self.cl.Finish)(q));
                     (self.cl.ReleaseEvent)(kernel_done);
                     self.put_dst(dst);
                     if let Some(pin) = pin {

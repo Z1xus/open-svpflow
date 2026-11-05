@@ -356,7 +356,8 @@ unsafe fn collect_state(
         metadata::scene_luma_lut(3, options.scene_luma()),
     ];
 
-    let gpu = if mode <= 1 && render_mode == 2 && !options.cpu_render() {
+    let wanted = mode <= 1 && render_mode == 2 && !options.cpu_render();
+    let gpu = if wanted {
         crate::gpu::GpuContext::new(
             i32::try_from(options.gpu_id()).unwrap_or(0),
             options.gpu_qn(),
@@ -366,8 +367,15 @@ unsafe fn collect_state(
     } else {
         None
     };
-    if let Some(g) = gpu.as_ref() {
-        eprintln!("open-svpflow: GPU renderer active on {}", g.device_name());
+    match gpu.as_ref() {
+        Some(g) => eprintln!("open-svpflow: GPU renderer active on {}", g.device_name()),
+        None if wanted => {
+            static NOTICE: std::sync::Once = std::sync::Once::new();
+            NOTICE.call_once(|| {
+                eprintln!("open-svpflow: the GPU is not available, using the CPU render");
+            });
+        }
+        None => {}
     }
     let render_mode = if mode <= 1 && render_mode == 2 && gpu.is_none() {
         1
@@ -913,7 +921,14 @@ unsafe extern "system" fn get_frame(
                 *frame_data = Box::into_raw(held).cast();
                 return std::ptr::null();
             }
-            state.get_frame(n, None, frame_ctx, core, vsapi, &held)
+            let output = state.get_frame(n, None, frame_ctx, core, vsapi, &held);
+            if output.is_null()
+                && let Some(set_error) =
+                    vs::table_fn::<vs::SetFilterError>(vsapi, vs::SET_FILTER_ERROR)
+            {
+                set_error(c"SVSmoothFps: render failed".as_ptr(), frame_ctx);
+            }
+            output
         },
         _ => std::ptr::null(),
     }

@@ -2,7 +2,6 @@ use core::ffi::c_void;
 
 use super::{
     CL_FALSE, CL_SUCCESS, CL_UNORM_INT8, ClCommandQueue, ClKernel, ClMem, ClUint, GpuContext, Unit,
-    note,
 };
 use svpflow_core::smooth::CoverLayout;
 
@@ -80,7 +79,7 @@ impl GpuContext {
         bytes: usize,
     ) -> Option<()> {
         let status = unsafe {
-            note((self.cl.EnqueueWriteBuffer)(
+            self.note((self.cl.EnqueueWriteBuffer)(
                 queue,
                 mem,
                 CL_FALSE,
@@ -109,7 +108,7 @@ impl GpuContext {
             }
         }
         let status = unsafe {
-            note((self.cl.EnqueueNDRangeKernel)(
+            self.note((self.cl.EnqueueNDRangeKernel)(
                 queue,
                 kernel,
                 global.len() as ClUint,

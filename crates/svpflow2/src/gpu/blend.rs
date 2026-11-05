@@ -7,7 +7,7 @@ use svpflow_host::opencl::ImageDesc;
 use super::{
     CL_FALSE, CL_MEM_READ_WRITE, CL_RGBA, CL_SUCCESS, CL_UNORM_INT8, ClEvent, ClImageFormat,
     ClKernel, ClMem, ClUint, GpuBuf, GpuContext, KernelParams, Layer, StillMask, SuperEntry,
-    SuperHandle, Unit, UploadPlane, layer::LAYER_VARIANT, note,
+    SuperHandle, Unit, UploadPlane, layer::LAYER_VARIANT,
 };
 
 pub(super) const BLEND_VARIANT: u32 = 1 << 13;
@@ -132,6 +132,16 @@ impl Slots {
         true
     }
 
+    pub(super) fn restore(&self, count: usize) {
+        let mut counts = self.counts();
+        let back = count.saturating_sub(counts.total);
+        let paid = back.min(counts.debt);
+        counts.debt -= paid;
+        counts.free += back - paid;
+        counts.total = count;
+        self.1.notify_all();
+    }
+
     pub(super) fn take(self: &Arc<Self>) -> Option<Slot> {
         let mut counts = self.counts();
         while counts.free == 0 {
@@ -237,6 +247,9 @@ impl GpuContext {
                 *kernel =
                     unsafe { (self.cl.CreateKernel)(self.program, name.as_ptr(), &raw mut err) };
                 if err != CL_SUCCESS || kernel.is_null() {
+                    for made in kernels.into_iter().filter(|made| !made.is_null()) {
+                        unsafe { (self.cl.ReleaseKernel)(made) };
+                    }
                     return None;
                 }
             }
@@ -278,7 +291,7 @@ impl GpuContext {
             )
         };
         if err != CL_SUCCESS || created.is_null() {
-            return super::exhausted();
+            return self.exhausted();
         }
         if !mem.is_null() {
             unsafe { (self.cl.ReleaseMemObject)(mem) };
@@ -331,7 +344,7 @@ impl GpuContext {
             {
                 return None;
             }
-            (note((self.cl.EnqueueNDRangeKernel)(
+            (self.note((self.cl.EnqueueNDRangeKernel)(
                 unit.queue,
                 resolve,
                 1,
@@ -360,7 +373,7 @@ impl GpuContext {
     fn release_job(&self, job: BlendJob, keep: bool) {
         let unit = job.unit.into_inner();
         if !keep {
-            unsafe { note((self.cl.Finish)(unit.queue)) };
+            unsafe { self.note((self.cl.Finish)(unit.queue)) };
         }
         drop(job.pending);
         match self.blend_pool.lock() {
@@ -553,7 +566,7 @@ impl GpuContext {
                     usize::try_from(params.height).ok()?,
                 ];
                 let wait = if plane == 0 { &waits[..] } else { &[] };
-                if note((self.cl.EnqueueNDRangeKernel)(
+                if self.note((self.cl.EnqueueNDRangeKernel)(
                     queue,
                     kernel,
                     2,
@@ -603,7 +616,7 @@ impl GpuContext {
             if filled {
                 let origin = [0usize; 3];
                 let region = [width, height, group.steps.count as usize];
-                if note((self.cl.EnqueueWriteImage)(
+                if self.note((self.cl.EnqueueWriteImage)(
                     unit.queue,
                     layers,
                     CL_FALSE,
@@ -829,7 +842,7 @@ impl GpuContext {
         if key.is_none() {
             self.flush(job)?;
             let queue = job.unit.borrow().queue;
-            if unsafe { note((self.cl.Finish)(queue)) } != CL_SUCCESS {
+            if unsafe { self.note((self.cl.Finish)(queue)) } != CL_SUCCESS {
                 return None;
             }
             let mut pending = job.pending.borrow_mut();
@@ -870,7 +883,7 @@ impl GpuContext {
             {
                 return None;
             }
-            if note((self.cl.EnqueueNDRangeKernel)(
+            if self.note((self.cl.EnqueueNDRangeKernel)(
                 unit.queue,
                 source,
                 2,
@@ -895,9 +908,7 @@ impl GpuContext {
     }
 
     pub fn admit(&self) -> Option<Slot> {
-        (self.mark().epoch > 0)
-            .then(|| self.blend_slots.take())
-            .flatten()
+        self.strained().then(|| self.blend_slots.take()).flatten()
     }
 
     pub fn blend_abort(&self, job: BlendJob) {
@@ -959,7 +970,7 @@ impl GpuContext {
                         _ => [chroma_width, luma_rows, 0],
                     };
                     let region = [plane.width, plane.height, 1];
-                    if note((self.cl.EnqueueReadBufferRect)(
+                    if self.note((self.cl.EnqueueReadBufferRect)(
                         queue,
                         job.buffers.bytes,
                         CL_FALSE,
@@ -980,7 +991,7 @@ impl GpuContext {
                         },
                     )) != CL_SUCCESS
                     {
-                        note((self.cl.Finish)(queue));
+                        self.note((self.cl.Finish)(queue));
                         return None;
                     }
                 }

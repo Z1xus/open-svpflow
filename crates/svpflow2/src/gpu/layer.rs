@@ -3,7 +3,7 @@ use std::sync::Arc;
 use super::{
     CL_FALSE, CL_HALF_FLOAT, CL_R, CL_RGBA, CL_SUCCESS, CL_TRUE, CL_UNORM_INT8, CL_UNORM_INT16,
     ClCommandQueue, ClKernel, ClMem, ClUint, FnRelease, GpuContext, ImageSlot, KernelParams,
-    SuperHandle, note,
+    SuperHandle,
 };
 
 pub(super) const LAYER_VARIANT: u32 = 1 << 15;
@@ -60,7 +60,7 @@ impl LayerState {
     }
 
     fn keep(&mut self, chunk: i64, fit: &Arc<Layer>, cap: usize) {
-        if self.fits.len() >= cap {
+        while self.fits.len() >= cap {
             let (old, gone) = self.fits.remove(0);
             self.held
                 .retain(|(key, fit)| *key != old && *key != chunk && fit.strong_count() > 0);
@@ -207,7 +207,7 @@ impl GpuContext {
 
     unsafe fn run(&self, queue: ClCommandQueue, kernel: ClKernel, size: [usize; 2]) -> bool {
         unsafe {
-            note((self.cl.EnqueueNDRangeKernel)(
+            self.note((self.cl.EnqueueNDRangeKernel)(
                 queue,
                 kernel,
                 2,
@@ -226,7 +226,7 @@ impl GpuContext {
             let mut err = 0;
             state.queue =
                 unsafe { (self.cl.CreateCommandQueue)(self.context, self.device, 0, &raw mut err) };
-            if err != CL_SUCCESS || state.queue.is_null() {
+            if self.note(err) != CL_SUCCESS || state.queue.is_null() {
                 state.queue = std::ptr::null_mut();
                 return None;
             }
@@ -241,7 +241,7 @@ impl GpuContext {
                 let mut err = 0;
                 *kernel =
                     unsafe { (self.cl.CreateKernel)(self.program, name.as_ptr(), &raw mut err) };
-                if err != CL_SUCCESS || kernel.is_null() {
+                if self.note(err) != CL_SUCCESS || kernel.is_null() {
                     *kernel = std::ptr::null_mut();
                     return None;
                 }
@@ -274,7 +274,7 @@ impl GpuContext {
                     self.ensure_image(&mut state.vectors[index], grid.0, grid.1, CL_UNORM_INT16)?;
                 let origin = [0usize; 3];
                 let region = [grid.0, grid.1, 1];
-                if note((self.cl.EnqueueWriteImage)(
+                if self.note((self.cl.EnqueueWriteImage)(
                     queue,
                     image,
                     CL_FALSE,
@@ -379,12 +379,17 @@ impl GpuContext {
         if let Some((_, fit)) = held.fits.iter().find(|(key, _)| *key == chunk) {
             return Some(Arc::clone(fit));
         }
-        let mut state = self.layer.lock().ok()?;
-        let (stats_cap, fit_cap) = if self.mark().epoch == 0 {
+        let width = usize::try_from(params[0].width).ok()?;
+        let height = usize::try_from(params[0].height).ok()?;
+        let chroma = usize::try_from(params[1].width * params[1].height).ok()?;
+        let bytes = (width * height * 5 + chroma * 4) * size_of::<f32>();
+        let (stats_cap, fit_cap) = if !self.strained() && self.room(bytes.saturating_mul(STATS_CAP))
+        {
             (STATS_CAP, FIT_CAP)
         } else {
             (3, 2)
         };
+        let mut state = self.layer.lock().ok()?;
         if let Some(pos) = state.fits.iter().position(|(key, _)| *key == chunk) {
             let entry = state.fits.remove(pos);
             let fit = Arc::clone(&entry.1);
@@ -397,10 +402,6 @@ impl GpuContext {
             return Some(fit);
         }
         unsafe { self.layer_setup(&mut state) }?;
-        let width = usize::try_from(params[0].width).ok()?;
-        let height = usize::try_from(params[0].height).ok()?;
-        let chroma = usize::try_from(params[1].width * params[1].height).ok()?;
-        let bytes = (width * height * 5 + chroma * 4) * size_of::<f32>();
         let mut parts = [None, None, None];
         for (slot, key) in parts.iter_mut().zip([chunk - 1, chunk, chunk + 1]) {
             if key < 0 || key > last {
@@ -427,13 +428,13 @@ impl GpuContext {
                 .try_for_each(|(index, group)| unsafe {
                     self.layer_stats(&mut state, mem, group, params, grid, index == 0)
                 });
-            if unsafe { note((self.cl.Finish)(state.queue)) } != CL_SUCCESS || stats.is_none() {
+            if unsafe { self.note((self.cl.Finish)(state.queue)) } != CL_SUCCESS || stats.is_none()
+            {
                 return None;
             }
             let count = i32::try_from(pairs.len() * 2).ok()?;
-            if state.stats.len() >= stats_cap {
-                state.stats.remove(0);
-            }
+            let over = (state.stats.len() + 1).saturating_sub(stats_cap);
+            state.stats.drain(..over);
             state.stats.push((key, Arc::clone(&sums), count));
             *slot = Some((sums, count));
         }
@@ -476,7 +477,7 @@ impl GpuContext {
                 && self.set(cover_kernel, 2, &w)
                 && self.set(cover_kernel, 3, &h)
                 && self.run(state.queue, cover_kernel, [cells.0, cells.1])
-                && note((self.cl.EnqueueReadBuffer)(
+                && self.note((self.cl.EnqueueReadBuffer)(
                     state.queue,
                     found,
                     CL_TRUE,
@@ -493,7 +494,7 @@ impl GpuContext {
             distances(&mut gaps, cells.0);
             let origin = [0usize; 3];
             let region = [cells.0, cells.1, 1];
-            if note((self.cl.EnqueueWriteImage)(
+            if self.note((self.cl.EnqueueWriteImage)(
                 state.queue,
                 made.cover.0,
                 CL_TRUE,
