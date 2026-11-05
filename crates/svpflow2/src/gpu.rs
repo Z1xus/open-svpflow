@@ -351,6 +351,13 @@ impl Drop for GpuContext {
             if let Ok(mut cache) = self.super_cache.lock() {
                 cache.clear();
             }
+            if let (Ok(mut pins), Some(Ok(unit))) =
+                (self.pins.lock(), self.units.first().map(|u| u.lock()))
+            {
+                for pin in pins.drain(..) {
+                    self.release_pin(unit.queue, &pin);
+                }
+            }
             for unit in &self.units {
                 if let Ok(u) = unit.lock() {
                     self.release_unit(&u);
@@ -363,11 +370,6 @@ impl Drop for GpuContext {
                             (self.cl.ReleaseMemObject)(b.0);
                         }
                     }
-                }
-            }
-            if let Ok(mut pins) = self.pins.lock() {
-                for pin in pins.drain(..) {
-                    (self.cl.ReleaseMemObject)(pin.mem);
                 }
             }
             if let Ok(mut pool) = self.blend_units.lock() {
@@ -1525,7 +1527,7 @@ impl GpuContext {
             if pin.size >= size {
                 return Some(pin);
             }
-            unsafe { (self.cl.ReleaseMemObject)(pin.mem) };
+            unsafe { self.release_pin(q, &pin) };
         }
         let mut err = 0;
         unsafe {
@@ -1560,6 +1562,20 @@ impl GpuContext {
                 ptr: ptr.cast(),
                 size,
             })
+        }
+    }
+
+    unsafe fn release_pin(&self, q: ClCommandQueue, pin: &Pin) {
+        unsafe {
+            (self.cl.EnqueueUnmapMemObject)(
+                q,
+                pin.mem,
+                pin.ptr.cast(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            );
+            (self.cl.ReleaseMemObject)(pin.mem);
         }
     }
 

@@ -73,6 +73,8 @@ pub type FnEnqueueMapBuffer = unsafe extern "C" fn(
     *mut c_void,
     *mut ClInt,
 ) -> *mut c_void;
+pub type FnEnqueueUnmap =
+    unsafe extern "C" fn(Handle, Handle, *mut c_void, ClUint, *const c_void, *mut c_void) -> ClInt;
 pub type FnEnqueueReadBuffer = unsafe extern "C" fn(
     Handle,
     Handle,
@@ -171,6 +173,7 @@ pub struct OpenCl {
     pub CreateBuffer: FnCreateBuffer,
     pub EnqueueReadBuffer: FnEnqueueReadBuffer,
     pub EnqueueMapBuffer: FnEnqueueMapBuffer,
+    pub EnqueueUnmapMemObject: FnEnqueueUnmap,
     pub EnqueueWriteBuffer: FnEnqueueReadBuffer,
     pub SetKernelArg: FnSetKernelArg,
     pub EnqueueNDRangeKernel: FnEnqueueNDRangeKernel,
@@ -220,6 +223,7 @@ impl OpenCl {
                 CreateBuffer: sym!("clCreateBuffer"),
                 EnqueueReadBuffer: sym!("clEnqueueReadBuffer"),
                 EnqueueMapBuffer: sym!("clEnqueueMapBuffer"),
+                EnqueueUnmapMemObject: sym!("clEnqueueUnmapMemObject"),
                 EnqueueWriteBuffer: sym!("clEnqueueWriteBuffer"),
                 SetKernelArg: sym!("clSetKernelArg"),
                 EnqueueNDRangeKernel: sym!("clEnqueueNDRangeKernel"),

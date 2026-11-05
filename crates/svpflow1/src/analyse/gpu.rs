@@ -586,7 +586,17 @@ impl RefineGpu {
         if buffer.capacity < size {
             let old = std::mem::take(buffer);
             if old.mem != 0 {
-                unsafe { (self.cl.ReleaseMemObject)(old.mem as Handle) };
+                unsafe {
+                    (self.cl.EnqueueUnmapMemObject)(
+                        queue as Handle,
+                        old.mem as Handle,
+                        old.host as *mut c_void,
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                    );
+                    (self.cl.ReleaseMemObject)(old.mem as Handle);
+                }
             }
             let capacity = size.next_multiple_of(4096);
             let mut err = 0;
