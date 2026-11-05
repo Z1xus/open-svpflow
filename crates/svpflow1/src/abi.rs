@@ -17,6 +17,7 @@ pub unsafe extern "system" fn VapourSynthPluginInit(
     register: Option<vs::Register>,
     plugin: vs::Raw,
 ) {
+    svpflow_host::pin();
     let Some(config) = config else {
         return;
     };

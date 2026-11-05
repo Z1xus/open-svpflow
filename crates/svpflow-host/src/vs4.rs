@@ -512,6 +512,7 @@ fn args4(args: &CStr) -> CString {
 }
 
 pub unsafe fn init(plugin: Raw, api: ConstRaw, config: &Plugin, functions: &[Function]) {
+    crate::pin();
     if api.is_null() {
         return;
     }

@@ -826,6 +826,7 @@ pub unsafe fn init(
     functions: &'static [Function],
     description: &'static CStr,
 ) -> *const c_char {
+    crate::pin();
     if let Some(api) = api() {
         for function in functions {
             unsafe {
