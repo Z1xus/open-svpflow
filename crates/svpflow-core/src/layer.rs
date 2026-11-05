@@ -231,7 +231,7 @@ fn set((a, b): (f32, f32)) -> bool {
     (a - 1.0).abs() > 0.02 || b.abs() > 1.0
 }
 
-fn distances(cells: &mut [u8], width: usize) {
+pub fn distances(cells: &mut [u8], width: usize) {
     let near = |cells: &[u8], at: usize, others: [Option<usize>; 4]| {
         others.into_iter().flatten().fold(cells[at], |best, other| {
             best.min(cells[other].saturating_add(1))
@@ -276,6 +276,7 @@ fn window(
     parts: [Option<&Stats>; 3],
     at: usize,
     limit: f32,
+    strict: bool,
 ) -> Option<((f32, f32), std::ops::Range<usize>)> {
     let own = parts[1]?;
     let sums = &own.luma[at];
@@ -300,6 +301,9 @@ fn window(
         let (found, e, range) = best;
         (e < 1.7 * same + 4.0 && found != (1.0, 0.0)).then_some((found, range))
     };
+    if !strict {
+        return pick(false);
+    }
     let near = [parts[0], parts[2]]
         .into_iter()
         .flatten()
@@ -317,6 +321,7 @@ pub fn fit(
     parts: [Option<&Stats>; 3],
     (width, height): (usize, usize),
     limit: f32,
+    strict: bool,
     ratio: usize,
 ) -> Option<Fit> {
     parts[1]?;
@@ -331,7 +336,7 @@ pub fn fit(
             scope.spawn(move |_| {
                 for (at, (rough, offsets)) in rough.iter_mut().zip(offsets).enumerate() {
                     let at = index * band + at;
-                    let Some(((a, b), range)) = window(parts, at, limit) else {
+                    let Some(((a, b), range)) = window(parts, at, limit, strict) else {
                         continue;
                     };
                     let at = (at / width / ratio) * half + (at % width) / ratio;
@@ -351,14 +356,9 @@ pub fn fit(
         }
     });
 
-    let fixed = |value: f32, scale: f32| (value * scale).round().clamp(-32767.0, 32767.0) as i16;
-    let mut luma = vec![0; width * height * 2];
-    let rows = height / ratio * 2;
-    let mut chroma = [vec![0; half * rows], vec![0; half * rows]];
     let cells = (width.div_ceil(CELL), height.div_ceil(CELL));
     let mut cover = vec![255; cells.0 * cells.1];
-    let (gains, shifts) = luma.split_at_mut(width * height);
-    gains.fill(GAIN as i16);
+    let mut kept = vec![false; width * height];
     for y in 0..height {
         for x in 0..width {
             let at = y * width + x;
@@ -378,23 +378,66 @@ pub fn fit(
                 }
                 cover[y / CELL * cells.0 + x / CELL] = 0;
             }
-            gains[at] = fixed(rough[at].0, GAIN);
-            shifts[at] = fixed(rough[at].1, OFFSET);
-            let at = (y / ratio) * half + x / ratio;
-            let share = (ratio * ratio) as f32;
-            for (plane, offset) in chroma.iter_mut().zip(offsets[y * width + x]) {
-                plane[at] += fixed(offset / share, OFFSET);
-            }
+            kept[at] = true;
         }
     }
     distances(&mut cover, cells.0);
-    for (row, cover) in cover.chunks_exact(cells.0).enumerate() {
+    let model = |at: usize| {
+        if kept[at] {
+            (rough[at].0, rough[at].1, offsets[at])
+        } else {
+            (1.0, 0.0, [0.0; 2])
+        }
+    };
+    Some(assemble((width, height), ratio, model, &cover))
+}
+
+#[must_use]
+pub fn assemble(
+    (width, height): (usize, usize),
+    ratio: usize,
+    model: impl Fn(usize) -> (f32, f32, [f32; 2]) + Sync,
+    cover: &[u8],
+) -> Fit {
+    let fixed = |value: f32, scale: f32| (value * scale).round().clamp(-32767.0, 32767.0) as i16;
+    let half = width / ratio;
+    let rows = height / ratio;
+    let mut luma = vec![0; width * height * 2];
+    let mut chroma = [vec![0; half * rows * 2], vec![0; half * rows * 2]];
+    let (gains, shifts) = luma.split_at_mut(width * height);
+    let share = (ratio * ratio) as f32;
+    let band = rows.div_ceil(crate::threads::workers()).max(1);
+    let [first, second] = &mut chroma;
+    crate::threads::scope(|scope| {
+        let bands = gains
+            .chunks_mut(band * ratio * width)
+            .zip(shifts.chunks_mut(band * ratio * width))
+            .zip(first[..half * rows].chunks_mut(band * half))
+            .zip(second[..half * rows].chunks_mut(band * half));
+        for (index, (((gains, shifts), first), second)) in bands.enumerate() {
+            let model = &model;
+            scope.spawn(move |_| {
+                let start = index * band * ratio * width;
+                for (local, (gain, shift)) in gains.iter_mut().zip(shifts.iter_mut()).enumerate() {
+                    let at = start + local;
+                    let (a, b, offsets) = model(at);
+                    *gain = fixed(a, GAIN);
+                    *shift = fixed(b, OFFSET);
+                    let target = (local / width / ratio) * half + (at % width) / ratio;
+                    first[target] += fixed(offsets[0] / share, OFFSET);
+                    second[target] += fixed(offsets[1] / share, OFFSET);
+                }
+            });
+        }
+    });
+    let cells = width.div_ceil(CELL);
+    for (row, cover) in cover.chunks_exact(cells).enumerate() {
         let at = (height / ratio + row) * half;
         for (cell, &distance) in chroma[1][at..].iter_mut().zip(cover) {
             *cell = i16::from(distance);
         }
     }
-    Some(Fit { luma, chroma })
+    Fit { luma, chroma }
 }
 
 impl Fit {
@@ -519,11 +562,10 @@ impl Layer<'_> {
 
     pub fn peel(&self, plane: usize, output: &mut [u8], pitch: usize, raw: Plane) {
         let (width, height) = self.plane(plane);
-        for y in 0..height {
-            for x in 0..width {
+        for (y, row) in output.chunks_mut(pitch).take(height).enumerate() {
+            for (x, out) in row[..width].iter_mut().enumerate() {
                 if self.gap(plane, x, y) <= 0.0 && self.texel(plane, x, y) != (1.0, 0.0) {
-                    let scene = self.scene(plane, raw, x as f32, y as f32, true).0;
-                    output[y * pitch + x] = pixel(scene);
+                    *out = pixel(self.scene(plane, raw, x as f32, y as f32, true).0);
                 }
             }
         }
@@ -531,21 +573,23 @@ impl Layer<'_> {
 
     pub fn unpeel(&self, plane: usize, output: &mut [u8], pitch: usize, frames: &Frames) {
         let (width, height) = self.plane(plane);
-        for y in 0..height {
-            for x in 0..width {
+        for (y, row) in output.chunks_mut(pitch).take(height).enumerate() {
+            for (x, out) in row[..width].iter_mut().enumerate() {
+                if self.gap(plane, x, y) > 0.0 {
+                    continue;
+                }
                 let (a, b) = self.texel(plane, x, y);
-                if self.gap(plane, x, y) > 0.0 || (a, b) == (1.0, 0.0) {
+                if (a, b) == (1.0, 0.0) {
                     continue;
                 }
                 let own = (frames.first[plane].at(x, y), frames.second[plane].at(x, y));
-                let at = y * pitch + x;
                 if a.abs() < MIN || (own.0 - own.1).abs() <= SAME {
-                    output[at] = pixel(mix(own.0, own.1, frames.time));
+                    *out = pixel(mix(own.0, own.1, frames.time));
                     continue;
                 }
                 let under = |own: f32| ((own - b) / a).clamp(0.0, 255.0);
-                let scene = median(f32::from(output[at]), under(own.0), under(own.1));
-                output[at] = pixel(a * scene + b);
+                let scene = median(f32::from(*out), under(own.0), under(own.1));
+                *out = pixel(a * scene + b);
             }
         }
     }

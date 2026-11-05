@@ -19,6 +19,7 @@ struct OpenCl {
     CreateImage: Option<FnCreateImage>,
     EnqueueReadBufferRect: FnEnqueueReadBufferRect,
     EnqueueWriteImage: FnEnqueueWriteImage,
+    EnqueueReadImage: FnEnqueueWriteImage,
     ReleaseKernel: FnRelease,
     ReleaseProgram: FnRelease,
     ReleaseCommandQueue: FnRelease,
@@ -41,6 +42,7 @@ impl OpenCl {
             CreateImage: unsafe { core.symbol("clCreateImage\0") }.ok(),
             EnqueueReadBufferRect: unsafe { core.symbol("clEnqueueReadBufferRect\0")? },
             EnqueueWriteImage: unsafe { core.symbol("clEnqueueWriteImage\0")? },
+            EnqueueReadImage: unsafe { core.symbol("clEnqueueReadImage\0")? },
             ReleaseKernel: unsafe { core.symbol("clReleaseKernel\0")? },
             ReleaseProgram: unsafe { core.symbol("clReleaseProgram\0")? },
             ReleaseCommandQueue: unsafe { core.symbol("clReleaseCommandQueue\0")? },
@@ -2750,7 +2752,7 @@ kernel void blend_resolve(
     sums[i] = 0.0f;
 }
 
-inline float2 layer_model(const float *t, float n, float limit) {
+inline float2 layer_model(const float *t, float n, float limit, int strict) {
     float mp = t[0]/n, mi = t[1]/n;
     float vp = t[2]/n - mp*mp, vi = t[4]/n - mi*mi, cov = t[3]/n - mp*mi;
     float a = cov/(vp+4.0f), b = mi - a*mp;
@@ -2758,6 +2760,7 @@ inline float2 layer_model(const float *t, float n, float limit) {
     float left = fmax(vi - 2.0f*a*cov + a*a*vp, 0.0f);
     float g = clamp((1.0f - left/fmax(same, 1e-3f) - 0.5f)/0.2f, 0.0f, 1.0f)
         * clamp((same-limit)/limit, 0.0f, 1.0f);
+    if (strict) g *= clamp((limit*0.5f - left)/(limit*0.25f), 0.0f, 1.0f);
     return (float2)(1.0f + g*(a-1.0f), g*b);
 }
 
@@ -2820,22 +2823,12 @@ kernel void layer_stats(
     for (int c = 0; c < channels; c++) sum[c] = total[c];
 }
 
-kernel void layer_fit(
-    global const float *prev, global const float *cur, global const float *next,
-    int n_prev, int n_cur, int n_next, write_only image2d_t fit, int width, int height,
-    float limit, int chroma_w, int chroma_h)
+inline float2 layer_pick(
+    global const float **parts, const int *counts, int at, const float *own, int n_cur,
+    float limit, int strict, int *from, int *to)
 {
-    int x = get_global_id(0), y = get_global_id(1);
-    int at = (y*width+x)*5;
-    int second = chroma_w*chroma_h*2;
-    int at_u = width*height*5 + ((y/(height/chroma_h))*chroma_w + x/(width/chroma_w))*2;
-    global const float *parts[3] = {prev, cur, next};
-    int counts[3] = {n_prev, n_cur, n_next};
-    float own[5];
-    for (int c = 0; c < 5; c++) own[c] = cur[at+c];
     float2 model = (float2)(1.0f, 0.0f);
     float error = 0.0f;
-    int from = 1, to = 1;
     for (int window = 0; window < 3; window++) {
         int lo = window == 2 ? 1 : 0, hi = window == 1 ? 1 : 2;
         float t[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -2845,17 +2838,44 @@ kernel void layer_fit(
             for (int c = 0; c < 5; c++) t[c] += parts[part][at+c];
             n += counts[part];
         }
-        float2 m = layer_model(t, n, limit*limit);
+        float2 m = layer_model(t, n, limit, strict);
         float e = layer_error(own, n_cur, m);
         if (window == 0 || e*1.15f + 2.0f < error) {
             model = m;
             error = e;
-            from = lo;
-            to = hi;
+            *from = lo;
+            *to = hi;
         }
     }
     float same = (own[4] - 2.0f*own[3] + own[2])/n_cur;
-    if (!(error < 1.7f*same + 4.0f)) model = (float2)(1.0f, 0.0f);
+    return error < 1.7f*same + 4.0f ? model : (float2)(1.0f, 0.0f);
+}
+
+kernel void layer_fit(
+    global const float *prev, global const float *cur, global const float *next,
+    int n_prev, int n_cur, int n_next, write_only image2d_t fit, int width, int height,
+    float limit, int chroma_w, int chroma_h, int strict)
+{
+    int x = get_global_id(0), y = get_global_id(1);
+    int at = (y*width+x)*5;
+    int second = chroma_w*chroma_h*2;
+    int at_u = width*height*5 + ((y/(height/chroma_h))*chroma_w + x/(width/chroma_w))*2;
+    global const float *parts[3] = {prev, cur, next};
+    int counts[3] = {n_prev, n_cur, n_next};
+    float own[5];
+    for (int c = 0; c < 5; c++) own[c] = cur[at+c];
+    int from = 1, to = 1;
+    float2 model = layer_pick(parts, counts, at, own, n_cur, limit*limit, strict, &from, &to);
+    int near = 0;
+    for (int part = 0; part < 3 && strict; part += 2) {
+        if (!counts[part]) continue;
+        float t[5];
+        for (int c = 0; c < 5; c++) t[c] = parts[part][at+c];
+        float2 m = layer_model(t, counts[part], limit*limit, 1);
+        near |= layer_set((float4)(m.x, m.y, 0.0f, 0.0f));
+    }
+    if (model.x == 1.0f && model.y == 0.0f && near)
+        model = layer_pick(parts, counts, at, own, n_cur, limit*limit, 0, &from, &to);
     float2 offset = (float2)(0.0f, 0.0f);
     if (model.x != 1.0f || model.y != 0.0f) {
         float t[4] = {0.0f, 0.0f, 0.0f, 0.0f};

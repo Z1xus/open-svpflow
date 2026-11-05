@@ -23,6 +23,14 @@ impl Drop for Owned {
 pub struct Layer {
     fit: Owned,
     cover: Owned,
+    gaps: Vec<u8>,
+}
+
+impl Layer {
+    #[must_use]
+    pub fn gaps(&self) -> &[u8] {
+        &self.gaps
+    }
 }
 
 pub struct Failed;
@@ -83,50 +91,6 @@ impl LayerState {
     }
 }
 
-fn distances(cells: &mut [u8], width: usize) {
-    for cell in cells.iter_mut() {
-        *cell = if *cell == 0 { 255 } else { 0 };
-    }
-    let near = |cells: &[u8], at: usize, others: [Option<usize>; 4]| {
-        others.into_iter().flatten().fold(cells[at], |best, other| {
-            best.min(cells[other].saturating_add(1))
-        })
-    };
-    let height = cells.len() / width;
-    for y in 0..height {
-        for x in 0..width {
-            let at = y * width + x;
-            let (left, right, up) = (x > 0, x + 1 < width, y > 0);
-            cells[at] = near(
-                cells,
-                at,
-                [
-                    left.then(|| at - 1),
-                    up.then(|| at - width),
-                    (up && left).then(|| at - width - 1),
-                    (up && right).then(|| at - width + 1),
-                ],
-            );
-        }
-    }
-    for y in (0..height).rev() {
-        for x in (0..width).rev() {
-            let at = y * width + x;
-            let (left, right, down) = (x > 0, x + 1 < width, y + 1 < height);
-            cells[at] = near(
-                cells,
-                at,
-                [
-                    right.then(|| at + 1),
-                    down.then(|| at + width),
-                    (down && right).then(|| at + width + 1),
-                    (down && left).then(|| at + width - 1),
-                ],
-            );
-        }
-    }
-}
-
 impl Layer {
     pub(super) fn images(&self) -> [ClMem; 2] {
         [self.fit.0, self.cover.0]
@@ -160,6 +124,39 @@ impl GpuContext {
                 }
             }
         }
+    }
+
+    pub fn layer_take(
+        &self,
+        chunk: i64,
+        layer: &Layer,
+        (width, height): (usize, usize),
+    ) -> Option<Vec<u16>> {
+        let mut state = self.layer.lock().ok()?;
+        let mut model = vec![0u16; width * height * 4];
+        let origin = [0usize; 3];
+        let region = [width, height, 1];
+        let status = unsafe {
+            self.note((self.cl.EnqueueReadImage)(
+                state.queue,
+                layer.fit.0,
+                CL_TRUE,
+                origin.as_ptr(),
+                region.as_ptr(),
+                width * 4 * size_of::<u16>(),
+                0,
+                model.as_mut_ptr().cast(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            ))
+        };
+        if status != CL_SUCCESS {
+            return None;
+        }
+        state.fits.retain(|(key, _)| *key != chunk);
+        state.held.retain(|(key, _)| *key != chunk);
+        Some(model)
     }
 
     pub fn layer_hold(&self, chunk: i32, last: i32, held: &mut LayerHeld) -> Vec<i32> {
@@ -355,13 +352,14 @@ impl GpuContext {
         params: &[KernelParams; 3],
         grid: (usize, usize),
         limit: f32,
+        strict: bool,
         held: &LayerHeld,
         pairs: impl FnMut(i64) -> Option<Vec<LayerPair>>,
     ) -> Result<Option<Arc<Layer>>, Failed> {
         if self.hi10 {
             return Ok(None);
         }
-        self.fit_chunk(chunk, last, params, grid, limit, held, pairs)
+        self.fit_chunk(chunk, last, params, grid, limit, strict, held, pairs)
             .map(Some)
             .ok_or(Failed)
     }
@@ -373,6 +371,7 @@ impl GpuContext {
         params: &[KernelParams; 3],
         grid: (usize, usize),
         limit: f32,
+        strict: bool,
         held: &LayerHeld,
         mut pairs: impl FnMut(i64) -> Option<Vec<LayerPair>>,
     ) -> Option<Arc<Layer>> {
@@ -442,9 +441,10 @@ impl GpuContext {
         let cells = (width.div_ceil(8), height.div_ceil(8));
         let fit = unsafe { self.create_image(CL_RGBA, CL_HALF_FLOAT, width, height) }?;
         let cover = unsafe { self.create_image(CL_R, CL_UNORM_INT8, cells.0, cells.1) }?;
-        let made = Layer {
+        let mut made = Layer {
             fit: Owned(fit.mem, self.cl.ReleaseMemObject),
             cover: Owned(cover.mem, self.cl.ReleaseMemObject),
+            gaps: Vec::new(),
         };
         std::mem::forget(fit);
         std::mem::forget(cover);
@@ -468,6 +468,7 @@ impl GpuContext {
                 && self.set(fit_kernel, 9, &limit)
                 && self.set(fit_kernel, 10, &params[1].width)
                 && self.set(fit_kernel, 11, &params[1].height)
+                && self.set(fit_kernel, 12, &i32::from(strict))
                 && self.run(state.queue, fit_kernel, [width, height])
                 && self.set(clean_kernel, 0, &rough)
                 && self.set(clean_kernel, 1, &made.fit.0)
@@ -491,7 +492,10 @@ impl GpuContext {
             if !ready {
                 return None;
             }
-            distances(&mut gaps, cells.0);
+            for gap in &mut gaps {
+                *gap = if *gap == 0 { 255 } else { 0 };
+            }
+            svpflow_core::layer::distances(&mut gaps, cells.0);
             let origin = [0usize; 3];
             let region = [cells.0, cells.1, 1];
             if self.note((self.cl.EnqueueWriteImage)(
@@ -511,6 +515,7 @@ impl GpuContext {
                 return None;
             }
         }
+        made.gaps = gaps;
         let made = Arc::new(made);
         state.keep(chunk, &made, fit_cap);
         Some(made)

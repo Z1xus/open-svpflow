@@ -188,9 +188,22 @@ impl FilterState {
         if !crate::video_format::is_cpu_source(&self.video_info) {
             return None;
         }
-        let chunks = crate::peel::Chunks {
+        let get = |node, k| fetch.get(node, k);
+        let chunks = self.chunks(api, &get, data, last);
+        let mut layers = self.layers.lock().ok()?;
+        layers.fit(&chunks, n / layer::CHUNK, limit, false, &held.cpu)
+    }
+
+    fn chunks<'a>(
+        &self,
+        api: &'a frame::PlaneApi,
+        get: &'a dyn Fn(vs::Raw, i32) -> vs::ConstRaw,
+        data: &'a metadata::VectorData,
+        last: i32,
+    ) -> crate::peel::Chunks<'a> {
+        crate::peel::Chunks {
             api,
-            get: &|node, k| fetch.get(node, k),
+            get,
             source: self.clips.source,
             vectors: self.clips.vectors,
             data,
@@ -200,9 +213,7 @@ impl FilterState {
             ),
             last,
             ratio: self.chroma().0 as usize,
-        };
-        let mut layers = self.layers.lock().ok()?;
-        layers.fit(&chunks, n / layer::CHUNK, limit, &held.cpu)
+        }
     }
 
     fn repeat(&self, fetch: &Fetch, api: &frame::PlaneApi, k: i32, threshold: f64) -> bool {
@@ -318,109 +329,26 @@ impl FilterState {
             false,
         );
         let cap = self.field_cap(shape);
-        let count = cells.0 * cells.1;
-        let pairs = |chunk: i64| {
-            let pairs: Vec<i32> = layer::pairs(i32::try_from(chunk).ok()?, last).collect();
-            let needed: Vec<i32> = (pairs[0]..=pairs[pairs.len() - 1] + 1).collect();
-            let frames: Vec<_> = needed
-                .iter()
-                .map(|&k| fetch.get(self.clips.source, k))
-                .collect();
-            let vectors: Vec<_> = pairs
-                .iter()
-                .map(|&k| fetch.get(self.clips.vectors, k))
-                .collect();
-            let planes: Option<Vec<_>> = frames
-                .iter()
-                .map(|&frame| {
-                    (!frame.is_null())
-                        .then(|| self.uploads(api, frame))
-                        .flatten()
-                })
-                .collect();
-            let payloads: Option<Vec<_>> = vectors
-                .iter()
-                .map(|&frame| {
-                    let (ptr, stride, len) =
-                        (!frame.is_null()).then(|| unsafe { api.read_plane(frame, 0, 1) })??;
-                    Some(unsafe { slice::from_raw_parts(ptr, len.max(stride)) })
-                })
-                .collect();
-            let made = planes.zip(payloads).map(|(planes, payloads)| {
-                let handles: Vec<_> = planes.iter().map(|_| std::sync::Mutex::new(None)).collect();
-                let moved: Vec<_> = payloads
-                    .iter()
-                    .map(|_| std::sync::Mutex::new(None))
-                    .collect();
-                let fields = &self.field_cache;
-                let workers = svpflow_core::threads::workers();
-                gpu.keep_frames(planes.len());
-                svpflow_core::threads::scope(|scope| {
-                    for worker in 0..workers {
-                        let (planes, payloads, handles, moved) =
-                            (&planes, &payloads, &handles, &moved);
-                        let (needed, pairs, motion) = (&needed, &pairs, &motion);
-                        scope.spawn(move |_| {
-                            for index in (worker..planes.len()).step_by(workers) {
-                                let handle =
-                                    gpu.cache_frame(i64::from(needed[index]), planes[index]);
-                                if let Ok(mut slot) = handles[index].lock() {
-                                    *slot = handle;
-                                }
-                            }
-                            for index in (worker..payloads.len()).step_by(workers) {
-                                let k = pairs[index];
-                                let field = crate::core::cache_cell(fields, i64::from(k), cap)
-                                    .and_then(|cell| {
-                                        cell.get_or_init(|| {
-                                            let mut field = VectorField::new(shape);
-                                            field.update(payloads[index]);
-                                            Some(std::sync::Arc::new(field))
-                                        })
-                                        .clone()
-                                    });
-                                if let (Some(field), Ok(mut slot)) = (field, moved[index].lock()) {
-                                    let m = motion(k, &field);
-                                    *slot = m[..4].iter().all(|v| v.len() >= count).then(|| {
-                                        (0..count)
-                                            .flat_map(|i| [m[2][i], m[1][i], m[0][i], m[3][i]])
-                                            .collect::<Vec<u16>>()
-                                    });
-                                }
-                            }
-                        });
-                    }
-                });
-                (handles, moved)
+        let get = |node, k| fetch.get(node, k);
+        let chunks = self.chunks(api, &get, vector_data, last);
+        let fields = &self.field_cache;
+        let motions = |k: i32, payload: &[u8]| {
+            let cell = crate::core::cache_cell(fields, i64::from(k), cap)?;
+            let field = cell.get_or_init(|| {
+                let mut field = VectorField::new(shape);
+                field.update(payload);
+                Some(std::sync::Arc::new(field))
             });
-            for frame in frames.into_iter().chain(vectors) {
-                fetch.drop(frame);
-            }
-            let (handles, moved) = made?;
-            let handles: Vec<crate::gpu::SuperHandle> = handles
-                .into_iter()
-                .map(|slot| slot.into_inner().ok().flatten())
-                .collect::<Option<_>>()?;
-            let frame = |k: i32| Some(handles[needed.binary_search(&k).ok()?].share());
-            pairs
-                .iter()
-                .zip(moved)
-                .map(|(&k, slot)| {
-                    let packed = slot.into_inner().ok().flatten()?;
-                    Some(crate::gpu::LayerPair {
-                        first: frame(k)?,
-                        second: frame(k + 1)?,
-                        packed,
-                    })
-                })
-                .collect()
+            Some(motion(k, field.as_ref()?))
         };
+        let pairs = |chunk: i64| chunks.uploaded(gpu, chunk, &motions);
         gpu.layer_fit(
             i64::from(n / layer::CHUNK),
             i64::from(last / layer::CHUNK),
             &kernel,
             cells,
             limit,
+            false,
             &held.gpu,
             pairs,
         )
