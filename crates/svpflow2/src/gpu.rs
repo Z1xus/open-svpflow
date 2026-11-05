@@ -2735,7 +2735,7 @@ kernel void blend_resolve_source(
         total = term + sums[i];
     }
     float value = total / divisor;
-    if (gamma != 1.0f && i < luma) value = 255.0f * powr(value, 1.0f / gamma);
+    if (gamma != 1.0f && i < luma) value = 255.0f * powr(fmax(value, 0.0f), 1.0f / gamma);
     destination[i] = (uchar)clamp(rint(value), 0.0f, 255.0f);
     sums[i] = 0.0f;
 }
@@ -2745,7 +2745,7 @@ kernel void blend_resolve(
 {
     size_t i = get_global_id(0);
     float value = sums[i] / divisor;
-    if (gamma != 1.0f && i < luma) value = 255.0f * powr(value, 1.0f / gamma);
+    if (gamma != 1.0f && i < luma) value = 255.0f * powr(fmax(value, 0.0f), 1.0f / gamma);
     destination[i] = (uchar)clamp(rint(value), 0.0f, 255.0f);
     sums[i] = 0.0f;
 }

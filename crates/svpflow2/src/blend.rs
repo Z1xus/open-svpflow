@@ -63,9 +63,7 @@ unsafe fn plan(
     vsapi: vs::ConstRaw,
 ) -> Result<Plan, &'static str> {
     let options = &inner.options;
-    let reason = if inner.gpu.is_none() {
-        Some("GPU rendering is required (build the super clip with gpu:1)")
-    } else if !video_format::is_cpu_source(&inner.video_info) {
+    let reason = if !video_format::is_cpu_source(&inner.video_info) {
         Some("clip must be YUV 4:2:0 or 4:4:4 8-bit")
     } else if options.padding(&vs::Source::source(&inner.video_info)) != (0, 0)
         || options.debug_qmap()
@@ -170,12 +168,8 @@ impl BlendState {
         let api = unsafe { frame::PlaneApi::load(vsapi) }?;
         let get_frame = unsafe { vs::table_fn::<vs::GetFrameFilter>(vsapi, vs::GET_FRAME_FILTER) }?;
         let free_frame = unsafe { vs::table_fn::<vs::FreeFrame>(vsapi, vs::FREE_FRAME) };
-        let Plan { info, .. } = &self.plan;
-        let width = usize::try_from(info.width).ok()?;
-        let height = usize::try_from(info.height).ok()?;
-        let (cx, cy) = video_format::chroma_divisors(info);
-        let chroma = (width / cx as usize, height / cy as usize);
-        let sizes = [(width, height), chroma, chroma];
+        let sizes = self.sizes()?;
+        let [(width, height), chroma, _] = sizes;
         let job = gpu.blend_begin(width.max(chroma.0 * 2), height, chroma.1, self.plan.gamma)?;
         for (frame, weight) in self.plan.window(n) {
             job.start(weight);
@@ -196,18 +190,7 @@ impl BlendState {
                 return None;
             }
         }
-        let center = self
-            .plan
-            .center(n)
-            .clamp(0, i64::from(self.plan.frames - 1)) as i32;
-        let source = get_node(
-            get_frame,
-            self.inner.clips.source,
-            self.inner.source_frame(center),
-            frame_ctx,
-        );
-        let output = unsafe { api.new_frame(info.format, info.width, info.height, source, core) };
-        drop_frame(source, free_frame);
+        let output = unsafe { self.new_output(n, &api, get_frame, free_frame, frame_ctx, core) };
         let Some(output) = output else {
             gpu.blend_abort(job);
             return None;
@@ -235,6 +218,115 @@ impl BlendState {
             unsafe { api.free(output.cast_const()) };
             return None;
         }
+        let info = &self.plan.info;
+        unsafe { api.set_duration(output, info.fps_den, info.fps_num) };
+        Some(output.cast_const())
+    }
+
+    fn sizes(&self) -> Option<[(usize, usize); 3]> {
+        let info = &self.plan.info;
+        let width = usize::try_from(info.width).ok()?;
+        let height = usize::try_from(info.height).ok()?;
+        let (cx, cy) = video_format::chroma_divisors(info);
+        let chroma = (width / cx as usize, height / cy as usize);
+        Some([(width, height), chroma, chroma])
+    }
+
+    unsafe fn new_output(
+        &self,
+        n: i32,
+        api: &frame::PlaneApi,
+        get_frame: vs::GetFrameFilter,
+        free_frame: Option<vs::FreeFrame>,
+        frame_ctx: vs::Raw,
+        core: vs::Raw,
+    ) -> Option<vs::Raw> {
+        let info = &self.plan.info;
+        let center = self
+            .plan
+            .center(n)
+            .clamp(0, i64::from(self.plan.frames - 1)) as i32;
+        let source = get_node(
+            get_frame,
+            self.inner.clips.source,
+            self.inner.source_frame(center),
+            frame_ctx,
+        );
+        let output = unsafe { api.new_frame(info.format, info.width, info.height, source, core) };
+        drop_frame(source, free_frame);
+        output
+    }
+
+    unsafe fn render_cpu(
+        &self,
+        n: i32,
+        frame_ctx: vs::Raw,
+        core: vs::Raw,
+        vsapi: vs::ConstRaw,
+        held: &Held,
+    ) -> Option<vs::ConstRaw> {
+        let api = unsafe { frame::PlaneApi::load(vsapi) }?;
+        let get_frame = unsafe { vs::table_fn::<vs::GetFrameFilter>(vsapi, vs::GET_FRAME_FILTER) }?;
+        let free_frame = unsafe { vs::table_fn::<vs::FreeFrame>(vsapi, vs::FREE_FRAME) };
+        let sizes = self.sizes()?;
+        let Plan { gamma, divisor, .. } = self.plan;
+        let curved = |plane| plane == 0 && gamma.to_bits() != 1.0_f32.to_bits();
+        let mut sums = sizes.map(|(width, height)| vec![0.0f32; width * height]);
+        for (frame, weight) in self.plan.window(n) {
+            let rendered = unsafe {
+                self.inner
+                    .get_frame(frame, None, frame_ctx, core, vsapi, held)
+            };
+            let added = !rendered.is_null()
+                && (0..)
+                    .zip(&mut sums)
+                    .zip(sizes)
+                    .all(|((plane, sum), (width, height))| {
+                        let Some((data, stride, len)) =
+                            (unsafe { api.read_plane(rendered, plane, height) })
+                        else {
+                            return false;
+                        };
+                        let data = unsafe { std::slice::from_raw_parts(data, len) };
+                        for (row, sum) in data.chunks(stride).zip(sum.chunks_mut(width)) {
+                            for (sum, &value) in sum.iter_mut().zip(row) {
+                                let value = f32::from(value);
+                                let value = if curved(plane) {
+                                    (value / 255.0).powf(gamma)
+                                } else {
+                                    value
+                                };
+                                *sum += weight * value;
+                            }
+                        }
+                        true
+                    });
+            drop_frame(rendered, free_frame);
+            if !added {
+                return None;
+            }
+        }
+        let output = unsafe { self.new_output(n, &api, get_frame, free_frame, frame_ctx, core) }?;
+        for (plane, (sum, (width, height))) in (0..).zip(sums.iter().zip(sizes)) {
+            let Some((data, stride, len)) = (unsafe { api.write_plane(output, plane, height) })
+            else {
+                unsafe { api.free(output.cast_const()) };
+                return None;
+            };
+            let data = unsafe { std::slice::from_raw_parts_mut(data, len) };
+            for (row, sum) in data.chunks_mut(stride).zip(sum.chunks(width)) {
+                for (pixel, &sum) in row.iter_mut().zip(sum) {
+                    let value = sum / divisor;
+                    let value = if curved(plane) {
+                        255.0 * value.max(0.0).powf(1.0 / gamma)
+                    } else {
+                        value
+                    };
+                    *pixel = value.round_ties_even().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        let info = &self.plan.info;
         unsafe { api.set_duration(output, info.fps_den, info.fps_num) };
         Some(output.cast_const())
     }
@@ -353,18 +445,29 @@ unsafe extern "system" fn get_frame(
                 return std::ptr::null();
             }
             let gpu = state.inner.gpu.as_ref();
-            let output = loop {
-                let mark = gpu.map(GpuContext::mark);
-                let output = unsafe { state.render(n, frame_ctx, core, vsapi, &held) };
-                if output.is_some() || !gpu.zip(mark).is_some_and(|(gpu, mark)| gpu.recover(mark)) {
-                    break output;
+            if let Some(gpu) = gpu {
+                gpu.retry();
+            }
+            let output = if gpu.is_none_or(GpuContext::cpu_render) {
+                None
+            } else {
+                loop {
+                    let mark = gpu.map(GpuContext::mark);
+                    let output = unsafe { state.render(n, frame_ctx, core, vsapi, &held) };
+                    if output.is_some()
+                        || !gpu.zip(mark).is_some_and(|(gpu, mark)| gpu.recover(mark))
+                    {
+                        break output;
+                    }
                 }
             };
+            let output =
+                output.or_else(|| unsafe { state.render_cpu(n, frame_ctx, core, vsapi, &held) });
             if output.is_none()
                 && let Some(set_error) =
                     unsafe { vs::table_fn::<vs::SetFilterError>(vsapi, vs::SET_FILTER_ERROR) }
             {
-                unsafe { set_error(c"SVSmoothFpsBlend: GPU blend failed".as_ptr(), frame_ctx) };
+                unsafe { set_error(c"SVSmoothFpsBlend: blend failed".as_ptr(), frame_ctx) };
             }
             output.unwrap_or(std::ptr::null())
         }
