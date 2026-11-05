@@ -2090,6 +2090,7 @@ pub(crate) const KERNEL_SRC: &str = r"
 #define LAYER_FILL 4.0f
 #define LAYER_NEAR 0.0f
 #define LAYER_SAME 2.5f
+#define LAYER_APART 24.0f
 #define STILL_AT(still, p, x, y) (read_imagef(still, linear_sampler, \
     ((float2)(x, y) + 0.5f) * (float2)(p.x_ratio, p.y_ratio)).x > 0.4f)
 #if HI10P
@@ -2265,6 +2266,22 @@ inline float2 layer_scene(
     return weight > 0.0f ? (float2)(total/weight, 1.0f) : (float2)(value, 0.0f);
 }
 
+inline void layer_agree(
+    read_only image2d_t raw_f, read_only image2d_t raw_b, read_only image2d_t layer,
+    const Params *p, float2 at_f, float2 at_b, float2 *moved_f, float2 *moved_b)
+{
+    int on_f = !layer_plain(p, read_imagef(layer, linear_sampler, layer_luma(p, at_f)));
+    int on_b = !layer_plain(p, read_imagef(layer, linear_sampler, layer_luma(p, at_b)));
+    if (on_f == on_b || moved_f->y < 0.5f || moved_b->y < 0.5f) return;
+    if (on_f) {
+        float raw = layer_raw(raw_f, p, at_f);
+        if (fabs(raw - moved_b->x) < fabs(moved_f->x - moved_b->x)) moved_f->x = raw;
+    } else {
+        float raw = layer_raw(raw_b, p, at_b);
+        if (fabs(raw - moved_f->x) < fabs(moved_b->x - moved_f->x)) moved_b->x = raw;
+    }
+}
+
 kernel void linear_luma(read_only image2d_t source, write_only image2d_t destination) {
     int2 position = (int2)(get_global_id(0), get_global_id(1));
 #if HI10P
@@ -2316,6 +2333,7 @@ kernel void render_frame(
         float4 model = read_imagef(layer, linear_sampler, layer_luma(&p, at));
         float2 moved_f = layer_scene(raw_f, layer, &p, at_f, 1);
         float2 moved_b = layer_scene(raw_b, layer, &p, at_b, 1);
+        layer_agree(raw_f, raw_b, layer, &p, at_f, at_b, &moved_f, &moved_b);
         float2 base_f = layer_scene(raw_f, layer, &p, at, 0);
         float2 base_b = layer_scene(raw_b, layer, &p, at, 0);
         float base = mix(base_f.x, base_b.x, time);
@@ -2635,6 +2653,7 @@ kernel void blend_frame(
             float4 model = read_imagef(layer, linear_sampler, layer_luma(&p, at));
             float2 moved_f = layer_scene(raw_f, layer, &p, at_f, 1);
             float2 moved_b = layer_scene(raw_b, layer, &p, at_b, 1);
+            layer_agree(raw_f, raw_b, layer, &p, at_f, at_b, &moved_f, &moved_b);
             float2 base_f = layer_scene(raw_f, layer, &p, at, 0);
             float2 base_b = layer_scene(raw_b, layer, &p, at, 0);
             float base = mix(base_f.x, base_b.x, time);
@@ -2788,10 +2807,11 @@ inline void layer_terms(
     float pa = layer_raw(second, p, clamp(at+step_b, zero, top));
     v[0] = pb + pa;
     v[1] = ib + ia;
-    if (channels == 5) {
+    if (channels == 6) {
         v[2] = pb*pb + pa*pa;
         v[3] = pb*ib + pa*ia;
         v[4] = ib*ib + ia*ia;
+        v[5] = (fabs(pb-ib) > LAYER_APART) + (fabs(pa-ia) > LAYER_APART);
     }
 }
 
@@ -2805,7 +2825,7 @@ kernel void layer_stats(
     int x = get_global_id(0), y = get_global_id(1);
     if (x >= p.width || y >= p.height) return;
     global float *sum = sums + base + (y*p.width+x)*channels;
-    float v[5], total[5];
+    float v[6], total[6];
     layer_terms(v, f0, f1, m0, &p, channels);
     for (int c = 0; c < channels; c++) total[c] = reset ? v[c] : sum[c] + v[c];
     if (pairs > 1) {
@@ -2825,17 +2845,17 @@ kernel void layer_stats(
 
 inline float2 layer_pick(
     global const float **parts, const int *counts, int at, const float *own, int n_cur,
-    float limit, int strict, int *from, int *to)
+    float limit, int strict, float proof, int *from, int *to)
 {
     float2 model = (float2)(1.0f, 0.0f);
-    float error = 0.0f;
+    float error = 0.0f, seen = 0.0f;
     for (int window = 0; window < 3; window++) {
         int lo = window == 2 ? 1 : 0, hi = window == 1 ? 1 : 2;
-        float t[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        float t[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         float n = 0.0f;
         for (int part = lo; part <= hi; part++) {
             if (!counts[part]) continue;
-            for (int c = 0; c < 5; c++) t[c] += parts[part][at+c];
+            for (int c = 0; c < 6; c++) t[c] += parts[part][at+c];
             n += counts[part];
         }
         float2 m = layer_model(t, n, limit, strict);
@@ -2843,39 +2863,40 @@ inline float2 layer_pick(
         if (window == 0 || e*1.15f + 2.0f < error) {
             model = m;
             error = e;
+            seen = t[5];
             *from = lo;
             *to = hi;
         }
     }
     float same = (own[4] - 2.0f*own[3] + own[2])/n_cur;
-    return error < 1.7f*same + 4.0f ? model : (float2)(1.0f, 0.0f);
+    return error < 1.7f*same + 4.0f && seen >= proof ? model : (float2)(1.0f, 0.0f);
 }
 
 kernel void layer_fit(
     global const float *prev, global const float *cur, global const float *next,
     int n_prev, int n_cur, int n_next, write_only image2d_t fit, int width, int height,
-    float limit, int chroma_w, int chroma_h, int strict)
+    float limit, int chroma_w, int chroma_h, int strict, float proof)
 {
     int x = get_global_id(0), y = get_global_id(1);
-    int at = (y*width+x)*5;
+    int at = (y*width+x)*6;
     int second = chroma_w*chroma_h*2;
-    int at_u = width*height*5 + ((y/(height/chroma_h))*chroma_w + x/(width/chroma_w))*2;
+    int at_u = width*height*6 + ((y/(height/chroma_h))*chroma_w + x/(width/chroma_w))*2;
     global const float *parts[3] = {prev, cur, next};
     int counts[3] = {n_prev, n_cur, n_next};
-    float own[5];
-    for (int c = 0; c < 5; c++) own[c] = cur[at+c];
+    float own[6];
+    for (int c = 0; c < 6; c++) own[c] = cur[at+c];
     int from = 1, to = 1;
-    float2 model = layer_pick(parts, counts, at, own, n_cur, limit*limit, strict, &from, &to);
+    float2 model = layer_pick(parts, counts, at, own, n_cur, limit*limit, strict, proof, &from, &to);
     int near = 0;
     for (int part = 0; part < 3 && strict; part += 2) {
         if (!counts[part]) continue;
-        float t[5];
-        for (int c = 0; c < 5; c++) t[c] = parts[part][at+c];
+        float t[6];
+        for (int c = 0; c < 6; c++) t[c] = parts[part][at+c];
         float2 m = layer_model(t, counts[part], limit*limit, 1);
         near |= layer_set((float4)(m.x, m.y, 0.0f, 0.0f));
     }
     if (model.x == 1.0f && model.y == 0.0f && near)
-        model = layer_pick(parts, counts, at, own, n_cur, limit*limit, 0, &from, &to);
+        model = layer_pick(parts, counts, at, own, n_cur, limit*limit, 0, proof, &from, &to);
     float2 offset = (float2)(0.0f, 0.0f);
     if (model.x != 1.0f || model.y != 0.0f) {
         float t[4] = {0.0f, 0.0f, 0.0f, 0.0f};

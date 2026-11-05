@@ -144,16 +144,18 @@ impl FilterState {
         }
     }
 
-    fn layer_plan(&self) -> Option<(i32, f32)> {
+    fn layer_plan(&self) -> Option<(i32, f32, f32)> {
         let limit = self.options.mask_peel()?;
+        let info = &self.video_info;
+        let proof = layer::proof((info.fps_num, info.fps_den));
         let last = self.video_info.num_frames - 2;
         let chroma = self.chroma();
         let even = chroma == (2, 2) || chroma == (1, 1);
-        (self.nvof.is_none() && last >= 0 && even).then_some((last, limit))
+        (self.nvof.is_none() && last >= 0 && even).then_some((last, limit, proof))
     }
 
     fn layer_wanted(&self, wanted: &mut Vec<(vs::Raw, i32)>, n: i32, held: &mut Held) {
-        let Some((last, _)) = self.layer_plan() else {
+        let Some((last, ..)) = self.layer_plan() else {
             return;
         };
         let (chunk, chunks) = (n / layer::CHUNK, last / layer::CHUNK);
@@ -184,14 +186,14 @@ impl FilterState {
         data: &metadata::VectorData,
         held: &Held,
     ) -> Option<std::sync::Arc<layer::Fit>> {
-        let (last, limit) = self.layer_plan()?;
+        let (last, limit, proof) = self.layer_plan()?;
         if !crate::video_format::is_cpu_source(&self.video_info) {
             return None;
         }
         let get = |node, k| fetch.get(node, k);
         let chunks = self.chunks(api, &get, data, last);
         let mut layers = self.layers.lock().ok()?;
-        layers.fit(&chunks, n / layer::CHUNK, limit, false, &held.cpu)
+        layers.fit(&chunks, n / layer::CHUNK, limit, proof, false, &held.cpu)
     }
 
     fn chunks<'a>(
@@ -302,7 +304,7 @@ impl FilterState {
         field: &VectorField,
         held: &Held,
     ) -> Result<Option<std::sync::Arc<crate::gpu::Layer>>, crate::gpu::Failed> {
-        let Some((last, limit)) = self.layer_plan() else {
+        let Some((last, limit, proof)) = self.layer_plan() else {
             return Ok(None);
         };
         let shape = *field.shape();
@@ -348,6 +350,7 @@ impl FilterState {
             &kernel,
             cells,
             limit,
+            proof,
             false,
             &held.gpu,
             pairs,

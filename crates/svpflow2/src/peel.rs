@@ -280,6 +280,7 @@ impl Layers {
         chunks: &Chunks,
         chunk: i32,
         limit: f32,
+        proof: f32,
         strict: bool,
         held: &Held,
     ) -> Option<Arc<Fit>> {
@@ -297,7 +298,14 @@ impl Layers {
             Some(stats)
         });
         let parts = parts.each_ref().map(Option::as_deref);
-        let fit = Arc::new(layer::fit(parts, chunks.size, limit, strict, chunks.ratio)?);
+        let fit = Arc::new(layer::fit(
+            parts,
+            chunks.size,
+            limit,
+            proof,
+            strict,
+            chunks.ratio,
+        )?);
         keep(&mut self.fits, chunk, &fit, FIT_CAP);
         Some(fit)
     }
@@ -319,6 +327,7 @@ enum Kind {
     Layer {
         data: metadata::VectorData,
         limit: f32,
+        proof: f32,
         last: i32,
         layers: Mutex<Layers>,
         gpu: Option<Box<Gpu>>,
@@ -444,6 +453,7 @@ pub(crate) unsafe extern "system" fn create_layer(
             kind: Kind::Layer {
                 data,
                 limit: layer::limit((error == 0).then_some(limit)),
+                proof: layer::proof((info.fps_num, info.fps_den)),
                 last: info.num_frames - 2,
                 layers: Mutex::default(),
                 gpu,
@@ -575,6 +585,7 @@ impl State {
         chunks: &Chunks,
         chunk: i32,
         limit: f32,
+        proof: f32,
         held: &crate::gpu::LayerHeld,
         layers: &Mutex<Layers>,
     ) -> Option<Arc<Fit>> {
@@ -596,6 +607,7 @@ impl State {
                 params,
                 gpu.grid,
                 limit,
+                proof,
                 true,
                 held,
                 &mut pairs,
@@ -740,6 +752,7 @@ unsafe extern "system" fn get_frame(
             Kind::Layer {
                 data,
                 limit,
+                proof,
                 last,
                 layers,
                 gpu,
@@ -785,13 +798,13 @@ unsafe extern "system" fn get_frame(
                 let fit = gpu
                     .filter(|gpu| !gpu.context.cpu_render())
                     .and_then(|gpu| unsafe {
-                        state.fit_gpu(gpu, &chunks, chunk, *limit, &held.gpu, layers)
+                        state.fit_gpu(gpu, &chunks, chunk, *limit, *proof, &held.gpu, layers)
                     })
                     .or_else(|| {
                         layers
                             .lock()
                             .ok()?
-                            .fit(&chunks, chunk, *limit, true, &held.cpu)
+                            .fit(&chunks, chunk, *limit, *proof, true, &held.cpu)
                     })?;
                 unsafe { state.layer(&api, &fit, core) }
             }

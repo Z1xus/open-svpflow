@@ -321,9 +321,9 @@ impl GpuContext {
             }
             let (pairs, reset) = (i32::try_from(group.len()).ok()?, i32::from(reset));
             for (plane, base, channels) in [
-                (0, 0, 5i32),
-                (1, luma * 5, 2),
-                (2, luma * 5 + chroma * 2, 2),
+                (0, 0, 6i32),
+                (1, luma * 6, 2),
+                (2, luma * 6 + chroma * 2, 2),
             ] {
                 let p = params[plane];
                 let size = [
@@ -352,6 +352,7 @@ impl GpuContext {
         params: &[KernelParams; 3],
         grid: (usize, usize),
         limit: f32,
+        proof: f32,
         strict: bool,
         held: &LayerHeld,
         pairs: impl FnMut(i64) -> Option<Vec<LayerPair>>,
@@ -359,7 +360,7 @@ impl GpuContext {
         if self.hi10 {
             return Ok(None);
         }
-        self.fit_chunk(chunk, last, params, grid, limit, strict, held, pairs)
+        self.fit_chunk(chunk, last, params, grid, limit, proof, strict, held, pairs)
             .map(Some)
             .ok_or(Failed)
     }
@@ -371,6 +372,7 @@ impl GpuContext {
         params: &[KernelParams; 3],
         grid: (usize, usize),
         limit: f32,
+        proof: f32,
         strict: bool,
         held: &LayerHeld,
         mut pairs: impl FnMut(i64) -> Option<Vec<LayerPair>>,
@@ -381,7 +383,7 @@ impl GpuContext {
         let width = usize::try_from(params[0].width).ok()?;
         let height = usize::try_from(params[0].height).ok()?;
         let chroma = usize::try_from(params[1].width * params[1].height).ok()?;
-        let bytes = (width * height * 5 + chroma * 4) * size_of::<f32>();
+        let bytes = (width * height * 6 + chroma * 4) * size_of::<f32>();
         let (stats_cap, fit_cap) = if !self.strained() && self.room(bytes.saturating_mul(STATS_CAP))
         {
             (STATS_CAP, FIT_CAP)
@@ -469,6 +471,7 @@ impl GpuContext {
                 && self.set(fit_kernel, 10, &params[1].width)
                 && self.set(fit_kernel, 11, &params[1].height)
                 && self.set(fit_kernel, 12, &i32::from(strict))
+                && self.set(fit_kernel, 13, &proof)
                 && self.run(state.queue, fit_kernel, [width, height])
                 && self.set(clean_kernel, 0, &rough)
                 && self.set(clean_kernel, 1, &made.fit.0)

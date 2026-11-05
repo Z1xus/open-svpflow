@@ -15,10 +15,23 @@ const SAME: f32 = 2.5;
 const GAIN: f32 = 4096.0;
 const OFFSET: f32 = 64.0;
 const CELL: usize = 8;
+const APART: f32 = 24.0;
+const PROOF: f32 = 2.0;
+const SPAN: f32 = 60.0;
 
 #[must_use]
 pub fn limit(limit: Option<f64>) -> f32 {
     limit.unwrap_or(6.0) as f32
+}
+
+#[must_use]
+pub fn proof((num, den): (i64, i64)) -> f32 {
+    let fps = if den > 0 {
+        num as f32 / den as f32
+    } else {
+        0.0
+    };
+    (fps / SPAN).max(PROOF)
 }
 
 #[must_use]
@@ -142,7 +155,7 @@ pub struct Pair<'a> {
 }
 
 pub struct Stats {
-    luma: Vec<[f32; 5]>,
+    luma: Vec<[f32; 6]>,
     chroma: [Vec<[f32; 2]>; 2],
     count: f32,
 }
@@ -175,12 +188,14 @@ fn gather<const N: usize>(
                                 raw.sample(x, (ay + dy).clamp(0.0, top.1), size)
                             };
                             let (pb, pa) = (moved(first, fx, fy), moved(second, bx, by));
+                            let apart = [pb - ib, pa - ia].into_iter().filter(|d| d.abs() > APART);
                             let terms = [
                                 pb + pa,
                                 ib + ia,
                                 pb * pb + pa * pa,
                                 pb * ib + pa * ia,
                                 ib * ib + ia * ia,
+                                apart.count() as f32,
                             ];
                             for (sum, term) in sum.iter_mut().zip(terms) {
                                 *sum += term;
@@ -206,7 +221,7 @@ pub fn stats(pairs: &[Pair], size: (usize, usize), chroma: usize) -> Stats {
     }
 }
 
-fn model(t: &[f32; 5], n: f32, limit: f32, strict: bool) -> (f32, f32) {
+fn model(t: &[f32; 6], n: f32, limit: f32, strict: bool) -> (f32, f32) {
     let (mp, mi) = (t[0] / n, t[1] / n);
     let (vp, vi, cov) = (t[2] / n - mp * mp, t[4] / n - mi * mi, t[3] / n - mp * mi);
     let a = cov / (vp + 4.0);
@@ -223,7 +238,7 @@ fn model(t: &[f32; 5], n: f32, limit: f32, strict: bool) -> (f32, f32) {
     (1.0 + g * (a - 1.0), g * b)
 }
 
-fn error(t: &[f32; 5], n: f32, (a, b): (f32, f32)) -> f32 {
+fn error(t: &[f32; 6], n: f32, (a, b): (f32, f32)) -> f32 {
     (t[4] - 2.0 * a * t[3] - 2.0 * b * t[1] + a * a * t[2] + 2.0 * a * b * t[0]) / n + b * b
 }
 
@@ -276,15 +291,16 @@ fn window(
     parts: [Option<&Stats>; 3],
     at: usize,
     limit: f32,
+    proof: f32,
     strict: bool,
 ) -> Option<((f32, f32), std::ops::Range<usize>)> {
     let own = parts[1]?;
     let sums = &own.luma[at];
     let same = (sums[4] - 2.0 * sums[3] + sums[2]) / own.count;
     let pick = |strict| {
-        let mut best = ((1.0, 0.0), 0.0, 0..3);
+        let mut best = ((1.0, 0.0), 0.0, 0..3, 0.0);
         for (window, range) in [0..3, 0..2, 1..3].into_iter().enumerate() {
-            let mut total = [0.0; 5];
+            let mut total = [0.0; 6];
             let mut n = 0.0;
             for part in parts[range.clone()].iter().flatten() {
                 for (total, sum) in total.iter_mut().zip(part.luma[at]) {
@@ -295,11 +311,11 @@ fn window(
             let found = model(&total, n, limit, strict);
             let e = error(sums, own.count, found);
             if window == 0 || e * 1.15 + 2.0 < best.1 {
-                best = (found, e, range);
+                best = (found, e, range, total[5]);
             }
         }
-        let (found, e, range) = best;
-        (e < 1.7 * same + 4.0 && found != (1.0, 0.0)).then_some((found, range))
+        let (found, e, range, seen) = best;
+        (e < 1.7 * same + 4.0 && found != (1.0, 0.0) && seen >= proof).then_some((found, range))
     };
     if !strict {
         return pick(false);
@@ -321,6 +337,7 @@ pub fn fit(
     parts: [Option<&Stats>; 3],
     (width, height): (usize, usize),
     limit: f32,
+    proof: f32,
     strict: bool,
     ratio: usize,
 ) -> Option<Fit> {
@@ -336,7 +353,7 @@ pub fn fit(
             scope.spawn(move |_| {
                 for (at, (rough, offsets)) in rough.iter_mut().zip(offsets).enumerate() {
                     let at = index * band + at;
-                    let Some(((a, b), range)) = window(parts, at, limit, strict) else {
+                    let Some(((a, b), range)) = window(parts, at, limit, proof, strict) else {
                         continue;
                     };
                     let at = (at / width / ratio) * half + (at % width) / ratio;
@@ -624,10 +641,22 @@ impl Layer<'_> {
                 }
                 let (ax, ay) = (x as f32, y as f32);
                 let moved = |raw: Plane, dx: f32, dy: f32| {
-                    let x = (ax + dx).clamp(0.0, top.0);
-                    self.scene(plane, raw, x, (ay + dy).clamp(0.0, top.1), true)
+                    let (x, y) = ((ax + dx).clamp(0.0, top.0), (ay + dy).clamp(0.0, top.1));
+                    let (a, b) = self.model(plane, x, y);
+                    let on = (a - 1.0).abs() >= 1e-4 || b.abs() >= 1e-2;
+                    let scene = self.scene(plane, raw, x, y, true);
+                    (scene, on, raw.sample(x, y, (width, height)))
                 };
-                let (moved_f, moved_b) = (moved(first, fx, fy), moved(second, bx, by));
+                let ((mut moved_f, on_f, raw_f), (mut moved_b, on_b, raw_b)) =
+                    (moved(first, fx, fy), moved(second, bx, by));
+                if on_f != on_b && moved_f.1 && moved_b.1 {
+                    let gap = (moved_f.0 - moved_b.0).abs();
+                    if on_f && (raw_f - moved_b.0).abs() < gap {
+                        moved_f.0 = raw_f;
+                    } else if on_b && (raw_b - moved_f.0).abs() < gap {
+                        moved_b.0 = raw_b;
+                    }
+                }
                 let base = mix(
                     self.scene(plane, first, ax, ay, false).0,
                     self.scene(plane, second, ax, ay, false).0,
