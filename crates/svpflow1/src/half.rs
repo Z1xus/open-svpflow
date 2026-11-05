@@ -34,6 +34,7 @@ struct State {
     vi: vs::VideoInfo,
     header: Box<[i32; 15]>,
     multiply: i32,
+    _live: svpflow_host::Live,
 }
 
 type Process = unsafe fn(&State, &Api, vs::ConstRaw, vs::Raw);
@@ -113,6 +114,7 @@ pub(crate) unsafe extern "system" fn create_halve(
         vi,
         header: Box::new([0; 15]),
         multiply: 0,
+        _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
     };
     unsafe { register(input, output, core, vsapi, c"SVHalve", state, halve_frame) };
     0
@@ -167,6 +169,7 @@ pub(crate) unsafe extern "system" fn create_double_vectors(
         vi,
         header,
         multiply,
+        _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
     };
     unsafe {
         register(

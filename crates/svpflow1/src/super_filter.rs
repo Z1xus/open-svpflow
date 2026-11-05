@@ -5,6 +5,7 @@ struct SuperState {
     vi: vs::VideoInfo,
     opts: SuperOpts,
     chroma_divisors: (usize, usize),
+    _live: svpflow_host::Live,
 }
 
 pub(crate) unsafe extern "system" fn create_super(
@@ -96,6 +97,7 @@ unsafe fn create_super_inner(
         vi: out_vi,
         opts,
         chroma_divisors,
+        _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
     }));
 
     unsafe {

@@ -217,6 +217,7 @@ struct State {
     info: vs::VideoInfo,
     size: (usize, usize),
     ratio: usize,
+    _live: svpflow_host::Live,
 }
 
 fn ratio(info: &vs::VideoInfo) -> usize {
@@ -315,6 +316,7 @@ pub(crate) unsafe extern "system" fn create_layer(
             },
             size: size(&info),
             ratio: ratio(&info),
+            _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
         })
     })();
     if state.is_none() {
@@ -347,6 +349,7 @@ pub(crate) unsafe extern "system" fn create_peel(
         info,
         size: size(&info),
         ratio: ratio(&info),
+        _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
     });
     let state =
         state.ok_or(c"SVPeel: the clip must be YUV420P8 or YUV444P8 with its layer from SVLayer");
@@ -384,6 +387,7 @@ pub(crate) unsafe extern "system" fn create_unpeel(
         info,
         size: size(&info),
         ratio: ratio(&info),
+        _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
     });
     let state = state.ok_or(
         c"SVUnpeel: both clips must be YUV420P8 or YUV444P8 of one size with frame rates and the layer of the source",

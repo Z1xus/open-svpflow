@@ -40,3 +40,29 @@ pub fn pin() {
 
 #[cfg(not(windows))]
 pub fn pin() {}
+
+static LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub struct Live(extern "C" fn());
+
+impl Live {
+    pub fn new(idle: extern "C" fn()) -> Self {
+        LIVE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(idle)
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        if LIVE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            (self.0)();
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            {
+                unsafe extern "C" {
+                    fn malloc_trim(pad: usize) -> i32;
+                }
+                unsafe { malloc_trim(0) };
+            }
+        }
+    }
+}

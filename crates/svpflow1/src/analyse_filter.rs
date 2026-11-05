@@ -19,6 +19,7 @@ struct AnalyseState {
     gray_format: vs::ConstRaw,
     depth: i32,
     ahead: Mutex<HashMap<i32, Arc<Slot>>>,
+    _live: svpflow_host::Live,
 }
 
 struct Inputs {
@@ -340,6 +341,7 @@ unsafe fn create_analyse_inner(
             gray_format: gray,
             depth: (cache / CACHE_SHARE / held).clamp(0, MAX_AHEAD) as i32,
             ahead: Mutex::default(),
+            _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
         })
     })();
     let state = match result {

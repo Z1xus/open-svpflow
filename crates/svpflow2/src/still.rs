@@ -12,6 +12,7 @@ struct StillState {
     step: (i64, i64),
     limits: [f32; 3],
     masks: Mutex<Vec<(i32, Arc<Vec<u8>>)>>,
+    _live: svpflow_host::Live,
 }
 
 pub(crate) unsafe extern "system" fn create_still(
@@ -72,6 +73,7 @@ pub(crate) unsafe extern "system" fn create_still(
         step,
         limits: still::limits(number(c"limit"), number(c"edge"), number(c"tolerance")),
         masks: Mutex::new(Vec::new()),
+        _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
     };
     unsafe {
         create(

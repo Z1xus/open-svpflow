@@ -92,6 +92,7 @@ pub(crate) struct FilterState {
     pub(crate) still_cache: Cache<Vec<u8>>,
     pub(crate) layers: std::sync::Mutex<crate::peel::Layers>,
     pub(crate) fallback_notice: std::sync::Once,
+    pub(crate) _live: svpflow_host::Live,
 }
 
 pub(crate) type Cell<T> = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<T>>>>;
@@ -123,6 +124,12 @@ pub(crate) struct SuperExpand {
 
 static EXPAND_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
 const EXPAND_POOL_CAP: usize = 48;
+
+pub(crate) fn clear_expand_pool() {
+    if let Ok(mut pool) = EXPAND_POOL.lock() {
+        pool.clear();
+    }
+}
 
 fn pooled_buffer(len: usize) -> Vec<u8> {
     let reused = EXPAND_POOL.lock().ok().and_then(|mut pool| {

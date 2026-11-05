@@ -402,6 +402,7 @@ unsafe fn collect_state(
         still_cache: std::sync::Mutex::default(),
         layers: std::sync::Mutex::default(),
         fallback_notice: std::sync::Once::new(),
+        _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
     }
 }
 
