@@ -808,6 +808,14 @@ impl FilterState {
         }
     }
 
+    pub(crate) fn cpu_fits(&self) -> bool {
+        let odd = matches!(self.vector_data(), metadata::VectorRecord::Ready(vectors) if vectors.has_odd_overlap());
+        let modern = matches!(self.mode, Mode::SmoothFps)
+            && !self.source_8bit_mode
+            && self.options.reference_supported();
+        video_format::is_cpu_source(&self.video_info) && (!odd || modern)
+    }
+
     fn passthrough(&self) -> bool {
         self.render_mode == 0
             && !self.options.debug_qmap()

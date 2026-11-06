@@ -874,7 +874,7 @@ impl FilterState {
                 &gpu_failed,
             )
         };
-        let fits_cpu = crate::video_format::is_cpu_source(&self.video_info);
+        let fits_cpu = self.cpu_fits();
         let output = if let Some(gpu) = self.gpu.as_ref() {
             if blend.is_none() {
                 gpu.retry();

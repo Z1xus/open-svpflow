@@ -377,12 +377,7 @@ unsafe fn collect_state(
         }
         None => {}
     }
-    let render_mode = if mode <= 1 && render_mode == 2 && gpu.is_none() {
-        1
-    } else {
-        render_mode
-    };
-    FilterData {
+    let mut data = FilterData {
         mode: core::Mode::from_raw(mode),
         clips,
         sdata,
@@ -411,7 +406,12 @@ unsafe fn collect_state(
         layers: std::sync::Mutex::default(),
         fallback_notice: std::sync::Once::new(),
         _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
+    };
+    let legacy = video_format::is_cpu_source(&data.video_info) && !data.cpu_fits();
+    if mode <= 1 && data.render_mode == 2 && data.gpu.is_none() && !legacy {
+        data.render_mode = 1;
     }
+    data
 }
 
 fn generated_vector_data(
@@ -775,7 +775,7 @@ unsafe fn validate_overlap(data: &FilterData, output: vs::Raw, vsapi: vs::ConstR
     let metadata::VectorRecord::Ready(vectors) = data.vector_data() else {
         return true;
     };
-    if vectors.has_odd_overlap() {
+    if vectors.render_mode_one() && vectors.has_odd_overlap() {
         unsafe { set_error(output, vsapi, strings::ERR_OVERLAP_CPU.as_ptr().cast()) };
         false
     } else {

@@ -945,15 +945,96 @@ impl Renderer {
         current: Frame<'_>,
         vectors: &PackedVectors<'_>,
     ) {
-        self.render_band(
-            algo,
-            interp,
-            dst,
-            next,
-            current,
-            vectors,
-            -1..self.shape.grid_h,
+        let blocks = -1..self.shape.grid_h;
+        if !self.split() {
+            self.render_band(algo, interp, dst, next, current, vectors, blocks);
+            return;
+        }
+        if algo == Algo::Fill {
+            self.fill(dst);
+            return;
+        }
+        let pass = self.pass(false, interp, next.y.pitch, blocks.clone());
+        let mut planes = [(&mut dst.y, next.y, current.y)];
+        self.render_algo(algo, interp, &pass, &mut planes, vectors, None);
+        let wide = |plane: Plane<'_>| self.widen(plane, next.y);
+        let (next_u, next_v, current_u, current_v) =
+            (wide(next.u), wide(next.v), wide(current.u), wide(current.v));
+        let full = dst.y.data.len();
+        let (mut u, mut v) = (vec![0; full], vec![0; full]);
+        let pitch = dst.y.pitch;
+        let plane = |data| Plane {
+            data,
+            pitch: next.y.pitch,
+            slack: 0,
+        };
+        {
+            let mut u = PlaneMut {
+                data: &mut u,
+                pitch,
+            };
+            let mut v = PlaneMut {
+                data: &mut v,
+                pitch,
+            };
+            let pass = self.pass(false, interp, next.y.pitch, blocks);
+            let mut planes = [
+                (&mut u, plane(&next_u), plane(&current_u)),
+                (&mut v, plane(&next_v), plane(&current_v)),
+            ];
+            let aux = Some((next.y, current.y));
+            self.render_algo(algo, interp, &pass, &mut planes, vectors, aux);
+        }
+        self.narrow(&u, pitch, &mut dst.u);
+        self.narrow(&v, pitch, &mut dst.v);
+    }
+
+    fn split(&self) -> bool {
+        let s = &self.shape;
+        let (cx, cy) = s.chroma;
+        s.step_x % cx != 0 || s.step_y % cy != 0 || s.origin_x % cx != 0 || s.origin_y % cy != 0
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    fn widen(&self, plane: Plane<'_>, luma: Plane<'_>) -> Vec<u8> {
+        let (cx, cy) = (self.shape.chroma.0 as usize, self.shape.chroma.1 as usize);
+        let rows = plane.data.len().div_ceil(plane.pitch.max(1)).max(1);
+        let pitch = luma.pitch.max(1);
+        let mut wide = vec![0; luma.data.len()];
+        for (r, rows_out) in wide.chunks_mut(pitch * cy).enumerate() {
+            let start = r.min(rows - 1) * plane.pitch;
+            let source = &plane.data[start..plane.data.len().min(start + plane.pitch)];
+            let (first, rest) = rows_out.split_at_mut(pitch.min(rows_out.len()));
+            let last = source.len() - 1;
+            for (c, pixels) in first.chunks_mut(cx).enumerate() {
+                pixels.fill(source[c.min(last)]);
+            }
+            for row in rest.chunks_mut(pitch) {
+                row.copy_from_slice(&first[..row.len()]);
+            }
+        }
+        wide
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    fn narrow(&self, wide: &[u8], pitch: usize, out: &mut PlaneMut<'_>) {
+        let (cx, cy) = (self.shape.chroma.0 as usize, self.shape.chroma.1 as usize);
+        let (width, height) = (
+            (self.shape.width / self.shape.chroma.0) as usize,
+            (self.shape.height / self.shape.chroma.1) as usize,
         );
+        let half = (cx * cy / 2) as u32;
+        for r in 0..height {
+            for c in 0..width {
+                let mut total = half;
+                for dy in 0..cy {
+                    for dx in 0..cx {
+                        total += u32::from(wide[(r * cy + dy) * pitch + c * cx + dx]);
+                    }
+                }
+                out.data[r * out.pitch + c] = (total / (cx * cy) as u32) as u8;
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

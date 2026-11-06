@@ -65,6 +65,8 @@ unsafe fn plan(
     let options = &inner.options;
     let reason = if !video_format::is_cpu_source(&inner.video_info) {
         Some("clip must be YUV 4:2:0 or 4:4:4 8-bit")
+    } else if inner.gpu.is_none() && !inner.cpu_fits() {
+        Some("GPU rendering is required for vectors with odd overlap")
     } else if options.padding(&vs::Source::source(&inner.video_info)) != (0, 0)
         || options.debug_qmap()
         || options.debug_vectors()
@@ -448,7 +450,8 @@ unsafe extern "system" fn get_frame(
             if let Some(gpu) = gpu {
                 gpu.retry();
             }
-            let output = if gpu.is_none_or(GpuContext::cpu_render) {
+            let fits = state.inner.cpu_fits();
+            let output = if fits && gpu.is_none_or(GpuContext::cpu_render) {
                 None
             } else {
                 loop {
@@ -461,8 +464,10 @@ unsafe extern "system" fn get_frame(
                     }
                 }
             };
-            let output =
-                output.or_else(|| unsafe { state.render_cpu(n, frame_ctx, core, vsapi, &held) });
+            let output = output.or_else(|| {
+                fits.then(|| unsafe { state.render_cpu(n, frame_ctx, core, vsapi, &held) })
+                    .flatten()
+            });
             if output.is_none()
                 && let Some(set_error) =
                     unsafe { vs::table_fn::<vs::SetFilterError>(vsapi, vs::SET_FILTER_ERROR) }
