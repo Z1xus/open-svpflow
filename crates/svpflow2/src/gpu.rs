@@ -90,7 +90,7 @@ pub struct GpuContext {
     program: ClProgram,
     variants: &'static std::sync::Mutex<Vec<(u32, ClProgram)>>,
     device_name: String,
-    hi10: bool,
+    depth: u32,
     linear: bool,
 
     units: Vec<std::sync::Mutex<Unit>>,
@@ -443,17 +443,17 @@ impl GpuContext {
         }
     }
 
-    pub fn new(gpuid: i32, qn: i64, hi10: bool, linear: bool) -> Option<Self> {
+    pub fn new(gpuid: i32, qn: i64, depth: u32, linear: bool) -> Option<Self> {
         let units = usize::try_from(qn)
             .unwrap_or(DEFAULT_UNITS)
             .clamp(MIN_UNITS, MAX_UNITS);
-        unsafe { Self::try_new(gpuid, units, hi10, linear) }.ok()
+        unsafe { Self::try_new(gpuid, units, depth, linear) }.ok()
     }
 
     unsafe fn try_new(
         gpuid: i32,
         num_units: usize,
-        hi10: bool,
+        depth: u32,
         linear: bool,
     ) -> Result<Self, String> {
         let cl = unsafe { OpenCl::load()? };
@@ -502,7 +502,7 @@ impl GpuContext {
                 context,
                 program,
                 ref variants,
-            }) = (unsafe { shared(&cl, device, hi10) })
+            }) = (unsafe { shared(&cl, device, depth) })
             else {
                 continue;
             };
@@ -598,7 +598,7 @@ impl GpuContext {
                 device,
                 program,
                 variants,
-                hi10,
+                depth,
                 linear,
                 device_name,
                 units,
@@ -759,7 +759,7 @@ impl GpuContext {
             width.max(planes[1].width + planes[2].width),
             height + planes[1].height,
         );
-        let depth = if self.hi10 { 2 } else { 1 };
+        let depth = if self.depth > 8 { 2 } else { 1 };
         let bytes = dims.0 * dims.1 * depth + if self.linear { width * height * 4 } else { 0 };
         self.frame_bytes
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
@@ -772,7 +772,7 @@ impl GpuContext {
         let (linear, packed) = if let Some(images) = reused {
             (images.linear, images.packed)
         } else {
-            let depth = if self.hi10 {
+            let depth = if self.depth > 8 {
                 CL_UNORM_INT16
             } else {
                 CL_UNORM_INT8
@@ -853,7 +853,7 @@ impl GpuContext {
         x: usize,
         y: usize,
     ) -> Option<()> {
-        let bytes = if self.hi10 { 2 } else { 1 };
+        let bytes = if self.depth > 8 { 2 } else { 1 };
         if plane.data.len()
             < plane
                 .stride
@@ -1186,7 +1186,7 @@ impl GpuContext {
                 program
             } else {
                 let source = format!(
-                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define STILL {}\n#define LAYER {}\n#define FUSE {}\n#define HI10P {}\n{}",
+                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define STILL {}\n#define LAYER {}\n#define FUSE {}\n#define DEPTH {}\n{}",
                     variant & 0xFF,
                     (variant >> 8) & 1,
                     (variant >> 9) & 1,
@@ -1197,7 +1197,7 @@ impl GpuContext {
                     (variant >> 14) & 1,
                     (variant >> 15) & 1,
                     (variant >> 17) & 1,
-                    u8::from(self.hi10),
+                    self.depth,
                     KERNEL_SRC
                 );
                 let program =
@@ -1252,13 +1252,13 @@ impl GpuContext {
         unsafe { (self.cl.SetKernelArg)(k, i, 4, (&raw const v).cast()) == CL_SUCCESS }
     }
 
-    fn variant(p: &KernelParams, hi10: bool) -> u32 {
+    fn variant(p: &KernelParams, high: bool) -> u32 {
         u32::try_from(p.algorithm & 0xFF).unwrap_or(23)
             | u32::from(p.cubic != 0) << 8
             | u32::from(p.cubic_ref != 0) << 9
             | u32::from(p.has_sad != 0) << 10
             | u32::from(p.linear_luma != 0) << 11
-            | u32::from(p.dither != 0 && !hi10) << 12
+            | u32::from(p.dither != 0 && !high) << 12
     }
 
     unsafe fn upload_motion(
@@ -1497,7 +1497,7 @@ impl GpuContext {
         second: &SuperHandle,
         limits: [f32; 3],
     ) -> Option<StillMask> {
-        if self.hi10 || first.entry.dims != second.entry.dims {
+        if self.depth > 8 || first.entry.dims != second.entry.dims {
             return None;
         }
         let dims = first.entry.luma;
@@ -1704,7 +1704,7 @@ impl GpuContext {
         unsafe {
             let k = self.bind_fields(
                 &mut unit,
-                Self::variant(&py, self.hi10)
+                Self::variant(&py, self.depth > 8)
                     | u32::from(still.is_some()) << 14
                     | if layer.is_some() {
                         layer::LAYER_VARIANT
@@ -1742,7 +1742,7 @@ impl GpuContext {
             }
             let q = unit.queue;
             let xq = unit.xfer;
-            let depth = if self.hi10 { 2 } else { 1 };
+            let depth = if self.depth > 8 { 2 } else { 1 };
             let mut dst = self
                 .dst_pool
                 .lock()
@@ -1926,11 +1926,11 @@ unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
 // no program builds while a clip frees its context
-unsafe fn shared(cl: &OpenCl, device: ClDeviceId, hi10: bool) -> Option<&'static Shared> {
-    static ALL: std::sync::Mutex<Vec<(usize, bool, &'static Shared)>> =
+unsafe fn shared(cl: &OpenCl, device: ClDeviceId, depth: u32) -> Option<&'static Shared> {
+    static ALL: std::sync::Mutex<Vec<(usize, u32, &'static Shared)>> =
         std::sync::Mutex::new(Vec::new());
     let mut all = ALL.lock().ok()?;
-    let key = (device as usize, hi10);
+    let key = (device as usize, depth);
     if let Some(&(.., found)) = all.iter().find(|entry| (entry.0, entry.1) == key) {
         return Some(found);
     }
@@ -1955,7 +1955,7 @@ unsafe fn shared(cl: &OpenCl, device: ClDeviceId, hi10: bool) -> Option<&'static
     if context.is_null() {
         return None;
     }
-    let base = format!("#define HI10P {}\n{KERNEL_SRC}", u8::from(hi10));
+    let base = format!("#define DEPTH {depth}\n{KERNEL_SRC}");
     let Ok(program) = (unsafe { build_program(cl, context, device, &base) }) else {
         return None;
     };
@@ -2070,8 +2070,8 @@ pub(crate) const KERNEL_SRC: &str = r"
 #ifndef DITHER
 #define DITHER 0
 #endif
-#ifndef HI10P
-#define HI10P 0
+#ifndef DEPTH
+#define DEPTH 8
 #endif
 #ifndef BLEND
 #define BLEND 0
@@ -2093,8 +2093,8 @@ pub(crate) const KERNEL_SRC: &str = r"
 #define LAYER_APART 24.0f
 #define STILL_AT(still, p, x, y) (read_imagef(still, linear_sampler, \
     ((float2)(x, y) + 0.5f) * (float2)(p.x_ratio, p.y_ratio)).x > 0.4f)
-#if HI10P
-#define REF_SCALE(p) ((p)->linear_luma ? 256.0f : 16384.0f)
+#if DEPTH > 8
+#define REF_SCALE(p) ((p)->linear_luma ? 256.0f : (float)(1 << (24 - DEPTH)))
 #else
 #define REF_SCALE(p) 255.0f
 #endif
@@ -2284,8 +2284,8 @@ inline void layer_agree(
 
 kernel void linear_luma(read_only image2d_t source, write_only image2d_t destination) {
     int2 position = (int2)(get_global_id(0), get_global_id(1));
-#if HI10P
-    float value = 64.0f * read_imagef(source, nearest_sampler, position).x;
+#if DEPTH > 8
+    float value = (float)(1 << (16 - DEPTH)) * read_imagef(source, nearest_sampler, position).x;
 #else
     float value = read_imagef(source, nearest_sampler, position).x;
 #endif
@@ -2406,23 +2406,23 @@ kernel void render_frame(
 
 #if LINEAR_LUMA
     if (p.linear_luma && !layered) {
-#if HI10P
+#if DEPTH > 8
         result = native_divide(result, 256.0f);
 #else
         result = native_divide(result, 255.0f);
 #endif
         if (result < 0.018f) result *= 4.5f;
         else result = 1.099f*native_powr(result, 0.45f)-0.099f;
-#if HI10P
+#if DEPTH > 8
         result *= 256.0f;
 #else
         result *= 255.0f;
 #endif
     }
 #endif
-#if HI10P
+#if DEPTH > 8
     ((global ushort *)destination)[y*destination_stride+x] =
-        (ushort)clamp(round(4.0f*result), 0.0f, 1023.0f);
+        (ushort)clamp(round((float)(1 << (DEPTH - 8))*result), 0.0f, (float)((1 << DEPTH) - 1));
 #else
 # if DITHER
     result += native_divide((float)(bayer[x%8][y%8]-32), 65.0f);
@@ -2431,7 +2431,7 @@ kernel void render_frame(
 #endif
 }
 
-#if BLEND && !HI10P
+#if BLEND && DEPTH == 8
 #define MAX_STEPS 16
 typedef struct {
     int count;

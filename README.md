@@ -33,6 +33,7 @@ The speedup mainly comes from AVX2/AVX-512 motion search, running part of that s
 
 - [VapourSynth](https://www.vapoursynth.com) API 4 support, so it works on current VapourSynth (R80 and newer can't load the original at all, since it only has API 3).
 - Native I444 input and output.
+- 10-bit and 16-bit sources on the CPU too, and 16-bit on the GPU actually works.
 - SmoothFpsBlend, which interpolates and frame-blends on the GPU in one go, so it's about 2x faster than blending separately (build with --no-default-features if you don't want it).
 - Halve and DoubleVectors, which let the motion search run on a half-size frame, a lot faster for a small quality loss.
 - SVAnalyse("{exact:false}") lets the motion search take shortcuts and run on the GPU with gpu:1, which makes it about 2x faster again. The vectors differ slightly from SVPFlow (within 0.2 dB PSNR) and it needs more VRAM, so it's opt-in.

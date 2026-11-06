@@ -361,7 +361,9 @@ unsafe fn collect_state(
         crate::gpu::GpuContext::new(
             i32::try_from(options.gpu_id()).unwrap_or(0),
             options.gpu_qn(),
-            video_format::source_depth(&video_info) == 10,
+            video_format::source_depth(&video_info)
+                .clamp(8, 16)
+                .cast_unsigned(),
             svpflow_core::smooth_engine::gpu_linear(&options.reference(), video_info.width),
         )
     } else {

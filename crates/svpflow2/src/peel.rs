@@ -430,7 +430,7 @@ pub(crate) unsafe extern "system" fn create_layer(
         let even = info.width % 2 == 0 && info.height % 2 == 0;
         let fits = video_format::is_cpu_source(&info) && even && info.num_frames > 1;
         let gpu = fits
-            .then(|| GpuContext::new(0, 2, false, false))
+            .then(|| GpuContext::new(0, 2, 8, false))
             .flatten()
             .map(|context| {
                 let mut reference = svpflow_core::smooth_options::Options::for_mode(0).reference();

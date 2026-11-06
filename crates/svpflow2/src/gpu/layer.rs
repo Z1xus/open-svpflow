@@ -357,7 +357,7 @@ impl GpuContext {
         held: &LayerHeld,
         pairs: impl FnMut(i64) -> Option<Vec<LayerPair>>,
     ) -> Result<Option<Arc<Layer>>, Failed> {
-        if self.hi10 {
+        if self.depth > 8 {
             return Ok(None);
         }
         self.fit_chunk(chunk, last, params, grid, limit, proof, strict, held, pairs)

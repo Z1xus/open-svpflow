@@ -393,7 +393,7 @@ impl GpuContext {
         chroma_height: usize,
         gamma: f32,
     ) -> Option<BlendJob> {
-        if self.hi10 || self.cl.CreateImage.is_none() {
+        if self.depth > 8 || self.cl.CreateImage.is_none() {
             return None;
         }
         let rows = height + chroma_height;
