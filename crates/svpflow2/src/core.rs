@@ -84,6 +84,7 @@ pub(crate) struct FilterState {
     pub(crate) prep_cache: PrepCache,
     pub(crate) decode_cache: DecodeCache,
     pub(crate) expand_cache: ExpandCache,
+    pub(crate) wide_cache: Cache<SuperExpand<u16>>,
     pub(crate) field_cache: Cache<svpflow_core::smooth::VectorField>,
     pub(crate) quality_cache: std::sync::Mutex<Vec<(i32, i32, Vec<u8>)>>,
     pub(crate) quality_cells: Cache<(i32, Vec<u8>)>,
@@ -114,25 +115,54 @@ pub(crate) fn cache_cell<T>(cache: &Cache<T>, key: i64, cap: usize) -> Option<Ce
     Some(cell)
 }
 
-pub(crate) struct SuperExpand {
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
+pub(crate) struct SuperExpand<T: Pooled = u8> {
+    y: Vec<T>,
+    u: Vec<T>,
+    v: Vec<T>,
     y_stride: usize,
     uv_stride: usize,
 }
 
+pub(crate) trait Pooled: svpflow_core::smooth::Sample {
+    fn pool() -> &'static std::sync::Mutex<Vec<Vec<Self>>>;
+    fn cache(state: &FilterState) -> &Cache<SuperExpand<Self>>;
+}
+
+impl Pooled for u8 {
+    fn pool() -> &'static std::sync::Mutex<Vec<Vec<Self>>> {
+        &EXPAND_POOL
+    }
+
+    fn cache(state: &FilterState) -> &Cache<SuperExpand<Self>> {
+        &state.expand_cache
+    }
+}
+
+impl Pooled for u16 {
+    fn pool() -> &'static std::sync::Mutex<Vec<Vec<Self>>> {
+        &WIDE_POOL
+    }
+
+    fn cache(state: &FilterState) -> &Cache<SuperExpand<Self>> {
+        &state.wide_cache
+    }
+}
+
 static EXPAND_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+static WIDE_POOL: std::sync::Mutex<Vec<Vec<u16>>> = std::sync::Mutex::new(Vec::new());
 const EXPAND_POOL_CAP: usize = 48;
 
 pub(crate) fn clear_expand_pool() {
     if let Ok(mut pool) = EXPAND_POOL.lock() {
         pool.clear();
     }
+    if let Ok(mut pool) = WIDE_POOL.lock() {
+        pool.clear();
+    }
 }
 
-fn pooled_buffer(len: usize) -> Vec<u8> {
-    let reused = EXPAND_POOL.lock().ok().and_then(|mut pool| {
+fn pooled_buffer<T: Pooled>(len: usize) -> Vec<T> {
+    let reused = T::pool().lock().ok().and_then(|mut pool| {
         let index = pool
             .iter()
             .position(|buffer| buffer.capacity() >= len + EXPAND_SLACK)?;
@@ -140,14 +170,14 @@ fn pooled_buffer(len: usize) -> Vec<u8> {
     });
     let mut buffer = reused.unwrap_or_else(|| Vec::with_capacity(len + EXPAND_SLACK));
     buffer.clear();
-    buffer.resize(len + EXPAND_SLACK, 0);
+    buffer.resize(len + EXPAND_SLACK, T::default());
     buffer.truncate(len);
     buffer
 }
 
-impl Drop for SuperExpand {
+impl<T: Pooled> Drop for SuperExpand<T> {
     fn drop(&mut self) {
-        if let Ok(mut pool) = EXPAND_POOL.lock() {
+        if let Ok(mut pool) = T::pool().lock() {
             for buffer in [&mut self.y, &mut self.u, &mut self.v] {
                 if pool.len() < EXPAND_POOL_CAP {
                     pool.push(std::mem::take(buffer));
@@ -157,8 +187,8 @@ impl Drop for SuperExpand {
     }
 }
 
-impl SuperExpand {
-    pub(crate) fn parts(&self) -> (&[u8], &[u8], &[u8], usize, usize) {
+impl<T: Pooled> SuperExpand<T> {
+    pub(crate) fn parts(&self) -> (&[T], &[T], &[T], usize, usize) {
         (&self.y, &self.u, &self.v, self.y_stride, self.uv_stride)
     }
 }
@@ -810,10 +840,22 @@ impl FilterState {
 
     pub(crate) fn cpu_fits(&self) -> bool {
         let odd = matches!(self.vector_data(), metadata::VectorRecord::Ready(vectors) if vectors.has_odd_overlap());
-        let modern = matches!(self.mode, Mode::SmoothFps)
+        self.cpu_source() && (!odd || self.modern())
+    }
+
+    pub(crate) fn cpu_source(&self) -> bool {
+        let half = matches!(self.vector_data(), metadata::VectorRecord::Ready(vectors) if vectors.marker <= 2);
+        video_format::is_cpu_source(&self.video_info)
+            || video_format::needs_8bit_vec_src(&self.video_info)
+                && self.modern()
+                && half
+                && self.options.padding(&self.video_info.source()) == (0, 0)
+    }
+
+    fn modern(&self) -> bool {
+        matches!(self.mode, Mode::SmoothFps)
             && !self.source_8bit_mode
-            && self.options.reference_supported();
-        video_format::is_cpu_source(&self.video_info) && (!odd || modern)
+            && self.options.reference_supported()
     }
 
     fn passthrough(&self) -> bool {
@@ -1251,22 +1293,21 @@ impl FilterState {
         .clone()
     }
 
-    pub(crate) fn cached_lean_expand(
+    pub(crate) fn cached_lean_expand<T: Pooled>(
         &self,
         key: i64,
-        planes: &renderer::FramePlanes<'_>,
-    ) -> Option<std::sync::Arc<SuperExpand>> {
+        [y, u, v]: [(&[T], usize); 3],
+    ) -> Option<std::sync::Arc<SuperExpand<T>>> {
         let width = usize::try_from(self.video_info.width.max(0)).ok()?;
         let height = usize::try_from(self.video_info.height.max(0)).ok()?;
         let (chroma_x_div, chroma_y_div) = video_format::chroma_divisors(&self.video_info);
         let chroma_x_div = usize::try_from(chroma_x_div).ok()?;
         let chroma_y_div = usize::try_from(chroma_y_div).ok()?;
-        let cell = cache_cell(&self.expand_cache, key, EXPAND_CACHE_CAP)?;
+        let cell = cache_cell(T::cache(self), key, EXPAND_CACHE_CAP / size_of::<T>())?;
         cell.get_or_init(|| {
-            let (y, y_stride) = expand_source(planes.y, width, height)?;
-            let (u, uv_stride) =
-                expand_source(planes.u, width / chroma_x_div, height / chroma_y_div)?;
-            let (v, _) = expand_source(planes.v, width / chroma_x_div, height / chroma_y_div)?;
+            let (y, y_stride) = expand_source(y, width, height)?;
+            let (u, uv_stride) = expand_source(u, width / chroma_x_div, height / chroma_y_div)?;
+            let (v, _) = expand_source(v, width / chroma_x_div, height / chroma_y_div)?;
             Some(std::sync::Arc::new(SuperExpand {
                 y,
                 u,
@@ -1735,15 +1776,22 @@ impl FilterState {
                 v: plane(src1_v, src1_v_stride, src1_v_len),
             }
         };
+        let lean = |p: renderer::FramePlanes<'static>| {
+            [
+                (p.y.data, p.y.stride),
+                (p.u.data, p.u.stride),
+                (p.v.data, p.v.stride),
+            ]
+        };
         let expand0 = if lean_pel {
-            self.cached_lean_expand(i64::from(source_frame), &raw_sources0)
+            self.cached_lean_expand(i64::from(source_frame), lean(raw_sources0))
         } else {
             super0
                 .as_ref()
                 .and_then(|planes| self.cached_expand(i64::from(source_frame), planes))
         };
         let expand1 = if lean_pel {
-            self.cached_lean_expand(i64::from(source_frame) + 1, &raw_sources1)
+            self.cached_lean_expand(i64::from(source_frame) + 1, lean(raw_sources1))
         } else {
             super1
                 .as_ref()
@@ -3284,24 +3332,23 @@ fn fill_plane(
     }
 }
 
-fn expand_source(
-    plane: renderer::Plane<'_>,
+fn expand_source<T: Pooled>(
+    (data, stride): (&[T], usize),
     width: usize,
     height: usize,
-) -> Option<(Vec<u8>, usize)> {
-    let stride = plane.stride;
+) -> Option<(Vec<T>, usize)> {
     let size = stride.checked_mul(height)?;
-    if width == 0 || height < 2 || width > stride || plane.data.len() < size {
+    if width == 0 || height < 2 || width > stride || data.len() < size {
         return None;
     }
-    let mut base = vec![0u8; size + stride + 2];
-    for (dst, src) in base
-        .chunks_exact_mut(stride)
-        .zip(plane.data.chunks_exact(stride))
-    {
+    let mut base = vec![T::default(); size + stride + 2];
+    for (dst, src) in base.chunks_exact_mut(stride).zip(data.chunks_exact(stride)) {
         dst[..width].copy_from_slice(&src[..width]);
     }
-    let mean = |a: u8, b: u8| ((u16::from(a) + u16::from(b) + 1) >> 1) as u8;
+    let mean = |a: T, b: T| {
+        let (a, b): (i32, i32) = (a.into(), b.into());
+        T::new((a + b + 1) >> 1)
+    };
     for j in size..base.len() {
         base[j] = mean(base[j - size], base[j - size + 1]);
     }

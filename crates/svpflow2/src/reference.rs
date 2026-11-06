@@ -4,14 +4,16 @@ use std::slice;
 
 use svpflow_core::layer;
 use svpflow_core::smooth::{
-    BlockVector, FieldShape, Frame, FrameMut, PackedVectors, Plane, PlaneMut, Renderer,
-    SceneLimits, VectorField,
+    Algo, BlockVector, FieldShape, Frame, FrameMut, PackedVectors, Plane, PlaneMut, RenderShape,
+    Renderer, SceneLimits, VectorField,
 };
 use svpflow_core::smooth_engine::{self as engine, Rates};
 
-use crate::core::{FilterState, Mode, drop_frame, get_node, request_node, super_frame_planes};
+use crate::core::{
+    FilterState, Mode, Pooled, SuperExpand, drop_frame, get_node, request_node, super_frame_planes,
+};
 use crate::vs::Source as _;
-use crate::{frame, metadata, options::ReferenceParams, renderer, vs};
+use crate::{frame, metadata, options::ReferenceParams, vs};
 
 fn cache_cap(bytes: usize) -> usize {
     // frames in flight share the entries, so a few per thread are enough
@@ -44,18 +46,18 @@ impl Fetch {
     }
 }
 
-struct Merged {
-    _keep: Option<std::sync::Arc<crate::core::SuperExpand>>,
-    y: &'static [u8],
-    u: &'static [u8],
-    v: &'static [u8],
+struct Merged<T: Pooled> {
+    _keep: Option<std::sync::Arc<SuperExpand<T>>>,
+    y: &'static [T],
+    u: &'static [T],
+    v: &'static [T],
     y_pitch: usize,
     uv_pitch: usize,
     slack: usize,
 }
 
-impl Merged {
-    fn frame(&self) -> Frame<'_> {
+impl<T: Pooled> Merged<T> {
+    fn frame(&self) -> Frame<'_, T> {
         Frame {
             y: Plane {
                 data: self.y,
@@ -519,6 +521,9 @@ impl FilterState {
         field: &VectorField,
         (luma, limits): (&[u8], &SceneLimits),
     ) {
+        if !crate::video_format::is_cpu_source(&self.video_info) {
+            return;
+        }
         let phase = self
             .options
             .timing(&self.video_info.source())
@@ -997,13 +1002,18 @@ impl FilterState {
         let sad = engine::merged_sad(selected, sad_masks.as_ref());
         let kind = engine::kind(selected, sad.is_some());
         let chroma = self.chroma();
-        let mut renderer = Renderer::new(engine::render_shape(
-            vector_data,
-            self.video_info.width,
-            self.video_info.height,
-            params.area_blend,
-            chroma,
-        ));
+        let mut renderer = Renderer::new(RenderShape {
+            depth: crate::video_format::source_depth(&self.video_info)
+                .max(8)
+                .unsigned_abs(),
+            ..engine::render_shape(
+                vector_data,
+                self.video_info.width,
+                self.video_info.height,
+                params.area_blend,
+                chroma,
+            )
+        });
         renderer.set_time(time);
         if self.render_mode == 2
             && !cpu
@@ -1082,36 +1092,29 @@ impl FilterState {
             }
             return output;
         }
-        let merged = |k: i32, raw: vs::ConstRaw| -> Option<Merged> {
-            if shape.pel <= 1 || !self.request_super {
-                let h = usize::try_from(self.video_info.height).ok()?;
-                let (y, yp, yl) = unsafe { api.read_plane(raw, 0, h) }?;
-                let (u, up, ul) = unsafe { api.read_plane(raw, 1, h / chroma.1 as usize) }?;
-                let (v, _, vl) = unsafe { api.read_plane(raw, 2, h / chroma.1 as usize) }?;
-                return Some(Merged {
-                    _keep: None,
-                    y: unsafe { slice::from_raw_parts(y, yl) },
-                    u: unsafe { slice::from_raw_parts(u, ul) },
-                    v: unsafe { slice::from_raw_parts(v, vl) },
-                    y_pitch: yp,
-                    uv_pitch: up,
-                    slack: 0,
-                });
-            }
-            let expand = if metadata::super_data(self.sdata).lean() {
-                let h = usize::try_from(self.video_info.height).ok()?;
-                let (y, yp, yl) = unsafe { api.read_plane(raw, 0, h) }?;
-                let (u, up, ul) = unsafe { api.read_plane(raw, 1, h / chroma.1 as usize) }?;
-                let (v, vp, vl) = unsafe { api.read_plane(raw, 2, h / chroma.1 as usize) }?;
-                let planes = unsafe {
-                    renderer::FramePlanes {
-                        y: renderer::Plane::linear(slice::from_raw_parts(y, yl), yp),
-                        u: renderer::Plane::linear(slice::from_raw_parts(u, ul), up),
-                        v: renderer::Plane::linear(slice::from_raw_parts(v, vl), vp),
-                    }
-                };
-                self.cached_lean_expand(i64::from(k), &planes)
-            } else {
+        let vectors = PackedVectors {
+            fwd_x,
+            fwd_y,
+            bwd_x,
+            bwd_y,
+            next_fwd_x: next_x,
+            next_fwd_y: next_y,
+            prev_bwd_x: prev_x,
+            prev_bwd_y: prev_y,
+            cover_bwd: &cover_bwd,
+            cover_fwd: &cover_fwd,
+            sad: sad.as_deref().unwrap_or(&[]),
+        };
+        let draw = (kind, interp, &renderer, &vectors);
+        let frames = (source, next_source, n, shape.pel);
+        let drawn = if crate::video_format::source_depth(&self.video_info) > 8 {
+            let expand = |k: i32, planes| self.cached_lean_expand::<u16>(i64::from(k), planes);
+            unsafe { self.draw(api, frames, draw, expand, core) }.map(|(output, _)| (output, None))
+        } else {
+            let expand = |k: i32, planes| {
+                if metadata::super_data(self.sdata).lean() {
+                    return self.cached_lean_expand(i64::from(k), planes);
+                }
                 let sup = fetch.get(self.clips.super_clip, k);
                 let planes = unsafe {
                     super_frame_planes(
@@ -1126,7 +1129,115 @@ impl FilterState {
                 fetch.drop(sup);
                 expand
             };
-            let expand = expand?;
+            unsafe { self.draw(api, frames, draw, expand, core) }
+                .map(|(output, dst)| (output, Some(dst)))
+        };
+        let Some((output, dst)) = drawn else {
+            return std::ptr::null();
+        };
+        let h = usize::try_from(self.video_info.height).unwrap_or(0);
+        let w = usize::try_from(self.video_info.width).unwrap_or(0);
+        let (cx, cy) = (chroma.0 as usize, chroma.1 as usize);
+        if let Some(mut dst) = dst {
+            let raw = unsafe {
+                (
+                    crate::peel::planes(api, source, (h, h / cy)),
+                    crate::peel::planes(api, next_source, (h, h / cy)),
+                )
+            };
+            let phase = if selected == 1 { 256 - time } else { time };
+            let phase = phase as f32 / 256.0;
+            if let (Some(limits), (Some(first), Some(second))) = (self.options.mask_still(), raw) {
+                let mask =
+                    crate::core::cache_cell(&self.still_cache, n.into(), 8).and_then(|cell| {
+                        let (a, b) = (first[0], second[0]);
+                        let mask =
+                            || svpflow_core::still::mask(a.data, b.data, a.pitch, w, h, limits);
+                        cell.get_or_init(|| Some(std::sync::Arc::new(mask())))
+                            .clone()
+                    });
+                if let Some(mask) = mask {
+                    for (plane, target) in
+                        [&mut dst.y, &mut dst.u, &mut dst.v].into_iter().enumerate()
+                    {
+                        let (a, b) = (first[plane], second[plane]);
+                        let (w, h) = if plane == 0 { (w, h) } else { (w / cx, h / cy) };
+                        let (data, pitch) = (&mut *target.data, target.pitch);
+                        let size = self.video_info.width as usize;
+                        svpflow_core::still::apply(
+                            data, pitch, a.data, b.data, a.pitch, w, h, &mask, size, phase,
+                        );
+                    }
+                }
+            }
+            let fit = self.layer_cpu(api, fetch, n, vector_data, held);
+            if fit.is_none() && self.layer_plan().is_some() {
+                unsafe { api.free(output.cast_const()) };
+                return std::ptr::null();
+            }
+            if let (Some(fit), (Some(first), Some(second))) = (fit, raw) {
+                let fit = fit.layer((w, h), cx);
+                let frames = layer::Frames {
+                    first,
+                    second,
+                    time: phase,
+                };
+                let motion = crate::peel::motion((fwd_x, fwd_y), (bwd_x, bwd_y), vector_data);
+                if !fit.empty() {
+                    for (plane, target) in
+                        [&mut dst.y, &mut dst.u, &mut dst.v].into_iter().enumerate()
+                    {
+                        fit.render(plane, target.data, target.pitch, &frames, &motion, selected);
+                    }
+                }
+            }
+        }
+        unsafe { self.reference_overlays(api, output, frame, class, field, (luma, limits)) };
+        unsafe { self.apply_light_border(api, output, frame) };
+        if self.options.debug_tt() {
+            unsafe { self.apply_timing_bar(api, output, frame) };
+        }
+        let timing = self.options.timing(&self.video_info.source());
+        let ratio = crate::core::f64_i64(timing.frame_num) / crate::core::f64_i64(timing.frame_den);
+        let raw_phase = timing.raw_phase_256(frame, n);
+        unsafe { api.copy_interpolated_timing(source, next_source, output, raw_phase, ratio) };
+        output.cast_const()
+    }
+
+    #[allow(clippy::type_complexity)]
+    unsafe fn draw<T: Pooled>(
+        &self,
+        api: &frame::PlaneApi,
+        (source, next_source, n, pel): (vs::ConstRaw, vs::ConstRaw, i32, i32),
+        (kind, interp, renderer, vectors): (Algo, bool, &Renderer, &PackedVectors<'_>),
+        expand: impl Fn(i32, [(&'static [T], usize); 3]) -> Option<std::sync::Arc<SuperExpand<T>>>,
+        core: vs::Raw,
+    ) -> Option<(vs::Raw, FrameMut<'static, T>)> {
+        let size = size_of::<T>();
+        let h = usize::try_from(self.video_info.height).ok()?;
+        let w = usize::try_from(self.video_info.width).ok()?;
+        let (cx, cy) = self.chroma();
+        let (cx, cy) = (cx as usize, cy as usize);
+        let merged = |k: i32, raw: vs::ConstRaw| -> Option<Merged<T>> {
+            let plane = |p: i32, rows: usize| -> Option<(&'static [T], usize)> {
+                let (ptr, pitch, len) = unsafe { api.read_plane(raw, p, rows) }?;
+                let data = unsafe { slice::from_raw_parts(ptr.cast::<T>(), len / size) };
+                Some((data, pitch / size))
+            };
+            let planes = [plane(0, h)?, plane(1, h / cy)?, plane(2, h / cy)?];
+            if pel <= 1 || !self.request_super {
+                let [(y, y_pitch), (u, uv_pitch), (v, _)] = planes;
+                return Some(Merged {
+                    _keep: None,
+                    y,
+                    u,
+                    v,
+                    y_pitch,
+                    uv_pitch,
+                    slack: 0,
+                });
+            }
+            let expand = expand(k, planes)?;
             let (y, u, v, y_pitch, uv_pitch) = expand.parts();
             let (y, u, v) = unsafe {
                 (
@@ -1145,11 +1256,10 @@ impl FilterState {
                 slack: crate::core::EXPAND_SLACK,
             })
         };
-        let (Some(cur), Some(nxt)) = (merged(n, source), merged(n + 1, next_source)) else {
-            return std::ptr::null();
-        };
+        let cur = merged(n, source)?;
+        let nxt = merged(n + 1, next_source)?;
         let output_info = self.output_info();
-        let Some(output) = (unsafe {
+        let output = unsafe {
             api.new_frame(
                 self.video_info.format,
                 output_info.width,
@@ -1157,110 +1267,33 @@ impl FilterState {
                 source,
                 core,
             )
-        }) else {
-            return std::ptr::null();
-        };
-        let h = usize::try_from(self.video_info.height).unwrap_or(0);
-        let w = usize::try_from(self.video_info.width).unwrap_or(0);
+        }?;
         let (pad_x, pad_y) = self.options.padding(&self.video_info.source());
-        let (cx, cy) = (chroma.0 as usize, chroma.1 as usize);
-        let plane_mut = |p: i32, rows: usize| -> Option<PlaneMut<'static>> {
+        let plane_mut = |p: i32, rows: usize| -> Option<PlaneMut<'static, T>> {
             let (dx, dy) = if p == 0 { (1, 1) } else { (cx, cy) };
             let (px, py) = (
                 usize::try_from(pad_x).ok()? / dx,
                 usize::try_from(pad_y).ok()? / dy,
             );
             let (ptr, pitch, len) = unsafe { api.write_plane(output, p, rows + 2 * py) }?;
+            let pitch = pitch / size;
             let start = py * pitch + px;
             let span = (rows.checked_sub(1)?) * pitch + w / dx;
-            if start + span > len {
+            if start + span > len / size {
                 return None;
             }
-            Some(PlaneMut {
-                data: unsafe { slice::from_raw_parts_mut(ptr.add(start), span) },
-                pitch,
-            })
+            let data = unsafe { slice::from_raw_parts_mut(ptr.cast::<T>().add(start), span) };
+            Some(PlaneMut { data, pitch })
         };
         let (Some(y), Some(u), Some(v)) =
             (plane_mut(0, h), plane_mut(1, h / cy), plane_mut(2, h / cy))
         else {
             unsafe { api.free(output.cast_const()) };
-            return std::ptr::null();
+            return None;
         };
         let mut dst = FrameMut { y, u, v };
-        let vectors = PackedVectors {
-            fwd_x,
-            fwd_y,
-            bwd_x,
-            bwd_y,
-            next_fwd_x: next_x,
-            next_fwd_y: next_y,
-            prev_bwd_x: prev_x,
-            prev_bwd_y: prev_y,
-            cover_bwd: &cover_bwd,
-            cover_fwd: &cover_fwd,
-            sad: sad.as_deref().unwrap_or(&[]),
-        };
-        renderer.render(kind, interp, &mut dst, nxt.frame(), cur.frame(), &vectors);
-        let raw = unsafe {
-            (
-                crate::peel::planes(api, source, (h, h / cy)),
-                crate::peel::planes(api, next_source, (h, h / cy)),
-            )
-        };
-        let phase = if selected == 1 { 256 - time } else { time };
-        let phase = phase as f32 / 256.0;
-        if let (Some(limits), (Some(first), Some(second))) = (self.options.mask_still(), raw) {
-            let mask = crate::core::cache_cell(&self.still_cache, n.into(), 8).and_then(|cell| {
-                let (a, b) = (first[0], second[0]);
-                let mask = || svpflow_core::still::mask(a.data, b.data, a.pitch, w, h, limits);
-                cell.get_or_init(|| Some(std::sync::Arc::new(mask())))
-                    .clone()
-            });
-            if let Some(mask) = mask {
-                for (plane, target) in [&mut dst.y, &mut dst.u, &mut dst.v].into_iter().enumerate()
-                {
-                    let (a, b) = (first[plane], second[plane]);
-                    let (w, h) = if plane == 0 { (w, h) } else { (w / cx, h / cy) };
-                    let (data, pitch) = (&mut *target.data, target.pitch);
-                    let size = self.video_info.width as usize;
-                    svpflow_core::still::apply(
-                        data, pitch, a.data, b.data, a.pitch, w, h, &mask, size, phase,
-                    );
-                }
-            }
-        }
-        let fit = self.layer_cpu(api, fetch, n, vector_data, held);
-        let peeled = crate::video_format::is_cpu_source(&self.video_info);
-        if fit.is_none() && peeled && self.layer_plan().is_some() {
-            unsafe { api.free(output.cast_const()) };
-            return std::ptr::null();
-        }
-        if let (Some(fit), (Some(first), Some(second))) = (fit, raw) {
-            let fit = fit.layer((w, h), cx);
-            let frames = layer::Frames {
-                first,
-                second,
-                time: phase,
-            };
-            let motion = crate::peel::motion((fwd_x, fwd_y), (bwd_x, bwd_y), vector_data);
-            if !fit.empty() {
-                for (plane, target) in [&mut dst.y, &mut dst.u, &mut dst.v].into_iter().enumerate()
-                {
-                    fit.render(plane, target.data, target.pitch, &frames, &motion, selected);
-                }
-            }
-        }
-        unsafe { self.reference_overlays(api, output, frame, class, field, (luma, limits)) };
-        unsafe { self.apply_light_border(api, output, frame) };
-        if self.options.debug_tt() {
-            unsafe { self.apply_timing_bar(api, output, frame) };
-        }
-        let timing = self.options.timing(&self.video_info.source());
-        let ratio = crate::core::f64_i64(timing.frame_num) / crate::core::f64_i64(timing.frame_den);
-        let raw_phase = timing.raw_phase_256(frame, n);
-        unsafe { api.copy_interpolated_timing(source, next_source, output, raw_phase, ratio) };
-        output.cast_const()
+        renderer.render(kind, interp, &mut dst, nxt.frame(), cur.frame(), vectors);
+        Some((output, dst))
     }
 }
 

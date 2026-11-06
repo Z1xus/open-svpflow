@@ -397,6 +397,7 @@ unsafe fn collect_state(
         prep_cache: std::sync::Mutex::new(Vec::new()),
         decode_cache: std::sync::Mutex::new(Vec::new()),
         expand_cache: std::sync::Mutex::new(Vec::new()),
+        wide_cache: std::sync::Mutex::new(Vec::new()),
         field_cache: std::sync::Mutex::new(Vec::new()),
         quality_cache: std::sync::Mutex::new(Vec::new()),
         quality_cells: std::sync::Mutex::new(Vec::new()),
@@ -785,7 +786,9 @@ unsafe fn validate_overlap(data: &FilterData, output: vs::Raw, vsapi: vs::ConstR
 
 unsafe fn validate_source_format(data: &FilterData, output: vs::Raw, vsapi: vs::ConstRaw) -> bool {
     let requires_cpu = unsafe { requires_cpu_source(data) };
-    if requires_cpu && !video_format::is_cpu_source(&data.video_info) {
+    let cpu =
+        video_format::is_cpu_source(&data.video_info) || data.render_mode == 1 && data.cpu_source();
+    if requires_cpu && !cpu {
         unsafe { set_error(output, vsapi, strings::ERR_SOURCE_CPU.as_ptr().cast()) };
         return false;
     }
