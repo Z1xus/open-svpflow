@@ -447,6 +447,7 @@ pub fn render_shape(
         pel: shape.pel,
         blend,
         chroma,
+        depth: 8,
     }
 }
 
