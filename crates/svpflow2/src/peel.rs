@@ -146,7 +146,8 @@ impl Chunks<'_> {
         let (start, first) = (*sources.start(), *vectors.start());
         let sources: Vec<_> = sources.map(|k| (self.get)(self.source, k)).collect();
         let vectors: Vec<_> = vectors.map(|k| (self.get)(self.vectors, k)).collect();
-        context.keep_frames(sources.len());
+        // a fit reads this chunk and the two beside it
+        context.keep_frames(3 * sources.len());
         let made = (|| {
             let planes: Vec<_> = sources
                 .iter()
