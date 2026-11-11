@@ -12,6 +12,7 @@ struct StillState {
     step: (i64, i64),
     limits: [f32; 3],
     masks: Mutex<Vec<(i32, Arc<Vec<u8>>)>>,
+    image: Option<Arc<crate::image::Mask>>,
     _live: svpflow_host::Live,
 }
 
@@ -22,11 +23,12 @@ pub(crate) unsafe extern "system" fn create_still(
     core: vs::Raw,
     vsapi: vs::ConstRaw,
 ) -> isize {
-    let (Some(get_node), Some(get_info), Some(get_float), Some(create)) = (unsafe {
+    let (Some(get_node), Some(get_info), Some(get_float), Some(get_int), Some(create)) = (unsafe {
         (
             vs::table_fn::<vs::PropGetNode>(vsapi, vs::PROP_GET_NODE),
             vs::table_fn::<vs::GetVideoInfo>(vsapi, vs::GET_VIDEO_INFO),
             vs::table_fn::<vs::PropGetFloat>(vsapi, vs::PROP_GET_FLOAT),
+            vs::table_fn::<vs::PropGetInt>(vsapi, vs::PROP_GET_INT),
             vs::table_fn::<vs::CreateFilter>(vsapi, vs::CREATE_FILTER),
         )
     }) else {
@@ -61,6 +63,20 @@ pub(crate) unsafe extern "system" fn create_still(
         }
         return 0;
     }
+    let mut missing = 0;
+    let id = unsafe { get_int(input, c"mask".as_ptr(), 0, &raw mut missing) };
+    let image = (missing == 0).then(|| crate::image::get(id, info.width, info.height));
+    if image.as_ref().is_some_and(Option::is_none) {
+        unsafe {
+            vs::free_nodes([clip, source], vsapi);
+            filter::set_error(
+                output,
+                vsapi,
+                c"SVStill: the image mask is missing or has another size".as_ptr(),
+            );
+        }
+        return 0;
+    }
     let number = |key: &std::ffi::CStr| {
         let mut error = 0;
         let value = unsafe { get_float(input, key.as_ptr(), 0, &raw mut error) };
@@ -73,6 +89,7 @@ pub(crate) unsafe extern "system" fn create_still(
         step,
         limits: still::limits(number(c"limit"), number(c"edge"), number(c"tolerance")),
         masks: Mutex::new(Vec::new()),
+        image: image.flatten(),
         _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
     };
     unsafe {
@@ -95,11 +112,11 @@ pub(crate) unsafe extern "system" fn create_still(
 impl StillState {
     #[allow(clippy::cast_precision_loss)]
     fn position(&self, n: i32) -> (i32, f32) {
-        let at = i64::from(n) * self.step.0;
-        (
-            (at / self.step.1) as i32,
-            (at % self.step.1) as f32 / self.step.1 as f32,
-        )
+        let (at, step) = (
+            i128::from(n) * i128::from(self.step.0),
+            i128::from(self.step.1),
+        );
+        ((at / step) as i32, (at % step) as f32 / step as f32)
     }
 
     unsafe fn render(
@@ -125,10 +142,37 @@ impl StillState {
         let (x_div, y_div) = video_format::chroma_divisors(&self.info);
         let done = (|| {
             let output = output?;
-            let plane = |frame, plane, rows| {
+            let plane = |frame: vs::ConstRaw, plane, rows| {
+                if frame.is_null() {
+                    return None;
+                }
                 let (data, pitch, len) = unsafe { api.read_plane(frame, plane, rows) }?;
                 Some((unsafe { std::slice::from_raw_parts(data, len) }, pitch))
             };
+            if let Some(mask) = &self.image {
+                for index in 0..3 {
+                    let (width, height) = if index == 0 {
+                        (width, height)
+                    } else {
+                        (width / x_div as usize, height / y_div as usize)
+                    };
+                    let (held, pitch) = plane(first, index, height)?;
+                    let (data, stride, len) = unsafe { api.write_plane(output, index, height) }?;
+                    let target = unsafe { std::slice::from_raw_parts_mut(data, len) };
+                    let mask_width = mask.width as usize;
+                    still::hold(
+                        target,
+                        stride,
+                        held,
+                        pitch,
+                        width,
+                        height,
+                        &mask.pixels,
+                        mask_width,
+                    );
+                }
+                return Some(output.cast_const());
+            }
             let (luma_a, pitch) = plane(first, 0, height)?;
             let (luma_b, _) = plane(second, 0, height)?;
             let cached = self.masks.lock().ok().and_then(|masks| {

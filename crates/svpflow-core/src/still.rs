@@ -84,3 +84,34 @@ pub fn apply(
         }
     }
 }
+
+#[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
+pub fn hold(
+    output: &mut [u8],
+    output_pitch: usize,
+    held: &[u8],
+    pitch: usize,
+    width: usize,
+    height: usize,
+    mask: &[u8],
+    mask_width: usize,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let (step_x, step_y) = (mask_width / width, mask.len() / mask_width / height);
+    let full = 255 * (step_x * step_y) as u32;
+    for y in 0..height {
+        for x in 0..width {
+            let weight: u32 = (0..step_y)
+                .flat_map(|dy| (0..step_x).map(move |dx| (dx, dy)))
+                .map(|(dx, dy)| u32::from(mask[(y * step_y + dy) * mask_width + x * step_x + dx]))
+                .sum();
+            if weight < full {
+                let at = y * output_pitch + x;
+                let (kept, made) = (u32::from(held[y * pitch + x]), u32::from(output[at]));
+                output[at] = ((kept * (full - weight) + made * weight + full / 2) / full) as u8;
+            }
+        }
+    }
+}

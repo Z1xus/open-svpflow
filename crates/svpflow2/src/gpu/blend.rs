@@ -608,6 +608,7 @@ impl GpuContext {
         let stride = i32::try_from(job.width).ok()?;
         let mut waits = Self::source_waits(group.sources[0][0], group.sources[1][0]);
         waits.extend(group.still.map(|StillMask(_, ready)| ready));
+        waits.retain(|ready| !ready.is_null());
         let masks = group.masks.as_ptr();
         let filled = !group.masks.is_empty();
         pending.masks.push(group.masks);
@@ -713,7 +714,7 @@ impl GpuContext {
         if !joins {
             let variant = Self::variant(&params[0], false)
                 | BLEND_VARIANT
-                | u32::from(still.is_some()) << 14
+                | self.mask_variant(still)
                 | if layer.is_some() { LAYER_VARIANT } else { 0 };
             let fused = job.fuse
                 && matches!(params[0].algorithm, 1 | 2 | 11 | 13)

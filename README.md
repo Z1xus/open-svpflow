@@ -46,6 +46,7 @@ All of these are off by default.
 
 - mask:{peel:true} learns the HUD and its opacity for each pixel from how the scene moves behind it, takes it off before the warp and puts it back after. Tune it with mask:{peel:{limit:6}}.
 - mask:{still:true} finds text, logos and other things that stay in place and keeps them from smearing. Tune it with mask:{still:{limit:4.5,edge:5,tolerance:30}}. svp2.Still(clip, source) does the same for frames from any other interpolator.
+- mask:{image:id} keeps the source frame where a mask from osvp_mask_create is black. osvp_hold does the same for frames from any other interpolator.
 - dedup:0.5 skips a frame that repeats the one before it and stretches the next motion over both frame times. The number is how different two frames can be and still count as a repeat.
 
 ## Install

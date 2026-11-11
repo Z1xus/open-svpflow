@@ -5,10 +5,10 @@ use std::ffi::CString;
 
 use svpflow_host::opencl::{
     CL_DEVICE_TYPE_GPU, CL_EVENT_COMMAND_EXECUTION_STATUS, CL_FALSE, CL_MAP_READ,
-    CL_MEM_ALLOC_HOST_PTR, CL_MEM_OBJECT_ALLOCATION_FAILURE, CL_MEM_READ_WRITE,
-    CL_OUT_OF_HOST_MEMORY, CL_OUT_OF_RESOURCES, CL_SUCCESS, CL_TRUE, ClImageFormat, ClInt, ClUint,
-    FnCreateImage, FnCreateImage2D, FnEnqueueReadBufferRect, FnEnqueueWriteImage,
-    FnGetProgramBuildInfo, FnRelease, FnWaitForEvents, OpenCl as CoreCl,
+    CL_MEM_ALLOC_HOST_PTR, CL_MEM_COPY_HOST_PTR, CL_MEM_OBJECT_ALLOCATION_FAILURE,
+    CL_MEM_READ_WRITE, CL_OUT_OF_HOST_MEMORY, CL_OUT_OF_RESOURCES, CL_SUCCESS, CL_TRUE,
+    ClImageFormat, ClInt, ClUint, FnCreateImage, FnCreateImage2D, FnEnqueueReadBufferRect,
+    FnEnqueueWriteImage, FnGetProgramBuildInfo, FnRelease, FnWaitForEvents, OpenCl as CoreCl,
 };
 
 #[allow(non_snake_case)]
@@ -108,6 +108,7 @@ pub struct GpuContext {
     fuse_fits: bool,
     image_pool: std::sync::Arc<ImagePool>,
     still: std::sync::Mutex<StillState>,
+    hold: ClMem,
     layer: std::sync::Mutex<layer::LayerState>,
     blend_pool: std::sync::Mutex<Vec<blend::Buffers>>,
     blend_slots: std::sync::Arc<blend::Slots>,
@@ -399,6 +400,9 @@ impl Drop for GpuContext {
                 }
             }
             self.release_layer();
+            if !self.hold.is_null() {
+                (self.cl.ReleaseMemObject)(self.hold);
+            }
             if let Ok(mut pool) = self.blend_pool.lock() {
                 for buffers in pool.drain(..) {
                     (self.cl.ReleaseMemObject)(buffers.sums);
@@ -620,6 +624,7 @@ impl GpuContext {
                     scratch: std::ptr::null_mut(),
                     dims: (0, 0),
                 }),
+                hold: std::ptr::null_mut(),
                 layer: std::sync::Mutex::new(layer::LayerState::new()),
                 blend_pool: std::sync::Mutex::new(Vec::new()),
                 readbacks,
@@ -1186,7 +1191,7 @@ impl GpuContext {
                 program
             } else {
                 let source = format!(
-                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define STILL {}\n#define LAYER {}\n#define FUSE {}\n#define DEPTH {}\n{}",
+                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define STILL {}\n#define LAYER {}\n#define HOLD {}\n#define FUSE {}\n#define DEPTH {}\n{}",
                     variant & 0xFF,
                     (variant >> 8) & 1,
                     (variant >> 9) & 1,
@@ -1196,6 +1201,7 @@ impl GpuContext {
                     (variant >> 13) & 1,
                     (variant >> 14) & 1,
                     (variant >> 15) & 1,
+                    (variant >> 16) & 1,
                     (variant >> 17) & 1,
                     self.depth,
                     KERNEL_SRC
@@ -1491,6 +1497,38 @@ impl GpuContext {
         Some(())
     }
 
+    pub fn set_hold(&mut self, pixels: &[u8], width: usize, height: usize) -> Option<()> {
+        let format = ClImageFormat {
+            channel_order: CL_R,
+            channel_data_type: CL_UNORM_INT8,
+        };
+        let mut err = 0;
+        let mem = unsafe {
+            (self.cl.CreateImage2D)(
+                self.context,
+                CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                &raw const format,
+                width,
+                height,
+                width,
+                pixels.as_ptr().cast_mut().cast(),
+                &raw mut err,
+            )
+        };
+        (err == CL_SUCCESS && !mem.is_null()).then(|| self.hold = mem)
+    }
+
+    pub fn hold(&self) -> Option<StillMask> {
+        (!self.hold.is_null()).then_some(StillMask(self.hold, std::ptr::null_mut()))
+    }
+
+    fn mask_variant(&self, mask: Option<StillMask>) -> u32 {
+        mask.map_or(
+            0,
+            |StillMask(mem, _)| if mem == self.hold { 1 << 16 } else { 1 << 14 },
+        )
+    }
+
     pub fn still_mask(
         &self,
         first: &SuperHandle,
@@ -1705,7 +1743,7 @@ impl GpuContext {
             let k = self.bind_fields(
                 &mut unit,
                 Self::variant(&py, self.depth > 8)
-                    | u32::from(still.is_some()) << 14
+                    | self.mask_variant(still)
                     | if layer.is_some() {
                         layer::LAYER_VARIANT
                     } else {
@@ -1727,7 +1765,9 @@ impl GpuContext {
                 {
                     return None;
                 }
-                waits.push(ready);
+                if !ready.is_null() {
+                    waits.push(ready);
+                }
             }
             if let Some(layer) = layer {
                 let base = 8 + ClUint::from(still.is_some());
@@ -2082,6 +2122,9 @@ pub(crate) const KERNEL_SRC: &str = r"
 #ifndef LAYER
 #define LAYER 0
 #endif
+#ifndef HOLD
+#define HOLD 0
+#endif
 #ifndef FUSE
 #define FUSE 0
 #endif
@@ -2091,8 +2134,9 @@ pub(crate) const KERNEL_SRC: &str = r"
 #define LAYER_NEAR 0.0f
 #define LAYER_SAME 2.5f
 #define LAYER_APART 24.0f
-#define STILL_AT(still, p, x, y) (read_imagef(still, linear_sampler, \
-    ((float2)(x, y) + 0.5f) * (float2)(p.x_ratio, p.y_ratio)).x > 0.4f)
+#define MASK_AT(mask, p, x, y) read_imagef(mask, linear_sampler, \
+    ((float2)(x, y) + 0.5f) * (float2)(p.x_ratio, p.y_ratio)).x
+#define STILL_AT(still, p, x, y) (MASK_AT(still, p, x, y) > 0.4f)
 #if DEPTH > 8
 #define REF_SCALE(p) ((p)->linear_luma ? 256.0f : (float)(1 << (24 - DEPTH)))
 #else
@@ -2190,16 +2234,35 @@ inline float linear_source_sample(
 const sampler_t cell_sampler = CLK_NORMALIZED_COORDS_FALSE |
     CLK_ADDRESS_CLAMP_TO_EDGE | CLK_FILTER_NEAREST;
 
+inline float cell_sample(read_only image2d_t source, const Params *p) {
+    return REF_SCALE(p) * read_imagef(source, cell_sampler,
+        (int2)(p->offset_x + get_global_id(0), p->offset_y + get_global_id(1))).x;
+}
+
 inline float base_sample(read_only image2d_t source, const Params *p) {
 #if CUBIC_REF
     float2 position = ((float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f))
         + (float2)(get_global_id(0), get_global_id(1));
     return REF_SCALE(p) * cubic_sample(source, position).x;
 #else
-    return REF_SCALE(p) * read_imagef(source, cell_sampler,
-        (int2)(p->offset_x + get_global_id(0), p->offset_y + get_global_id(1))).x;
+    return cell_sample(source, p);
 #endif
 }
+
+#if HOLD
+inline float held_value(read_only image2d_t source, const Params *p) {
+    float value = cell_sample(source, p);
+#if LINEAR_LUMA
+    if (p->linear_luma) {
+        value = native_divide(value, 255.0f);
+        if (value < 0.018f) value *= 4.5f;
+        else value = 1.099f*native_powr(value, 0.45f)-0.099f;
+        value *= 255.0f;
+    }
+#endif
+    return value;
+}
+#endif
 
 inline float2 full_step(const Params *p, float vx, float vy) {
     return native_divide(
@@ -2299,7 +2362,7 @@ kernel void render_frame(
     read_only image2d_t source_f, read_only image2d_t source_b,
     read_only image2d_t vectors, read_only image2d_t vectors_ext,
     read_only image2d_t masks, Params p
-#if STILL
+#if STILL || HOLD
     , read_only image2d_t still
 #endif
 #if LAYER
@@ -2400,7 +2463,7 @@ kernel void render_frame(
 
 #if STILL
     if (STILL_AT(still, p, x, y))
-        result = mix(base_sample(source_f, &p), base_sample(source_b, &p), time);
+        result = mix(cell_sample(source_f, &p), cell_sample(source_b, &p), time);
 #endif
     }
 
@@ -2419,6 +2482,10 @@ kernel void render_frame(
         result *= 255.0f;
 #endif
     }
+#endif
+#if HOLD
+    float weight = MASK_AT(still, p, x, y);
+    if (weight < 1.0f) result = mix(held_value(source_f, &p), result, weight);
 #endif
 #if DEPTH > 8
     ((global ushort *)destination)[y*destination_stride+x] =
@@ -2595,7 +2662,7 @@ kernel void blend_frame(
     read_only image2d_t source_f, read_only image2d_t source_b,
     read_only image2d_t vectors, read_only image2d_t vectors_ext,
     read_only image2d_array_t masks, Params p, Steps steps
-#if STILL
+#if STILL || HOLD
     , read_only image2d_t still
 #endif
 #if LAYER
@@ -2628,9 +2695,13 @@ kernel void blend_frame(
     int kept = STILL_AT(still, p, x, y);
     float kept_f = 0.0f, kept_b = 0.0f;
     if (kept) {
-        kept_f = base_sample(source_f, &p);
-        kept_b = base_sample(source_b, &p);
+        kept_f = cell_sample(source_f, &p);
+        kept_b = cell_sample(source_b, &p);
     }
+#endif
+#if HOLD
+    float weight = MASK_AT(still, p, x, y);
+    float held = held_value(source_f, &p);
 #endif
 #if LAYER
     float2 at = (float2)(x, y), top = (float2)(p.width-1, p.height-1);
@@ -2687,6 +2758,9 @@ kernel void blend_frame(
         }
 
         float value = blend_round(result, &p, layered, x, y);
+#if HOLD
+        if (weight < 1.0f) value = round(mix(held, value, weight));
+#endif
         {
 #pragma OPENCL FP_CONTRACT OFF
             if (steps.gamma != 1.0f) value = curve[(int)value];

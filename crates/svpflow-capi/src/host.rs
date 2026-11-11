@@ -429,6 +429,19 @@ pub fn set_threads(count: usize) {
     }
 }
 
+pub fn mask(pixels: *const u8, width: i32, height: i32) -> i64 {
+    let plugins = PLUGINS.lock().unwrap_or_else(PoisonError::into_inner);
+    let mask = plugins.iter().find_map(|plugin| plugin.mask);
+    mask.map_or(0, |mask| unsafe { mask(pixels, width, height) })
+}
+
+pub fn unmask(id: i64) {
+    let plugins = PLUGINS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(unmask) = plugins.iter().find_map(|plugin| plugin.unmask) {
+        unsafe { unmask(id) };
+    }
+}
+
 pub fn stop() {
     WORKERS.resize(0);
     for plugin in PLUGINS
@@ -445,6 +458,8 @@ pub fn stop() {
 struct Plugin {
     set: Option<unsafe extern "C" fn(usize)>,
     stop: Option<unsafe extern "C" fn()>,
+    mask: Option<unsafe extern "C" fn(*const u8, i32, i32) -> i64>,
+    unmask: Option<unsafe extern "C" fn(i64)>,
 }
 
 static PLUGINS: Mutex<Vec<Plugin>> = Mutex::new(Vec::new());
@@ -947,13 +962,24 @@ impl Host {
                 let stop = unsafe { library.get::<unsafe extern "C" fn()>(b"osvp_plugin_stop\0") }
                     .ok()
                     .map(|symbol| *symbol);
+                let mask = unsafe { library.get(b"osvp_plugin_mask\0") }
+                    .ok()
+                    .map(|symbol| *symbol);
+                let unmask = unsafe { library.get(b"osvp_plugin_unmask\0") }
+                    .ok()
+                    .map(|symbol| *symbol);
                 if let Some(set) = set {
                     unsafe { set(WANT.load(Ordering::Relaxed)) };
                 }
                 PLUGINS
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .push(Plugin { set, stop });
+                    .push(Plugin {
+                        set,
+                        stop,
+                        mask,
+                        unmask,
+                    });
                 std::mem::forget(library);
             }
             Ok(functions)

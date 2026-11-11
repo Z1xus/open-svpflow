@@ -103,6 +103,7 @@ pub struct Mask {
     pub area_blend: f64,
     pub still: Option<[f32; 3]>,
     pub peel: Option<f32>,
+    pub image: Option<i64>,
 }
 
 #[allow(dead_code)]
@@ -251,11 +252,19 @@ impl Options {
     }
 
     pub const fn mask_still(&self) -> Option<[f32; 3]> {
-        self.mask.still
+        if self.mask.image.is_some() {
+            None
+        } else {
+            self.mask.still
+        }
     }
 
     pub const fn mask_peel(&self) -> Option<f32> {
         self.mask.peel
+    }
+
+    pub const fn mask_image(&self) -> Option<i64> {
+        self.mask.image
     }
 
     pub fn apply_source_depth(&mut self, depth: i32) {
@@ -581,6 +590,7 @@ impl Default for Mask {
             area_blend: 0.4,
             still: None,
             peel: None,
+            image: None,
         }
     }
 }
@@ -692,6 +702,7 @@ impl Mask {
                 .bool_at(&["mask", "peel"])
                 .unwrap_or(false)
                 .then(|| crate::layer::limit(value.float_at(&["mask", "peel", "limit"]))),
+            image: value.int_at(&["mask", "image"]),
         }
     }
 }

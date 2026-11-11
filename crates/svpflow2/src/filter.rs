@@ -154,6 +154,22 @@ pub(crate) unsafe fn build_state(
         unsafe { data.free(vsapi) };
         return None;
     }
+    if let Some(id) = data.options.mask_image() {
+        let (width, height) = (data.video_info.width, data.video_info.height);
+        let mask = crate::image::get(id, width, height)
+            .filter(|_| video_format::is_cpu_source(&data.video_info) && data.reference_enabled());
+        let uploaded = match (&mask, data.gpu.as_mut()) {
+            (Some(mask), Some(gpu)) => gpu.set_hold(&mask.pixels, width as usize, height as usize),
+            _ => Some(()),
+        };
+        if mask.is_none() || uploaded.is_none() {
+            let error = c"SVSmoothFps: the image mask is missing, has another size, or does not fit this render";
+            unsafe { set_error(output, vsapi, error.as_ptr()) };
+            unsafe { data.free(vsapi) };
+            return None;
+        }
+        data.image = mask;
+    }
     Some((data, api))
 }
 
@@ -407,6 +423,7 @@ unsafe fn collect_state(
         repeat_cache: std::sync::Mutex::new(Vec::new()),
         still_cache: std::sync::Mutex::default(),
         layers: std::sync::Mutex::default(),
+        image: None,
         fallback_notice: std::sync::Once::new(),
         _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
     };

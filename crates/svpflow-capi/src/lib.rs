@@ -330,6 +330,37 @@ pub unsafe extern "C" fn osvp_still(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn osvp_mask_create(pixels: *const u8, width: i32, height: i32) -> i64 {
+    match host::mask(pixels, width, height) {
+        0 => {
+            fail::<()>("the mask could not be made");
+            0
+        }
+        id => id,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn osvp_mask_free(mask: i64) {
+    host::unmask(mask);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn osvp_hold(
+    context: *const Context,
+    clip: *const Clip,
+    source: *const Clip,
+    mask: i64,
+) -> *mut Clip {
+    let (host, clip, source) = unsafe { (&(*context).0, &(*clip).node, &(*source).node) };
+    let mut input = Map::default();
+    input.set(c"clip", Value::Node(Arc::clone(clip)));
+    input.set(c"source", Value::Node(Arc::clone(source)));
+    input.set(c"mask", Value::Int(mask));
+    finish(host, c"Still", Ok(input))
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn osvp_layer(
     context: *const Context,
     source: *const Clip,

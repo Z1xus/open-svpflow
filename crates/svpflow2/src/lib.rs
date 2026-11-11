@@ -21,6 +21,7 @@ mod filter;
 mod frame;
 mod gpu;
 mod hdr;
+mod image;
 mod light;
 mod metadata;
 mod nvof;

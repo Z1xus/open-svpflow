@@ -6,7 +6,7 @@ use crate::{filter, strings, vs};
 
 #[cfg(feature = "still")]
 const STILL_ARGS: &std::ffi::CStr =
-    c"clip:clip;source:clip;limit:float:opt;edge:float:opt;tolerance:float:opt";
+    c"clip:clip;source:clip;limit:float:opt;edge:float:opt;tolerance:float:opt;mask:int:opt";
 
 const PEEL: [(&std::ffi::CStr, &std::ffi::CStr, vs::Create); 3] = [
     (

@@ -69,6 +69,14 @@ osvp_clip *osvp_smooth_fps_blend(const osvp_context *context, const osvp_clip *s
 osvp_clip *osvp_still(const osvp_context *context, const osvp_clip *clip,
                       const osvp_clip *source, double limit, double edge, double tolerance);
 
+/* 8-bit grey of the size of the clip, black keeps the source frame. needs a context, 0 on failure */
+int64_t osvp_mask_create(const uint8_t *pixels, int32_t width, int32_t height);
+void osvp_mask_free(int64_t mask);
+
+/* clip is an interpolation of source */
+osvp_clip *osvp_hold(const osvp_context *context, const osvp_clip *clip,
+                     const osvp_clip *source, int64_t mask);
+
 osvp_clip *osvp_layer(const osvp_context *context, const osvp_clip *source,
                       const char *super_opt, const char *analyse_opt, int32_t half_analysis,
                       double limit);

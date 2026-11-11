@@ -13,6 +13,7 @@ pub const CL_TRUE: ClUint = 1;
 pub const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
 pub const CL_MEM_READ_WRITE: u64 = 1;
 pub const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
+pub const CL_MEM_COPY_HOST_PTR: u64 = 1 << 5;
 pub const CL_MAP_READ: u64 = 1;
 pub const CL_EVENT_COMMAND_EXECUTION_STATUS: ClUint = 0x11D3;
 

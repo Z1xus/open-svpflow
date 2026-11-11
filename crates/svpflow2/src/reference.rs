@@ -83,6 +83,49 @@ impl FilterState {
         crate::video_format::chroma_divisors(&self.video_info)
     }
 
+    unsafe fn hold(
+        &self,
+        api: &frame::PlaneApi,
+        output: vs::Raw,
+        held: vs::ConstRaw,
+    ) -> Option<()> {
+        let mask = self.image.as_ref()?;
+        let w = usize::try_from(self.video_info.width).ok()?;
+        let h = usize::try_from(self.video_info.height).ok()?;
+        let (cx, cy) = self.chroma();
+        let (pad_x, pad_y) = self.options.padding(&self.video_info.source());
+        for plane in 0..3 {
+            let (dx, dy) = if plane == 0 {
+                (1, 1)
+            } else {
+                (cx as usize, cy as usize)
+            };
+            let (width, height) = (w / dx, h / dy);
+            let (px, py) = (
+                usize::try_from(pad_x).ok()? / dx,
+                usize::try_from(pad_y).ok()? / dy,
+            );
+            let (data, pitch, len) = unsafe { api.read_plane(held, plane, height) }?;
+            let source = unsafe { slice::from_raw_parts(data, len) };
+            let (data, stride, len) = unsafe { api.write_plane(output, plane, height + 2 * py) }?;
+            let start = py * stride + px;
+            let target =
+                unsafe { slice::from_raw_parts_mut(data.add(start), len.checked_sub(start)?) };
+            let mask_width = mask.width as usize;
+            svpflow_core::still::hold(
+                target,
+                stride,
+                source,
+                pitch,
+                width,
+                height,
+                &mask.pixels,
+                mask_width,
+            );
+        }
+        Some(())
+    }
+
     pub(crate) fn reference_enabled(&self) -> bool {
         (matches!(self.mode, Mode::SmoothFps) || self.nvof.is_some())
             && (self.render_mode == 1 || (self.render_mode == 2 && self.gpu.is_some()))
@@ -416,7 +459,8 @@ impl FilterState {
         let still = self
             .options
             .mask_still()
-            .and_then(|limits| gpu.still_mask(&current, &next, limits));
+            .and_then(|limits| gpu.still_mask(&current, &next, limits))
+            .or_else(|| gpu.hold());
         if let Some(job) = blend {
             gpu.blend_render(
                 job,
@@ -832,6 +876,9 @@ impl FilterState {
                     vsapi,
                 )
             };
+            if use_next && !output.is_null() && output != selected {
+                unsafe { self.hold(&api, output.cast_mut(), source) };
+            }
             fetch.drop(other);
             if !output.is_null() && engine::needs_vectors(phase) {
                 let field = field();
@@ -1192,6 +1239,7 @@ impl FilterState {
                 }
             }
         }
+        unsafe { self.hold(api, output, source) };
         unsafe { self.reference_overlays(api, output, frame, class, field, (luma, limits)) };
         unsafe { self.apply_light_border(api, output, frame) };
         if self.options.debug_tt() {
