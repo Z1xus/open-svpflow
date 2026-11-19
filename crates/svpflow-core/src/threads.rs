@@ -80,7 +80,7 @@ pub fn workers() -> usize {
 
 // host frame threads also run filters, so the pool gets three quarters
 fn pool_size() -> usize {
-    (workers() * 3).div_ceil(4).max(2)
+    (workers() * 3).div_ceil(4).max(1)
 }
 
 pub fn set(count: usize) {

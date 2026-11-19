@@ -5,7 +5,7 @@ mod host;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use host::{Frame, Host, Map, Need, Node, Pending, Read, Release, Render, Value};
@@ -78,7 +78,7 @@ pub extern "C" fn osvp_error_callback() -> i32 {
     i32::from(CALLBACK.get())
 }
 
-static CONTEXTS: AtomicUsize = AtomicUsize::new(0);
+static CONTEXTS: Mutex<usize> = Mutex::new(0);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn osvp_set_threads(count: i32) {
@@ -93,12 +93,23 @@ pub unsafe extern "C" fn osvp_create(plugin_dir: *const c_char) -> *mut Context 
             .into_owned()
     });
     let directory = directory.as_deref().map(std::path::Path::new);
+    // counted first, so a destroy cannot stop the host
+    *CONTEXTS.lock().unwrap_or_else(PoisonError::into_inner) += 1;
     match Host::new(directory) {
-        Ok(host) => {
-            CONTEXTS.fetch_add(1, Ordering::SeqCst);
-            Box::into_raw(Box::new(Context(host)))
+        Ok(host) => Box::into_raw(Box::new(Context(host))),
+        Err(error) => {
+            release();
+            fail(error)
         }
-        Err(error) => fail(error),
+    }
+}
+
+// unlocked while a context drops, it waits for the workers
+fn release() {
+    let mut contexts = CONTEXTS.lock().unwrap_or_else(PoisonError::into_inner);
+    *contexts -= 1;
+    if *contexts == 0 {
+        host::stop();
     }
 }
 
@@ -106,9 +117,7 @@ pub unsafe extern "C" fn osvp_create(plugin_dir: *const c_char) -> *mut Context 
 pub unsafe extern "C" fn osvp_destroy(context: *mut Context) {
     if !context.is_null() {
         drop(unsafe { Box::from_raw(context) });
-        if CONTEXTS.fetch_sub(1, Ordering::SeqCst) == 1 {
-            host::stop();
-        }
+        release();
     }
 }
 
