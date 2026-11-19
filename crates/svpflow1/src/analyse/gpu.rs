@@ -288,6 +288,16 @@ pub(crate) fn refine_gpu() -> Option<&'static RefineGpu> {
     GPU.get_or_init(|| unsafe { RefineGpu::new() }).as_ref()
 }
 
+pub(crate) fn trim() {
+    if let Some(Some(gpu)) = GPU.get()
+        && let Ok(mut pool) = gpu.pool.lock()
+    {
+        for (mem, _) in pool.drain(..) {
+            unsafe { (gpu.cl.ReleaseMemObject)(mem as Handle) };
+        }
+    }
+}
+
 pub(crate) fn purge(id: usize) {
     if let Some(Some(gpu)) = GPU.get()
         && let Ok(mut cache) = gpu.cache.lock()
@@ -1103,7 +1113,11 @@ impl Session<'_, '_> {
             shift: plan.shift,
             ..Variant::new(plan.width, plan.height, plan.satd)
         })?;
-        unsafe { self.enqueue(plan, src, reference, program, source, target) }
+        let ticket = unsafe { self.enqueue(plan, src, reference, program, source, target) };
+        if ticket.is_none() {
+            unsafe { (self.gpu.cl.Finish)(self.unit.queue as Handle) };
+        }
+        ticket
     }
 
     pub(crate) fn submit_compact(
@@ -1121,7 +1135,11 @@ impl Session<'_, '_> {
             shift: plan.shift,
             ..Variant::new(4, 4, plan.satd)
         })?;
-        unsafe { self.enqueue_compact(plan, src, reference, program, source, target) }
+        let ticket = unsafe { self.enqueue_compact(plan, src, reference, program, source, target) };
+        if ticket.is_none() {
+            unsafe { (self.gpu.cl.Finish)(self.unit.queue as Handle) };
+        }
+        ticket
     }
 
     unsafe fn enqueue_compact(
@@ -1249,7 +1267,7 @@ impl Session<'_, '_> {
             let events: Vec<Handle> = self.upload_events();
             let chunk = CHUNK.min(blocks);
             let params = self.hold(bytes(&params));
-            let records = bytes(&plan.records);
+            let records = self.hold(bytes(&plan.records));
             let params_mem = unsafe { self.write(|u| &mut u.params[slot], params)? };
             let records_mem = unsafe {
                 self.gpu
@@ -1338,7 +1356,11 @@ impl Session<'_, '_> {
             &params.q,
             params.border,
         )?;
-        unsafe { self.enqueue_search(params, pred, rev, src, reference, programs) }
+        let ticket = unsafe { self.enqueue_search(params, pred, rev, src, reference, programs) };
+        if ticket.is_none() {
+            unsafe { (self.gpu.cl.Finish)(self.unit.queue as Handle) };
+        }
+        ticket
     }
 
     unsafe fn launch_search(
@@ -1458,7 +1480,8 @@ impl Session<'_, '_> {
         let q2 = self.hold(bytes(&border_q));
         let q_mem = unsafe { self.write(|u| &mut u.search[src].q, q)? };
         let q2_mem = unsafe { self.write(|u| &mut u.search[src].q2, q2)? };
-        let pred_mem = unsafe { self.write(|u| &mut u.search[src].pred, bytes(pred))? };
+        let pred = self.hold(bytes(pred));
+        let pred_mem = unsafe { self.write(|u| &mut u.search[src].pred, pred)? };
         let mut rev_rank = Vec::with_capacity(size_of_val(rev) + size_of_val(&params.rank[..]));
         rev_rank.extend_from_slice(bytes(rev));
         rev_rank.extend_from_slice(bytes(&params.rank));

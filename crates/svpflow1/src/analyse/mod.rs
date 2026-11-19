@@ -12,7 +12,7 @@ mod planes;
 mod pyramid;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use gpu::purge;
+pub(crate) use gpu::{purge, trim};
 pub(crate) use params::{AnalyseParams, SuperParams};
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use planes::plane_size;

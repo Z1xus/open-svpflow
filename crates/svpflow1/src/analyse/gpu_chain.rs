@@ -252,6 +252,15 @@ impl Session<'_, '_> {
         plan: &ChainPlan,
         top_out: &[Vec<[i32; 4]>],
     ) -> Option<Vec<usize>> {
+        let tickets = self.enqueue_chain(plan, top_out);
+        // work that went out before a failure still uses the buffers
+        if tickets.is_none() {
+            unsafe { (self.gpu.cl.Finish)(self.unit.queue as Handle) };
+        }
+        tickets
+    }
+
+    fn enqueue_chain(&mut self, plan: &ChainPlan, top_out: &[Vec<[i32; 4]>]) -> Option<Vec<usize>> {
         self.flush();
         let chain = self.gpu.chain_program()?;
         let dirs = 1 + usize::from(plan.both);
