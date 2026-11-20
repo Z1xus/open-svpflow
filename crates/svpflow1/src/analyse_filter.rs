@@ -308,10 +308,14 @@ unsafe fn create_analyse_inner(
         };
         let held = frame_bytes(&super_vi) + if full { 0 } else { frame_bytes(&src_vi) };
         let info = unsafe { get_core_info(core) };
-        let cache = if info.is_null() {
-            0
-        } else {
+        // vapoursynth hosts like mpv buffer few input frames and run requests in parallel
+        let cache = if !info.is_null()
+            && !unsafe { (*info).version }.is_null()
+            && unsafe { std::ffi::CStr::from_ptr((*info).version) } == vs::AVISYNTH
+        {
             unsafe { (*info).max_framebuffer }
+        } else {
+            0
         };
 
         let header: Box<[i32]> = Box::new(analyse::analysis_header(&params));
@@ -339,7 +343,7 @@ unsafe fn create_analyse_inner(
             super_height: super_height as usize,
             _header: header,
             gray_format: gray,
-            depth: (cache / CACHE_SHARE / held).clamp(0, MAX_AHEAD) as i32,
+            depth: (cache / CACHE_SHARE / held.max(1)).clamp(0, MAX_AHEAD) as i32,
             ahead: Mutex::default(),
             _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
         })
@@ -523,21 +527,26 @@ unsafe extern "system" fn get_frame_analyse(
         return std::ptr::null();
     };
 
-    let (slot, fresh) = unsafe { state.look_ahead(&api, n, frame_ctx) };
+    // with no look-ahead each frame computes on its own
+    let ahead = (state.depth > 0).then(|| unsafe { state.look_ahead(&api, n, frame_ctx) });
     let Some(inputs) = (unsafe { state.fetch(&api, n, frame_ctx) }) else {
-        slot.set(Ahead::Taken);
+        if let Some((slot, _)) = &ahead {
+            slot.set(Ahead::Taken);
+        }
         return std::ptr::null();
     };
-    let ready = match slot.claim() {
-        _ if fresh => None,
+    let ready = ahead.as_ref().and_then(|(slot, fresh)| match slot.claim() {
+        _ if *fresh => None,
         Some(queued) => {
             unsafe { api.release(&queued) };
             None
         }
         None => slot.take(),
-    };
+    });
     let payload = ready.unwrap_or_else(|| unsafe { state.compute(&api, n, &inputs) });
-    slot.set(Ahead::Taken);
+    if let Some((slot, _)) = ahead {
+        slot.set(Ahead::Taken);
+    }
     let out = unsafe {
         new_frame(
             state.gray_format,

@@ -148,6 +148,7 @@ pub struct VideoInfo {
 unsafe impl Send for VideoInfo {}
 
 pub const LATER_REQUESTS: &std::ffi::CStr = c"open-svpflow";
+pub const AVISYNTH: &std::ffi::CStr = c"avisynth";
 
 #[repr(C)]
 #[derive(Clone, Copy)]

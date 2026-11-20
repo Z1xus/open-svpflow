@@ -652,7 +652,7 @@ unsafe extern "system" fn copy_frame(frame: ConstRaw, core: Raw) -> Raw {
 unsafe extern "system" fn get_core_info(core: Raw) -> *const CoreInfo {
     thread_local! {
         static INFO: Cell<CoreInfo> = const { Cell::new(CoreInfo {
-            version: std::ptr::null(),
+            version: vs3::AVISYNTH.as_ptr(),
             core: 0,
             api: 0,
             num_threads: 0,
