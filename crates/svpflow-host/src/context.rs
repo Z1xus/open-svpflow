@@ -56,13 +56,18 @@ fn sibling(device: Handle) -> Handle {
 }
 
 pub fn shared(device: Handle, create: impl FnOnce() -> Handle) -> Handle {
+    let mut context = osvp_cl_context_v1(device);
+    if !context.is_null() {
+        return context;
+    }
+    // the sibling takes its own lock, so this one is not held
+    context = sibling(device);
     let mut own = OWN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(entry) = own.iter().find(|entry| entry.0 == device as usize) {
         return entry.1 as Handle;
     }
-    let mut context = sibling(device);
     if context.is_null() {
         context = create();
     }

@@ -36,12 +36,20 @@ impl Rates {
     pub fn new(params: &ReferenceParams, source: &SourceInfo) -> Self {
         let src_num = u64::try_from(source.fps_num.max(1)).unwrap_or(1);
         let src_den = u64::try_from(source.fps_den.max(1)).unwrap_or(1);
-        let (out_num, out_den) = if params.absolute {
-            (params.rate_num, params.rate_den)
+        // each fraction is reduced first, so that the products below stay small
+        let common = gcd(src_num, src_den).max(1);
+        let (src_num, src_den) = (src_num / common, src_den / common);
+        let common = gcd(params.rate_num, params.rate_den).max(1);
+        let (rate_num, rate_den) = (params.rate_num / common, params.rate_den / common);
+        // a relative rate is the ratio itself, the factors cancel before the products
+        let (outer, inner) = if params.absolute {
+            (src_den, src_num)
         } else {
-            (src_num * params.rate_num, src_den * params.rate_den)
+            (1, 1)
         };
-        let (num, den) = (out_num * src_den, out_den * src_num);
+        let (left, right) = (gcd(rate_num, inner).max(1), gcd(outer, rate_den).max(1));
+        let num = (rate_num / left).saturating_mul(outer / right);
+        let den = (rate_den / right).saturating_mul(inner / left);
         let common = gcd(num, den).max(1);
         Self {
             num: num / common,
@@ -50,13 +58,12 @@ impl Rates {
     }
 
     pub fn source_frame(&self, frame: i32) -> i32 {
-        let frame = u64::try_from(frame.max(0)).unwrap_or(0);
-        i32::try_from(frame * self.den / self.num).unwrap_or(i32::MAX)
+        let frame = u128::try_from(frame.max(0)).unwrap_or(0);
+        i32::try_from(frame * u128::from(self.den) / u128::from(self.num)).unwrap_or(i32::MAX)
     }
 
     pub fn raw_phase(&self, frame: i32, source: i32) -> f64 {
-        256.0
-            * (f64::from(frame) * f64::from(self.den as i32) / self.num as f64 - f64::from(source))
+        256.0 * (f64::from(frame) * self.den as f64 / self.num as f64 - f64::from(source))
     }
 
     pub fn ratio(&self) -> f64 {
@@ -64,7 +71,7 @@ impl Rates {
     }
 
     pub fn time_to_fixed(&self, raw: f64, mode: i32) -> i32 {
-        let step = f64::from(self.den as i32) * 256.0 / self.num as f64;
+        let step = self.den as f64 * 256.0 / self.num as f64;
         let mut left = (raw / step).floor() as i32;
         let rem = raw - f64::from(left) * step;
         let mut right = ((256.0 - raw - 0.001) / step).floor() as i32;

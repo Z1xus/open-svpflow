@@ -101,7 +101,7 @@ const MAP_GET_DATA_SIZE: usize = 560;
 const MAP_GET_NODE: usize = 584;
 const GET_CORE_INFO: usize = 808;
 
-const PT_VIDEO_NODE: i32 = 3;
+const PT_VIDEO_NODE: i32 = 5;
 static API4: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 fn api() -> ConstRaw {
@@ -229,13 +229,14 @@ unsafe extern "system" fn get_frame4(
     core: Raw,
     _: ConstRaw,
 ) -> ConstRaw {
-    let adapter = unsafe { &mut *instance.cast::<Adapter>() };
+    // frames run in parallel, so no reference to the adapter
+    let adapter = instance.cast::<Adapter>();
     let reason = if reason == 1 { 2 } else { reason };
     unsafe {
-        (adapter.get_frame)(
+        ((*adapter).get_frame)(
             n,
             reason,
-            &raw mut adapter.instance,
+            &raw mut (*adapter).instance,
             frame_data,
             ctx,
             core,
@@ -347,7 +348,16 @@ unsafe fn input_nodes(input: ConstRaw) -> Vec<Dependency> {
         for element in 0..unsafe { count(input, key) } {
             let mut error = 0;
             let node = unsafe { get_node(input, key, element, &raw mut error) };
-            if error == 0 && !node.is_null() {
+            if error != 0 || node.is_null() {
+                continue;
+            }
+            // a clip given twice is one dependency, the extra reference goes
+            if nodes
+                .iter()
+                .any(|dependency: &Dependency| dependency.source == node)
+            {
+                unsafe { free_node(node) };
+            } else {
                 nodes.push(Dependency {
                     source: node,
                     pattern: 0,

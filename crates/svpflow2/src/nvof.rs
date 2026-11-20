@@ -515,7 +515,9 @@ impl Session {
         reference: &[u8],
         vector_data: metadata::VectorData,
     ) -> Result<Vec<u8>, i32> {
-        let required = self.width.saturating_mul(self.height).saturating_mul(3) / 2;
+        let required = self
+            .width
+            .saturating_mul(self.height + self.height.div_ceil(2));
         if input.len() < required || reference.len() < required {
             return Err(5);
         }

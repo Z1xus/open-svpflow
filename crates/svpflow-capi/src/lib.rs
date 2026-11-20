@@ -296,8 +296,12 @@ pub unsafe extern "C" fn osvp_smooth_fps_blend(
     gamma: f64,
 ) -> *mut Clip {
     let (host, source) = unsafe { (&(*context).0, &(*source).node) };
-    let weights =
-        unsafe { std::slice::from_raw_parts(weights, usize::try_from(weight_count).unwrap_or(0)) };
+    let weights = match usize::try_from(weight_count) {
+        Ok(count) if count > 0 && !weights.is_null() => unsafe {
+            std::slice::from_raw_parts(weights, count)
+        },
+        _ => &[],
+    };
     let half = half_analysis != 0;
     let input = unsafe { vectors(host, source, super_opt, analyse_opt, smooth_opt, half) }.map(
         |mut input| {

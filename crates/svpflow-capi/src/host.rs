@@ -409,15 +409,14 @@ fn pool() -> &'static Pool {
 
 pub fn set_threads(count: usize) {
     WANT.store(count, Ordering::Relaxed);
-    let running = WORKERS
-        .queue
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .target
-        > 0;
-    if running {
-        WORKERS.resize(threads());
+    // a stop between a check and a resize would wait for workers that came back
+    let mut queue = WORKERS.queue.lock().unwrap_or_else(PoisonError::into_inner);
+    if queue.target > 0 {
+        queue.target = threads();
+        WORKERS.grow(&mut queue);
     }
+    drop(queue);
+    WORKERS.ready.notify_all();
     for plugin in PLUGINS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -507,9 +506,10 @@ impl Pool {
         if queue.target > 0 {
             return;
         }
-        drop(queue);
+        // a spawn after the unlock adds live workers that must not be joined here
         let handles =
             std::mem::take(&mut *self.handles.lock().unwrap_or_else(PoisonError::into_inner));
+        drop(queue);
         for handle in handles {
             let _ = handle.join();
         }

@@ -66,10 +66,8 @@ fn class(layout: Layout) -> Option<Layout> {
         return None;
     }
     let step = layout.size().next_power_of_two() / 8;
-    Some(class_layout(
-        layout.size().next_multiple_of(step),
-        layout.align(),
-    ))
+    // one alignment, so any block of a class serves any request
+    Some(class_layout(layout.size().next_multiple_of(step), 16))
 }
 
 fn effective(layout: Layout) -> Layout {
@@ -115,7 +113,16 @@ unsafe impl GlobalAlloc for Cached {
         if old.size() == new.size() {
             return ptr;
         }
-        unsafe { System.realloc(ptr, old, new.size()) }
+        if old.align() == new.align() {
+            return unsafe { System.realloc(ptr, old, new.size()) };
+        }
+        // a block that moves into or out of the classes changes its alignment
+        let moved = unsafe { self.alloc(class_layout(new_size, layout.align())) };
+        if !moved.is_null() {
+            unsafe { moved.copy_from_nonoverlapping(ptr, layout.size().min(new_size)) };
+            unsafe { self.dealloc(ptr, layout) };
+        }
+        moved
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
