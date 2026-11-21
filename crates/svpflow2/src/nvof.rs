@@ -1003,6 +1003,7 @@ fn pack_vectors(
         && flows.len() >= total
         && costs.len() >= total
         && svpflow_core::threads::workers() >= 2
+        && svpflow_core::threads::busy_count().saturating_mul(2) <= svpflow_core::threads::workers()
     {
         let bands = svpflow_core::threads::workers().min(4);
         let chunk_rows = grid_height.div_ceil(bands);

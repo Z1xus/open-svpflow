@@ -1,11 +1,46 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 
 use rayon::{Scope, ThreadPool, ThreadPoolBuilder};
 
 static WANT: AtomicUsize = AtomicUsize::new(0);
+static BUSY_LOCAL: AtomicUsize = AtomicUsize::new(0);
+static BUSY_PROBE: OnceLock<fn(isize) -> usize> = OnceLock::new();
 static POOL: Mutex<Option<Arc<Pool>>> = Mutex::new(None);
+
+pub struct BusyGuard;
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        if let Some(probe) = BUSY_PROBE.get() {
+            probe(-1);
+        } else {
+            BUSY_LOCAL.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn set_busy_probe(probe: fn(isize) -> usize) {
+    let _ = BUSY_PROBE.set(probe);
+}
+
+pub fn enter_busy() -> (BusyGuard, usize) {
+    let active = if let Some(probe) = BUSY_PROBE.get() {
+        probe(1)
+    } else {
+        BUSY_LOCAL.fetch_add(1, Ordering::Relaxed) + 1
+    };
+    (BusyGuard, active)
+}
+
+pub fn busy_count() -> usize {
+    if let Some(probe) = BUSY_PROBE.get() {
+        probe(0)
+    } else {
+        BUSY_LOCAL.load(Ordering::Relaxed)
+    }
+}
 
 struct Pool {
     threads: Option<ThreadPool>,

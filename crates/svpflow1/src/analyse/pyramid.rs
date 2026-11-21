@@ -1,5 +1,3 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use super::field::recalc::{CompactPlan, RecalcPlan};
 use super::field::{Field, Mv, VectorOutput};
 use super::gpu::Session;
@@ -7,26 +5,17 @@ use super::params::{AnalyseParams, Stage};
 use super::planes::LevelFrame;
 use super::planes::{LevelSource, SuperFrameView};
 
-static ACTIVE_ANALYSES: AtomicUsize = AtomicUsize::new(0);
-
 pub(crate) fn has_spare_cores() -> bool {
     let workers = svpflow_core::threads::workers();
-    let active = ACTIVE_ANALYSES.load(Ordering::Relaxed);
+    let active = svpflow_core::threads::busy_count();
     active.saturating_mul(2) <= workers
 }
 
-struct ActiveGuard;
+struct ActiveGuard(svpflow_core::threads::BusyGuard);
 
 impl ActiveGuard {
     fn enter() -> Self {
-        ACTIVE_ANALYSES.fetch_add(1, Ordering::Relaxed);
-        Self
-    }
-}
-
-impl Drop for ActiveGuard {
-    fn drop(&mut self) {
-        ACTIVE_ANALYSES.fetch_sub(1, Ordering::Relaxed);
+        Self(svpflow_core::threads::enter_busy().0)
     }
 }
 

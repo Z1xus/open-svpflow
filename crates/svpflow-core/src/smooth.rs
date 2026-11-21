@@ -6,23 +6,8 @@
 )]
 
 use std::cell::RefCell;
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::metadata::VectorData;
-
-#[cfg(not(target_arch = "wasm32"))]
-static ACTIVE_RENDERS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(not(target_arch = "wasm32"))]
-struct RenderGuard;
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Drop for RenderGuard {
-    fn drop(&mut self) {
-        ACTIVE_RENDERS.fetch_sub(1, Ordering::Relaxed);
-    }
-}
 
 type BlockEntry = (i32, usize, [i16; 32], [i16; 32]);
 
@@ -1029,8 +1014,7 @@ impl Renderer {
         if !self.split() {
             #[cfg(not(target_arch = "wasm32"))]
             if algo != Algo::Fill && self.shape.grid_h >= 16 {
-                let active = ACTIVE_RENDERS.fetch_add(1, Ordering::Relaxed) + 1;
-                let _guard = RenderGuard;
+                let (_guard, active) = crate::threads::enter_busy();
                 let workers = crate::threads::workers();
                 let bands = if active * 2 <= workers && workers >= 4 {
                     (workers / active.max(1))

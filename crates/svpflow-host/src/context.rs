@@ -12,6 +12,8 @@ type FinishSource = unsafe extern "C" fn(Handle, Handle, Handle) -> i32;
 type HasPtr = unsafe extern "C" fn(Handle, usize) -> i32;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 type LookupAny = unsafe extern "C" fn() -> Handle;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+type CpuActive = unsafe extern "C" fn() -> usize;
 
 #[cfg(target_os = "linux")]
 const SIBLINGS: [&str; 2] = ["libsvpflow1_vs.so", "libsvpflow2_vs.so"];
@@ -100,6 +102,12 @@ static SOURCES: Mutex<SourceTable> = Mutex::new(SourceTable {
 });
 static SOURCES_CV: Condvar = Condvar::new();
 static SOURCE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CPU_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn osvp_cpu_active_v1() -> usize {
+    CPU_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn osvp_cl_has_sources_v1() -> i32 {
@@ -620,4 +628,46 @@ pub unsafe fn lookup_source(context: Handle, hash: u64) -> Option<SharedSource> 
         return Some(out);
     }
     None
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn sibling_cpu_active() -> Option<CpuActive> {
+    static FN: OnceLock<Option<CpuActive>> = OnceLock::new();
+    *FN.get_or_init(|| {
+        for name in SIBLINGS {
+            let Some(library) = open_sibling(name) else {
+                continue;
+            };
+            let Ok(lookup) = (unsafe { library.get::<CpuActive>(b"osvp_cpu_active_v1\0") }) else {
+                continue;
+            };
+            let lookup: CpuActive = *lookup;
+            if lookup as *const () == osvp_cpu_active_v1 as *const () {
+                continue;
+            }
+            std::mem::forget(library);
+            return Some(lookup);
+        }
+        None
+    })
+}
+
+pub fn cpu_busy(delta: isize) -> usize {
+    if delta < 0 {
+        let sub = delta.unsigned_abs();
+        return CPU_ACTIVE
+            .fetch_sub(sub, std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(sub);
+    }
+    let local = if delta > 0 {
+        let add = delta.cast_unsigned();
+        CPU_ACTIVE.fetch_add(add, std::sync::atomic::Ordering::Relaxed) + add
+    } else {
+        CPU_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    let remote = sibling_cpu_active().map_or(0, |f| unsafe { f() });
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let remote = 0;
+    local.saturating_add(remote)
 }

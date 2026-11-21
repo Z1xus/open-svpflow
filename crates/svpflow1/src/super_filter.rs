@@ -24,6 +24,7 @@ unsafe fn create_super_inner(
     core: vs::Raw,
     vsapi: vs::ConstRaw,
 ) -> isize {
+    svpflow_core::threads::set_busy_probe(svpflow_host::context::cpu_busy);
     svpflow_core::threads::set_default(unsafe { vs::core_threads(core, vsapi) });
     let Some(get_node) = (unsafe { vs::table_fn::<vs::PropGetNode>(vsapi, vs::PROP_GET_NODE) })
     else {
@@ -241,6 +242,7 @@ unsafe extern "system" fn get_frame_super(
         return std::ptr::null();
     }
 
+    let _busy = svpflow_core::threads::enter_busy();
     for plane in 0..3 {
         let stride = unsafe { get_stride(out.cast_const(), plane) } as usize;
         let ptr = unsafe { get_write(out, plane) };
