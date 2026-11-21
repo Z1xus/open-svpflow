@@ -425,7 +425,6 @@ impl PlaneApi {
         (!copy.is_null()).then_some(copy)
     }
 
-    #[cfg(feature = "blend")]
     pub(crate) unsafe fn set_duration(&self, frame: vs::Raw, num: i64, den: i64) {
         let mut timing = unsafe { self.read_timing(frame.cast_const()) };
         timing.duration_num = num;

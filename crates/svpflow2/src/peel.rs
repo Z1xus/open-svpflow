@@ -912,13 +912,15 @@ unsafe extern "system" fn get_frame(
                 Some(unsafe { State::layer_store(&api, cached_frames, chunk, built, core) })
             }
             Kind::Peel => {
+                let wanted = [(first, n), (second, n / layer::CHUNK * layer::CHUNK)];
                 if !ready {
-                    request_node(request, first, n, frame_ctx);
-                    request_node(request, second, n, frame_ctx);
+                    for (node, k) in wanted {
+                        request_node(request, node, k, frame_ctx);
+                    }
                     waiting.set(true);
                     return None;
                 }
-                let frames = [first, second].map(|node| get_node(get, node, n, frame_ctx));
+                let frames = wanted.map(|(node, k)| get_node(get, node, k, frame_ctx));
                 let made = (|| {
                     let raw = unsafe {
                         planes(&api, frames[0], (state.size.1, state.size.1 / state.ratio))
@@ -941,7 +943,24 @@ unsafe extern "system" fn get_frame(
             Kind::Unpeel { step, last } => {
                 let (index, time) = State::position(*step, n);
                 let (index, next) = (index.min(*last), index.saturating_add(1).min(*last));
-                let wanted = [(first, n), (second, index), (second, next), (third, index)];
+                if time == 0.0 {
+                    if !ready {
+                        request_node(request, second, index, frame_ctx);
+                        waiting.set(true);
+                        return None;
+                    }
+                    let source = get_node(get, second, index, frame_ctx);
+                    if source.is_null() {
+                        return None;
+                    }
+                    let output = unsafe { api.copy(source, core) };
+                    drop_frame(source, free);
+                    let output = output?;
+                    unsafe { api.set_duration(output, state.info.fps_den, state.info.fps_num) };
+                    return Some(output.cast_const());
+                }
+                let chunk = index / layer::CHUNK * layer::CHUNK;
+                let wanted = [(first, n), (second, index), (second, next), (third, chunk)];
                 if !ready {
                     for (node, k) in wanted {
                         request_node(request, node, k, frame_ctx);
