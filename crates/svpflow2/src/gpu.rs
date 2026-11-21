@@ -2499,12 +2499,6 @@ inline float linear_at(read_only image2d_t source, const Params *p, float2 pos) 
 #endif
 
 #if FAST_BLEND
-inline float ign_noise(int x, int y) {
-    float v = 0.06711056f * (float)x + 0.00583715f * (float)y;
-    float f = 52.9829189f * (v - floor(v));
-    return f - floor(f);
-}
-
 inline float linear_source_sample_f(
     read_only image2d_t source, const Params *p, float vx, float vy, float time_f)
 {
@@ -2515,6 +2509,21 @@ inline float linear_source_sample_f(
         (float2)(0.0f, 0.0f), (float2)(p->width-1, p->height-1));
     float2 position = ((float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f)) + moved_pos;
     return REF_SCALE(p) * read_imagef(source, linear_sampler, position).x;
+}
+
+inline int fast_blend_want(float travel, int is_chroma) {
+    if (is_chroma) {
+#if FAST_BLEND >= 2
+        return 1;
+#else
+        return travel < 1.0f ? 1 : (travel < 3.0f ? 2 : 4);
+#endif
+    }
+#if FAST_BLEND >= 2
+    return travel < 0.75f ? 1 : (travel < 2.5f ? 2 : 4);
+#else
+    return travel < 0.5f ? 1 : (travel < 1.75f ? 2 : (travel < 4.0f ? 4 : 8));
+#endif
 }
 #endif
 
@@ -3074,7 +3083,7 @@ inline float blend_value(
 #if FAST_BLEND
 inline float fast_blend_tap(
     read_only image2d_t source_f, read_only image2d_t source_b, const Params *p,
-    float4 vector, float4 mask, float pf, int is_chroma)
+    float4 vector, float4 mask, float ref_f0, float ref_b0, float pf, int is_chroma)
 {
     float time = pf * 0.00390625f;
 #if FAST_BLEND >= 2
@@ -3090,6 +3099,8 @@ inline float fast_blend_tap(
     return ref_b;
 #elif ALGO == 2
     return ref_f;
+#elif ALGO == 13
+    return median3(ref_f, ref_b, mix(ref_f0, ref_b0, time));
 #elif ALGO >= 21
     return mix(mix(ref_f, ref_b, mask.y), mix(ref_b, ref_f, mask.z), time);
 #else
@@ -3121,7 +3132,7 @@ inline float fuse_slot(
 #if ADAPTIVE && ALGO == 23 && !FAST_BLEND
     read_only image2d_t vectors_ext,
 #endif
-    Params p, Steps steps, float total, int x, int y, int slot_id)
+    Params p, Steps steps, float total, int x, int y)
 {
     if (steps.source != 0.0f) {
 #pragma OPENCL FP_CONTRACT OFF
@@ -3144,12 +3155,23 @@ inline float fuse_slot(
     float occ = clamp(native_sqrt(dv.x * dv.x + dv.y * dv.y) * 0.25f, 0.0f, 1.0f);
     mask = (float4)(0.0f, occ, occ, 0.0f);
 # endif
+# if ALGO == 13
+    float ref_f0 = base_sample(source_f, &p);
+    float ref_b0 = base_sample(source_b, &p);
+# else
+    float ref_f0 = 0.0f;
+    float ref_b0 = 0.0f;
+# endif
 # if ALGO != 1 && ALGO != 2
     int zero_mv = sf.x == 0.0f && sf.y == 0.0f && sb.x == 0.0f && sb.y == 0.0f;
     if (zero_mv) {
         float rf = linear_source_sample_f(source_f, &p, vector.x, vector.w, 0.0f);
         float rb = linear_source_sample_f(source_b, &p, vector.z, vector.y, 0.0f);
+# if ALGO == 13
+        if (rf == rb && ref_f0 == rf && ref_b0 == rb) {
+# else
         if (rf == rb) {
+# endif
             float value = blend_round(rf, &p, 0, x, y);
             float wsum = 0.0f;
             for (int step = 0; step < steps.count; step++) wsum += steps.weight[step];
@@ -3158,44 +3180,38 @@ inline float fuse_slot(
     }
 # endif
     int is_chroma = p.x_ratio > 1 || p.y_ratio > 1;
-    int cap = (FAST_BLEND >= 2 || is_chroma) ? 1 : 2;
     float travel = fmax(fmax(fabs(sf.x), fabs(sf.y)), fmax(fabs(sb.x), fabs(sb.y)));
-    int want = travel < 0.5f ? 1 : cap;
-    int buckets = min(want, steps.count);
-    if (steps.count == 2) {
+    int want = fast_blend_want(travel, is_chroma);
+    if (steps.count == 2 && want > 2 && fabs((float)(steps.phase[1] - steps.phase[0])) > 1.0f) {
+        int half_n = want >> 1;
+        float inv_h = 1.0f / (float)half_n;
         float p0 = (float)steps.phase[0];
         float p1 = (float)steps.phase[1];
-        float dp = (p1 - p0) * 0.5f;
-        if (buckets == 1) {
-            float lo = clamp(p0 - dp, 0.0f, 256.0f);
-            float hi = clamp(p1 + dp, 0.0f, 256.0f);
-            float j = ign_noise(x + slot_id * 17, y + slot_id * 31);
-            float pf = mix(lo, hi, j);
-            float result = fast_blend_tap(source_f, source_b, &p, vector, mask, pf, is_chroma);
-            float value = blend_round(result, &p, 0, x, y);
-            total += (steps.weight[0] + steps.weight[1]) * value;
-        } else {
-            float j0 = ign_noise(x + slot_id * 17, y + slot_id * 31);
-            float pf0 = mix(clamp(p0 - dp, 0.0f, 256.0f), clamp(p0 + dp, 0.0f, 256.0f), j0);
-            float r0 = fast_blend_tap(source_f, source_b, &p, vector, mask, pf0, is_chroma);
-            total += steps.weight[0] * blend_round(r0, &p, 0, x, y);
-            float j1 = ign_noise(x + slot_id * 17 + 7, y + slot_id * 31 + 13);
-            float pf1 = mix(clamp(p1 - dp, 0.0f, 256.0f), clamp(p1 + dp, 0.0f, 256.0f), j1);
-            float r1 = fast_blend_tap(source_f, source_b, &p, vector, mask, pf1, is_chroma);
-            total += steps.weight[1] * blend_round(r1, &p, 0, x, y);
+        float dp = fabs(p1 - p0) * 0.5f;
+        float lo0 = clamp(p0 - dp, 0.0f, 256.0f), hi0 = clamp(p0 + dp, 0.0f, 256.0f);
+        float lo1 = clamp(p1 - dp, 0.0f, 256.0f), hi1 = clamp(p1 + dp, 0.0f, 256.0f);
+        float w0 = steps.weight[0] * inv_h;
+        float w1 = steps.weight[1] * inv_h;
+        for (int b = 0; b < half_n; b++) {
+            float u = ((float)b + 0.5f) * inv_h;
+            float r0 = fast_blend_tap(source_f, source_b, &p, vector, mask, ref_f0, ref_b0, mix(lo0, hi0, u), is_chroma);
+            total += w0 * blend_round(r0, &p, 0, x, y);
+            float r1 = fast_blend_tap(source_f, source_b, &p, vector, mask, ref_f0, ref_b0, mix(lo1, hi1, u), is_chroma);
+            total += w1 * blend_round(r1, &p, 0, x, y);
         }
         return total;
     }
+    int buckets = min(want, steps.count);
     for (int b = 0; b < buckets; b++) {
         int s0 = (b * steps.count) / buckets;
         int s1 = ((b + 1) * steps.count) / buckets;
-        float wsum = 0.0f;
-        for (int s = s0; s < s1; s++) wsum += steps.weight[s];
-        float j = ign_noise(x + slot_id * 17 + b * 7, y + slot_id * 31 + b * 13);
-        float pf = s1 - s0 > 1
-            ? mix((float)steps.phase[s0], (float)steps.phase[s1 - 1], j)
-            : (float)steps.phase[s0];
-        float result = fast_blend_tap(source_f, source_b, &p, vector, mask, pf, is_chroma);
+        float wsum = 0.0f, psum = 0.0f;
+        for (int s = s0; s < s1; s++) {
+            wsum += steps.weight[s];
+            psum += steps.weight[s] * (float)steps.phase[s];
+        }
+        float pf = wsum > 0.0f ? (psum / wsum) : (float)steps.phase[s0];
+        float result = fast_blend_tap(source_f, source_b, &p, vector, mask, ref_f0, ref_b0, pf, is_chroma);
         total += wsum * blend_round(result, &p, 0, x, y);
     }
     return total;
@@ -3319,15 +3335,15 @@ kernel void blend_frame(
     global float *sum = sums + (p.offset_y+y)*stride + p.offset_x + x;
     float total = overwrite ? 0.0f : *sum;
 #if ADAPTIVE && ALGO == 23 && !FAST_BLEND
-    total = fuse_slot(source0, forward0, backward0, vectors0, ext0, p, steps0, total, x, y, 0);
-    total = fuse_slot(source1, forward1, backward1, vectors1, ext1, p, steps1, total, x, y, 1);
-    total = fuse_slot(source2, forward2, backward2, vectors2, ext2, p, steps2, total, x, y, 2);
-    total = fuse_slot(source3, forward3, backward3, vectors3, ext3, p, steps3, total, x, y, 3);
+    total = fuse_slot(source0, forward0, backward0, vectors0, ext0, p, steps0, total, x, y);
+    total = fuse_slot(source1, forward1, backward1, vectors1, ext1, p, steps1, total, x, y);
+    total = fuse_slot(source2, forward2, backward2, vectors2, ext2, p, steps2, total, x, y);
+    total = fuse_slot(source3, forward3, backward3, vectors3, ext3, p, steps3, total, x, y);
 #else
-    total = fuse_slot(source0, forward0, backward0, vectors0, p, steps0, total, x, y, 0);
-    total = fuse_slot(source1, forward1, backward1, vectors1, p, steps1, total, x, y, 1);
-    total = fuse_slot(source2, forward2, backward2, vectors2, p, steps2, total, x, y, 2);
-    total = fuse_slot(source3, forward3, backward3, vectors3, p, steps3, total, x, y, 3);
+    total = fuse_slot(source0, forward0, backward0, vectors0, p, steps0, total, x, y);
+    total = fuse_slot(source1, forward1, backward1, vectors1, p, steps1, total, x, y);
+    total = fuse_slot(source2, forward2, backward2, vectors2, p, steps2, total, x, y);
+    total = fuse_slot(source3, forward3, backward3, vectors3, p, steps3, total, x, y);
 #endif
     *sum = total;
 }
@@ -3511,10 +3527,11 @@ kernel void blend_frame(
 #if FAST_BLEND
         if (!is_kept) {
             int fb_chroma = p.x_ratio > 1 || p.y_ratio > 1;
-            int fb_cap = (FAST_BLEND >= 2 || fb_chroma) ? 1 : 2;
             float fb_travel = fmax(fmax(fabs(zsf.x), fabs(zsf.y)), fmax(fabs(zsb.x), fabs(zsb.y)));
-            int fb_want = fb_travel < 0.5f ? 1 : fb_cap;
-            int fb_buckets = min(fb_want, steps.count);
+            int fb_want = fast_blend_want(fb_travel, fb_chroma);
+            int fb_sub = steps.count == 2 && fb_want > 2
+                && fabs((float)(steps.phase[1] - steps.phase[0])) > 1.0f;
+            int fb_buckets = fb_sub ? fb_want : min(fb_want, steps.count);
             float4 fb_mask = (float4)(0.0f);
 #if ALGO >= 21
             float2 fb_dv = zsf + zsb;
@@ -3525,27 +3542,29 @@ kernel void blend_frame(
                 float wsum;
                 float pf;
                 int sad_idx;
-                float j = ign_noise(x + b * 7, y + b * 13);
-                if (steps.count == 2) {
+                if (fb_sub) {
+                    int half_n = fb_buckets >> 1;
+                    int side = b >= half_n;
+                    int sub = side ? (b - half_n) : b;
+                    float u = ((float)sub + 0.5f) / (float)half_n;
                     float p0 = (float)steps.phase[0];
                     float p1 = (float)steps.phase[1];
-                    float dp = (p1 - p0) * 0.5f;
-                    float lo = fb_buckets == 1 ? clamp(p0 - dp, 0.0f, 256.0f)
-                        : clamp((b == 0 ? p0 : p1) - dp, 0.0f, 256.0f);
-                    float hi = fb_buckets == 1 ? clamp(p1 + dp, 0.0f, 256.0f)
-                        : clamp((b == 0 ? p0 : p1) + dp, 0.0f, 256.0f);
-                    wsum = fb_buckets == 1 ? (steps.weight[0] + steps.weight[1]) : steps.weight[b];
-                    pf = mix(lo, hi, j);
-                    sad_idx = b;
+                    float dp = fabs(p1 - p0) * 0.5f;
+                    float pc = side ? p1 : p0;
+                    pf = mix(clamp(pc - dp, 0.0f, 256.0f), clamp(pc + dp, 0.0f, 256.0f), u);
+                    wsum = steps.weight[side] / (float)half_n;
+                    sad_idx = side;
                 } else {
                     int s0 = (b * steps.count) / fb_buckets;
                     int s1 = ((b + 1) * steps.count) / fb_buckets;
                     sad_idx = (s0 + s1 - 1) >> 1;
                     wsum = 0.0f;
-                    for (int s = s0; s < s1; s++) wsum += steps.weight[s];
-                    pf = s1 - s0 > 1
-                        ? mix((float)steps.phase[s0], (float)steps.phase[s1 - 1], j)
-                        : (float)steps.phase[s0];
+                    float psum = 0.0f;
+                    for (int s = s0; s < s1; s++) {
+                        wsum += steps.weight[s];
+                        psum += steps.weight[s] * (float)steps.phase[s];
+                    }
+                    pf = wsum > 0.0f ? (psum / wsum) : (float)steps.phase[s0];
                 }
                 float result;
                 int layered = 0;
@@ -3573,7 +3592,7 @@ kernel void blend_frame(
                         result = l_model.x*scene + layer_offset(&p, l_model);
                     }
                 } else {
-                    result = fast_blend_tap(source_f, source_b, &p, vector, fb_mask, pf, fb_chroma);
+                    result = fast_blend_tap(source_f, source_b, &p, vector, fb_mask, ref_f0, ref_b0, pf, fb_chroma);
 #if HAS_SAD
                     float4 m = layer_sample(masks, field_position, sad_idx);
                     result = mix(result, mix(ref_f0, ref_b0, steps.sad_blend[sad_idx]), fmax(m.w, m.x));
@@ -3657,10 +3676,11 @@ kernel void blend_frame(
 #if FAST_BLEND
     if (!is_kept) {
     int fb_chroma = p.x_ratio > 1 || p.y_ratio > 1;
-    int fb_cap = (FAST_BLEND >= 2 || fb_chroma) ? 1 : 2;
     float fb_travel = fmax(fmax(fabs(zsf.x), fabs(zsf.y)), fmax(fabs(zsb.x), fabs(zsb.y)));
-    int fb_want = fb_travel < 0.5f ? 1 : fb_cap;
-    int fb_buckets = min(fb_want, steps.count);
+    int fb_want = fast_blend_want(fb_travel, fb_chroma);
+    int fb_sub = steps.count == 2 && fb_want > 2
+        && fabs((float)(steps.phase[1] - steps.phase[0])) > 1.0f;
+    int fb_buckets = fb_sub ? fb_want : min(fb_want, steps.count);
     float4 fb_mask = (float4)(0.0f);
 #if ALGO >= 21
     float2 fb_dv = zsf + zsb;
@@ -3671,29 +3691,31 @@ kernel void blend_frame(
         float wsum;
         float pf;
         int sad_idx;
-        float j = ign_noise(x + b * 7, y + b * 13);
-        if (steps.count == 2) {
+        if (fb_sub) {
+            int half_n = fb_buckets >> 1;
+            int side = b >= half_n;
+            int sub = side ? (b - half_n) : b;
+            float u = ((float)sub + 0.5f) / (float)half_n;
             float p0 = (float)steps.phase[0];
             float p1 = (float)steps.phase[1];
-            float dp = (p1 - p0) * 0.5f;
-            float lo = fb_buckets == 1 ? clamp(p0 - dp, 0.0f, 256.0f)
-                : clamp((b == 0 ? p0 : p1) - dp, 0.0f, 256.0f);
-            float hi = fb_buckets == 1 ? clamp(p1 + dp, 0.0f, 256.0f)
-                : clamp((b == 0 ? p0 : p1) + dp, 0.0f, 256.0f);
-            wsum = fb_buckets == 1 ? (steps.weight[0] + steps.weight[1]) : steps.weight[b];
-            pf = mix(lo, hi, j);
-            sad_idx = b;
+            float dp = fabs(p1 - p0) * 0.5f;
+            float pc = side ? p1 : p0;
+            pf = mix(clamp(pc - dp, 0.0f, 256.0f), clamp(pc + dp, 0.0f, 256.0f), u);
+            wsum = steps.weight[side] / (float)half_n;
+            sad_idx = side;
         } else {
             int s0 = (b * steps.count) / fb_buckets;
             int s1 = ((b + 1) * steps.count) / fb_buckets;
             sad_idx = (s0 + s1 - 1) >> 1;
             wsum = 0.0f;
-            for (int s = s0; s < s1; s++) wsum += steps.weight[s];
-            pf = s1 - s0 > 1
-                ? mix((float)steps.phase[s0], (float)steps.phase[s1 - 1], j)
-                : (float)steps.phase[s0];
+            float psum = 0.0f;
+            for (int s = s0; s < s1; s++) {
+                wsum += steps.weight[s];
+                psum += steps.weight[s] * (float)steps.phase[s];
+            }
+            pf = wsum > 0.0f ? (psum / wsum) : (float)steps.phase[s0];
         }
-        float result = fast_blend_tap(source_f, source_b, &p, vector, fb_mask, pf, fb_chroma);
+        float result = fast_blend_tap(source_f, source_b, &p, vector, fb_mask, ref_f0, ref_b0, pf, fb_chroma);
 #if HAS_SAD
         float4 m = layer_sample(masks, field_position, sad_idx);
         result = mix(result, mix(ref_f0, ref_b0, steps.sad_blend[sad_idx]), fmax(m.w, m.x));
