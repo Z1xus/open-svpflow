@@ -1480,15 +1480,14 @@ impl GpuContext {
                 CL_UNORM_INT16,
             )?;
             if cached_motion_key[slot] != motion_key {
-                packed_base.reserve(count * 4);
-                for i in 0..count {
-                    packed_base.extend_from_slice(&[
-                        motions[0].0[i],
-                        motions[1].1[i],
-                        motions[1].0[i],
-                        motions[0].1[i],
-                    ]);
-                }
+                interleave4_u16(
+                    packed_base,
+                    count,
+                    motions[0].0,
+                    motions[1].1,
+                    motions[1].0,
+                    motions[0].1,
+                );
                 self.enqueue_image_raw(
                     q,
                     base_mem,
@@ -1507,15 +1506,14 @@ impl GpuContext {
                     CL_UNORM_INT16,
                 )?;
                 if cached_motion_key[slot + 1] != motion_key {
-                    packed_ext.reserve(count * 4);
-                    for i in 0..count {
-                        packed_ext.extend_from_slice(&[
-                            motions[2].0[i],
-                            motions[3].1[i],
-                            motions[3].0[i],
-                            motions[2].1[i],
-                        ]);
-                    }
+                    interleave4_u16(
+                        packed_ext,
+                        count,
+                        motions[2].0,
+                        motions[3].1,
+                        motions[3].0,
+                        motions[2].1,
+                    );
                     self.enqueue_image_raw(
                         q,
                         mem,
@@ -1549,16 +1547,26 @@ impl GpuContext {
         {
             return None;
         }
-        packed.reserve(count * 4);
-        for i in 0..count {
-            let sad_f = area.map_or(0, |(a, _)| a[i]);
-            let sad_b = area.map_or(0, |(_, b)| b[i]);
-            packed.extend_from_slice(&[
-                sad_b,
-                if needs_coverage { coverage.0[i] } else { 0 },
-                if needs_coverage { coverage.1[i] } else { 0 },
-                sad_f,
-            ]);
+        let start = packed.len();
+        packed.resize(start + count * 4, 0);
+        let dst = &mut packed[start..start + count * 4];
+        match (needs_coverage, area) {
+            (true, Some((af, ab))) => {
+                interleave4_u8(dst, count, ab, coverage.0, coverage.1, af);
+            }
+            (true, None) => {
+                interleave4_u8_zero_outer(dst, count, coverage.0, coverage.1);
+            }
+            (false, Some((af, ab))) => {
+                for i in 0..count {
+                    let o = i * 4;
+                    dst[o] = ab[i];
+                    dst[o + 1] = 0;
+                    dst[o + 2] = 0;
+                    dst[o + 3] = af[i];
+                }
+            }
+            (false, None) => {}
         }
         Some(())
     }
@@ -2864,11 +2872,6 @@ kernel void render_frame(
     float ref_b0 = base_sample(source_b, &p);
     float ref_f0 = base_sample(source_f, &p);
 #endif
-#if ALGO == 23 && !FAST_OCC
-    float4 ext = field_sample(vectors_ext, field_position, CUBIC);
-    float ref_bb = linear_source_sample(source_b, &p, ext.z, ext.y, 256-p.phase);
-    float ref_ff = linear_source_sample(source_f, &p, ext.x, ext.w, p.phase);
-#endif
 
 #if ALGO == 1
     result = ref_b + ref_f*0.00001f;
@@ -2901,10 +2904,19 @@ kernel void render_frame(
     }
     result = mix(r_lo, r_hi, time);
 # else
-    result = mix(
-        mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y),
-        mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z),
-        time);
+    float r_lo = ref_f, r_hi = ref_b;
+    if (mask.y != 0.0f || mask.z != 0.0f) {
+        float4 ext = field_sample(vectors_ext, field_position, CUBIC);
+        if (mask.y != 0.0f) {
+            float ref_bb = linear_source_sample(source_b, &p, ext.z, ext.y, 256-p.phase);
+            r_lo = mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y);
+        }
+        if (mask.z != 0.0f) {
+            float ref_ff = linear_source_sample(source_f, &p, ext.x, ext.w, p.phase);
+            r_hi = mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z);
+        }
+    }
+    result = mix(r_lo, r_hi, time);
 # endif
 #endif
 
@@ -3002,10 +3014,6 @@ inline float blend_value(
     float result;
     float ref_b = source_sample(source_b, p, vector.z, vector.y, 256-p->phase);
     float ref_f = source_sample(source_f, p, vector.x, vector.w, p->phase);
-#if ALGO == 23 && !FAST_OCC
-    float ref_bb = linear_source_sample(source_b, p, ext.z, ext.y, 256-p->phase);
-    float ref_ff = linear_source_sample(source_f, p, ext.x, ext.w, p->phase);
-#endif
 
 #if ALGO == 1
     result = ref_b + ref_f*0.00001f;
@@ -3035,10 +3043,16 @@ inline float blend_value(
     }
     result = mix(r_lo, r_hi, time);
 # else
-    result = mix(
-        mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y),
-        mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z),
-        time);
+    float r_lo = ref_f, r_hi = ref_b;
+    if (mask.y != 0.0f) {
+        float ref_bb = linear_source_sample(source_b, p, ext.z, ext.y, 256-p->phase);
+        r_lo = mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y);
+    }
+    if (mask.z != 0.0f) {
+        float ref_ff = linear_source_sample(source_f, p, ext.x, ext.w, p->phase);
+        r_hi = mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z);
+    }
+    result = mix(r_lo, r_hi, time);
 # endif
 #endif
 
@@ -3338,8 +3352,7 @@ kernel void blend_frame(
     int has_base = ALGO == 13 || ALGO == 22 || HAS_SAD;
     float ref_b0 = has_base ? base_sample(source_b, &p) : 0.0f;
     float ref_f0 = has_base ? base_sample(source_f, &p) : 0.0f;
-    float4 ext = (ALGO == 23 && !(FAST_BLEND && !LAYER && !STILL))
-        ? field_sample(vectors_ext, field_position, CUBIC) : (float4)(0.0f);
+    float4 ext = (float4)(0.0f);
     global float *sum = sums + (p.offset_y+y)*stride + p.offset_x + x;
     float total = overwrite ? 0.0f : *sum;
 #if STILL
@@ -3359,45 +3372,74 @@ kernel void blend_frame(
     float2 step_f = full_step(&p, vector.x, vector.w);
     float2 step_b = full_step(&p, vector.z, vector.y);
     float gap = layer_gap(cover, &p, at);
-#endif
-
-#if !LAYER && !STILL
+    float2 zsf = step_f, zsb = step_b;
+    int can_layer = gap <= layer_reach(&p, step_f, step_b);
+    int can_layer_zero = gap <= 16.0f;
+#else
     float2 zsf = full_step(&p, vector.x, vector.w);
     float2 zsb = full_step(&p, vector.z, vector.y);
-    int zero_mv = zsf.x == 0.0f && zsf.y == 0.0f && zsb.x == 0.0f && zsb.y == 0.0f;
-#if ALGO == 23 && !FAST_BLEND
-    float2 zef = full_step(&p, ext.x, ext.w);
-    float2 zeb = full_step(&p, ext.z, ext.y);
-    zero_mv = zero_mv && zef.x == 0.0f && zef.y == 0.0f && zeb.x == 0.0f && zeb.y == 0.0f;
+    int can_layer = 0;
+    int can_layer_zero = 0;
 #endif
-    if (zero_mv && ALGO != 1 && ALGO != 2) {
-        float rf = source_sample(source_f, &p, vector.x, vector.w, 0);
-        float rb = source_sample(source_b, &p, vector.z, vector.y, 0);
-#if ALGO == 23 && !FAST_BLEND
-        float rff = linear_source_sample(source_f, &p, ext.x, ext.w, 0);
-        float rbb = linear_source_sample(source_b, &p, ext.z, ext.y, 0);
-        int same = rf == rb && rff == rf && rbb == rb && (!HAS_SAD || (ref_f0 == rf && ref_b0 == rb));
-#else
-        int same = rf == rb && (!has_base || (ref_f0 == rf && ref_b0 == rb));
-#endif
-        if (same) {
-            float value = blend_round(rf, &p, 0, x, y);
+#if STILL
+    int is_kept = kept;
+    if (is_kept && !can_layer && kept_f == kept_b) {
+        float value = blend_round(kept_f, &p, 0, x, y);
 #if HOLD
-            if (weight < 1.0f) value = round(mix(held, value, weight));
+        if (weight < 1.0f) value = round(mix(held, value, weight));
 #endif
-            if (steps.gamma != 1.0f) value = curve[(int)value];
-            for (int step = 0; step < steps.count; step++) {
+        if (steps.gamma != 1.0f) value = curve[(int)value];
+        for (int step = 0; step < steps.count; step++) {
 #pragma OPENCL FP_CONTRACT OFF
-                float term = steps.weight[step] * value;
-                total = term + total;
-            }
-            *sum = total;
-            return;
+            float term = steps.weight[step] * value;
+            total = term + total;
         }
+        *sum = total;
+        return;
     }
+#else
+    int is_kept = 0;
 #endif
 
-#if FAST_BLEND && !LAYER && !STILL
+    if (!can_layer_zero && !is_kept) {
+        int zero_mv = zsf.x == 0.0f && zsf.y == 0.0f && zsb.x == 0.0f && zsb.y == 0.0f;
+#if ALGO == 23 && !FAST_BLEND
+        if (zero_mv) {
+            ext = field_sample(vectors_ext, field_position, CUBIC);
+            float2 zef = full_step(&p, ext.x, ext.w);
+            float2 zeb = full_step(&p, ext.z, ext.y);
+            zero_mv = zef.x == 0.0f && zef.y == 0.0f && zeb.x == 0.0f && zeb.y == 0.0f;
+        }
+#endif
+        if (zero_mv && ALGO != 1 && ALGO != 2) {
+            float rf = source_sample(source_f, &p, vector.x, vector.w, 0);
+            float rb = source_sample(source_b, &p, vector.z, vector.y, 0);
+#if ALGO == 23 && !FAST_BLEND
+            float rff = linear_source_sample(source_f, &p, ext.x, ext.w, 0);
+            float rbb = linear_source_sample(source_b, &p, ext.z, ext.y, 0);
+            int same = rf == rb && rff == rf && rbb == rb && (!HAS_SAD || (ref_f0 == rf && ref_b0 == rb));
+#else
+            int same = rf == rb && (!has_base || (ref_f0 == rf && ref_b0 == rb));
+#endif
+            if (same) {
+                float value = blend_round(rf, &p, 0, x, y);
+#if HOLD
+                if (weight < 1.0f) value = round(mix(held, value, weight));
+#endif
+                if (steps.gamma != 1.0f) value = curve[(int)value];
+                for (int step = 0; step < steps.count; step++) {
+#pragma OPENCL FP_CONTRACT OFF
+                    float term = steps.weight[step] * value;
+                    total = term + total;
+                }
+                *sum = total;
+                return;
+            }
+        }
+    }
+
+#if FAST_BLEND
+    if (!can_layer && !is_kept) {
     int fb_chroma = p.x_ratio > 1 || p.y_ratio > 1;
     int fb_cap = (FAST_BLEND >= 2 || fb_chroma) ? 1 : 2;
     float fb_travel = fmax(fmax(fabs(zsf.x), fabs(zsf.y)), fmax(fabs(zsb.x), fabs(zsb.y)));
@@ -3459,9 +3501,15 @@ kernel void blend_frame(
     }
     *sum = total;
     return;
+    }
 #endif
 
-#if ADAPTIVE && !LAYER && !STILL
+#if ALGO == 23
+    ext = field_sample(vectors_ext, field_position, CUBIC);
+#endif
+
+#if ADAPTIVE
+    if (!can_layer && !is_kept) {
     float atravel = fmax(fmax(fabs(zsf.x), fabs(zsf.y)), fmax(fabs(zsb.x), fabs(zsb.y)));
     int awant = atravel < 0.25f ? 1 : (atravel < 1.5f ? 2 : (atravel < 4.0f ? 4 : (atravel < 8.0f ? 8 : steps.count)));
     int abuckets = min(awant, steps.count);
@@ -3499,6 +3547,7 @@ kernel void blend_frame(
     }
     *sum = total;
     return;
+    }
 #endif
 
     for (int step = 0; step < steps.count; step++) {
@@ -3916,4 +3965,267 @@ unsafe fn device_size(cl: &OpenCl, device: ClDeviceId, param: ClUint) -> Option<
     usize::try_from(size)
         .ok()
         .filter(|&size| status == CL_SUCCESS && size > 0)
+}
+
+fn interleave4_u16(
+    dst_vec: &mut Vec<u16>,
+    count: usize,
+    c0: &[u16],
+    c1: &[u16],
+    c2: &[u16],
+    c3: &[u16],
+) {
+    dst_vec.resize(count * 4, 0);
+    let dst = &mut dst_vec[..count * 4];
+    #[cfg(target_arch = "x86_64")]
+    let done = if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe { interleave4_u16_avx2(dst, count, c0, c1, c2, c3) }
+    } else {
+        0
+    };
+    #[cfg(target_arch = "aarch64")]
+    let done = unsafe { interleave4_u16_neon(dst, count, c0, c1, c2, c3) };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let done = 0usize;
+    for idx in done..count {
+        let off = idx * 4;
+        dst[off] = c0[idx];
+        dst[off + 1] = c1[idx];
+        dst[off + 2] = c2[idx];
+        dst[off + 3] = c3[idx];
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn interleave4_u16_avx2(
+    dst: &mut [u16],
+    count: usize,
+    c0: &[u16],
+    c1: &[u16],
+    c2: &[u16],
+    c3: &[u16],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm256_loadu_si256, _mm256_permute2x128_si256, _mm256_storeu_si256, _mm256_unpackhi_epi16,
+        _mm256_unpackhi_epi32, _mm256_unpacklo_epi16, _mm256_unpacklo_epi32,
+    };
+    let mut idx = 0;
+    while idx + 16 <= count {
+        unsafe {
+            let va = _mm256_loadu_si256(c0.as_ptr().add(idx).cast());
+            let vb = _mm256_loadu_si256(c1.as_ptr().add(idx).cast());
+            let vc = _mm256_loadu_si256(c2.as_ptr().add(idx).cast());
+            let vd = _mm256_loadu_si256(c3.as_ptr().add(idx).cast());
+            let ab_lo = _mm256_unpacklo_epi16(va, vb);
+            let ab_hi = _mm256_unpackhi_epi16(va, vb);
+            let cd_lo = _mm256_unpacklo_epi16(vc, vd);
+            let cd_hi = _mm256_unpackhi_epi16(vc, vd);
+            let q0 = _mm256_unpacklo_epi32(ab_lo, cd_lo);
+            let q1 = _mm256_unpackhi_epi32(ab_lo, cd_lo);
+            let q2 = _mm256_unpacklo_epi32(ab_hi, cd_hi);
+            let q3 = _mm256_unpackhi_epi32(ab_hi, cd_hi);
+            let out = dst.as_mut_ptr().add(idx * 4);
+            _mm256_storeu_si256(out.cast(), _mm256_permute2x128_si256::<0x20>(q0, q1));
+            _mm256_storeu_si256(out.add(16).cast(), _mm256_permute2x128_si256::<0x20>(q2, q3));
+            _mm256_storeu_si256(out.add(32).cast(), _mm256_permute2x128_si256::<0x31>(q0, q1));
+            _mm256_storeu_si256(out.add(48).cast(), _mm256_permute2x128_si256::<0x31>(q2, q3));
+        }
+        idx += 16;
+    }
+    idx
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn interleave4_u16_neon(
+    dst: &mut [u16],
+    count: usize,
+    c0: &[u16],
+    c1: &[u16],
+    c2: &[u16],
+    c3: &[u16],
+) -> usize {
+    use std::arch::aarch64::{uint16x8x4_t, vld1q_u16, vst4q_u16};
+    let mut idx = 0;
+    while idx + 8 <= count {
+        unsafe {
+            let quad = uint16x8x4_t(
+                vld1q_u16(c0.as_ptr().add(idx)),
+                vld1q_u16(c1.as_ptr().add(idx)),
+                vld1q_u16(c2.as_ptr().add(idx)),
+                vld1q_u16(c3.as_ptr().add(idx)),
+            );
+            vst4q_u16(dst.as_mut_ptr().add(idx * 4), quad);
+        }
+        idx += 8;
+    }
+    idx
+}
+
+fn interleave4_u8(dst: &mut [u8], count: usize, c0: &[u8], c1: &[u8], c2: &[u8], c3: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    let done = if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe { interleave4_u8_avx2(dst, count, c0, c1, c2, c3) }
+    } else {
+        0
+    };
+    #[cfg(target_arch = "aarch64")]
+    let done = unsafe { interleave4_u8_neon(dst, count, c0, c1, c2, c3) };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let done = 0usize;
+    for idx in done..count {
+        let off = idx * 4;
+        dst[off] = c0[idx];
+        dst[off + 1] = c1[idx];
+        dst[off + 2] = c2[idx];
+        dst[off + 3] = c3[idx];
+    }
+}
+
+fn interleave4_u8_zero_outer(dst: &mut [u8], count: usize, c1: &[u8], c2: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    let done = if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe { interleave4_u8_zero_outer_avx2(dst, count, c1, c2) }
+    } else {
+        0
+    };
+    #[cfg(target_arch = "aarch64")]
+    let done = unsafe { interleave4_u8_zero_outer_neon(dst, count, c1, c2) };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let done = 0usize;
+    for idx in done..count {
+        let off = idx * 4;
+        dst[off] = 0;
+        dst[off + 1] = c1[idx];
+        dst[off + 2] = c2[idx];
+        dst[off + 3] = 0;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn interleave4_u8_avx2(
+    dst: &mut [u8],
+    count: usize,
+    c0: &[u8],
+    c1: &[u8],
+    c2: &[u8],
+    c3: &[u8],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm256_loadu_si256, _mm256_permute2x128_si256, _mm256_storeu_si256, _mm256_unpackhi_epi8,
+        _mm256_unpackhi_epi16, _mm256_unpacklo_epi8, _mm256_unpacklo_epi16,
+    };
+    let mut idx = 0;
+    while idx + 32 <= count {
+        unsafe {
+            let va = _mm256_loadu_si256(c0.as_ptr().add(idx).cast());
+            let vb = _mm256_loadu_si256(c1.as_ptr().add(idx).cast());
+            let vc = _mm256_loadu_si256(c2.as_ptr().add(idx).cast());
+            let vd = _mm256_loadu_si256(c3.as_ptr().add(idx).cast());
+            let ab_lo = _mm256_unpacklo_epi8(va, vb);
+            let ab_hi = _mm256_unpackhi_epi8(va, vb);
+            let cd_lo = _mm256_unpacklo_epi8(vc, vd);
+            let cd_hi = _mm256_unpackhi_epi8(vc, vd);
+            let q0 = _mm256_unpacklo_epi16(ab_lo, cd_lo);
+            let q1 = _mm256_unpackhi_epi16(ab_lo, cd_lo);
+            let q2 = _mm256_unpacklo_epi16(ab_hi, cd_hi);
+            let q3 = _mm256_unpackhi_epi16(ab_hi, cd_hi);
+            let out = dst.as_mut_ptr().add(idx * 4);
+            _mm256_storeu_si256(out.cast(), _mm256_permute2x128_si256::<0x20>(q0, q1));
+            _mm256_storeu_si256(out.add(32).cast(), _mm256_permute2x128_si256::<0x20>(q2, q3));
+            _mm256_storeu_si256(out.add(64).cast(), _mm256_permute2x128_si256::<0x31>(q0, q1));
+            _mm256_storeu_si256(out.add(96).cast(), _mm256_permute2x128_si256::<0x31>(q2, q3));
+        }
+        idx += 32;
+    }
+    idx
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn interleave4_u8_zero_outer_avx2(
+    dst: &mut [u8],
+    count: usize,
+    c1: &[u8],
+    c2: &[u8],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm256_loadu_si256, _mm256_permute2x128_si256, _mm256_setzero_si256, _mm256_storeu_si256,
+        _mm256_unpackhi_epi8, _mm256_unpackhi_epi16, _mm256_unpacklo_epi8, _mm256_unpacklo_epi16,
+    };
+    let z = _mm256_setzero_si256();
+    let mut idx = 0;
+    while idx + 32 <= count {
+        unsafe {
+            let vb = _mm256_loadu_si256(c1.as_ptr().add(idx).cast());
+            let vc = _mm256_loadu_si256(c2.as_ptr().add(idx).cast());
+            let ab_lo = _mm256_unpacklo_epi8(z, vb);
+            let ab_hi = _mm256_unpackhi_epi8(z, vb);
+            let cd_lo = _mm256_unpacklo_epi8(vc, z);
+            let cd_hi = _mm256_unpackhi_epi8(vc, z);
+            let q0 = _mm256_unpacklo_epi16(ab_lo, cd_lo);
+            let q1 = _mm256_unpackhi_epi16(ab_lo, cd_lo);
+            let q2 = _mm256_unpacklo_epi16(ab_hi, cd_hi);
+            let q3 = _mm256_unpackhi_epi16(ab_hi, cd_hi);
+            let out = dst.as_mut_ptr().add(idx * 4);
+            _mm256_storeu_si256(out.cast(), _mm256_permute2x128_si256::<0x20>(q0, q1));
+            _mm256_storeu_si256(out.add(32).cast(), _mm256_permute2x128_si256::<0x20>(q2, q3));
+            _mm256_storeu_si256(out.add(64).cast(), _mm256_permute2x128_si256::<0x31>(q0, q1));
+            _mm256_storeu_si256(out.add(96).cast(), _mm256_permute2x128_si256::<0x31>(q2, q3));
+        }
+        idx += 32;
+    }
+    idx
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn interleave4_u8_neon(
+    dst: &mut [u8],
+    count: usize,
+    c0: &[u8],
+    c1: &[u8],
+    c2: &[u8],
+    c3: &[u8],
+) -> usize {
+    use std::arch::aarch64::{uint8x16x4_t, vld1q_u8, vst4q_u8};
+    let mut idx = 0;
+    while idx + 16 <= count {
+        unsafe {
+            let quad = uint8x16x4_t(
+                vld1q_u8(c0.as_ptr().add(idx)),
+                vld1q_u8(c1.as_ptr().add(idx)),
+                vld1q_u8(c2.as_ptr().add(idx)),
+                vld1q_u8(c3.as_ptr().add(idx)),
+            );
+            vst4q_u8(dst.as_mut_ptr().add(idx * 4), quad);
+        }
+        idx += 16;
+    }
+    idx
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn interleave4_u8_zero_outer_neon(
+    dst: &mut [u8],
+    count: usize,
+    c1: &[u8],
+    c2: &[u8],
+) -> usize {
+    use std::arch::aarch64::{uint8x16x4_t, vdupq_n_u8, vld1q_u8, vst4q_u8};
+    let z = unsafe { vdupq_n_u8(0) };
+    let mut idx = 0;
+    while idx + 16 <= count {
+        unsafe {
+            let quad = uint8x16x4_t(
+                z,
+                vld1q_u8(c1.as_ptr().add(idx)),
+                vld1q_u8(c2.as_ptr().add(idx)),
+                z,
+            );
+            vst4q_u8(dst.as_mut_ptr().add(idx * 4), quad);
+        }
+        idx += 16;
+    }
+    idx
 }

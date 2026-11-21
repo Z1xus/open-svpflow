@@ -1301,7 +1301,6 @@ impl Renderer {
             tb,
             rtb,
             wrap: (256 << self.shape.depth) - 1,
-            fast_occ: self.fast_occ(),
         };
         let use_pair = self.fast_cpu() && interp && pass.width >= 4;
         SCRATCH.with(|cell| {
@@ -2152,7 +2151,6 @@ mod row {
         pub(super) tb: i32,
         pub(super) rtb: i32,
         pub(super) wrap: i32,
-        pub(super) fast_occ: bool,
     }
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -2182,11 +2180,12 @@ mod row {
             _mm256_testz_si256, _mm512_add_epi32, _mm512_and_si512, _mm512_castsi512_si128,
             _mm512_cmpeq_epi32_mask, _mm512_cmpgt_epi32_mask, _mm512_cvtepu8_epi32,
             _mm512_cvtepu16_epi32, _mm512_cvtusepi32_epi8, _mm512_cvtusepi32_epi16,
-            _mm512_i32gather_epi32, _mm512_loadu_si512, _mm512_max_epi32, _mm512_min_epi32,
-            _mm512_mullo_epi32, _mm512_permutexvar_epi8, _mm512_permutexvar_epi16,
-            _mm512_set1_epi32, _mm512_setr_epi32, _mm512_setzero_si512, _mm512_slli_epi32,
-            _mm512_srai_epi32, _mm512_srli_epi32, _mm512_srlv_epi32, _mm512_sub_epi32,
-            _mm512_test_epi32_mask,
+            _mm512_i32gather_epi32, _mm512_loadu_si512, _mm512_madd_epi16,
+            _mm512_maskz_permutex2var_epi8, _mm512_maskz_permutex2var_epi16,
+            _mm512_maskz_permutexvar_epi8, _mm512_maskz_permutexvar_epi16, _mm512_max_epi32,
+            _mm512_min_epi32, _mm512_mullo_epi16, _mm512_mullo_epi32, _mm512_set1_epi32,
+            _mm512_setr_epi32, _mm512_setzero_si512, _mm512_slli_epi32, _mm512_srai_epi32,
+            _mm512_srli_epi32, _mm512_srlv_epi32, _mm512_sub_epi32, _mm512_test_epi32_mask,
         };
         use std::marker::PhantomData;
         use std::sync::OnceLock;
@@ -2518,10 +2517,12 @@ mod row {
                 unsafe {
                     let x = self.lane(x, c);
                     let y = self.lane(y, c);
-                    _mm256_add_epi32(
-                        _mm256_add_epi32(chunk, x),
-                        _mm256_mullo_epi32(y, self.pitch),
-                    )
+                    let dy = if (0..=32767).contains(&self.pitch_i32) {
+                        _mm256_madd_epi16(y, self.pitch)
+                    } else {
+                        _mm256_mullo_epi32(y, self.pitch)
+                    };
+                    _mm256_add_epi32(_mm256_add_epi32(chunk, x), dy)
                 }
             }
 
@@ -2733,6 +2734,95 @@ mod row {
             unsafe { _mm256_srli_epi32::<8>(a) }
         }
 
+        #[inline(always)]
+        fn blend255_256<T: Sample>(a: __m256i, b: __m256i, m: __m256i, full: __m256i) -> __m256i {
+            unsafe {
+                if size_of::<T>() == 1 {
+                    let p0 = _mm256_mullo_epi16(_mm256_sub_epi32(full, m), a);
+                    let p1 = _mm256_mullo_epi16(m, b);
+                    _mm256_srli_epi32::<8>(_mm256_add_epi32(_mm256_add_epi32(p0, p1), full))
+                } else {
+                    let a255 = _mm256_sub_epi32(_mm256_slli_epi32::<8>(a), a);
+                    _mm256_srai_epi32::<8>(_mm256_add_epi32(
+                        _mm256_add_epi32(a255, _mm256_mullo_epi32(m, _mm256_sub_epi32(b, a))),
+                        full,
+                    ))
+                }
+            }
+        }
+
+        #[inline(always)]
+        fn blend256_256<T: Sample>(a: __m256i, b: __m256i, rt: __m256i, t: __m256i) -> __m256i {
+            unsafe {
+                if size_of::<T>() == 1 {
+                    let p0 = _mm256_mullo_epi16(rt, a);
+                    let p1 = _mm256_mullo_epi16(t, b);
+                    _mm256_srli_epi32::<8>(_mm256_add_epi32(p0, p1))
+                } else {
+                    _mm256_srai_epi32::<8>(_mm256_add_epi32(
+                        _mm256_slli_epi32::<8>(a),
+                        _mm256_mullo_epi32(t, _mm256_sub_epi32(b, a)),
+                    ))
+                }
+            }
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        #[inline]
+        unsafe fn blend255_512<T: Sample>(
+            a: __m512i,
+            b: __m512i,
+            m: __m512i,
+            full: __m512i,
+        ) -> __m512i {
+            if size_of::<T>() == 1 {
+                let p0 = _mm512_mullo_epi16(_mm512_sub_epi32(full, m), a);
+                let p1 = _mm512_mullo_epi16(m, b);
+                _mm512_srli_epi32::<8>(_mm512_add_epi32(_mm512_add_epi32(p0, p1), full))
+            } else {
+                let a255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(a), a);
+                _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_add_epi32(a255, _mm512_mullo_epi32(m, _mm512_sub_epi32(b, a))),
+                    full,
+                ))
+            }
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        #[inline]
+        unsafe fn blend256_512<T: Sample>(
+            a: __m512i,
+            b: __m512i,
+            rt: __m512i,
+            t: __m512i,
+        ) -> __m512i {
+            if size_of::<T>() == 1 {
+                let p0 = _mm512_mullo_epi16(rt, a);
+                let p1 = _mm512_mullo_epi16(t, b);
+                _mm512_srli_epi32::<8>(_mm512_add_epi32(p0, p1))
+            } else {
+                _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_slli_epi32::<8>(a),
+                    _mm512_mullo_epi32(t, _mm512_sub_epi32(b, a)),
+                ))
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Pitch512 {
+            vec: __m512i,
+            short: bool,
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        #[inline]
+        unsafe fn pitch512(pitch: i32) -> Pitch512 {
+            Pitch512 {
+                vec: _mm512_set1_epi32(pitch),
+                short: (0..=32767).contains(&pitch),
+            }
+        }
+
         #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
         #[inline]
         unsafe fn load512<T: Sample>(src: &Source<T>, start: i32) -> Option<__m512i> {
@@ -2797,6 +2887,7 @@ mod row {
             let index = _mm512_min_epi32(_mm512_max_epi32(index, zero), last);
             let cfirst = _mm_cvtsi128_si32(_mm512_castsi512_si128(index));
             if Source::<T>::SIZE == 1 {
+                const LOW_BYTES: u64 = 0x1111_1111_1111_1111;
                 let win_base = if src.pel == 4 {
                     cfirst.max(0)
                 } else {
@@ -2807,22 +2898,33 @@ mod row {
                     && (win_base as usize) + 64 <= src.readable
                 {
                     let win = _mm512_loadu_si512(src.data.add(win_base as usize).cast::<__m512i>());
-                    return _mm512_and_si512(
-                        _mm512_permutexvar_epi8(rel, win),
-                        _mm512_set1_epi32(0xFF),
-                    );
+                    return _mm512_maskz_permutexvar_epi8(LOW_BYTES, rel, win);
+                }
+                if _mm512_test_epi32_mask(rel, _mm512_set1_epi32(!127)) == 0
+                    && (win_base as usize) + 128 <= src.readable
+                {
+                    let base_ptr = src.data.add(win_base as usize);
+                    let win0 = _mm512_loadu_si512(base_ptr.cast::<__m512i>());
+                    let win1 = _mm512_loadu_si512(base_ptr.add(64).cast::<__m512i>());
+                    return _mm512_maskz_permutex2var_epi8(LOW_BYTES, win0, rel, win1);
                 }
             } else {
+                const LOW_WORDS: u32 = 0x5555_5555;
                 let win_base = (cfirst - 2).max(0);
                 let rel = _mm512_sub_epi32(index, _mm512_set1_epi32(win_base));
                 if _mm512_test_epi32_mask(rel, _mm512_set1_epi32(!31)) == 0
                     && (win_base as usize) + 32 <= src.readable
                 {
                     let win = _mm512_loadu_si512(src.data.add(win_base as usize).cast::<__m512i>());
-                    return _mm512_and_si512(
-                        _mm512_permutexvar_epi16(rel, win),
-                        _mm512_set1_epi32(0xFFFF),
-                    );
+                    return _mm512_maskz_permutexvar_epi16(LOW_WORDS, rel, win);
+                }
+                if _mm512_test_epi32_mask(rel, _mm512_set1_epi32(!63)) == 0
+                    && (win_base as usize) + 64 <= src.readable
+                {
+                    let base_ptr = src.data.add(win_base as usize);
+                    let win0 = _mm512_loadu_si512(base_ptr.cast::<__m512i>());
+                    let win1 = _mm512_loadu_si512(base_ptr.add(32).cast::<__m512i>());
+                    return _mm512_maskz_permutex2var_epi16(LOW_WORDS, win0, rel, win1);
                 }
             }
             if src.padded {
@@ -2867,14 +2969,19 @@ mod row {
         #[inline]
         unsafe fn at512(
             chunk: __m512i,
-            pitch: __m512i,
+            pitch: Pitch512,
             x: &[i32],
             y: &[i32],
             c: usize,
         ) -> __m512i {
             let xv = lane512(x, c);
             let yv = lane512(y, c);
-            _mm512_add_epi32(_mm512_add_epi32(chunk, xv), _mm512_mullo_epi32(yv, pitch))
+            let dy = if pitch.short {
+                _mm512_madd_epi16(yv, pitch.vec)
+            } else {
+                _mm512_mullo_epi32(yv, pitch.vec)
+            };
+            _mm512_add_epi32(_mm512_add_epi32(chunk, xv), dy)
         }
 
         #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
@@ -2889,7 +2996,11 @@ mod row {
         #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
         #[inline]
         unsafe fn store512<T: Sample>(out: &mut [T], c: usize, n: usize, value: __m512i) {
-            let clamped = _mm512_max_epi32(value, _mm512_setzero_si512());
+            let clamped = if size_of::<T>() == 1 {
+                value
+            } else {
+                _mm512_max_epi32(value, _mm512_setzero_si512())
+            };
             if c + 16 <= out.len() {
                 let ptr = out.as_mut_ptr().add(c);
                 if size_of::<T>() == 1 {
@@ -2981,6 +3092,7 @@ mod row {
             let in_last = _mm512_cmpgt_epi32_mask(clamped, _mm512_set1_epi32(src.len - 1 - src.pel))
                 == 0;
             if Source::<T>::SIZE == 1 && src.pel <= 2 && in_last {
+                const LOW_BYTES: u64 = 0x1111_1111_1111_1111;
                 let cfirst = _mm_cvtsi128_si32(_mm512_castsi512_si128(clamped));
                 let win_base = (cfirst - 4).max(0);
                 let rel = _mm512_sub_epi32(clamped, _mm512_set1_epi32(win_base));
@@ -2990,10 +3102,21 @@ mod row {
                     && (win_base as usize) + 64 <= src.readable
                 {
                     let win = _mm512_loadu_si512(src.data.add(win_base as usize).cast::<__m512i>());
-                    let mask = _mm512_set1_epi32(0xFF);
                     return (
-                        _mm512_and_si512(_mm512_permutexvar_epi8(rel, win), mask),
-                        _mm512_and_si512(_mm512_permutexvar_epi8(rel_odd, win), mask),
+                        _mm512_maskz_permutexvar_epi8(LOW_BYTES, rel, win),
+                        _mm512_maskz_permutexvar_epi8(LOW_BYTES, rel_odd, win),
+                    );
+                }
+                if _mm512_test_epi32_mask(rel, _mm512_set1_epi32(!127)) == 0
+                    && _mm512_test_epi32_mask(rel_odd, _mm512_set1_epi32(!127)) == 0
+                    && (win_base as usize) + 128 <= src.readable
+                {
+                    let base_ptr = src.data.add(win_base as usize);
+                    let win0 = _mm512_loadu_si512(base_ptr.cast::<__m512i>());
+                    let win1 = _mm512_loadu_si512(base_ptr.add(64).cast::<__m512i>());
+                    return (
+                        _mm512_maskz_permutex2var_epi8(LOW_BYTES, win0, rel, win1),
+                        _mm512_maskz_permutex2var_epi8(LOW_BYTES, win0, rel_odd, win1),
                     );
                 }
             }
@@ -3093,7 +3216,7 @@ mod row {
             let src = if next { &p.a } else { &p.b };
             let offsets = offsets512(p.pel);
             let step = _mm512_set1_epi32(16 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let pitch = pitch512(p.pitch_i32);
             let mut chunk = _mm512_add_epi32(_mm512_set1_epi32(base), offsets);
             let mut c = 0;
             while c < n {
@@ -3116,7 +3239,7 @@ mod row {
         ) {
             let offsets = offsets512(p.pel);
             let step = _mm512_set1_epi32(16 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let pitch = pitch512(p.pitch_i32);
             let (t, rt, tb, rtb) = (
                 _mm512_set1_epi32(w.t),
                 _mm512_set1_epi32(w.rt),
@@ -3132,19 +3255,13 @@ mod row {
                 let value = if median {
                     let b0 = still512(&p.b, start, chunk, offsets);
                     let a0 = still512(&p.a, start, chunk, offsets);
-                    let mid = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                        _mm512_mullo_epi32(rtb, b0),
-                        _mm512_mullo_epi32(tb, a0),
-                    ));
+                    let mid = blend256_512::<T>(b0, a0, rtb, tb);
                     _mm512_max_epi32(
                         _mm512_min_epi32(mid, _mm512_max_epi32(pb, pa)),
                         _mm512_min_epi32(pb, pa),
                     )
                 } else {
-                    _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                        _mm512_mullo_epi32(rt, pb),
-                        _mm512_mullo_epi32(t, pa),
-                    ))
+                    blend256_512::<T>(pb, pa, rt, t)
                 };
                 store512(out, c, n, value);
                 start += 16 * p.pel;
@@ -3165,7 +3282,7 @@ mod row {
         ) {
             let offsets = offsets512(p.pel);
             let step = _mm512_set1_epi32(16 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let pitch = pitch512(p.pitch_i32);
             let (t, rt, full) = (
                 _mm512_set1_epi32(w.t),
                 _mm512_set1_epi32(w.rt),
@@ -3180,20 +3297,16 @@ mod row {
                 let m9 = lane512(l[4], c);
                 let m8 = lane512(l[5], c);
                 let (first, second) = if simple {
-                    let f = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                        _mm512_add_epi32(
-                            _mm512_mullo_epi32(_mm512_sub_epi32(full, m9), pb),
-                            _mm512_mullo_epi32(m9, pa),
-                        ),
-                        full,
-                    ));
-                    let s = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                        _mm512_add_epi32(
-                            _mm512_mullo_epi32(_mm512_sub_epi32(full, m8), pa),
-                            _mm512_mullo_epi32(m8, pb),
-                        ),
-                        full,
-                    ));
+                    let f = if size_of::<T>() == 1 && _mm512_test_epi32_mask(m9, m9) == 0 {
+                        pb
+                    } else {
+                        blend255_512::<T>(pb, pa, m9, full)
+                    };
+                    let s = if size_of::<T>() == 1 && _mm512_test_epi32_mask(m8, m8) == 0 {
+                        pa
+                    } else {
+                        blend255_512::<T>(pa, pb, m8, full)
+                    };
                     (f, s)
                 } else {
                     let bb = _mm512_mullo_epi32(_mm512_sub_epi32(full, m9), pb);
@@ -3218,10 +3331,7 @@ mod row {
                     ));
                     (first, second)
                 };
-                let value = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                    _mm512_mullo_epi32(rt, first),
-                    _mm512_mullo_epi32(t, second),
-                ));
+                let value = blend256_512::<T>(first, second, rt, t);
                 store512(out, c, n, value);
                 start += 16 * p.pel;
                 chunk = _mm512_add_epi32(chunk, step);
@@ -3240,8 +3350,12 @@ mod row {
         ) {
             let offsets = offsets512(p.pel);
             let step = _mm512_set1_epi32(16 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
-            let (t, full) = (_mm512_set1_epi32(w.t), _mm512_set1_epi32(255));
+            let pitch = pitch512(p.pitch_i32);
+            let (t, rt, full) = (
+                _mm512_set1_epi32(w.t),
+                _mm512_set1_epi32(w.rt),
+                _mm512_set1_epi32(255),
+            );
             let mut chunk = _mm512_add_epi32(_mm512_set1_epi32(base), offsets);
             let mut c = 0;
             while c < n {
@@ -3249,8 +3363,8 @@ mod row {
                 let n0 = fetch512(&p.a, at512(chunk, pitch, l[2], l[3], c), offsets);
                 let m9 = lane512(l[8], c);
                 let m8 = lane512(l[9], c);
-                let has_m9 = !w.fast_occ || _mm512_test_epi32_mask(m9, m9) != 0;
-                let has_m8 = !w.fast_occ || _mm512_test_epi32_mask(m8, m8) != 0;
+                let has_m9 = _mm512_test_epi32_mask(m9, m9) != 0;
+                let has_m8 = _mm512_test_epi32_mask(m8, m8) != 0;
                 let value = if !has_m9 && !has_m8 {
                     let first = if size_of::<T>() == 1 {
                         c0
@@ -3264,24 +3378,14 @@ mod row {
                         let n0_255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(n0), n0);
                         _mm512_srai_epi32::<8>(_mm512_add_epi32(n0_255, full))
                     };
-                    _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                        _mm512_slli_epi32::<8>(first),
-                        _mm512_mullo_epi32(t, _mm512_sub_epi32(second, first)),
-                    ))
+                    blend256_512::<T>(first, second, rt, t)
                 } else {
                     let lo = _mm512_min_epi32(c0, n0);
                     let hi = _mm512_max_epi32(c0, n0);
                     let first = if has_m9 {
                         let n1 = fetch512(&p.a, at512(chunk, pitch, l[6], l[7], c), offsets);
                         let cn = _mm512_max_epi32(lo, _mm512_min_epi32(n1, hi));
-                        let c0_255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(c0), c0);
-                        _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                            _mm512_add_epi32(
-                                c0_255,
-                                _mm512_mullo_epi32(m9, _mm512_sub_epi32(cn, c0)),
-                            ),
-                            full,
-                        ))
+                        blend255_512::<T>(c0, cn, m9, full)
                     } else if size_of::<T>() == 1 {
                         c0
                     } else {
@@ -3291,24 +3395,14 @@ mod row {
                     let second = if has_m8 {
                         let c1 = fetch512(&p.b, at512(chunk, pitch, l[4], l[5], c), offsets);
                         let cc = _mm512_max_epi32(lo, _mm512_min_epi32(c1, hi));
-                        let n0_255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(n0), n0);
-                        _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                            _mm512_add_epi32(
-                                n0_255,
-                                _mm512_mullo_epi32(m8, _mm512_sub_epi32(cc, n0)),
-                            ),
-                            full,
-                        ))
+                        blend255_512::<T>(n0, cc, m8, full)
                     } else if size_of::<T>() == 1 {
                         n0
                     } else {
                         let n0_255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(n0), n0);
                         _mm512_srai_epi32::<8>(_mm512_add_epi32(n0_255, full))
                     };
-                    _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                        _mm512_slli_epi32::<8>(first),
-                        _mm512_mullo_epi32(t, _mm512_sub_epi32(second, first)),
-                    ))
+                    blend256_512::<T>(first, second, rt, t)
                 };
                 store512(out, c, n, value);
                 chunk = _mm512_add_epi32(chunk, step);
@@ -3328,22 +3422,25 @@ mod row {
             let src = if next { &p.a } else { &p.b };
             let offsets = offsets512(p.pel);
             let step = _mm512_set1_epi32(16 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let pitch = pitch512(p.pitch_i32);
             let full = _mm512_set1_epi32(255);
             let mut chunk = _mm512_add_epi32(_mm512_set1_epi32(base), offsets);
             let mut start = base;
             let mut c = 0;
             while c < n {
                 let moved = fetch512(src, at512(chunk, pitch, l[0], l[1], c), offsets);
-                let still = still512(src, start, chunk, offsets);
                 let s = lane512(l[2], c);
-                let value = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                    _mm512_add_epi32(
-                        _mm512_mullo_epi32(_mm512_sub_epi32(full, s), moved),
-                        _mm512_mullo_epi32(s, still),
-                    ),
-                    full,
-                ));
+                let value = if _mm512_test_epi32_mask(s, s) == 0 {
+                    if size_of::<T>() == 1 {
+                        moved
+                    } else {
+                        let m255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(moved), moved);
+                        _mm512_srai_epi32::<8>(_mm512_add_epi32(m255, full))
+                    }
+                } else {
+                    let still = still512(src, start, chunk, offsets);
+                    blend255_512::<T>(moved, still, s, full)
+                };
                 store512(out, c, n, value);
                 start += 16 * p.pel;
                 chunk = _mm512_add_epi32(chunk, step);
@@ -3363,7 +3460,7 @@ mod row {
         ) {
             let offsets = offsets512(p.pel);
             let step = _mm512_set1_epi32(16 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let pitch = pitch512(p.pitch_i32);
             let (t, rt, tb, rtb, full) = (
                 _mm512_set1_epi32(w.t),
                 _mm512_set1_epi32(w.rt),
@@ -3378,30 +3475,36 @@ mod row {
                 let pb = fetch512(&p.b, at512(chunk, pitch, l[0], l[1], c), offsets);
                 let pa = fetch512(&p.a, at512(chunk, pitch, l[2], l[3], c), offsets);
                 let s = lane512(l[4], c);
-                let b0 = still512(&p.b, start, chunk, offsets);
-                let a0 = still512(&p.a, start, chunk, offsets);
-                let mid = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                    _mm512_mullo_epi32(rtb, b0),
-                    _mm512_mullo_epi32(tb, a0),
-                ));
-                let value = if median {
-                    _mm512_max_epi32(
-                        _mm512_min_epi32(mid, _mm512_max_epi32(pb, pa)),
-                        _mm512_min_epi32(pb, pa),
-                    )
+                let has_s = _mm512_test_epi32_mask(s, s) != 0;
+                let res = if !median && !has_s {
+                    let value = blend256_512::<T>(pb, pa, rt, t);
+                    if size_of::<T>() == 1 {
+                        value
+                    } else {
+                        let v255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(value), value);
+                        _mm512_srai_epi32::<8>(_mm512_add_epi32(v255, full))
+                    }
                 } else {
-                    _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                        _mm512_mullo_epi32(rt, pb),
-                        _mm512_mullo_epi32(t, pa),
-                    ))
+                    let b0 = still512(&p.b, start, chunk, offsets);
+                    let a0 = still512(&p.a, start, chunk, offsets);
+                    let mid = blend256_512::<T>(b0, a0, rtb, tb);
+                    let value = if median {
+                        _mm512_max_epi32(
+                            _mm512_min_epi32(mid, _mm512_max_epi32(pb, pa)),
+                            _mm512_min_epi32(pb, pa),
+                        )
+                    } else {
+                        blend256_512::<T>(pb, pa, rt, t)
+                    };
+                    if has_s {
+                        blend255_512::<T>(value, mid, s, full)
+                    } else if size_of::<T>() == 1 {
+                        value
+                    } else {
+                        let v255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(value), value);
+                        _mm512_srai_epi32::<8>(_mm512_add_epi32(v255, full))
+                    }
                 };
-                let res = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                    _mm512_add_epi32(
-                        _mm512_mullo_epi32(_mm512_sub_epi32(full, s), value),
-                        _mm512_mullo_epi32(s, mid),
-                    ),
-                    full,
-                ));
                 store512(out, c, n, res);
                 start += 16 * p.pel;
                 chunk = _mm512_add_epi32(chunk, step);
@@ -3421,7 +3524,7 @@ mod row {
         ) {
             let offsets = offsets512(p.pel);
             let step = _mm512_set1_epi32(16 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let pitch = pitch512(p.pitch_i32);
             let (t, rt, tb, rtb, full, wrap) = (
                 _mm512_set1_epi32(w.t),
                 _mm512_set1_epi32(w.rt),
@@ -3440,60 +3543,51 @@ mod row {
                 let m9 = lane512(l[4], c);
                 let m8 = lane512(l[5], c);
                 let s = lane512(l[6], c);
-                let first = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                    _mm512_add_epi32(
-                        _mm512_mullo_epi32(_mm512_sub_epi32(full, m9), pb),
-                        _mm512_mullo_epi32(m9, pa),
-                    ),
-                    full,
-                ));
-                let second = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                    _mm512_add_epi32(
-                        _mm512_mullo_epi32(_mm512_sub_epi32(full, m8), pa),
-                        _mm512_mullo_epi32(m8, pb),
-                    ),
-                    full,
-                ));
-                let b0 = still512(&p.b, start, chunk, offsets);
-                let a0 = still512(&p.a, start, chunk, offsets);
-                let (value, mid) = if simple {
-                    let value = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                        _mm512_mullo_epi32(rt, first),
-                        _mm512_mullo_epi32(t, second),
-                    ));
-                    let weight = if p.index == 1 { odd } else { rtb };
-                    let mixed = _mm512_and_si512(
-                        _mm512_add_epi32(
-                            _mm512_mullo_epi32(weight, b0),
-                            _mm512_mullo_epi32(tb, a0),
-                        ),
-                        wrap,
-                    );
-                    (value, _mm512_srai_epi32::<8>(mixed))
+                let first = if size_of::<T>() == 1 && _mm512_test_epi32_mask(m9, m9) == 0 {
+                    pb
+                } else {
+                    blend255_512::<T>(pb, pa, m9, full)
+                };
+                let second = if size_of::<T>() == 1 && _mm512_test_epi32_mask(m8, m8) == 0 {
+                    pa
+                } else {
+                    blend255_512::<T>(pa, pb, m8, full)
+                };
+                let has_s = _mm512_test_epi32_mask(s, s) != 0;
+                let value = if simple {
+                    blend256_512::<T>(first, second, rt, t)
                 } else {
                     let ab0 = still512(&p.aux_b, start, chunk, offsets);
                     let aa0 = still512(&p.aux_a, start, chunk, offsets);
-                    let time = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                        _mm512_mullo_epi32(rt, ab0),
-                        _mm512_mullo_epi32(t, aa0),
-                    ));
-                    let value = _mm512_max_epi32(
+                    let time = blend256_512::<T>(ab0, aa0, rt, t);
+                    _mm512_max_epi32(
                         _mm512_min_epi32(time, _mm512_max_epi32(first, second)),
                         _mm512_min_epi32(first, second),
-                    );
-                    let mid = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                        _mm512_mullo_epi32(rtb, b0),
-                        _mm512_mullo_epi32(tb, a0),
-                    ));
-                    (value, mid)
+                    )
                 };
-                let res = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                    _mm512_add_epi32(
-                        _mm512_mullo_epi32(_mm512_sub_epi32(full, s), value),
-                        _mm512_mullo_epi32(s, mid),
-                    ),
-                    full,
-                ));
+                let res = if has_s {
+                    let b0 = still512(&p.b, start, chunk, offsets);
+                    let a0 = still512(&p.a, start, chunk, offsets);
+                    let mid = if simple {
+                        let weight = if p.index == 1 { odd } else { rtb };
+                        let mixed = _mm512_and_si512(
+                            _mm512_add_epi32(
+                                _mm512_mullo_epi32(weight, b0),
+                                _mm512_mullo_epi32(tb, a0),
+                            ),
+                            wrap,
+                        );
+                        _mm512_srai_epi32::<8>(mixed)
+                    } else {
+                        blend256_512::<T>(b0, a0, rtb, tb)
+                    };
+                    blend255_512::<T>(value, mid, s, full)
+                } else if size_of::<T>() == 1 {
+                    value
+                } else {
+                    let v255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(value), value);
+                    _mm512_srai_epi32::<8>(_mm512_add_epi32(v255, full))
+                };
                 store512(out, c, n, res);
                 start += 16 * p.pel;
                 chunk = _mm512_add_epi32(chunk, step);
@@ -3512,9 +3606,10 @@ mod row {
         ) {
             let offsets = offsets512(p.pel);
             let step = _mm512_set1_epi32(16 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
-            let (t, tb, rtb, full) = (
+            let pitch = pitch512(p.pitch_i32);
+            let (t, rt, tb, rtb, full) = (
                 _mm512_set1_epi32(w.t),
+                _mm512_set1_epi32(w.rt),
                 _mm512_set1_epi32(w.tb),
                 _mm512_set1_epi32(w.rtb),
                 _mm512_set1_epi32(255),
@@ -3528,8 +3623,8 @@ mod row {
                 let m9 = lane512(l[8], c);
                 let m8 = lane512(l[9], c);
                 let s = lane512(l[10], c);
-                let has_m9 = !w.fast_occ || _mm512_test_epi32_mask(m9, m9) != 0;
-                let has_m8 = !w.fast_occ || _mm512_test_epi32_mask(m8, m8) != 0;
+                let has_m9 = _mm512_test_epi32_mask(m9, m9) != 0;
+                let has_m8 = _mm512_test_epi32_mask(m8, m8) != 0;
                 let value = if !has_m9 && !has_m8 {
                     let first = if size_of::<T>() == 1 {
                         c0
@@ -3543,24 +3638,14 @@ mod row {
                         let n0_255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(n0), n0);
                         _mm512_srai_epi32::<8>(_mm512_add_epi32(n0_255, full))
                     };
-                    _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                        _mm512_slli_epi32::<8>(first),
-                        _mm512_mullo_epi32(t, _mm512_sub_epi32(second, first)),
-                    ))
+                    blend256_512::<T>(first, second, rt, t)
                 } else {
                     let lo = _mm512_min_epi32(c0, n0);
                     let hi = _mm512_max_epi32(c0, n0);
                     let first = if has_m9 {
                         let n1 = fetch512(&p.a, at512(chunk, pitch, l[6], l[7], c), offsets);
                         let cn = _mm512_max_epi32(lo, _mm512_min_epi32(n1, hi));
-                        let c0_255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(c0), c0);
-                        _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                            _mm512_add_epi32(
-                                c0_255,
-                                _mm512_mullo_epi32(m9, _mm512_sub_epi32(cn, c0)),
-                            ),
-                            full,
-                        ))
+                        blend255_512::<T>(c0, cn, m9, full)
                     } else if size_of::<T>() == 1 {
                         c0
                     } else {
@@ -3570,38 +3655,28 @@ mod row {
                     let second = if has_m8 {
                         let c1 = fetch512(&p.b, at512(chunk, pitch, l[4], l[5], c), offsets);
                         let cc = _mm512_max_epi32(lo, _mm512_min_epi32(c1, hi));
-                        let n0_255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(n0), n0);
-                        _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                            _mm512_add_epi32(
-                                n0_255,
-                                _mm512_mullo_epi32(m8, _mm512_sub_epi32(cc, n0)),
-                            ),
-                            full,
-                        ))
+                        blend255_512::<T>(n0, cc, m8, full)
                     } else if size_of::<T>() == 1 {
                         n0
                     } else {
                         let n0_255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(n0), n0);
                         _mm512_srai_epi32::<8>(_mm512_add_epi32(n0_255, full))
                     };
-                    _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                        _mm512_slli_epi32::<8>(first),
-                        _mm512_mullo_epi32(t, _mm512_sub_epi32(second, first)),
-                    ))
+                    blend256_512::<T>(first, second, rt, t)
                 };
-                let b0 = still512(&p.b, start, chunk, offsets);
-                let a0 = still512(&p.a, start, chunk, offsets);
-                let mid = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                    _mm512_mullo_epi32(rtb, b0),
-                    _mm512_mullo_epi32(tb, a0),
-                ));
-                let res = _mm512_srai_epi32::<8>(_mm512_add_epi32(
-                    _mm512_add_epi32(
-                        _mm512_mullo_epi32(_mm512_sub_epi32(full, s), value),
-                        _mm512_mullo_epi32(s, mid),
-                    ),
-                    full,
-                ));
+                let res = if _mm512_test_epi32_mask(s, s) == 0 {
+                    if size_of::<T>() == 1 {
+                        value
+                    } else {
+                        let v255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(value), value);
+                        _mm512_srai_epi32::<8>(_mm512_add_epi32(v255, full))
+                    }
+                } else {
+                    let b0 = still512(&p.b, start, chunk, offsets);
+                    let a0 = still512(&p.a, start, chunk, offsets);
+                    let mid = blend256_512::<T>(b0, a0, rtb, tb);
+                    blend255_512::<T>(value, mid, s, full)
+                };
                 store512(out, c, n, res);
                 start += 16 * p.pel;
                 chunk = _mm512_add_epi32(chunk, step);
@@ -3705,14 +3780,14 @@ mod row {
                 unsafe { extended_512(out, p, base, n, l, w) };
                 return;
             }
-            let (t, full) = (splat(w.t), splat(255));
+            let (t, rt, full) = (splat(w.t), splat(w.rt), splat(255));
             p.run(out, base, n, |c, chunk, _| {
                 let c0 = p.b.fetch(p.at(chunk, l[0], l[1], c));
                 let n0 = p.a.fetch(p.at(chunk, l[2], l[3], c));
                 let m9 = p.lane(l[8], c);
                 let m8 = p.lane(l[9], c);
-                let has_m9 = !w.fast_occ || unsafe { _mm256_testz_si256(m9, m9) } == 0;
-                let has_m8 = !w.fast_occ || unsafe { _mm256_testz_si256(m8, m8) } == 0;
+                let has_m9 = unsafe { _mm256_testz_si256(m9, m9) } == 0;
+                let has_m8 = unsafe { _mm256_testz_si256(m8, m8) } == 0;
                 if !has_m9 && !has_m8 {
                     let first = if size_of::<T>() == 1 {
                         c0
@@ -3724,18 +3799,14 @@ mod row {
                     } else {
                         shr8(add(sub(unsafe { _mm256_slli_epi32::<8>(n0) }, n0), full))
                     };
-                    return shr8(add(
-                        unsafe { _mm256_slli_epi32::<8>(first) },
-                        mul(t, sub(second, first)),
-                    ));
+                    return blend256_256::<T>(first, second, rt, t);
                 }
                 let lo = min(c0, n0);
                 let hi = max(c0, n0);
                 let first = if has_m9 {
                     let n1 = p.a.fetch(p.at(chunk, l[6], l[7], c));
                     let cn = max(lo, min(n1, hi));
-                    let c0_255 = sub(unsafe { _mm256_slli_epi32::<8>(c0) }, c0);
-                    shr8(add(add(c0_255, mul(m9, sub(cn, c0))), full))
+                    blend255_256::<T>(c0, cn, m9, full)
                 } else if size_of::<T>() == 1 {
                     c0
                 } else {
@@ -3744,17 +3815,13 @@ mod row {
                 let second = if has_m8 {
                     let c1 = p.b.fetch(p.at(chunk, l[4], l[5], c));
                     let cc = max(lo, min(c1, hi));
-                    let n0_255 = sub(unsafe { _mm256_slli_epi32::<8>(n0) }, n0);
-                    shr8(add(add(n0_255, mul(m8, sub(cc, n0))), full))
+                    blend255_256::<T>(n0, cc, m8, full)
                 } else if size_of::<T>() == 1 {
                     n0
                 } else {
                     shr8(add(sub(unsafe { _mm256_slli_epi32::<8>(n0) }, n0), full))
                 };
-                shr8(add(
-                    unsafe { _mm256_slli_epi32::<8>(first) },
-                    mul(t, sub(second, first)),
-                ))
+                blend256_256::<T>(first, second, rt, t)
             });
         }
 
@@ -3774,9 +3841,17 @@ mod row {
             let full = splat(255);
             p.run(out, base, n, |c, chunk, start| {
                 let moved = src.fetch(p.at(chunk, l[0], l[1], c));
-                let still = src.still(start, chunk);
                 let s = p.lane(l[2], c);
-                shr8(add(add(mul(sub(full, s), moved), mul(s, still)), full))
+                if unsafe { _mm256_testz_si256(s, s) } != 0 {
+                    if size_of::<T>() == 1 {
+                        moved
+                    } else {
+                        shr8(add(sub(unsafe { _mm256_slli_epi32::<8>(moved) }, moved), full))
+                    }
+                } else {
+                    let still = src.still(start, chunk);
+                    blend255_256::<T>(moved, still, s, full)
+                }
             });
         }
 
@@ -3804,15 +3879,30 @@ mod row {
                 let pb = p.b.fetch(p.at(chunk, l[0], l[1], c));
                 let pa = p.a.fetch(p.at(chunk, l[2], l[3], c));
                 let s = p.lane(l[4], c);
+                let has_s = unsafe { _mm256_testz_si256(s, s) } == 0;
+                if !median && !has_s {
+                    let value = blend256_256::<T>(pb, pa, rt, t);
+                    return if size_of::<T>() == 1 {
+                        value
+                    } else {
+                        shr8(add(sub(unsafe { _mm256_slli_epi32::<8>(value) }, value), full))
+                    };
+                }
                 let b0 = p.b.still(start, chunk);
                 let a0 = p.a.still(start, chunk);
-                let mid = shr8(add(mul(rtb, b0), mul(tb, a0)));
+                let mid = blend256_256::<T>(b0, a0, rtb, tb);
                 let value = if median {
                     max(min(mid, max(pb, pa)), min(pb, pa))
                 } else {
-                    shr8(add(mul(rt, pb), mul(t, pa)))
+                    blend256_256::<T>(pb, pa, rt, t)
                 };
-                shr8(add(add(mul(sub(full, s), value), mul(s, mid)), full))
+                if has_s {
+                    blend255_256::<T>(value, mid, s, full)
+                } else if size_of::<T>() == 1 {
+                    value
+                } else {
+                    shr8(add(sub(unsafe { _mm256_slli_epi32::<8>(value) }, value), full))
+                }
             });
         }
 
@@ -3843,24 +3933,43 @@ mod row {
                 let m9 = p.lane(l[4], c);
                 let m8 = p.lane(l[5], c);
                 let s = p.lane(l[6], c);
-                let first = shr8(add(add(mul(sub(full, m9), pb), mul(m9, pa)), full));
-                let second = shr8(add(add(mul(sub(full, m8), pa), mul(m8, pb)), full));
-                let b0 = p.b.still(start, chunk);
-                let a0 = p.a.still(start, chunk);
-                let (value, mid) = if simple {
-                    let value = shr8(add(mul(rt, first), mul(t, second)));
-                    let weight = if p.index == 1 { odd } else { rtb };
-                    let mixed = add(mul(weight, b0), mul(tb, a0));
-                    let mixed = unsafe { _mm256_and_si256(mixed, splat(w.wrap)) };
-                    (value, shr8(mixed))
+                let first = if size_of::<T>() == 1 && unsafe { _mm256_testz_si256(m9, m9) } != 0 {
+                    pb
+                } else {
+                    blend255_256::<T>(pb, pa, m9, full)
+                };
+                let second = if size_of::<T>() == 1 && unsafe { _mm256_testz_si256(m8, m8) } != 0 {
+                    pa
+                } else {
+                    blend255_256::<T>(pa, pb, m8, full)
+                };
+                let value = if simple {
+                    blend256_256::<T>(first, second, rt, t)
                 } else {
                     let ab0 = p.aux_b.still(start, chunk);
                     let aa0 = p.aux_a.still(start, chunk);
-                    let time = shr8(add(mul(rt, ab0), mul(t, aa0)));
-                    let value = max(min(time, max(first, second)), min(first, second));
-                    (value, shr8(add(mul(rtb, b0), mul(tb, a0))))
+                    let time = blend256_256::<T>(ab0, aa0, rt, t);
+                    max(min(time, max(first, second)), min(first, second))
                 };
-                shr8(add(add(mul(sub(full, s), value), mul(s, mid)), full))
+                if unsafe { _mm256_testz_si256(s, s) } != 0 {
+                    if size_of::<T>() == 1 {
+                        value
+                    } else {
+                        shr8(add(sub(unsafe { _mm256_slli_epi32::<8>(value) }, value), full))
+                    }
+                } else {
+                    let b0 = p.b.still(start, chunk);
+                    let a0 = p.a.still(start, chunk);
+                    let mid = if simple {
+                        let weight = if p.index == 1 { odd } else { rtb };
+                        let mixed = add(mul(weight, b0), mul(tb, a0));
+                        let mixed = unsafe { _mm256_and_si256(mixed, splat(w.wrap)) };
+                        shr8(mixed)
+                    } else {
+                        blend256_256::<T>(b0, a0, rtb, tb)
+                    };
+                    blend255_256::<T>(value, mid, s, full)
+                }
             });
         }
 
@@ -3889,8 +3998,8 @@ mod row {
                 let m9 = p.lane(l[8], c);
                 let m8 = p.lane(l[9], c);
                 let s = p.lane(l[10], c);
-                let has_m9 = !w.fast_occ || unsafe { _mm256_testz_si256(m9, m9) } == 0;
-                let has_m8 = !w.fast_occ || unsafe { _mm256_testz_si256(m8, m8) } == 0;
+                let has_m9 = unsafe { _mm256_testz_si256(m9, m9) } == 0;
+                let has_m8 = unsafe { _mm256_testz_si256(m8, m8) } == 0;
                 let value = if !has_m9 && !has_m8 {
                     let first = if size_of::<T>() == 1 {
                         c0
@@ -3902,14 +4011,14 @@ mod row {
                     } else {
                         shr8(add(mul(n0, full), full))
                     };
-                    shr8(add(mul(rt, first), mul(t, second)))
+                    blend256_256::<T>(first, second, rt, t)
                 } else {
                     let lo = min(c0, n0);
                     let hi = max(c0, n0);
                     let first = if has_m9 {
                         let n1 = p.a.fetch(p.at(chunk, l[6], l[7], c));
                         let cn = max(lo, min(n1, hi));
-                        shr8(add(add(mul(m9, cn), mul(c0, sub(full, m9))), full))
+                        blend255_256::<T>(c0, cn, m9, full)
                     } else if size_of::<T>() == 1 {
                         c0
                     } else {
@@ -3918,18 +4027,26 @@ mod row {
                     let second = if has_m8 {
                         let c1 = p.b.fetch(p.at(chunk, l[4], l[5], c));
                         let cc = max(lo, min(c1, hi));
-                        shr8(add(add(mul(m8, cc), mul(n0, sub(full, m8))), full))
+                        blend255_256::<T>(n0, cc, m8, full)
                     } else if size_of::<T>() == 1 {
                         n0
                     } else {
                         shr8(add(mul(n0, full), full))
                     };
-                    shr8(add(mul(rt, first), mul(t, second)))
+                    blend256_256::<T>(first, second, rt, t)
                 };
-                let b0 = p.b.still(start, chunk);
-                let a0 = p.a.still(start, chunk);
-                let mid = shr8(add(mul(rtb, b0), mul(tb, a0)));
-                shr8(add(add(mul(sub(full, s), value), mul(s, mid)), full))
+                if unsafe { _mm256_testz_si256(s, s) } != 0 {
+                    if size_of::<T>() == 1 {
+                        value
+                    } else {
+                        shr8(add(sub(unsafe { _mm256_slli_epi32::<8>(value) }, value), full))
+                    }
+                } else {
+                    let b0 = p.b.still(start, chunk);
+                    let a0 = p.a.still(start, chunk);
+                    let mid = blend256_256::<T>(b0, a0, rtb, tb);
+                    blend255_256::<T>(value, mid, s, full)
+                }
             });
         }
 
@@ -4039,7 +4156,7 @@ mod row {
             let offsets1 = offsets512(p.pel);
             let offsets2 = offsets512(2 * p.pel);
             let step = _mm512_set1_epi32(32 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let pitch = pitch512(p.pitch_i32);
             let mut chunk = _mm512_add_epi32(_mm512_set1_epi32(base), offsets2);
             let (mut pi, mut c) = (0, 0);
             while c < n {
@@ -4064,7 +4181,7 @@ mod row {
             let offsets1 = offsets512(p.pel);
             let offsets2 = offsets512(2 * p.pel);
             let step = _mm512_set1_epi32(32 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let pitch = pitch512(p.pitch_i32);
             let (t, rt, tb, rtb) = (
                 _mm512_set1_epi32(w.t),
                 _mm512_set1_epi32(w.rt),
@@ -4123,7 +4240,7 @@ mod row {
             let offsets1 = offsets512(p.pel);
             let offsets2 = offsets512(2 * p.pel);
             let step = _mm512_set1_epi32(32 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let pitch = pitch512(p.pitch_i32);
             let (t, rt, full) = (
                 _mm512_set1_epi32(w.t),
                 _mm512_set1_epi32(w.rt),
@@ -4200,7 +4317,7 @@ mod row {
             let offsets1 = offsets512(p.pel);
             let offsets2 = offsets512(2 * p.pel);
             let step = _mm512_set1_epi32(32 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let pitch = pitch512(p.pitch_i32);
             let (t, full) = (_mm512_set1_epi32(w.t), _mm512_set1_epi32(255));
             let mut chunk = _mm512_add_epi32(_mm512_set1_epi32(base), offsets2);
             let (mut pi, mut c) = (0, 0);
@@ -4211,8 +4328,8 @@ mod row {
                     fetch_pair512(&p.a, at512(chunk, pitch, l[2], l[3], pi), offsets2, offsets1);
                 let m9 = lane512(l[8], pi);
                 let m8 = lane512(l[9], pi);
-                let has_m9 = !w.fast_occ || _mm512_test_epi32_mask(m9, m9) != 0;
-                let has_m8 = !w.fast_occ || _mm512_test_epi32_mask(m8, m8) != 0;
+                let has_m9 = _mm512_test_epi32_mask(m9, m9) != 0;
+                let has_m8 = _mm512_test_epi32_mask(m8, m8) != 0;
                 let (c1_e, c1_o) = if has_m8 {
                     let pair = fetch_pair512(&p.b, at512(chunk, pitch, l[4], l[5], pi), offsets2, offsets1);
                     (Some(pair.0), Some(pair.1))
@@ -4247,7 +4364,7 @@ mod row {
             let offsets1 = offsets512(p.pel);
             let offsets2 = offsets512(2 * p.pel);
             let step = _mm512_set1_epi32(32 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let pitch = pitch512(p.pitch_i32);
             let full = _mm512_set1_epi32(255);
             let mut chunk = _mm512_add_epi32(_mm512_set1_epi32(base), offsets2);
             let mut start = base;
@@ -4285,7 +4402,7 @@ mod row {
             let offsets1 = offsets512(p.pel);
             let offsets2 = offsets512(2 * p.pel);
             let step = _mm512_set1_epi32(32 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let pitch = pitch512(p.pitch_i32);
             let (t, rt, tb, rtb, full) = (
                 _mm512_set1_epi32(w.t),
                 _mm512_set1_epi32(w.rt),
@@ -4347,7 +4464,7 @@ mod row {
             let offsets1 = offsets512(p.pel);
             let offsets2 = offsets512(2 * p.pel);
             let step = _mm512_set1_epi32(32 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let pitch = pitch512(p.pitch_i32);
             let (t, rt, tb, rtb, full, wrap) = (
                 _mm512_set1_epi32(w.t),
                 _mm512_set1_epi32(w.rt),
@@ -4446,7 +4563,7 @@ mod row {
             let offsets1 = offsets512(p.pel);
             let offsets2 = offsets512(2 * p.pel);
             let step = _mm512_set1_epi32(32 * p.pel);
-            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let pitch = pitch512(p.pitch_i32);
             let (t, tb, rtb, full) = (
                 _mm512_set1_epi32(w.t),
                 _mm512_set1_epi32(w.tb),
@@ -4465,8 +4582,8 @@ mod row {
                 let m8 = lane512(l[9], pi);
                 let s = lane512(l[10], pi);
                 let inv_s = _mm512_sub_epi32(full, s);
-                let has_m9 = !w.fast_occ || _mm512_test_epi32_mask(m9, m9) != 0;
-                let has_m8 = !w.fast_occ || _mm512_test_epi32_mask(m8, m8) != 0;
+                let has_m9 = _mm512_test_epi32_mask(m9, m9) != 0;
+                let has_m8 = _mm512_test_epi32_mask(m8, m8) != 0;
                 let (c1_e, c1_o) = if has_m8 {
                     let pair = fetch_pair512(&p.b, at512(chunk, pitch, l[4], l[5], pi), offsets2, offsets1);
                     (Some(pair.0), Some(pair.1))
@@ -4616,8 +4733,8 @@ mod row {
                 let (n0_e, n0_o) = p.a.fetch_pair(p.at(chunk, l[2], l[3], pi), off2);
                 let m9 = p.lane(l[8], pi);
                 let m8 = p.lane(l[9], pi);
-                let has_m9 = !w.fast_occ || unsafe { _mm256_testz_si256(m9, m9) } == 0;
-                let has_m8 = !w.fast_occ || unsafe { _mm256_testz_si256(m8, m8) } == 0;
+                let has_m9 = unsafe { _mm256_testz_si256(m9, m9) } == 0;
+                let has_m8 = unsafe { _mm256_testz_si256(m8, m8) } == 0;
                 let (c1_e, c1_o) = if has_m8 {
                     let pair = p.b.fetch_pair(p.at(chunk, l[4], l[5], pi), off2);
                     (Some(pair.0), Some(pair.1))
@@ -4786,8 +4903,8 @@ mod row {
                 let m8 = p.lane(l[9], pi);
                 let s = p.lane(l[10], pi);
                 let inv_s = sub(full, s);
-                let has_m9 = !w.fast_occ || unsafe { _mm256_testz_si256(m9, m9) } == 0;
-                let has_m8 = !w.fast_occ || unsafe { _mm256_testz_si256(m8, m8) } == 0;
+                let has_m9 = unsafe { _mm256_testz_si256(m9, m9) } == 0;
+                let has_m8 = unsafe { _mm256_testz_si256(m8, m8) } == 0;
                 let (c1_e, c1_o) = if has_m8 {
                     let pair = p.b.fetch_pair(p.at(chunk, l[4], l[5], pi), off2);
                     (Some(pair.0), Some(pair.1))
@@ -5081,7 +5198,7 @@ mod row {
                             if size_of::<T>() == 1 {
                                 let s16 = vqmovn_s32(value);
                                 let bytes = vqmovun_s16(vcombine_s16(s16, s16));
-                                let packed = std::mem::transmute::<_, u64>(bytes) as u32;
+                                let packed = std::mem::transmute::<std::arch::aarch64::uint8x8_t, u64>(bytes) as u32;
                                 std::ptr::write_unaligned(ptr.cast::<u32>(), packed);
                             } else {
                                 vst1_u16(ptr.cast::<u16>(), vqmovun_s32(value));
@@ -5091,7 +5208,7 @@ mod row {
                             if size_of::<T>() == 1 {
                                 let s16 = vqmovn_s32(value);
                                 let bytes = vqmovun_s16(vcombine_s16(s16, s16));
-                                let packed = std::mem::transmute::<_, u64>(bytes) as u32;
+                                let packed = std::mem::transmute::<std::arch::aarch64::uint8x8_t, u64>(bytes) as u32;
                                 std::ptr::write_unaligned(tmp.as_mut_ptr().cast::<u32>(), packed);
                             } else {
                                 vst1_u16(tmp.as_mut_ptr().cast::<u16>(), vqmovun_s32(value));
@@ -5314,8 +5431,8 @@ mod row {
                 let n0 = p.a.fetch(p.at(chunk, l[2], l[3], c));
                 let m9 = p.lane(l[8], c);
                 let m8 = p.lane(l[9], c);
-                let has_m9 = !w.fast_occ || unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m9)) } != 0;
-                let has_m8 = !w.fast_occ || unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m8)) } != 0;
+                let has_m9 = unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m9)) } != 0;
+                let has_m8 = unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m8)) } != 0;
                 let first = if has_m9 {
                     let n1 = p.a.fetch(p.at(chunk, l[6], l[7], c));
                     let lo = min(c0, n0);
@@ -5461,8 +5578,8 @@ mod row {
                 let m9 = p.lane(l[8], c);
                 let m8 = p.lane(l[9], c);
                 let s = p.lane(l[10], c);
-                let has_m9 = !w.fast_occ || unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m9)) } != 0;
-                let has_m8 = !w.fast_occ || unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m8)) } != 0;
+                let has_m9 = unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m9)) } != 0;
+                let has_m8 = unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m8)) } != 0;
                 let first = if has_m9 {
                     let n1 = p.a.fetch(p.at(chunk, l[6], l[7], c));
                     let lo = min(c0, n0);
@@ -5486,10 +5603,18 @@ mod row {
                     shr8(add(mul(n0, full), full))
                 };
                 let value = shr8(add(mul(rt, first), mul(t, second)));
-                let b0 = p.b.still(start, chunk);
-                let a0 = p.a.still(start, chunk);
-                let mid = shr8(add(mul(rtb, b0), mul(tb, a0)));
-                shr8(add(add(mul(sub(full, s), value), mul(s, mid)), full))
+                if unsafe { vmaxvq_u32(vreinterpretq_u32_s32(s)) } == 0 {
+                    if size_of::<T>() == 1 {
+                        value
+                    } else {
+                        shr8(add(mul(value, full), full))
+                    }
+                } else {
+                    let b0 = p.b.still(start, chunk);
+                    let a0 = p.a.still(start, chunk);
+                    let mid = shr8(add(mul(rtb, b0), mul(tb, a0)));
+                    shr8(add(add(mul(sub(full, s), value), mul(s, mid)), full))
+                }
             });
         }
 
@@ -5632,8 +5757,8 @@ mod row {
                 let (n0_e, n0_o) = p.a.fetch_pair(p.at(chunk, l[2], l[3], pi));
                 let m9 = p.lane(l[8], pi);
                 let m8 = p.lane(l[9], pi);
-                let has_m9 = !w.fast_occ || unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m9)) } != 0;
-                let has_m8 = !w.fast_occ || unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m8)) } != 0;
+                let has_m9 = unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m9)) } != 0;
+                let has_m8 = unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m8)) } != 0;
                 let (c1_e, c1_o) = if has_m8 {
                     let pair = p.b.fetch_pair(p.at(chunk, l[4], l[5], pi));
                     (Some(pair.0), Some(pair.1))
@@ -5784,8 +5909,8 @@ mod row {
                 let m8 = p.lane(l[9], pi);
                 let s = p.lane(l[10], pi);
                 let inv_s = sub(full, s);
-                let has_m9 = !w.fast_occ || unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m9)) } != 0;
-                let has_m8 = !w.fast_occ || unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m8)) } != 0;
+                let has_m9 = unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m9)) } != 0;
+                let has_m8 = unsafe { vmaxvq_u32(vreinterpretq_u32_s32(m8)) } != 0;
                 let (c1_e, c1_o) = if has_m8 {
                     let pair = p.b.fetch_pair(p.at(chunk, l[4], l[5], pi));
                     (Some(pair.0), Some(pair.1))
@@ -5997,7 +6122,7 @@ mod row {
                 let c0 = p.at(p.b, base, l[0], l[1], c);
                 let n0 = p.at(p.a, base, l[2], l[3], c);
                 let (m9, m8) = (p.lane(l[8], c), p.lane(l[9], c));
-                if w.fast_occ && (m9 | m8) == 0 {
+                if (m9 | m8) == 0 {
                     let first = if size_of::<T>() == 1 {
                         c0
                     } else {
@@ -6013,7 +6138,7 @@ mod row {
                 }
                 let lo = c0.min(n0);
                 let hi = c0.max(n0);
-                let first = if !w.fast_occ || m9 != 0 {
+                let first = if m9 != 0 {
                     let n1 = p.at(p.a, base, l[6], l[7], c);
                     let cn = lo.max(n1.min(hi));
                     (m9 * cn + c0 * (255 - m9) + 255) >> 8
@@ -6022,7 +6147,7 @@ mod row {
                 } else {
                     (c0 * 255 + 255) >> 8
                 };
-                let second = if !w.fast_occ || m8 != 0 {
+                let second = if m8 != 0 {
                     let c1 = p.at(p.b, base, l[4], l[5], c);
                     let cc = lo.max(c1.min(hi));
                     (m8 * cc + n0 * (255 - m8) + 255) >> 8
@@ -6122,7 +6247,7 @@ mod row {
                 let c0 = p.at(p.b, base, l[0], l[1], c);
                 let n0 = p.at(p.a, base, l[2], l[3], c);
                 let (m9, m8, s) = (p.lane(l[8], c), p.lane(l[9], c), p.lane(l[10], c));
-                let value = if w.fast_occ && (m9 | m8) == 0 {
+                let value = if (m9 | m8) == 0 {
                     let first = if size_of::<T>() == 1 {
                         c0
                     } else {
@@ -6137,7 +6262,7 @@ mod row {
                 } else {
                     let lo = c0.min(n0);
                     let hi = c0.max(n0);
-                    let first = if !w.fast_occ || m9 != 0 {
+                    let first = if m9 != 0 {
                         let n1 = p.at(p.a, base, l[6], l[7], c);
                         let cn = lo.max(n1.min(hi));
                         (m9 * cn + c0 * (255 - m9) + 255) >> 8
@@ -6146,7 +6271,7 @@ mod row {
                     } else {
                         (c0 * 255 + 255) >> 8
                     };
-                    let second = if !w.fast_occ || m8 != 0 {
+                    let second = if m8 != 0 {
                         let c1 = p.at(p.b, base, l[4], l[5], c);
                         let cc = lo.max(c1.min(hi));
                         (m8 * cc + n0 * (255 - m8) + 255) >> 8
@@ -6293,13 +6418,13 @@ mod row {
                 let (c0_e, c0_o) = pair_at(p, p.b, base, l[0], l[1], pi, c);
                 let (n0_e, n0_o) = pair_at(p, p.a, base, l[2], l[3], pi, c);
                 let (m9, m8) = (p.lane(l[8], pi), p.lane(l[9], pi));
-                let (c1_e, c1_o) = if !w.fast_occ || m8 != 0 {
+                let (c1_e, c1_o) = if m8 != 0 {
                     let pair = pair_at(p, p.b, base, l[4], l[5], pi, c);
                     (Some(pair.0), Some(pair.1))
                 } else {
                     (None, None)
                 };
-                let (n1_e, n1_o) = if !w.fast_occ || m9 != 0 {
+                let (n1_e, n1_o) = if m9 != 0 {
                     let pair = pair_at(p, p.a, base, l[6], l[7], pi, c);
                     (Some(pair.0), Some(pair.1))
                 } else {
@@ -6457,13 +6582,13 @@ mod row {
                 let (c0_e, c0_o) = pair_at(p, p.b, base, l[0], l[1], pi, c);
                 let (n0_e, n0_o) = pair_at(p, p.a, base, l[2], l[3], pi, c);
                 let (m9, m8, s) = (p.lane(l[8], pi), p.lane(l[9], pi), p.lane(l[10], pi));
-                let (c1_e, c1_o) = if !w.fast_occ || m8 != 0 {
+                let (c1_e, c1_o) = if m8 != 0 {
                     let pair = pair_at(p, p.b, base, l[4], l[5], pi, c);
                     (Some(pair.0), Some(pair.1))
                 } else {
                     (None, None)
                 };
-                let (n1_e, n1_o) = if !w.fast_occ || m9 != 0 {
+                let (n1_e, n1_o) = if m9 != 0 {
                     let pair = pair_at(p, p.a, base, l[6], l[7], pi, c);
                     (Some(pair.0), Some(pair.1))
                 } else {

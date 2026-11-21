@@ -231,7 +231,7 @@ pub fn total_ram_bytes() -> usize {
             fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
         }
         let mut status = MemoryStatusEx {
-            length: size_of::<MemoryStatusEx>() as u32,
+            length: u32::try_from(size_of::<MemoryStatusEx>()).unwrap_or(0),
             memory_load: 0,
             total_phys: 0,
             avail_phys: 0,
