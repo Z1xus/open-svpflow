@@ -53,6 +53,7 @@ impl OpenCl {
 use super::chain::Pyramid;
 use super::field::recalc::{CompactPlan, RecalcPlan};
 use super::field::{GpuSearchParams, Mv};
+use super::params::{FAST_EARLY_EXIT, FAST_NO_CHROMA, FAST_SAD_GATED_SATD, FAST_STRIDE_SAD};
 
 #[path = "gpu_chain.rs"]
 mod chain;
@@ -73,6 +74,7 @@ pub(crate) struct Variant {
     pub(crate) satd: bool,
     pub(crate) shift: u32,
     pub(crate) dev: bool,
+    pub(crate) fast_flags: u8,
 }
 
 impl Variant {
@@ -83,8 +85,26 @@ impl Variant {
             satd,
             shift: 1,
             dev: false,
+            fast_flags: 0,
         }
     }
+}
+
+fn fast_defines(flags: u8, satd: bool) -> String {
+    let mut out = String::new();
+    if flags & FAST_NO_CHROMA != 0 {
+        out.push_str("#define NO_CHROMA 1\n");
+    }
+    if !satd && flags & FAST_STRIDE_SAD != 0 {
+        out.push_str("#define STRIDE_SAD 1\n");
+    }
+    if flags & FAST_EARLY_EXIT != 0 {
+        out.push_str("#define EARLY_EXIT 1\n");
+    }
+    if satd && flags & FAST_SAD_GATED_SATD != 0 {
+        out.push_str("#define SAD_GATED_SATD 1\n");
+    }
+    out
 }
 
 #[derive(Clone, Copy)]
@@ -437,8 +457,9 @@ impl RefineGpu {
             return Some(program);
         }
         let kernel = if variant.width == 4 { COMPACT } else { KERNEL };
+        let fast = fast_defines(variant.fast_flags, variant.satd);
         let program = self.build(&format!(
-            "#define W {}\n#define H {}\n#define SATD {}\n#define S {}\n#define RECORD {RECORD}\n{}{kernel}",
+            "#define W {}\n#define H {}\n#define SATD {}\n#define S {}\n#define RECORD {RECORD}\n{}{fast}{kernel}",
             variant.width,
             variant.height,
             u8::from(variant.satd),
@@ -454,10 +475,11 @@ impl RefineGpu {
         if let Some(&(_, program)) = programs.iter().find(|(v, _)| *v == (variant, rmax, spec)) {
             return Some(program);
         }
+        let fast = fast_defines(variant.fast_flags, variant.satd);
         let build = |portable: &str| {
             self.build_with(
                 &format!(
-                    "#define W {}\n#define H {}\n#define CS {}\n#define RMAX {}\n{}#define PELV {}\n#define LOGAV {}\n#define DONTV {}\n#define BLURV {}\n#define BORDERV {}\n{portable}{SEARCH}",
+                    "#define W {}\n#define H {}\n#define CS {}\n#define RMAX {}\n{}#define PELV {}\n#define LOGAV {}\n#define DONTV {}\n#define BLURV {}\n#define BORDERV {}\n{fast}{portable}{SEARCH}",
                     variant.width,
                     variant.height,
                     variant.shift,
@@ -1166,6 +1188,7 @@ impl Session<'_, '_> {
         );
         let program = self.gpu.program(Variant {
             shift: plan.shift,
+            fast_flags: plan.fast_flags,
             ..Variant::new(plan.width, plan.height, plan.satd)
         })?;
         let ticket = unsafe { self.enqueue(plan, src, reference, program, source, target) };
@@ -1188,6 +1211,7 @@ impl Session<'_, '_> {
         );
         let program = self.gpu.program(Variant {
             shift: plan.shift,
+            fast_flags: plan.fast_flags,
             ..Variant::new(4, 4, plan.satd)
         })?;
         let ticket = unsafe { self.enqueue_compact(plan, src, reference, program, source, target) };
@@ -1405,6 +1429,7 @@ impl Session<'_, '_> {
         let programs = self.gpu.search_pair(
             Variant {
                 shift: params.shift,
+                fast_flags: params.fast_flags,
                 ..Variant::new(params.width, params.height, params.satd)
             },
             params.rmax,
@@ -1575,7 +1600,7 @@ impl Session<'_, '_> {
             self.launch_search(
                 &mems,
                 (blocks, params.border),
-                if params.q[32] == 0 { SWEEPS } else { 0 },
+                if params.q[32] == 0 { params.sweeps } else { 0 },
                 programs,
                 params.width == 8 && params.height == 8,
                 &events,
@@ -1710,8 +1735,6 @@ fn bytes<T: Copy>(values: &[T]) -> &[u8] {
 
 const SEARCH: &str = include_str!("search.cl");
 
-const SWEEPS: usize = 4;
-
 const EXPAND: &str = r"
 __kernel void expand(__global uchar *plane, long pitch, long height) {
     long size = pitch * height;
@@ -1790,6 +1813,50 @@ inline uint tile_cost4(int4 s0, int4 s1, int4 s2, int4 s3, __global const uchar 
     return t.x + t.y + t.z + t.w;
 #endif
 }
+
+#if SATD && defined(SAD_GATED_SATD)
+inline uint tile_sad4_only(int4 s0, int4 s1, int4 s2, int4 s3, __global const uchar *data, long length, long offset, long pitch) {
+    int4 r0, r1, r2, r3;
+    if (offset >= 0 && offset + 3 * pitch + 4 <= length) {
+        r0 = s0 - convert_int4(vload4(0, data + offset));
+        r1 = s1 - convert_int4(vload4(0, data + offset + pitch));
+        r2 = s2 - convert_int4(vload4(0, data + offset + 2 * pitch));
+        r3 = s3 - convert_int4(vload4(0, data + offset + 3 * pitch));
+    } else {
+        long o0 = offset, o1 = offset + pitch, o2 = offset + 2 * pitch, o3 = offset + 3 * pitch;
+        r0 = s0 - (int4)(fetch(data, length, o0), fetch(data, length, o0 + 1), fetch(data, length, o0 + 2), fetch(data, length, o0 + 3));
+        r1 = s1 - (int4)(fetch(data, length, o1), fetch(data, length, o1 + 1), fetch(data, length, o1 + 2), fetch(data, length, o1 + 3));
+        r2 = s2 - (int4)(fetch(data, length, o2), fetch(data, length, o2 + 1), fetch(data, length, o2 + 2), fetch(data, length, o2 + 3));
+        r3 = s3 - (int4)(fetch(data, length, o3), fetch(data, length, o3 + 1), fetch(data, length, o3 + 2), fetch(data, length, o3 + 3));
+    }
+    uint4 t = abs(r0) + abs(r1) + abs(r2) + abs(r3);
+    return t.x + t.y + t.z + t.w;
+}
+
+inline uint tile_cost4_gated(int4 s0, int4 s1, int4 s2, int4 s3, __global const uchar *data, long length, long offset, long pitch, uint best_raw, uint *out_raw) {
+    int4 r0, r1, r2, r3;
+    if (offset >= 0 && offset + 3 * pitch + 4 <= length) {
+        r0 = s0 - convert_int4(vload4(0, data + offset));
+        r1 = s1 - convert_int4(vload4(0, data + offset + pitch));
+        r2 = s2 - convert_int4(vload4(0, data + offset + 2 * pitch));
+        r3 = s3 - convert_int4(vload4(0, data + offset + 3 * pitch));
+    } else {
+        long o0 = offset, o1 = offset + pitch, o2 = offset + 2 * pitch, o3 = offset + 3 * pitch;
+        r0 = s0 - (int4)(fetch(data, length, o0), fetch(data, length, o0 + 1), fetch(data, length, o0 + 2), fetch(data, length, o0 + 3));
+        r1 = s1 - (int4)(fetch(data, length, o1), fetch(data, length, o1 + 1), fetch(data, length, o1 + 2), fetch(data, length, o1 + 3));
+        r2 = s2 - (int4)(fetch(data, length, o2), fetch(data, length, o2 + 1), fetch(data, length, o2 + 2), fetch(data, length, o2 + 3));
+        r3 = s3 - (int4)(fetch(data, length, o3), fetch(data, length, o3 + 1), fetch(data, length, o3 + 2), fetch(data, length, o3 + 3));
+    }
+    uint4 t = abs(r0) + abs(r1) + abs(r2) + abs(r3);
+    uint raw = t.x + t.y + t.z + t.w;
+    *out_raw = raw;
+    if (raw * 4u > best_raw * 5u) return 2147483647u;
+    int4 a0 = r0 + r1, a1 = r2 + r3;
+    int4 b0 = r0 - r1, b1 = r2 - r3;
+    uint total = had4_row(a0 + a1) + had4_row(a0 - a1) + had4_row(b0 + b1) + had4_row(b0 - b1);
+    return total >> 1;
+}
+#endif
 
 inline uint tile_cost(const int *src, __global const uchar *data, long length, long offset, long pitch) {
     return tile_cost4(
@@ -1944,20 +2011,33 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
             sy2 = (int4)(fetch(sy, lsy, o2), fetch(sy, lsy, o2 + 1), fetch(sy, lsy, o2 + 2), fetch(sy, lsy, o2 + 3));
             sy3 = (int4)(fetch(sy, lsy, o3), fetch(sy, lsy, o3 + 1), fetch(sy, lsy, o3 + 2), fetch(sy, lsy, o3 + 3));
         }
+#ifndef NO_CHROMA
         int src_u[CW * CW], src_v[CW * CW];
         long u_at = p[31] + (long)csrc_y * psu + csrc_x, v_at = p[32] + (long)csrc_y * psv + csrc_x;
         for (int b = 0; b < CW * CW; b++) {
             src_u[b] = fetch(su, lsu, u_at + (long)(b / CW) * psu + b % CW);
             src_v[b] = fetch(sv, lsv, v_at + (long)(b / CW) * psv + b % CW);
         }
+#endif
         int ref_x = pos_x * pel, ref_y = pos_y * pel, cref_x = cpos_x * pel, cref_y = cpos_y * pel;
 #define LUMA(vx, vy) ((int)tile_cost4(sy0, sy1, sy2, sy3, ry, lry, subpel(p[12], pry, p[14], pel, ref_x + (vx), ref_y + (vy)), pry))
+#ifdef NO_CHROMA
+#define CHROMA(vx, vy) 0
+#else
 #define CHROMA(vx, vy) chroma_value(src_u, src_v, ru, rv, lru, lrv, pru, prv, subpel(p[13], pru, p[15], pel, cref_x + ((vx) >> S), cref_y + ((vy) >> S)))
+#endif
         bsad = LUMA(px, py) + CHROMA(px, py);
         int min_cost = bsad;
+#if SATD && defined(SAD_GATED_SATD)
+        uint best_raw = tile_sad4_only(sy0, sy1, sy2, sy3, ry, lry, subpel(p[12], pry, p[14], pel, ref_x + px, ref_y + py), pry);
+#endif
         int min_x = max(px - radius, low_x), max_x = min(px + radius, high_x - 1);
         int min_y = max(py - radius, low_y), max_y = min(py + radius, high_y - 1);
+#ifdef EARLY_EXIT
+        if (bsad > 16 && min_x <= max_x && min_y <= max_y) {
+#else
         if (min_x <= max_x && min_y <= max_y) {
+#endif
             for (int vy = min_y; vy <= max_y; vy++) {
                 int dy = py - vy;
                 uint dy2 = (uint)dy * (uint)dy;
@@ -1968,7 +2048,14 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
                     if (cost >= min_cost) continue;
                     int at = pel == 1 ? luma_x : vx;
                     if (pel == 1) luma_x++;
+#if SATD && defined(SAD_GATED_SATD)
+                    uint cand_raw = 0;
+                    uint sad_u = tile_cost4_gated(sy0, sy1, sy2, sy3, ry, lry, subpel(p[12], pry, p[14], pel, ref_x + at, ref_y + vy), pry, best_raw, &cand_raw);
+                    if (sad_u == 2147483647u) continue;
+                    int sad = (int)sad_u;
+#else
                     int sad = LUMA(at, vy);
+#endif
                     cost = (int)((uint)cost + (uint)sad + (uint)(((int)((uint)pnew * (uint)sad)) >> 8));
                     if (cost >= min_cost) continue;
                     int uv = CHROMA(vx, vy);
@@ -1978,6 +2065,9 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
                     best_y = vy;
                     bsad = sad + uv;
                     min_cost = cost;
+#if SATD && defined(SAD_GATED_SATD)
+                    best_raw = cand_raw;
+#endif
                 }
             }
         }
@@ -2083,6 +2173,7 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
         }
         src_luma[b] = (uchar)value;
     }
+#ifndef NO_CHROMA
     if (!negative) {
         for (int b = lid; b < cw * ch; b += 64) {
             int y = b / cw, x = b % cw;
@@ -2090,6 +2181,7 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
             src_v[b] = vs == NONE_V ? 0 : (uchar)fetch(sv, lsv, vs + (long)y * psv + x);
         }
     }
+#endif
     barrier(CLK_LOCAL_MEM_FENCE);
     if (r[4] != NONE_V) {
         int part = 0;
@@ -2101,7 +2193,11 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
     int ww = max_x - min_x + 1, wh = max_y - min_y + 1;
     int px = LO(r[7]), py = HI(r[7]);
     int luma_tiles = (bw / 4) * (bh / 4);
+#ifdef NO_CHROMA
+    int chroma_tiles = 0;
+#else
     int chroma_tiles = negative ? 0 : (cw / 4) * (ch / 4);
+#endif
     int per_slot = luma_tiles + 2 * chroma_tiles;
     if (bad) {
         for (int task = lid; task < slots * per_slot; task += 64) {

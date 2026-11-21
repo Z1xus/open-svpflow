@@ -84,6 +84,16 @@ pub(crate) fn analyse(
         } else {
             [Some(region0), (params.vectors == 3).then_some(region1)]
         };
+        if params.fast.level >= 1 && frames_static(first, second) {
+            let [out0, out1] = outputs;
+            if let Some(out) = out0 {
+                fill_static_output(params, first, out);
+            }
+            if let Some(out) = out1 {
+                fill_static_output(params, second, out);
+            }
+            return words;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         let plan = keys
             .filter(|_| {
@@ -230,6 +240,74 @@ fn cpu_search_stages(
     }
 }
 
+fn frames_static(first: &SuperFrameView<'_>, second: &SuperFrameView<'_>) -> bool {
+    let left = first.level(0).y;
+    let right = second.level(0).y;
+    let (width, height) = (left.width.min(right.width), left.height.min(right.height));
+    if width <= 0 || height <= 0 {
+        return false;
+    }
+    let (ad, bd) = (left.data(), right.data());
+    let (ap, bp) = (left.pitch, right.pitch);
+    let (ab, bb) = (left.base(), right.base());
+    let (wu, hu) = (width as usize, height as usize);
+    if ab + (hu - 1) * ap + wu > ad.len() || bb + (hu - 1) * bp + wu > bd.len() {
+        return false;
+    }
+    for phase in [0usize, 8usize] {
+        let mut row = phase;
+        while row < hu {
+            let ra = &ad[ab + row * ap..];
+            let rb = &bd[bb + row * bp..];
+            let mut col = phase;
+            while col < wu {
+                if ra[col] != rb[col] {
+                    return false;
+                }
+                col += 16;
+            }
+            row += 16;
+        }
+    }
+    true
+}
+
+fn fill_static_output(params: &AnalyseParams, frame: &SuperFrameView<'_>, out: &mut [u32]) {
+    let stage = params.output();
+    let layout = stage.layout;
+    let (bw, bh) = (layout.width, layout.height);
+    let (sx, sy) = (bw - layout.overlap_x, bh - layout.overlap_y);
+    let (blk_x, blk_y) = (stage.blk_x, stage.blk_y);
+    let plane = frame.level(0).y;
+    let data = plane.data();
+    let base = plane.base();
+    let pitch = plane.pitch;
+    let (max_x, max_y) = (plane.width.max(1) - 1, plane.height.max(1) - 1);
+    let qx0 = bw >> 2;
+    let qx1 = (bw * 3) >> 2;
+    let qy0 = bh >> 2;
+    let qy1 = (bh * 3) >> 2;
+    let sample = |px: i32, py: i32| -> u32 {
+        let idx = base + py.clamp(0, max_y) as usize * pitch + px.clamp(0, max_x) as usize;
+        u32::from(data.get(idx).copied().unwrap_or(128))
+    };
+    for by in 0..blk_y {
+        let y0 = by * sy;
+        for bx in 0..blk_x {
+            let x0 = bx * sx;
+            let avg = (sample(x0 + qx0, y0 + qy0)
+                + sample(x0 + qx1, y0 + qy0)
+                + sample(x0 + qx0, y0 + qy1)
+                + sample(x0 + qx1, y0 + qy1)
+                + 2)
+                >> 2;
+            let idx = (by * blk_x + bx) as usize;
+            out[2 * idx] = 0;
+            out[2 * idx + 1] = avg << 24;
+        }
+    }
+}
+
 fn search_stages(
     params: &AnalyseParams,
     first: &SuperFrameView<'_>,
@@ -237,17 +315,73 @@ fn search_stages(
     outputs: [Option<&mut [u32]>; 2],
     mut session: Option<&mut gpu::Session<'_, '_>>,
 ) {
-    let mut outputs = Some(outputs);
-    let last = params.stages.len() - 1;
-    let mut take = |index: usize| {
-        if index == last {
-            outputs.take().unwrap_or_default()
-        } else {
-            [None, None]
-        }
-    };
-    let mut lambda = 0;
+    let mirror = params.fast.mirror() && params.vectors == 3;
+    let start_level = i32::from(params.fast.start_level).max(params.min_level());
     let main = &params.stages[0];
+    if params.fast.start_level >= 1 && start_level < main.levels {
+        let [out_forward, out_backward] = outputs;
+        let mut lambda = 0;
+        let mut previous = Pyramid::new(params, main, false, start_level);
+        previous.search(
+            params,
+            main,
+            first,
+            second,
+            &mut lambda,
+            [None, None],
+            |_, _, _, _| {},
+            session.as_deref_mut(),
+            start_level,
+        );
+        let out_stage = params.output();
+        if let Some(fwd) = previous.field_ref(false, start_level as usize) {
+            if let Some(out) = out_forward {
+                fwd.upsample_bilateral_output(
+                    out_stage,
+                    params.super_params.pel,
+                    &first.level(0).y,
+                    &first.level(start_level).y,
+                    out,
+                );
+            }
+            if let Some(out) = out_backward {
+                if mirror {
+                    let mut bwd = main.field(
+                        start_level,
+                        params.super_params.pel,
+                        params.chroma_shift,
+                        false,
+                        params.fast,
+                    );
+                    bwd.mirror_from_forward(
+                        fwd,
+                        &second.level(start_level),
+                        &first.level(start_level),
+                        params.fast,
+                    );
+                    bwd.upsample_bilateral_output(
+                        out_stage,
+                        params.super_params.pel,
+                        &second.level(0).y,
+                        &second.level(start_level).y,
+                        out,
+                    );
+                } else if let Some(bwd) = previous.field_ref(true, start_level as usize) {
+                    bwd.upsample_bilateral_output(
+                        out_stage,
+                        params.super_params.pel,
+                        &second.level(0).y,
+                        &second.level(start_level).y,
+                        out,
+                    );
+                }
+            }
+        }
+        return;
+    }
+    let [mut out_forward, mut out_backward] = outputs;
+    let last = params.stages.len() - 1;
+    let mut lambda = 0;
     let mut previous = Pyramid::new(params, main, false, params.min_level());
     if let Some(session) = session.as_deref_mut()
         && last == 1
@@ -256,7 +390,7 @@ fn search_stages(
         let stage = &params.stages[1];
         let mut refined = Pyramid::new(params, stage, true, params.min_level());
         let mut settings = stage.settings(params, 0, true);
-        let [mut out_forward, mut out_backward] = take(1);
+        let mut bwd_slot = if mirror { None } else { out_backward.take() };
         let mut starts = [None, None];
         let mut refine_lambda = 0;
         previous.search(
@@ -273,7 +407,7 @@ fn search_stages(
                 let output = if dir == 0 {
                     out_forward.as_deref_mut()
                 } else {
-                    out_backward.as_deref_mut()
+                    bwd_slot.as_deref_mut()
                 };
                 let lambda_out = (dir == 0).then_some(&mut refine_lambda);
                 starts[dir] = refined.refine_start(
@@ -293,25 +427,54 @@ fn search_stages(
             starts,
             [first, second],
             session,
-            [out_forward, out_backward],
+            [out_forward.as_deref_mut(), bwd_slot],
             &previous,
             params.min_level() as usize,
         );
+        if mirror
+            && let (Some(fwd), Some(bwd)) = (out_forward.as_deref(), out_backward.as_deref_mut())
+        {
+            field::Field::mirror_packed_output(
+                params.output(),
+                params.super_params.pel,
+                params.fast,
+                fwd,
+                bwd,
+                &second.level(0),
+                &first.level(0),
+            );
+        }
         return;
     }
+    let main_outputs = if last == 0 {
+        [
+            out_forward.as_deref_mut(),
+            if mirror { None } else { out_backward.as_deref_mut() },
+        ]
+    } else {
+        [None, None]
+    };
     previous.search(
         params,
         main,
         first,
         second,
         &mut lambda,
-        take(0),
+        main_outputs,
         |_, _, _, _| {},
         session.as_deref_mut(),
         params.min_level(),
     );
     for (index, stage) in params.stages.iter().enumerate().skip(1) {
         let mut refined = Pyramid::new(params, stage, false, params.min_level());
+        let stage_outputs = if index == last {
+            [
+                out_forward.as_deref_mut(),
+                if mirror { None } else { out_backward.as_deref_mut() },
+            ]
+        } else {
+            [None, None]
+        };
         refined.recalculate(
             params,
             stage,
@@ -319,10 +482,23 @@ fn search_stages(
             first,
             second,
             &mut lambda,
-            take(index),
+            stage_outputs,
             session.as_deref_mut(),
         );
         previous = refined;
+    }
+    if mirror
+        && let (Some(fwd), Some(bwd)) = (out_forward.as_deref(), out_backward)
+    {
+        field::Field::mirror_packed_output(
+            params.output(),
+            params.super_params.pel,
+            params.fast,
+            fwd,
+            bwd,
+            &second.level(0),
+            &first.level(0),
+        );
     }
 }
 
@@ -440,7 +616,12 @@ fn cpu_search<F: planes::LevelSource>(
         None,
         start,
     );
-    (0..=usize::from(plan.both))
+    let dirs = if plan.mirror {
+        1
+    } else {
+        1 + usize::from(plan.both)
+    };
+    (0..dirs)
         .map(|d| {
             cpu.fields(d == 1)[start as usize]
                 .as_ref()

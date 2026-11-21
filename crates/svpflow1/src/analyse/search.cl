@@ -273,7 +273,11 @@ inline void sad_slow(__global const uchar *gy, __global const uchar *gu, __globa
     uint sb = (uint)q[P_SBY] + (uint)s->py * (uint)q[P_SPY] + (uint)s->px;
     uint acc = 0;
     #pragma unroll 1
+#ifdef STRIDE_SAD
+    for (int j = 0; j < H; j += 2) {
+#else
     for (int j = 0; j < H; j++) {
+#endif
         uint so = sb + (uint)j * (uint)q[P_SPY], ro = off + (uint)j * rp;
         __global const uint *sw = (__global const uint *)(gy + (so & ~3u));
         __global const uint *rw = (__global const uint *)(ry + (ro & ~3u));
@@ -287,7 +291,14 @@ inline void sad_slow(__global const uchar *gy, __global const uchar *gu, __globa
             rpv = rn;
         }
     }
+#ifdef STRIDE_SAD
+    *luma = (int)(acc << 1);
+#else
     *luma = (int)acc;
+#endif
+#ifdef NO_CHROMA
+    *chroma = 0;
+#else
     uint coff = (uint)subpel(q[P_RBU], cp, q[P_RHU], pel, s->cpx * pel + (vx >> CS), s->cpy * pel + (vy >> CS));
     uint cb = (uint)q[P_SBU] + (uint)s->cpy * (uint)q[P_SPU] + (uint)s->cpx;
     uint cacc = 0;
@@ -310,6 +321,7 @@ inline void sad_slow(__global const uchar *gy, __global const uchar *gu, __globa
         }
     }
     *chroma = (int)cacc << CSH;
+#endif
 }
 
 #ifdef SATD
@@ -360,6 +372,9 @@ inline void satd_at(__global const uchar *gy, __global const uchar *gu, __global
         total += had4x4(d) / 2;
     }
     *luma = total;
+#ifdef NO_CHROMA
+    *chroma = 0;
+#else
     long coff = subpel(q[P_RBU], cp, q[P_RHU], pel, s->cpx * pel + (vx >> CS), s->cpy * pel + (vy >> CS));
     long cs = q[P_SBU] + (long)s->cpy * q[P_SPU] + s->cpx;
     long csp = q[P_SPU];
@@ -380,6 +395,7 @@ inline void satd_at(__global const uchar *gy, __global const uchar *gu, __global
             tv += had4x4(dv) / 2;
         }
     *chroma = (tu + tv) << CSH;
+#endif
 }
 #endif
 
@@ -473,8 +489,9 @@ inline __attribute__((always_inline)) void tasks(__local const uint *ss, __local
             a += (uint)(had4x4(d) / 2);
         }
     }
-    uint sc = (ccol & 3) * 8, cc = ccol >> 2;
     uint b = 0;
+#ifndef NO_CHROMA
+    uint sc = (ccol & 3) * 8, cc = ccol >> 2;
     #pragma unroll 1
     for (uint i = 0; i < (2 * TC + G - 1) / G; i++) {
         uint t = g + i * G;
@@ -493,6 +510,7 @@ inline __attribute__((always_inline)) void tasks(__local const uint *ss, __local
             b += (uint)(had4x4(d) / 2);
         }
     }
+#endif
     *accL = a;
     *accC = b;
 }
@@ -502,6 +520,21 @@ inline __attribute__((always_inline)) void tasks(__local const uint *ss, __local
                   uint g, const uint G, int lrow, uint lcol, int crow, uint ccol, uint *accL, uint *accC) {
     uint sl = (lcol & 3) * 8, wc = lcol >> 2;
     uint a = 0;
+#ifdef STRIDE_SAD
+    #pragma unroll 4
+    for (uint i = 0; i < (LT / 2 + G - 1) / G; i++) {
+        uint t = g + i * G;
+        if (t < LT / 2) {
+            uint row = 2u * (t / LTR), grp = t % LTR;
+            uint st = row * LTR + grp;
+            __local const uint *w = stl + (row + lrow) * RSL + wc + grp * 2;
+            uint a0 = w[0], a1 = w[1], a2 = w[2];
+            a = sad4(ss[2 * st], funnel(a0, a1, sl), a);
+            a = sad4(ss[2 * st + 1], funnel(a1, a2, sl), a);
+        }
+    }
+    a <<= 1;
+#else
     #pragma unroll 4
     for (uint i = 0; i < (LT + G - 1) / G; i++) {
         uint t = g + i * G;
@@ -513,8 +546,10 @@ inline __attribute__((always_inline)) void tasks(__local const uint *ss, __local
             a = sad4(ss[2 * t + 1], funnel(a1, a2, sl), a);
         }
     }
-    uint sc = (ccol & 3) * 8, cc = ccol >> 2;
+#endif
     uint b = 0;
+#ifndef NO_CHROMA
+    uint sc = (ccol & 3) * 8, cc = ccol >> 2;
     #pragma unroll 4
     for (uint i = 0; i < (CT + G - 1) / G; i++) {
         uint t = g + i * G;
@@ -527,6 +562,7 @@ inline __attribute__((always_inline)) void tasks(__local const uint *ss, __local
             if (CTW == 2) b = sad4(ss[CB + t * CTW + 1], funnel(a1, w[2], sc), b);
         }
     }
+#endif
     *accL = a;
     *accC = b;
 }
@@ -541,12 +577,18 @@ inline void cand_sad(__global const uchar *ry, __global const uchar *ru, __globa
     uint coff0 = (uint)subpel(q[P_RBU], q[P_RPU], q[P_RHU], pel, (x0 >> CS) * pel + (vx >> CS), (y0 >> CS) * pel + (vy >> CS));
     wsync();
     stage(stl, NCHL, ry, off0, (uint)q[P_RPY], H, (W + 30) / 16, l);
+#ifndef NO_CHROMA
     stage2(stc, NCHC, ROWSC * NCHC, ru, rv, coff0, (uint)q[P_RPU], CH, (CW + 30) / 16, l);
+#endif
     wsync();
     uint al, ac;
     tasks(ss, (__local const uint *)stl, (__local const uint *)stc, l, 32, 0, off0 & 15u, 0, coff0 & 15u, &al, &ac);
     *sl = (int)radd(al, scr);
+#ifdef NO_CHROMA
+    *sc = 0;
+#else
     *sc = (int)radd(ac, scr) << CSH;
+#endif
 }
 
 #ifdef LANEG
@@ -590,19 +632,40 @@ inline uint2 grp_part(__global const uchar *ry, __global const uchar *ru, __glob
 #if defined(SATD) && CS == 0
     uint t = r & 3u;
     uint th = r < 4 ? tile_had(ry, off0 + (t >> 1) * 4u * rp + (t & 1u) * 4u, rp, sr) : 0u;
+#ifdef NO_CHROMA
+    uint tc = 0u;
+#else
     uint tc = tile_had((r & 4u) ? rv : ru, coff0 + (t >> 1) * 4u * cp + (t & 1u) * 4u, cp, sr + 4);
+#endif
     return (uint2)(th, tc);
 #elif defined(SATD)
     bool lum = r < 4;
+#ifdef NO_CHROMA
+    uint th = lum ? tile_had(ry, off0 + (r >> 1) * 4u * rp + (r & 1u) * 4u, rp, sr) : 0u;
+    return (uint2)(th, 0u);
+#else
     uint o0 = lum ? off0 + (r >> 1) * 4u * rp + (r & 1u) * 4u : coff0;
     uint th = tile_had(lum ? ry : (r & 1u) ? rv : ru, o0, lum ? rp : cp, sr);
     return (uint2)(lum ? th : 0u, (r == 4u || r == 5u) ? th : 0u);
+#endif
+#else
+#ifdef STRIDE_SAD
+    uint al = 0u;
+    if ((r & 1u) == 0u) {
+        uint o = off0 + r * rp;
+        __global const uint *p = (__global const uint *)(ry + (o & ~3u));
+        uint sh = (o & 3u) * 8u, c0 = p[0], c1 = p[1], c2 = p[2];
+        al = sad4(sr[1], funnel(c1, c2, sh), sad4(sr[0], funnel(c0, c1, sh), 0u)) << 1;
+    }
 #else
     uint o = off0 + r * rp;
     __global const uint *p = (__global const uint *)(ry + (o & ~3u));
     uint sh = (o & 3u) * 8u, c0 = p[0], c1 = p[1], c2 = p[2];
     uint al = sad4(sr[1], funnel(c1, c2, sh), sad4(sr[0], funnel(c0, c1, sh), 0u));
-#if CS == 0
+#endif
+#ifdef NO_CHROMA
+    uint ac = 0u;
+#elif CS == 0
     uint co = coff0 + r * cp, cs = (co & 3u) * 8u;
     __global const uint *pu = (__global const uint *)(ru + (co & ~3u));
     __global const uint *pv = (__global const uint *)(rv + (co & ~3u));
@@ -657,13 +720,22 @@ inline uint grp_src(__global const uchar *sy, __global const uchar *su, __global
     uint t = r & 3u;
     if (lum) tile_load(sy, (uint)q[P_SBY] + (uint)(y0 + (int)(t >> 1) * 4) * spy + (uint)x0 + (t & 1u) * 4u, spy, sr);
     else sr[0] = sr[1] = sr[2] = sr[3] = 0;
+#ifdef NO_CHROMA
+    sr[4] = sr[5] = sr[6] = sr[7] = 0;
+#else
     tile_load((r & 4u) ? sv : su, (uint)q[P_SBU] + (uint)(y0 + (int)(t >> 1) * 4) * spu + (uint)x0 + (t & 1u) * 4u, spu, sr + 4);
+#endif
     return lum ? sad4(sr[3], 0u, sad4(sr[2], 0u, sad4(sr[1], 0u, sad4(sr[0], 0u, 0u)))) : 0u;
 #elif defined(SATD)
     bool lum = r < 4;
+#ifdef NO_CHROMA
+    if (lum) tile_load(sy, (uint)q[P_SBY] + (uint)(y0 + (int)(r >> 1) * 4) * spy + (uint)x0 + (r & 1u) * 4u, spy, sr);
+    else sr[0] = sr[1] = sr[2] = sr[3] = 0;
+#else
     uint o0 = lum ? (uint)q[P_SBY] + (uint)(y0 + (int)(r >> 1) * 4) * spy + (uint)x0 + (r & 1u) * 4u
                   : (uint)q[P_SBU] + (uint)(y0 >> 1) * spu + (uint)(x0 >> 1);
     tile_load(lum ? sy : (r & 1u) ? sv : su, o0, lum ? spy : spu, sr);
+#endif
     return lum ? sad4(sr[3], 0u, sad4(sr[2], 0u, sad4(sr[1], 0u, sad4(sr[0], 0u, 0u)))) : 0u;
 #else
     uint so = (uint)q[P_SBY] + (uint)(y0 + (int)r) * spy + (uint)x0;
@@ -671,7 +743,13 @@ inline uint grp_src(__global const uchar *sy, __global const uchar *su, __global
     uint sh = (so & 3u) * 8u, c0 = p[0], c1 = p[1], c2 = p[2];
     sr[0] = funnel(c0, c1, sh);
     sr[1] = funnel(c1, c2, sh);
+#ifdef NO_CHROMA
 #if CS == 0
+    sr[2] = sr[3] = sr[4] = sr[5] = 0;
+#else
+    sr[2] = sr[3] = 0;
+#endif
+#elif CS == 0
     uint co = (uint)q[P_SBU] + (uint)(y0 + (int)r) * spu + (uint)x0, cs = (co & 3u) * 8u;
     __global const uint *pu = (__global const uint *)(su + (co & ~3u));
     __global const uint *pv = (__global const uint *)(sv + (co & ~3u));
@@ -836,12 +914,20 @@ typedef struct {
 
 inline void batch_load(Batch *B, int s, __global const uchar *ry, __global const uchar *ru, __global const uchar *rv,
                        uint rh, uint cplane) {
+#ifdef STRIDE_SAD
+    if ((get_local_id(0) & 2u) == 0u) {
+        B->vl[s] = *(__global const uint4 *)(ry + (B->offl[s] & ~15u) + 16u * rh);
+    }
+#else
     B->vl[s] = *(__global const uint4 *)(ry + (B->offl[s] & ~15u) + 16u * rh);
+#endif
+#ifndef NO_CHROMA
 #if CS == 0
     B->vu[s] = *(__global const uint4 *)(ru + (B->offc[s] & ~15u) + 16u * rh);
     B->vv[s] = *(__global const uint4 *)(rv + (B->offc[s] & ~15u) + 16u * rh);
 #else
     B->vc[s] = *(__global const uint2 *)((cplane ? rv : ru) + (B->offc[s] & ~7u) + 8u * rh);
+#endif
 #endif
 }
 
@@ -873,13 +959,22 @@ inline void finish_batch(const Batch *B, uint s0, uint s1, csrc scw, uint rh, __
     for (int s = 0; s < NSLOT; s++) {
         uint pl = 0, pc = 0;
         if (B->act[s]) {
+#ifdef STRIDE_SAD
+            uint2 g = glu(B->vl[s], B->offl[s], rh, scr);
+            if ((get_local_id(0) & 2u) == 0u) {
+                pl = sad4(s1, g.y, sad4(s0, g.x, 0)) << 1;
+            }
+#else
             uint2 g = glu(B->vl[s], B->offl[s], rh, scr);
             pl = sad4(s1, g.y, sad4(s0, g.x, 0));
+#endif
+#ifndef NO_CHROMA
 #if CS == 0
             uint2 gu = glu(B->vu[s], B->offc[s], rh, scr), gv = glu(B->vv[s], B->offc[s], rh, scr);
             pc = sad4(scw.w, gv.y, sad4(scw.z, gv.x, sad4(scw.y, gu.y, sad4(scw.x, gu.x, 0))));
 #else
             pc = sad4(scw, gcu(B->vc[s], B->offc[s], rh, scr), 0);
+#endif
 #endif
         }
         v[2 * s] = pl;
@@ -888,7 +983,11 @@ inline void finish_batch(const Batch *B, uint s0, uint s1, csrc scw, uint rh, __
     #pragma unroll
     for (int s = 0; s < NSLOT; s++) {
         rl[s] = (int)radd(v[2 * s], scr);
+#ifdef NO_CHROMA
+        rc[s] = 0;
+#else
         rc[s] = (int)radd(v[2 * s + 1], scr) << CSH;
+#endif
     }
 }
 
@@ -1256,9 +1355,13 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
         }
 #endif
         dl = gsum(dl, scr);
+#ifdef NO_CHROMA
+        int contrast = min(dl * 2 / AREA, 255);
+#else
         du = gsum(du, scr);
         dv = gsum(dv, scr);
         int contrast = min(dl / AREA + du / CAREA + dv / CAREA, 255);
+#endif
         radius = contrast < 2 ? 0 : 1 + ((radius * min(contrast * 255 / 150, 255)) >> 8);
     }
     int cxp = LO(pv.x), cyp = HI(pv.x);
@@ -1267,7 +1370,11 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
         const int x1 = (int)shfl_i((uint)vxA, gs + 1u, scr), y1 = (int)shfl_i((uint)vyA, gs + 1u, scr);
         if (pp1 != IMAX && pp1 < pp0) { cxp = x1; cyp = y1; }
     }
+#ifdef EARLY_EXIT
+    const bool do_ex = found && !(craw >= 0 && craw * 2 <= 3 * AREA);
+#else
     const bool do_ex = found;
+#endif
     int rst = 0;
     if (do_ex) {
         rst = min(radius, RMAX);
@@ -1374,7 +1481,11 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
         nvec = rin[ni].x;
         cn = cen[b];
         ax = aux[b];
+#ifdef EARLY_EXIT
+        if (!ballot(inb && nd != 0, scr) || (cn.y >= 0 && cn.y * 2 <= 3 * AREA)) {
+#else
         if (!ballot(inb && nd != 0, scr)) {
+#endif
             if (l == 0) {
                 rout[ob] = rin[ob];
                 dout[ob] = 0;
@@ -1402,12 +1513,20 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
     const uint soffC = (uint)q[P_SBU] + (uint)((y0 >> CS) + (int)crow) * (uint)q[P_SPU] + (uint)(x0 >> CS);
     uint4 svl = *(__global const uint4 *)(sY + (soffL & ~15u) + 16u * rh);
 #if CS == 0
+#ifdef NO_CHROMA
+    uint4 svu = (uint4)(0), svv = (uint4)(0);
+#else
     uint4 svu = *(__global const uint4 *)(sU + (soffC & ~15u) + 16u * rh);
     uint4 svv = *(__global const uint4 *)(sV + (soffC & ~15u) + 16u * rh);
+#endif
     uint s0 = 0, s1 = 0;
     uint4 scw = (uint4)(0);
 #else
+#ifdef NO_CHROMA
+    uint2 svc = (uint2)(0);
+#else
     uint2 svc = *(__global const uint2 *)((cplane ? sV : sU) + (soffC & ~7u) + 8u * rh);
+#endif
     uint s0 = 0, s1 = 0, scw = 0;
 #endif
 #endif
@@ -1482,7 +1601,9 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
     }
     const uint pyi = (uint)q[P_RPY], pui = (uint)q[P_RPU];
     bool prepped = false;
-#if CS == 0
+#ifdef NO_CHROMA
+#define SRC_CHROMA() do { } while (0)
+#elif CS == 0
 #define SRC_CHROMA() do { \
         uint2 gu_ = glu(svu, soffC, rh, scr), gv_ = glu(svv, soffC, rh, scr); \
         scw = (uint4)(gu_.x, gu_.y, gv_.x, gv_.y); \
@@ -1565,6 +1686,7 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
             __global const uint *p = (__global const uint *)(sY + (o & ~3u));
             ss[k] = funnel(p[0], p[1], (o & 3) * 8);
         }
+#ifndef NO_CHROMA
         for (int k = l; k < CAREA / 4; k += 32) {
             uint o = coff0 + (k / (CW / 4)) * (uint)q[P_SPU] + 4 * (k % (CW / 4));
             __global const uint *pu_ = (__global const uint *)(sU + (o & ~3u));
@@ -1573,13 +1695,15 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
             ss[CB + k] = funnel(pu_[0], pu_[1], sft);
             ss[CB + CAREA / 4 + k] = funnel(pv_[0], pv_[1], sft);
         }
+#endif
 #else
         stage(stl, NCHL, sY, off0, (uint)q[P_SPY], H, (W + 30) / 16, l);
+#ifndef NO_CHROMA
         stage2(stc, NCHC, ROWSC * NCHC, sU, sV, coff0, (uint)q[P_SPU], CH, (CW + 30) / 16, l);
+#endif
         wsync();
         {
             __local const uint *stlw = (__local const uint *)stl;
-            __local const uint *stcw = (__local const uint *)stc;
             uint sl = (off0 & 3u) * 8, wc = (off0 & 15u) >> 2;
             for (uint t = l; t < LT; t += 32) {
                 uint row = t / LTR, grp = t % LTR;
@@ -1588,6 +1712,8 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
                 ss[2 * t] = funnel(a0, a1, sl);
                 ss[2 * t + 1] = funnel(a1, a2, sl);
             }
+#ifndef NO_CHROMA
+            __local const uint *stcw = (__local const uint *)stc;
             uint sc = (coff0 & 3u) * 8, cc = (coff0 & 15u) >> 2;
             for (uint t = l; t < CT; t += 32) {
                 uint pr = t / CTR, grp = t % CTR;
@@ -1597,15 +1723,18 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
                 ss[CB + t * CTW] = funnel(a0, a1, sc);
                 if (CTW == 2) ss[CB + t * CTW + 1] = funnel(a1, w[2], sc);
             }
+#endif
         }
 #endif
         wsync();
         for (int k = l; k < 2 * LT; k += 32) pl = sad4(ss[k], 0u, pl);
         if (blur && pass == 0) for (int i = l; i < AREA; i += 32) pb += blurred((__local const uchar *)ss, i);
+#ifndef NO_CHROMA
         if (pass == 0) for (int k = l; k < CAREA / 4; k += 32) {
             pu = sad4(ss[CB + k], 0u, pu);
             pw = sad4(ss[CB + CAREA / 4 + k], 0u, pw);
         }
+#endif
         SUMS_REDUCE()
     }
     while (om) {
@@ -1715,9 +1844,13 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
             }
 #endif
             dl = wsum(dl, scr);
+#ifdef NO_CHROMA
+            int contrast = min(dl * 2 / AREA, 255);
+#else
             du = wsum(du, scr);
             dv = wsum(dv, scr);
             int contrast = min(dl / AREA + du / CAREA + dv / CAREA, 255);
+#endif
             radius = contrast < 2 ? 0 : 1 + ((radius * min(contrast * 255 / 150, 255)) >> 8);
         }
         cxp = LO(pv.x); cyp = HI(pv.x);
@@ -1744,7 +1877,11 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
     } else {
         cvx = LO(cn.x); cvy = HI(cn.x); craw = cn.y; cmin = cn.z;
     }
+#ifdef EARLY_EXIT
+    const bool do_ex = found && !DONTV && !(craw >= 0 && craw * 2 <= 3 * AREA);
+#else
     const bool do_ex = found && !DONTV;
+#endif
     const int bx = cvx, by = cvy;
 
     int rst = 0;
@@ -1836,7 +1973,9 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
 #endif
                 wsync();
                 stage(stl, NCHL, rY, loff, (uint)q[P_RPY], H + 2 * rst, (W + 2 * rst + 30) / 16, l);
+#ifndef NO_CHROMA
                 stage2(stc, NCHC, ROWSC * NCHC, rU, rV, coff, (uint)q[P_RPU], CH + crst, (CW + crst + 30) / 16, l);
+#endif
                 wsync();
                 const bool g4 = ns <= 8;
                 const int G = g4 ? 4 : 1;
@@ -2035,7 +2174,11 @@ void refine(__global const uchar *sY_, __global const uchar *sU_, __global const
     const int omin_x = -pel * x0, omin_y = -pel * y0;
     const int omax_x = pel * (PW - x0 - W), omax_y = pel * (PH - y0 - H);
     const int vx = LO(nvec), vy = HI(nvec);
+#ifdef EARLY_EXIT
+    bool valid = gact && nd != 0 && nvec != cn.x && !(cn.y >= 0 && cn.y * 2 <= 3 * AREA);
+#else
     bool valid = gact && nd != 0 && nvec != cn.x;
+#endif
     const bool inside = vx >= omin_x && vx < omax_x && vy >= omin_y && vy < omax_y;
     if (valid && !inside) {
         Sh t = make_sh(x0, y0, pel, PW, PH, vx, vy, 0);

@@ -3,6 +3,58 @@ use crate::params::Value;
 
 const DEFAULT_LEVEL_FLOOR: i32 = 3;
 
+pub(crate) const FAST_NO_CHROMA: u8 = 1 << 0;
+pub(crate) const FAST_STRIDE_SAD: u8 = 1 << 1;
+pub(crate) const FAST_EARLY_EXIT: u8 = 1 << 2;
+pub(crate) const FAST_SAD_GATED_SATD: u8 = 1 << 3;
+pub(crate) const FAST_MIRROR: u8 = 1 << 4;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FastOpts {
+    pub(crate) level: u8,
+    pub(crate) flags: u8,
+    pub(crate) stride_sad: u8,
+    pub(crate) start_level: u8,
+}
+
+impl FastOpts {
+    pub(crate) const fn chroma_sad(self) -> bool {
+        self.flags & FAST_NO_CHROMA == 0
+    }
+
+    pub(crate) const fn strided(self) -> bool {
+        self.stride_sad >= 2
+    }
+
+    pub(crate) const fn early_exit(self) -> bool {
+        self.flags & FAST_EARLY_EXIT != 0
+    }
+
+    pub(crate) const fn sad_gated_satd(self) -> bool {
+        self.flags & FAST_SAD_GATED_SATD != 0
+    }
+
+    pub(crate) const fn mirror(self) -> bool {
+        self.flags & FAST_MIRROR != 0
+    }
+
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) const fn gpu_flags(self) -> u8 {
+        self.flags & 0x0F
+    }
+
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) const fn gpu_sweeps(self) -> usize {
+        if self.level >= 2 {
+            1
+        } else if self.early_exit() {
+            2
+        } else {
+            4
+        }
+    }
+}
+
 pub(crate) fn level_floor(flags: i32, mask: i32, shift: i32) -> i32 {
     match (flags & mask) >> shift {
         0 => DEFAULT_LEVEL_FLOOR,
@@ -120,6 +172,7 @@ impl Stage {
         pel: i32,
         chroma_shift: (u32, u32),
         lean: bool,
+        fast: FastOpts,
     ) -> Field {
         let l = self.layout;
         let (blk_x, blk_y) = self.block_counts(level);
@@ -136,6 +189,7 @@ impl Stage {
             satd,
             chroma_shift,
             lean,
+            fast,
         )
     }
 
@@ -180,6 +234,7 @@ impl Stage {
             try_many: params.try_many && (top || level > self.full_math_level),
             exact: params.exact,
             flags: params.flags,
+            fast: params.fast,
         }
     }
 }
@@ -189,6 +244,7 @@ pub(crate) struct AnalyseParams {
     pub(crate) super_params: SuperParams,
     pub(crate) gpu_mode: i32,
     pub(crate) exact: bool,
+    pub(crate) fast: FastOpts,
     pub(crate) vectors: i32,
     pub(crate) delta: i32,
     pub(crate) flags: i32,
@@ -370,10 +426,63 @@ impl AnalyseParams {
             });
         }
 
+        let fast_level = int(&["fast"], 0).clamp(0, 3) as u8;
+        let chroma_sad = flag(&["chroma_sad"], fast_level < 2);
+        let stride_sad = if int(&["stride_sad"], if fast_level >= 2 { 2 } else { 1 }) >= 2 {
+            2u8
+        } else {
+            1u8
+        };
+        let early_exit = flag(&["early_exit"], fast_level >= 1);
+        let sad_gated_satd = flag(&["sad_gated_satd"], fast_level >= 1);
+        let mirror = flag(&["mirror"], fast_level >= 2) && vectors == 3;
+        let default_start = if fast_level >= 3
+            && sp.width >= 640
+            && sp.height >= 360
+            && levels >= 2
+            && gpu_mode != 2
+        {
+            1
+        } else {
+            0
+        };
+        let start_level = if int(&["start_level"], default_start) >= 1
+            && levels >= 2
+            && gpu_mode != 2
+        {
+            1u8
+        } else {
+            0u8
+        };
+        let mut fast_flags = 0u8;
+        if !chroma_sad {
+            fast_flags |= FAST_NO_CHROMA;
+        }
+        if stride_sad >= 2 {
+            fast_flags |= FAST_STRIDE_SAD;
+        }
+        if early_exit {
+            fast_flags |= FAST_EARLY_EXIT;
+        }
+        if sad_gated_satd {
+            fast_flags |= FAST_SAD_GATED_SATD;
+        }
+        if mirror {
+            fast_flags |= FAST_MIRROR;
+        }
+        let fast = FastOpts {
+            level: fast_level,
+            flags: fast_flags,
+            stride_sad,
+            start_level,
+        };
+        let default_exact = fast_level == 0 && fast_flags == 0 && start_level == 0;
+
         Ok(Self {
             super_params: sp,
             gpu_mode,
-            exact: flag(&["exact"], true),
+            exact: flag(&["exact"], default_exact),
+            fast,
             vectors,
             delta: (int(&["special", "delta"], 1) as i32).max(1),
             flags,

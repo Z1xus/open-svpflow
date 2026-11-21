@@ -1,5 +1,5 @@
 use super::metric::{self, ChromaCost, Kernel, LumaCost, Shape};
-use super::params::level_floor;
+use super::params::{FastOpts, Stage, level_floor};
 
 use super::planes::{LevelFrame, MAX_BLOCK_AREA, PlaneView};
 
@@ -82,6 +82,7 @@ pub(crate) struct SearchSettings {
     pub(crate) try_many: bool,
     pub(crate) exact: bool,
     pub(crate) flags: i32,
+    pub(crate) fast: FastOpts,
 }
 
 pub(crate) type VectorOutput<'o> = &'o mut [u32];
@@ -105,6 +106,8 @@ pub(crate) struct GpuSearchParams {
     pub(crate) border: usize,
     pub(crate) satd: bool,
     pub(crate) shift: u32,
+    pub(crate) fast_flags: u8,
+    pub(crate) sweeps: usize,
     pub(crate) rank: Vec<i32>,
 }
 
@@ -117,13 +120,13 @@ const NO_CONTRAST_BLUR_FLAG: i32 = 0x10;
 #[derive(Clone, Copy)]
 struct Kernels {
     luma: Kernel,
+    sad_luma: Kernel,
     chroma: Kernel,
     pair: Option<metric::PairKernel>,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     wide: Option<metric::Wide>,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     stacked: bool,
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     satd: bool,
 }
 
@@ -242,12 +245,32 @@ impl Field {
         satd: bool,
         chroma_shift: (u32, u32),
         lean: bool,
+        fast: FastOpts,
     ) -> Self {
         let shape = Shape::new(layout.width as usize, layout.height as usize);
-        let chroma = if chroma_shift == (0, 0) {
+        let use_chroma = fast.chroma_sad();
+        let chroma = if !use_chroma {
+            metric::null_kernel
+        } else if chroma_shift == (0, 0) {
             metric::luma_kernel(shape, satd)
         } else {
             metric::chroma420_kernel(shape, satd)
+        };
+        let sad_luma = if fast.strided() {
+            metric::luma_strided_kernel(shape)
+        } else {
+            metric::luma_kernel(shape, false)
+        };
+        let luma = if !satd && fast.strided() {
+            sad_luma
+        } else {
+            metric::luma_kernel(shape, satd)
+        };
+        let half_shape = shape.half();
+        let half_sad = if fast.strided() && half_shape.height >= 4 {
+            metric::luma_strided_kernel(half_shape)
+        } else {
+            metric::chroma420_kernel(shape, false)
         };
         let mut field = Self {
             blk_x,
@@ -259,17 +282,23 @@ impl Field {
             smallest,
             chroma_shift,
             full: Kernels {
-                luma: metric::luma_kernel(shape, satd),
+                luma,
+                sad_luma,
                 chroma,
-                pair: (chroma_shift == (1, 1))
+                pair: (use_chroma && chroma_shift == (1, 1))
                     .then(|| metric::chroma420_pair(shape, satd))
                     .flatten(),
                 wide: metric::wide_shape(shape, satd),
-                stacked: chroma_shift == (1, 1) && metric::stacked_pair(shape, satd),
+                stacked: use_chroma && chroma_shift == (1, 1) && metric::stacked_pair(shape, satd),
                 satd,
             },
             half: Kernels {
-                luma: metric::chroma420_kernel(shape, satd),
+                luma: if !satd && fast.strided() && half_shape.height >= 4 {
+                    half_sad
+                } else {
+                    metric::chroma420_kernel(shape, satd)
+                },
+                sad_luma: half_sad,
                 chroma: metric::null_kernel,
                 pair: None,
                 wide: None,
@@ -724,6 +753,8 @@ impl Field {
             rmax: param as usize,
             satd: self.satd,
             shift: self.chroma_shift.0,
+            fast_flags: settings.fast.gpu_flags(),
+            sweeps: settings.fast.gpu_sweeps(),
             border: if self.level > 0 { self.border_len() } else { 0 },
         })
     }
@@ -893,7 +924,15 @@ impl Field {
                             let i = base + off;
                             let bx = (i as i32) % blk_x;
                             let by = (i as i32) / blk_x;
-                            *slot = self.predictor_sad(i, bx, by, src, reference, need_luma);
+                            *slot = self.predictor_sad(
+                                i,
+                                bx,
+                                by,
+                                src,
+                                reference,
+                                need_luma,
+                                settings.fast,
+                            );
                         }
                     });
             });
@@ -953,6 +992,7 @@ impl Field {
                     bounds,
                     best: Mv::default(),
                     min_cost: 0,
+                    best_raw_sad: -1,
                     predictor: self.vectors[predictor_index],
                     lambda,
                     sad_limit: settings.lsad,
@@ -1129,6 +1169,7 @@ impl Field {
                                     bounds,
                                     best: Mv::default(),
                                     min_cost: 0,
+                                    best_raw_sad: -1,
                                     predictor: t.predictor,
                                     lambda,
                                     sad_limit: settings.lsad,
@@ -1166,7 +1207,7 @@ impl Field {
             if predictor_only
                 && let Some(i) = index
                 && let Some((best, luma)) =
-                    self.predictor_sad(i, bx, by, src, reference, output.is_some())
+                    self.predictor_sad(i, bx, by, src, reference, output.is_some(), settings.fast)
             {
                 self.vectors[i] = best;
                 if let Some(out) = output.as_deref_mut() {
@@ -1219,6 +1260,7 @@ impl Field {
                 bounds,
                 best: Mv::default(),
                 min_cost: 0,
+                best_raw_sad: -1,
                 predictor: self.vectors[predictor_index],
                 lambda,
                 sad_limit: settings.lsad,
@@ -1270,6 +1312,7 @@ impl Field {
         src: &LevelFrame<'_>,
         reference: &LevelFrame<'_>,
         need_luma: bool,
+        fast: FastOpts,
     ) -> Option<(Mv, i32)> {
         let v = self.vectors[index];
         if v.sad < 0 {
@@ -1292,18 +1335,27 @@ impl Field {
             reference.y.subpel(x0 * pel + vx, y0 * pel + vy),
             shape.span(reference.y.pitch),
         )?;
-        let luma = metric::sad_pitched(shape, luma_src, src.y.pitch, luma_ref, reference.y.pitch);
-        let half = shape.half();
-        let (cx0, cy0) = (x0 >> 1, y0 >> 1);
-        let offset = reference
-            .u
-            .subpel(cx0 * pel + (vx >> 1), cy0 * pel + (vy >> 1));
-        let mut chroma = 0;
-        for (plane, reference) in [(&src.u, &reference.u), (&src.v, &reference.v)] {
-            let s = plane.slice(plane.pel1(cx0, cy0), half.span(plane.pitch))?;
-            let r = reference.slice(offset, half.span(reference.pitch))?;
-            chroma += metric::sad_pitched(half, s, plane.pitch, r, reference.pitch);
-        }
+        let luma = if fast.strided() {
+            metric::sad_pitched_strided(shape, luma_src, src.y.pitch, luma_ref, reference.y.pitch)
+        } else {
+            metric::sad_pitched(shape, luma_src, src.y.pitch, luma_ref, reference.y.pitch)
+        };
+        let chroma = if fast.chroma_sad() {
+            let half = shape.half();
+            let (cx0, cy0) = (x0 >> 1, y0 >> 1);
+            let offset = reference
+                .u
+                .subpel(cx0 * pel + (vx >> 1), cy0 * pel + (vy >> 1));
+            let mut sum = 0;
+            for (plane, reference) in [(&src.u, &reference.u), (&src.v, &reference.v)] {
+                let s = plane.slice(plane.pel1(cx0, cy0), half.span(plane.pitch))?;
+                let r = reference.slice(offset, half.span(reference.pitch))?;
+                sum += metric::sad_pitched(half, s, plane.pitch, r, reference.pitch);
+            }
+            sum
+        } else {
+            0
+        };
         let sad = luma as i32 + ((chroma as i32) << 2);
         let average = if need_luma {
             metric::block_average(luma_src, src.y.pitch, shape)
@@ -1536,6 +1588,7 @@ struct BlockState {
     bounds: Bounds,
     best: Mv,
     min_cost: i32,
+    best_raw_sad: i32,
     predictor: Mv,
     lambda: i32,
     sad_limit: i32,
@@ -1679,7 +1732,7 @@ impl BlockSearch<'_> {
     }
 
     fn copy_chroma(&mut self, set: usize) {
-        if self.half {
+        if self.half || !self.settings.fast.chroma_sad() {
             return;
         }
         #[cfg(target_arch = "x86_64")]
@@ -1783,8 +1836,18 @@ impl BlockSearch<'_> {
         })
     }
 
+    fn luma_raw_sad(&mut self, vx: i32, vy: i32) -> i32 {
+        let plane = self.reference.y;
+        let offset = plane.subpel(
+            self.state.pos[0] * self.pel + vx,
+            self.state.pos_y[0] * self.pel + vy,
+        );
+        let (block, pitch) = plane.block(offset, self.shape, &mut self.scratch);
+        (self.kernels.sad_luma)(&self.buffers[self.active].y, block, pitch) as i32
+    }
+
     fn chroma_sad(&mut self, vx: i32, vy: i32) -> i32 {
-        if self.half {
+        if self.half || !self.settings.fast.chroma_sad() {
             return 0;
         }
         let shape = self.chroma_shape();
@@ -1847,6 +1910,16 @@ impl BlockSearch<'_> {
         if cost >= self.state.min_cost {
             return false;
         }
+        let gated = self.kernels.satd && self.settings.fast.sad_gated_satd();
+        let cand_raw = if gated && self.state.best_raw_sad >= 0 {
+            let raw = self.luma_raw_sad(luma_x, vy);
+            if raw * 4 > self.state.best_raw_sad * 5 {
+                return false;
+            }
+            raw
+        } else {
+            -1
+        };
         let sad = self.luma_sad(luma_x, vy);
         cost = cost.wrapping_add(self.new_penalty(sad));
         if cost >= self.state.min_cost {
@@ -1859,6 +1932,9 @@ impl BlockSearch<'_> {
         }
         self.state.best = Mv::new(vx, vy, sad + sad_uv);
         self.state.min_cost = cost;
+        if gated && cand_raw >= 0 {
+            self.state.best_raw_sad = cand_raw;
+        }
         true
     }
 
@@ -1906,7 +1982,7 @@ impl BlockSearch<'_> {
             return false;
         }
         let (sx, sy) = self.chroma_shift;
-        let chroma = !self.half;
+        let chroma = !self.half && self.settings.fast.chroma_sad();
         let chroma_shape = self.chroma_shape();
         let chroma_span = chroma_shape.span(u.pitch);
         let (cx, cy) = (s.pos[1] * pel, s.pos_y[1] * pel);
@@ -1960,7 +2036,7 @@ impl BlockSearch<'_> {
             src: [&buffer.u, &buffer.v],
         };
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        if !self.kernels.satd {
+        if !self.kernels.satd && !self.settings.fast.strided() {
             let src = &buffer.y[..];
             let result = match (self.shape.width, self.shape.height) {
                 (16, 16) => Some(self.exhaustive_loop::<BITS, _, _>(
@@ -2044,7 +2120,7 @@ impl BlockSearch<'_> {
         let (lx, ly) = (s.pos[0] * pel, s.pos_y[0] * pel);
         let (cx, cy) = (s.pos[1] * pel, s.pos_y[1] * pel);
         let (sx, sy) = self.chroma_shift;
-        let chroma = !self.half;
+        let chroma = !self.half && self.settings.fast.chroma_sad();
         let pnew = self.settings.pnew;
         let penalty = |sad: i32| sad.wrapping_add(pnew.wrapping_mul(sad) >> 8);
         let bounded = pnew > -256;
@@ -2055,6 +2131,15 @@ impl BlockSearch<'_> {
         let (luma_pitch, chroma_pitch) = (y.pitch, u.pitch);
         let mut min_cost = s.min_cost;
         let mut best = s.best;
+        let gated = self.kernels.satd && self.settings.fast.sad_gated_satd();
+        let mut best_raw_sad = s.best_raw_sad;
+        let sad_kernel = self.kernels.sad_luma;
+        let src_y = &self.buffers[self.active].y;
+        let early_thresh = if self.settings.fast.early_exit() {
+            self.shape.area() as i32
+        } else {
+            -1
+        };
         for vy in min_y..=max_y {
             let dy = py - vy;
             let dy2 = dy.wrapping_mul(dy);
@@ -2073,6 +2158,15 @@ impl BlockSearch<'_> {
                 }
                 let offset = (luma_row + y.column_offset::<BITS>(lx + at)) as usize;
                 let block = unsafe { std::slice::from_raw_parts(yd.add(offset), luma_span) };
+                let cand_raw = if gated {
+                    let raw = sad_kernel(src_y, block, luma_pitch) as i32;
+                    if best_raw_sad >= 0 && raw * 4 > best_raw_sad * 5 {
+                        continue;
+                    }
+                    raw
+                } else {
+                    -1
+                };
                 let sad = if bounded {
                     luma.cost_until(block, luma_pitch, |partial| {
                         cost.wrapping_add(penalty(partial as i32)) >= min_cost
@@ -2102,6 +2196,12 @@ impl BlockSearch<'_> {
                 }
                 best = Mv::new(vx, vy, sad + sad_uv);
                 min_cost = cost;
+                if gated {
+                    best_raw_sad = cand_raw;
+                }
+                if best.sad <= early_thresh {
+                    return (best, min_cost);
+                }
             }
         }
         (best, min_cost)
@@ -2169,6 +2269,12 @@ impl BlockSearch<'_> {
         if !moved {
             let best = self.state.best;
             self.move_block(best.x.into(), best.y.into(), 2);
+        }
+        if self.kernels.satd && self.settings.fast.sad_gated_satd() {
+            let best = self.state.best;
+            self.state.best_raw_sad = self.luma_raw_sad(best.x.into(), best.y.into());
+        } else {
+            self.state.best_raw_sad = -1;
         }
         let radius = self.state.search_param;
         match self.settings.search_type {
@@ -2272,7 +2378,7 @@ impl BlockSearch<'_> {
         let (average, mut contrast) =
             Self::contrast(luma, shape, self.kernels.luma, &mut self.flat);
         self.block_luma = average;
-        if negative {
+        if negative || !self.settings.fast.chroma_sad() {
             contrast *= 2;
         } else {
             let chroma = self.chroma_shape();
@@ -2322,8 +2428,17 @@ impl BlockSearch<'_> {
                 self.state.predictor = reverse;
             }
         }
-        let early = !self.settings.exact && !self.settings.try_many && !negative;
+        let early =
+            (self.settings.fast.early_exit() || !self.settings.exact) && !self.settings.try_many && !negative;
         if early && self.settled() {
+            return;
+        }
+        if self.settings.fast.early_exit()
+            && self.settings.try_many
+            && !negative
+            && self.state.best.sad >= 0
+            && self.state.best.sad <= self.shape.area() as i32
+        {
             return;
         }
         self.check_predictor(self.global, self.settings.pglobal, false, 2);
@@ -2378,6 +2493,433 @@ impl BlockSearch<'_> {
         let sad = self.full_sad(vx, vy);
         self.state.best.sad = sad;
         self.state.min_cost = sad;
+        if self.settings.fast.early_exit() && sad <= self.shape.area() as i32 {
+            return;
+        }
         self.refine(true);
+    }
+}
+
+#[inline]
+fn floor_div_i32(a: i32, b: i32) -> i32 {
+    let q = a / b;
+    if a % b < 0 { q - 1 } else { q }
+}
+
+#[inline]
+pub(crate) fn unpack_packed_mv(w0: u32, w1: u32) -> (i32, i32, i32) {
+    let vy = i32::from(w0 as i16);
+    let vx = i32::from((w0.wrapping_sub(vy as u32) >> 16) as i16);
+    let sad = (w1 & 0x00FF_FFFF) as i32;
+    (vx, vy, sad)
+}
+
+fn eval_luma_candidate(
+    src_y: &PlaneView<'_>,
+    ref_y: &PlaneView<'_>,
+    x0: i32,
+    y0: i32,
+    vx: i32,
+    vy: i32,
+    pel: i32,
+    shape: Shape,
+    strided: bool,
+) -> Option<i32> {
+    let bw = shape.width as i32;
+    let bh = shape.height as i32;
+    if vx < -pel * x0
+        || vx >= pel * (ref_y.width - x0 - bw)
+        || vy < -pel * y0
+        || vy >= pel * (ref_y.height - y0 - bh)
+    {
+        return None;
+    }
+    let s = src_y.slice(src_y.pel1(x0, y0), shape.span(src_y.pitch))?;
+    let r = ref_y.slice(
+        ref_y.subpel(x0 * pel + vx, y0 * pel + vy),
+        shape.span(ref_y.pitch),
+    )?;
+    let sad = if strided {
+        metric::sad_pitched_strided(shape, s, src_y.pitch, r, ref_y.pitch)
+    } else {
+        metric::sad_pitched(shape, s, src_y.pitch, r, ref_y.pitch)
+    };
+    Some(sad as i32)
+}
+
+fn splat_grid(
+    blk_x: i32,
+    blk_y: i32,
+    step_x: i32,
+    step_y: i32,
+    pel: i32,
+    fwd: &[(i16, i16, i32)],
+) -> Vec<(i16, i16, i32)> {
+    let count = (blk_x * blk_y) as usize;
+    let mut bwd = vec![(0i16, 0i16, i32::MAX); count];
+    let sx = (step_x * pel).max(1);
+    let sy = (step_y * pel).max(1);
+    let hx = sx >> 1;
+    let hy = sy >> 1;
+    for by in 0..blk_y {
+        for bx in 0..blk_x {
+            let idx = (by * blk_x + bx) as usize;
+            let (vx, vy, sad) = fwd[idx];
+            let dx = floor_div_i32(i32::from(vx) + hx, sx);
+            let dy = floor_div_i32(i32::from(vy) + hy, sy);
+            let tx = (bx + dx).clamp(0, blk_x - 1);
+            let ty = (by + dy).clamp(0, blk_y - 1);
+            let dst = (ty * blk_x + tx) as usize;
+            if sad < bwd[dst].2 {
+                bwd[dst] = (vx.saturating_neg(), vy.saturating_neg(), sad);
+            }
+        }
+    }
+    let snapshot = bwd.clone();
+    for by in 0..blk_y {
+        for bx in 0..blk_x {
+            let idx = (by * blk_x + bx) as usize;
+            if bwd[idx].2 != i32::MAX {
+                continue;
+            }
+            let mut best = (fwd[idx].0.saturating_neg(), fwd[idx].1.saturating_neg(), i32::MAX);
+            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let nx = bx + dx;
+                let ny = by + dy;
+                if nx >= 0 && nx < blk_x && ny >= 0 && ny < blk_y {
+                    let cand = snapshot[(ny * blk_x + nx) as usize];
+                    if cand.2 < best.2 {
+                        best = cand;
+                    }
+                }
+            }
+            bwd[idx] = best;
+        }
+    }
+    bwd
+}
+
+fn verify_3cand(
+    src_y: &PlaneView<'_>,
+    ref_y: &PlaneView<'_>,
+    x0: i32,
+    y0: i32,
+    pel: i32,
+    shape: Shape,
+    strided: bool,
+    splat: (i32, i32),
+    neg_fwd: (i32, i32),
+) -> Mv {
+    let mut best_x = 0;
+    let mut best_y = 0;
+    let mut best_sad = i32::MAX;
+    let cands = [splat, neg_fwd, (0, 0)];
+    for (ci, &(cx, cy)) in cands.iter().enumerate() {
+        if ci > 0 && cands[..ci].contains(&(cx, cy)) {
+            continue;
+        }
+        if let Some(sad) = eval_luma_candidate(src_y, ref_y, x0, y0, cx, cy, pel, shape, strided)
+            && sad < best_sad
+        {
+            best_x = cx;
+            best_y = cy;
+            best_sad = sad;
+        }
+    }
+    if best_sad == i32::MAX {
+        Mv::new(0, 0, 0)
+    } else {
+        Mv::new(best_x, best_y, best_sad)
+    }
+}
+
+impl Field {
+    pub(crate) fn mirror_from_forward(
+        &mut self,
+        fwd: &Self,
+        src: &LevelFrame<'_>,
+        reference: &LevelFrame<'_>,
+        fast: FastOpts,
+    ) {
+        self.materialize();
+        let l = self.layout;
+        let pel = self.pel;
+        let shape = Shape::new(l.width as usize, l.height as usize);
+        let strided = fast.strided();
+        let fwd_list: Vec<(i16, i16, i32)> =
+            fwd.vectors.iter().map(|v| (v.x, v.y, v.sad)).collect();
+        let splat = splat_grid(self.blk_x, self.blk_y, l.step_x(), l.step_y(), pel, &fwd_list);
+        let blk_x = self.blk_x;
+        let step_x = l.step_x();
+        let step_y = l.step_y();
+        let run_block = |i: usize| {
+            let bx = (i as i32) % blk_x;
+            let by = (i as i32) / blk_x;
+            let x0 = bx * step_x;
+            let y0 = by * step_y;
+            let sp = (i32::from(splat[i].0), i32::from(splat[i].1));
+            let nf = (
+                i32::from(fwd_list[i].0.saturating_neg()),
+                i32::from(fwd_list[i].1.saturating_neg()),
+            );
+            verify_3cand(&src.y, &reference.y, x0, y0, pel, shape, strided, sp, nf)
+        };
+        if !cfg!(target_arch = "wasm32")
+            && self.vectors.len() >= 256
+            && super::pyramid::has_spare_cores()
+            && svpflow_core::threads::workers() >= 2
+        {
+            use rayon::prelude::*;
+            svpflow_core::threads::run(|| {
+                self.vectors
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(i, slot)| *slot = run_block(i));
+            });
+        } else {
+            for (i, slot) in self.vectors.iter_mut().enumerate() {
+                *slot = run_block(i);
+            }
+        }
+        for b in &mut self.border {
+            *b = Mv::default();
+        }
+    }
+
+    pub(crate) fn mirror_packed_output(
+        stage: &Stage,
+        pel: i32,
+        fast: FastOpts,
+        fwd_out: &[u32],
+        bwd_out: &mut [u32],
+        src: &LevelFrame<'_>,
+        reference: &LevelFrame<'_>,
+    ) {
+        let l = stage.layout;
+        let blk_x = stage.blk_x;
+        let blk_y = stage.blk_y;
+        let count = (blk_x * blk_y) as usize;
+        if fwd_out.len() < 2 * count || bwd_out.len() < 2 * count {
+            return;
+        }
+        let shape = Shape::new(l.width as usize, l.height as usize);
+        let step_x = l.width - l.overlap_x;
+        let step_y = l.height - l.overlap_y;
+        let strided = fast.strided();
+        let (w, h) = (src.y.width, src.y.height);
+        let diagonal = (pel * f64::from(w * w + h * h).sqrt() as i32).max(1);
+        let mut fwd_list = Vec::with_capacity(count);
+        for i in 0..count {
+            let (vx, vy, sad) = unpack_packed_mv(fwd_out[2 * i], fwd_out[2 * i + 1]);
+            fwd_list.push((vx as i16, vy as i16, sad));
+        }
+        let splat = splat_grid(blk_x, blk_y, step_x, step_y, pel, &fwd_list);
+        let compute = |i: usize| -> (u32, u32) {
+            let bx = (i as i32) % blk_x;
+            let by = (i as i32) / blk_x;
+            let x0 = bx * step_x;
+            let y0 = by * step_y;
+            let sp = (i32::from(splat[i].0), i32::from(splat[i].1));
+            let nf = (
+                i32::from(fwd_list[i].0.saturating_neg()),
+                i32::from(fwd_list[i].1.saturating_neg()),
+            );
+            let best = verify_3cand(&src.y, &reference.y, x0, y0, pel, shape, strided, sp, nf);
+            let luma = src
+                .y
+                .slice(src.y.pel1(x0, y0), shape.span(src.y.pitch))
+                .map_or(128, |block| metric::block_average(block, src.y.pitch, shape));
+            (
+                ((i32::from(best.x) << 16) + i32::from(best.y)) as u32,
+                packed_score(best, diagonal, luma),
+            )
+        };
+        if !cfg!(target_arch = "wasm32")
+            && count >= 512
+            && super::pyramid::has_spare_cores()
+            && svpflow_core::threads::workers() >= 2
+        {
+            use rayon::prelude::*;
+            let chunk = (count / (svpflow_core::threads::workers() * 4)).clamp(64, 512);
+            svpflow_core::threads::run(|| {
+                bwd_out[..2 * count]
+                    .par_chunks_mut(chunk * 2)
+                    .enumerate()
+                    .for_each(|(ci, slice)| {
+                        let base = ci * chunk;
+                        for (off, pair) in slice.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                            let (w0, w1) = compute(base + off);
+                            pair[0] = w0;
+                            pair[1] = w1;
+                        }
+                    });
+            });
+        } else {
+            for i in 0..count {
+                let (w0, w1) = compute(i);
+                bwd_out[2 * i] = w0;
+                bwd_out[2 * i + 1] = w1;
+            }
+        }
+    }
+
+    pub(crate) fn upsample_bilateral_output(
+        &self,
+        out_stage: &Stage,
+        out_pel: i32,
+        src_l0: &PlaneView<'_>,
+        src_l1: &PlaneView<'_>,
+        out: &mut [u32],
+    ) {
+        let cbx = self.blk_x;
+        let cby = self.blk_y;
+        let c_step_x = self.layout.step_x();
+        let c_step_y = self.layout.step_y();
+        let c_bw = self.layout.width;
+        let c_bh = self.layout.height;
+        let c_shape = Shape::new(c_bw as usize, c_bh as usize);
+        let c_count = (cbx * cby) as usize;
+        let mut coarse_luma = vec![128i32; c_count];
+        for cy in 0..cby {
+            for cx in 0..cbx {
+                let idx = (cy * cbx + cx) as usize;
+                let x0 = cx * c_step_x;
+                let y0 = cy * c_step_y;
+                if let Some(block) = src_l1.slice(src_l1.pel1(x0, y0), c_shape.span(src_l1.pitch)) {
+                    coarse_luma[idx] = metric::block_average(block, src_l1.pitch, c_shape);
+                }
+            }
+        }
+        let obx = out_stage.blk_x;
+        let oby = out_stage.blk_y;
+        let o_bw = out_stage.layout.width;
+        let o_bh = out_stage.layout.height;
+        let o_sx = o_bw - out_stage.layout.overlap_x;
+        let o_sy = o_bh - out_stage.layout.overlap_y;
+        let o_shape = Shape::new(o_bw as usize, o_bh as usize);
+        let count = (obx * oby) as usize;
+        if out.len() < 2 * count {
+            return;
+        }
+        let (fw, fh) = (src_l0.width, src_l0.height);
+        let diagonal = (out_pel * f64::from(fw * fw + fh * fh).sqrt() as i32).max(1);
+        let mv_scale = 2 * out_pel;
+        let sad_num = (o_bw * o_bh).max(1);
+        let sad_den = (c_bw * c_bh).max(1);
+        let compute = |i: usize| -> (u32, u32) {
+            let bx = (i as i32) % obx;
+            let by = (i as i32) / obx;
+            let x0 = bx * o_sx;
+            let y0 = by * o_sy;
+            let y_fine = src_l0
+                .slice(src_l0.pel1(x0, y0), o_shape.span(src_l0.pitch))
+                .map_or(128, |block| metric::block_average(block, src_l0.pitch, o_shape));
+            let fx = ((x0 * 2 + o_bw) as f32 * 0.25 - c_bw as f32 * 0.5)
+                / c_step_x.max(1) as f32;
+            let fy = ((y0 * 2 + o_bh) as f32 * 0.25 - c_bh as f32 * 0.5)
+                / c_step_y.max(1) as f32;
+            let ix0 = (fx.floor() as i32).clamp(0, cbx - 1);
+            let iy0 = (fy.floor() as i32).clamp(0, cby - 1);
+            let ix1 = (ix0 + 1).min(cbx - 1);
+            let iy1 = (iy0 + 1).min(cby - 1);
+            let wx = ((fx - ix0 as f32).clamp(0.0, 1.0) * 64.0) as i32;
+            let wy = ((fy - iy0 as f32).clamp(0.0, 1.0) * 64.0) as i32;
+            let sw = [
+                (64 - wx) * (64 - wy),
+                wx * (64 - wy),
+                (64 - wx) * wy,
+                wx * wy,
+            ];
+            let idxs = [
+                (iy0 * cbx + ix0) as usize,
+                (iy0 * cbx + ix1) as usize,
+                (iy1 * cbx + ix0) as usize,
+                (iy1 * cbx + ix1) as usize,
+            ];
+            let mut sum_w = 0i64;
+            let mut sum_x = 0i64;
+            let mut sum_y = 0i64;
+            let mut sum_sad = 0i64;
+            let mut max_w = -1i64;
+            let mut best_k = 0usize;
+            let mut min_vx = i32::MAX;
+            let mut max_vx = i32::MIN;
+            let mut min_vy = i32::MAX;
+            let mut max_vy = i32::MIN;
+            for k in 0..4 {
+                let mv = self.vectors[idxs[k]];
+                let vx = i32::from(mv.x);
+                let vy = i32::from(mv.y);
+                min_vx = min_vx.min(vx);
+                max_vx = max_vx.max(vx);
+                min_vy = min_vy.min(vy);
+                max_vy = max_vy.max(vy);
+                let dy = (y_fine - coarse_luma[idxs[k]]).abs();
+                let rw = 256 / (1 + ((dy * dy) >> 6));
+                let w = i64::from(sw[k].max(1)) * i64::from(rw);
+                if w > max_w {
+                    max_w = w;
+                    best_k = k;
+                }
+                sum_w += w;
+                sum_x += w * i64::from(vx);
+                sum_y += w * i64::from(vy);
+                sum_sad += w * i64::from(mv.sad.max(0));
+            }
+            let (vx, vy, sad) = if (max_vx - min_vx) + (max_vy - min_vy) > 4 {
+                let mv = self.vectors[idxs[best_k]];
+                (
+                    i32::from(mv.x) * mv_scale,
+                    i32::from(mv.y) * mv_scale,
+                    (i64::from(mv.sad.max(0)) * i64::from(sad_num) / i64::from(sad_den)) as i32,
+                )
+            } else {
+                let div = sum_w.max(1);
+                let round_div = |num: i64| -> i32 {
+                    let half = div >> 1;
+                    (if num >= 0 { num + half } else { num - half } / div) as i32
+                };
+                let vx = round_div(sum_x * i64::from(mv_scale));
+                let vy = round_div(sum_y * i64::from(mv_scale));
+                let sad = ((sum_sad / div) * i64::from(sad_num) / i64::from(sad_den)) as i32;
+                (vx, vy, sad)
+            };
+            let min_x = -out_pel * x0;
+            let max_x = out_pel * (fw - x0 - o_bw).max(0);
+            let min_y = -out_pel * y0;
+            let max_y = out_pel * (fh - y0 - o_bh).max(0);
+            let mv = Mv::new(vx.clamp(min_x, max_x), vy.clamp(min_y, max_y), sad);
+            (
+                ((i32::from(mv.x) << 16) + i32::from(mv.y)) as u32,
+                packed_score(mv, diagonal, y_fine),
+            )
+        };
+        if !cfg!(target_arch = "wasm32")
+            && count >= 512
+            && super::pyramid::has_spare_cores()
+            && svpflow_core::threads::workers() >= 2
+        {
+            use rayon::prelude::*;
+            let chunk = (count / (svpflow_core::threads::workers() * 4)).clamp(64, 512);
+            svpflow_core::threads::run(|| {
+                out[..2 * count]
+                    .par_chunks_mut(chunk * 2)
+                    .enumerate()
+                    .for_each(|(ci, slice)| {
+                        let base = ci * chunk;
+                        for (off, pair) in slice.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                            let (w0, w1) = compute(base + off);
+                            pair[0] = w0;
+                            pair[1] = w1;
+                        }
+                    });
+            });
+        } else {
+            for i in 0..count {
+                let (w0, w1) = compute(i);
+                out[2 * i] = w0;
+                out[2 * i + 1] = w1;
+            }
+        }
     }
 }

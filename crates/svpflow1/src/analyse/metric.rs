@@ -51,6 +51,19 @@ pub(crate) fn luma_kernel(shape: Shape, satd: bool) -> Kernel {
     }
 }
 
+pub(crate) fn luma_strided_kernel(shape: Shape) -> Kernel {
+    match (shape.width, shape.height) {
+        (32, 32) => sad_strided::<32, 32>,
+        (32, 16) => sad_strided::<32, 16>,
+        (16, 16) => sad_strided::<16, 16>,
+        (16, 8) => sad_strided::<16, 8>,
+        (8, 8) => sad_strided::<8, 8>,
+        (8, 4) => sad_strided::<8, 4>,
+        (4, 4) => sad_strided::<4, 4>,
+        _ => generic(shape, false),
+    }
+}
+
 pub(crate) fn chroma420_kernel(luma: Shape, satd: bool) -> Kernel {
     match (luma.width, luma.height) {
         (4, 4) => sad_2x2_swapped,
@@ -183,6 +196,49 @@ fn sad<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usiz
     sad_scalar(src, reference, pitch, W, H)
 }
 
+fn sad_strided<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
+    assert!(src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
+    #[cfg(target_arch = "x86_64")]
+    if W >= 8 {
+        return unsafe {
+            sad_rows_pitched::<W>(src.as_ptr(), W * 2, reference.as_ptr(), pitch * 2, H / 2)
+        } << 1;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if W >= 4 {
+        return neon::sad(src, W * 2, reference, pitch * 2, W, H / 2) << 1;
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if W >= 4 {
+        return simd128::sad(src, W * 2, reference, pitch * 2, W, H / 2) << 1;
+    }
+    let mut sum = 0u32;
+    for row in (0..H).step_by(2) {
+        let s = &src[row * W..][..W];
+        let r = &reference[row * pitch..][..W];
+        sum += s
+            .iter()
+            .zip(r)
+            .map(|(&a, &b)| u32::from(a.abs_diff(b)))
+            .sum::<u32>();
+    }
+    sum << 1
+}
+
+pub(crate) fn sad_pitched_strided(
+    shape: Shape,
+    a: &[u8],
+    a_pitch: usize,
+    b: &[u8],
+    b_pitch: usize,
+) -> u32 {
+    if shape.height < 4 || !shape.height.is_multiple_of(2) {
+        return sad_pitched(shape, a, a_pitch, b, b_pitch);
+    }
+    let half = Shape::new(shape.width, shape.height / 2);
+    sad_pitched(half, a, a_pitch * 2, b, b_pitch * 2) << 1
+}
+
 pub(crate) fn sad_pitched(shape: Shape, a: &[u8], a_pitch: usize, b: &[u8], b_pitch: usize) -> u32 {
     assert!(a.len() >= shape.span(a_pitch) && b.len() >= shape.span(b_pitch));
     #[cfg(target_arch = "aarch64")]
@@ -194,11 +250,9 @@ pub(crate) fn sad_pitched(shape: Shape, a: &[u8], a_pitch: usize, b: &[u8], b_pi
         let (a, b) = (a.as_ptr(), b.as_ptr());
         match (shape.width, shape.height) {
             (4, 4) => return sad_4x4_pitched(a, a_pitch, b, b_pitch),
-            (8, 8) => return sad_rows_pitched::<8>(a, a_pitch, b, b_pitch, 8),
-            (16, 8) => return sad_rows_pitched::<16>(a, a_pitch, b, b_pitch, 8),
-            (16, 16) => return sad_rows_pitched::<16>(a, a_pitch, b, b_pitch, 16),
-            (32, 16) => return sad_rows_pitched::<32>(a, a_pitch, b, b_pitch, 16),
-            (32, 32) => return sad_rows_pitched::<32>(a, a_pitch, b, b_pitch, 32),
+            (8, h) if h >= 2 => return sad_rows_pitched::<8>(a, a_pitch, b, b_pitch, h),
+            (16, h) if h >= 2 => return sad_rows_pitched::<16>(a, a_pitch, b, b_pitch, h),
+            (32, h) if h >= 2 => return sad_rows_pitched::<32>(a, a_pitch, b, b_pitch, h),
             _ => {}
         }
     }

@@ -1,4 +1,5 @@
 use super::{Field, Mv, SearchSettings, SearchType, VectorOutput, packed_score};
+use crate::analyse::params::FAST_NO_CHROMA;
 use crate::analyse::planes::LevelFrame;
 
 pub(crate) const NONE: i32 = i32::MIN;
@@ -116,6 +117,7 @@ pub(crate) struct RecalcPlan {
     pub(crate) height: usize,
     pub(crate) satd: bool,
     pub(crate) shift: u32,
+    pub(crate) fast_flags: u8,
     diagonal: i32,
     pub(crate) pnew: i32,
     pub(crate) pel: i32,
@@ -166,6 +168,7 @@ impl Field {
         plan.height = layout.height as usize;
         plan.satd = self.satd;
         plan.shift = self.chroma_shift.0;
+        plan.fast_flags = settings.fast.gpu_flags();
         plan.diagonal = pel * f64::from(frame_w * frame_w + frame_h * frame_h).sqrt() as i32;
         plan.pnew = settings.pnew;
         plan.pel = pel;
@@ -369,7 +372,7 @@ impl Field {
                     |y, x| source_luma(y * bw + x),
                     reference_luma,
                 );
-                if negative {
+                if negative || plan.fast_flags & FAST_NO_CHROMA != 0 {
                     continue;
                 }
                 let (cw, ch) = (fw >> plan.shift, fh >> plan.shift);
@@ -527,6 +530,7 @@ pub(crate) struct CompactPlan {
     pub(crate) blocks: usize,
     pub(crate) satd: bool,
     pub(crate) shift: u32,
+    pub(crate) fast_flags: u8,
 }
 
 impl CompactPlan {
@@ -719,6 +723,7 @@ impl Field {
         plan.blocks = self.count();
         plan.satd = self.satd;
         plan.shift = self.chroma_shift.0;
+        plan.fast_flags = settings.fast.gpu_flags();
         true
     }
 }

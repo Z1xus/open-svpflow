@@ -87,12 +87,15 @@ pub(crate) struct LevelPlan {
     pub(crate) flat: bool,
     pub(crate) sorted: bool,
     pub(crate) shift: u32,
+    pub(crate) fast_flags: u8,
+    pub(crate) sweeps: usize,
 }
 
 pub(crate) struct RefinePlan {
     pub(crate) geometry: [i32; 20],
     pub(crate) satd: bool,
     pub(crate) shift: u32,
+    pub(crate) fast_flags: u8,
     pub(crate) blk_x: i32,
     pub(crate) blk_y: i32,
     pub(crate) step_x: i32,
@@ -110,7 +113,12 @@ pub(crate) struct ChainPlan {
     pub(crate) levels: Vec<LevelPlan>,
     pub(crate) pyramid: Pyramid,
     pub(crate) both: bool,
+    pub(crate) mirror: bool,
+    pub(crate) start_level: usize,
     pub(crate) lean: bool,
+    pub(crate) step_row: i32,
+    pub(crate) out_pel: i32,
+    pub(crate) out_grid: [i32; 6],
     pub(crate) refine: Option<RefinePlan>,
     pub(crate) sort_shift: i32,
     pub(crate) sort_buckets: i32,
@@ -126,10 +134,7 @@ impl ChainPlan {
     }
 
     pub(crate) fn output_blocks(&self) -> usize {
-        match &self.refine {
-            Some(r) => (r.blk_x * r.blk_y) as usize,
-            None => (self.levels[0].blk_x * self.levels[0].blk_y) as usize,
-        }
+        (self.out_grid[0] * self.out_grid[1]) as usize
     }
 
     pub(crate) fn new(
@@ -139,8 +144,9 @@ impl ChainPlan {
     ) -> Option<Self> {
         let sp = params.super_params;
         let main = &params.stages[0];
+        let start_level = params.fast.start_level as usize;
         if params.min_level() != 0
-            || params.stages.len() > 2
+            || (start_level == 0 && params.stages.len() > 2)
             || sp.custom_scale
             || (!sp.lean && (first.source.is_some() || second.source.is_some()))
             || !main.gpu_searchable(params)
@@ -162,10 +168,17 @@ impl ChainPlan {
             return None;
         }
         let top = params.exact_floor(main.levels - 1);
+        let pyr_levels = if sp.lean {
+            main.levels
+        } else if start_level >= 1 {
+            top.max(2)
+        } else {
+            top
+        };
         let pyramid = Pyramid {
             width: sp.width,
             height: sp.height,
-            levels: if sp.lean { main.levels } else { top },
+            levels: pyr_levels,
             pitch: l0.y.pitch,
             chroma_pitch: l0.u.pitch,
             shift: params.chroma_shift.0,
@@ -173,7 +186,7 @@ impl ChainPlan {
         let mut levels = Vec::new();
         let mut lambda0 = 0;
         for level in 0..=top {
-            let field = main.field(level, sp.pel, params.chroma_shift, true);
+            let field = main.field(level, sp.pel, params.chroma_shift, true, params.fast);
             let mut settings = main.settings(params, level, level == top);
             if level == top {
                 settings.pnew = 0;
@@ -225,6 +238,8 @@ impl ChainPlan {
                 flat: layout.overlap_x == 0 && layout.overlap_y == 0,
                 sorted,
                 shift: params.chroma_shift.0,
+                fast_flags: gp.fast_flags,
+                sweeps: gp.sweeps,
             });
         }
         for pair in levels.windows(2) {
@@ -244,10 +259,10 @@ impl ChainPlan {
         }
         let area = main.layout.width * main.layout.height;
         let log = (area * 256 / 2048).ilog2() as i32;
-        let refine = if params.stages.len() == 2 {
+        let refine = if start_level == 0 && params.stages.len() == 2 {
             let stage = &params.stages[1];
-            let refined = stage.field(0, sp.pel, params.chroma_shift, true);
-            let coarse = main.field(0, sp.pel, params.chroma_shift, true);
+            let refined = stage.field(0, sp.pel, params.chroma_shift, true, params.fast);
+            let coarse = main.field(0, sp.pel, params.chroma_shift, true, params.fast);
             let mut settings = stage.settings(params, 0, true);
             settings.lambda = lambda0;
             if !refined.compact_eligible(&settings) || sp.pel > 2 {
@@ -259,6 +274,7 @@ impl ChainPlan {
                 geometry: refined.compact_geometry(&coarse, w, h, &settings),
                 satd: refined.uses_satd(),
                 shift: params.chroma_shift.0,
+                fast_flags: params.fast.gpu_flags(),
                 blk_x: refined.blk_x,
                 blk_y: refined.blk_y,
                 step_x: interp.step_x,
@@ -274,11 +290,25 @@ impl ChainPlan {
         } else {
             None
         };
+        let out = params.output();
+        let out_grid = [
+            out.blk_x,
+            out.blk_y,
+            out.layout.width,
+            out.layout.height,
+            out.layout.width - out.layout.overlap_x,
+            out.layout.height - out.layout.overlap_y,
+        ];
         Some(Self {
             levels,
             pyramid,
             both: params.vectors == 3,
+            mirror: params.fast.mirror() && params.vectors == 3,
+            start_level,
             lean: sp.lean,
+            step_row: if params.fast.strided() { 2 } else { 1 },
+            out_pel: sp.pel,
+            out_grid,
             refine,
             sort_shift: log + 1,
             sort_buckets: (area * 255) >> log,

@@ -27,20 +27,32 @@ pub(crate) struct Pyramid {
 
 impl Pyramid {
     pub(crate) fn new(params: &AnalyseParams, stage: &Stage, lean: bool, floor: i32) -> Self {
+        let both = params.vectors == 3 && !params.fast.mirror();
         let build = || {
             (0..stage.levels)
                 .map(|level| {
                     (level >= floor).then(|| {
-                        stage.field(level, params.super_params.pel, params.chroma_shift, lean)
+                        stage.field(
+                            level,
+                            params.super_params.pel,
+                            params.chroma_shift,
+                            lean,
+                            params.fast,
+                        )
                     })
                 })
                 .collect()
         };
         Self {
             forward: build(),
-            backward: build(),
-            both: params.vectors == 3,
+            backward: if both { build() } else { Vec::new() },
+            both,
         }
+    }
+
+    pub(crate) fn field_ref(&self, backward: bool, level: usize) -> Option<&Field> {
+        let list = if backward { &self.backward } else { &self.forward };
+        list.get(level).and_then(Option::as_ref)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -55,7 +67,7 @@ impl Pyramid {
     fn pair(&mut self, level: usize) -> (&mut Field, Option<&mut Field>) {
         let forward = self.forward[level].as_mut().expect("searched level");
         let backward = if self.both {
-            self.backward[level].as_mut()
+            self.backward.get_mut(level).and_then(Option::as_mut)
         } else {
             None
         };
@@ -301,15 +313,21 @@ impl Pyramid {
         let [mut out_forward, mut out_backward] = outputs;
         let mut settings = stage.settings(params, 0, true);
         settings.lambda = *lambda_out;
-        let seeds = [&previous.forward[0], &previous.backward[0]];
-        for (fields, seed) in [&mut self.forward, &mut self.backward]
-            .into_iter()
-            .zip(seeds)
+        if let (Some(field), Some(seed)) = (
+            self.forward.first_mut().and_then(Option::as_mut),
+            previous.forward.first().and_then(Option::as_ref),
+        ) {
+            field.interpolate_prediction(seed, true);
+            field.set_order(None);
+        }
+        if self.both
+            && let (Some(field), Some(seed)) = (
+                self.backward.first_mut().and_then(Option::as_mut),
+                previous.backward.first().and_then(Option::as_ref),
+            )
         {
-            if let (Some(field), Some(seed)) = (fields[0].as_mut(), seed.as_ref()) {
-                field.interpolate_prediction(seed, true);
-                field.set_order(None);
-            }
+            field.interpolate_prediction(seed, true);
+            field.set_order(None);
         }
         let (src, reference) = (first.level(0), second.level(0));
         let (f, b) = self.pair(0);
@@ -416,9 +434,9 @@ impl Pyramid {
     ) -> Option<RefineStart> {
         let session = session?;
         let field = if direction == 0 {
-            self.forward[0].as_mut()?
+            self.forward.first_mut().and_then(Option::as_mut)?
         } else if self.both {
-            self.backward[0].as_mut()?
+            self.backward.first_mut().and_then(Option::as_mut)?
         } else {
             return None;
         };
@@ -468,9 +486,9 @@ impl Pyramid {
                 continue;
             };
             let field = if direction == 0 {
-                self.forward[0].as_mut()
+                self.forward.first_mut().and_then(Option::as_mut)
             } else {
-                self.backward[0].as_mut()
+                self.backward.first_mut().and_then(Option::as_mut)
             };
             let Some(field) = field else {
                 continue;

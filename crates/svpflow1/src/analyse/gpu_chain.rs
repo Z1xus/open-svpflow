@@ -1,7 +1,7 @@
 use super::{
     Arg, Buffer, CHAIN_PIN, CL_DEVICE_LOCAL_MEM_SIZE, CL_DEVICE_MAX_WORK_GROUP_SIZE, CL_FALSE,
-    CL_SUCCESS, Frame, Handle, RefineGpu, SWEEPS, SearchMems, Session, Uploaded, Variant,
-    bytes, compact_params, recalc_args,
+    CL_SUCCESS, Frame, Handle, RefineGpu, SearchMems, Session, Uploaded, Variant, bytes,
+    compact_params, recalc_args,
 };
 use crate::analyse::chain::{ChainPlan, LevelPlan, Pyramid, RANK_BLOCKS, RefinePlan};
 use std::ptr::null_mut;
@@ -263,8 +263,11 @@ impl Session<'_, '_> {
     fn enqueue_chain(&mut self, plan: &ChainPlan, top_out: &[Vec<[i32; 4]>]) -> Option<Vec<usize>> {
         self.flush();
         let chain = self.gpu.chain_program()?;
-        let dirs = 1 + usize::from(plan.both);
+        let out_dirs = 1 + usize::from(plan.both);
+        let dirs = if plan.mirror { 1 } else { out_dirs };
         let top = plan.top();
+        let min_level = plan.start_level.min(top);
+        let blocks = plan.output_blocks();
         let mut infos = Vec::new();
         for slot in 0..2 {
             let frame = self.frames[slot].as_ref()?;
@@ -290,13 +293,14 @@ impl Session<'_, '_> {
                 .map(|s| s.out)
                 .max()
                 .unwrap_or(0)
-                * dirs
+                * out_dirs
         };
+        let min_bytes = most(|s| s.min).max(if plan.mirror { slab(blocks * 4) } else { 0 });
         let shared = Shared {
             pred: most(|s| s.pred),
             res: most(|s| s.out),
             dirty: most(|s| s.dirty),
-            min: most(|s| s.min),
+            min: min_bytes,
             out: [parity(0), parity(1)],
         };
         if self.unit.chain.levels.len() < plan.levels.len() {
@@ -331,6 +335,9 @@ impl Session<'_, '_> {
             }
         }
         for (level, lp) in plan.levels.iter().enumerate() {
+            if level < min_level {
+                continue;
+            }
             let b = bufs[level];
             let nb = (lp.blk_x * lp.blk_y) as usize;
             for d in 0..dirs {
@@ -365,8 +372,8 @@ impl Session<'_, '_> {
             }
         }
         let mut waits: &[Handle] = &events;
-        let both = i32::from(plan.both);
-        for level in (0..top).rev() {
+        let both = i32::from(dirs > 1);
+        for level in (min_level..top).rev() {
             let lp = &plan.levels[level];
             let (b, c) = (bufs[level], bufs[level + 1]);
             let nb = (lp.blk_x * lp.blk_y) as i32;
@@ -553,51 +560,240 @@ impl Session<'_, '_> {
             };
             unsafe { self.chain_search(lp, &mems)? };
         }
-        let blocks = plan.output_blocks();
         let words_slab = slab(blocks * 8);
-        let (words, _) = unsafe { self.chain_buf(|c| &mut c.words, words_slab * dirs)? };
-        let out0 = bufs[0];
-        let mut st = out0.slabs.stride();
-        st[4] = both;
-        st[5] = (words_slab / 8) as i32;
-        match &plan.refine {
-            None => unsafe {
+        let (words, _) = unsafe { self.chain_buf(|c| &mut c.words, words_slab * out_dirs)? };
+        if min_level >= 1 {
+            let l1 = &plan.levels[min_level];
+            let b1 = bufs[min_level];
+            let nb1 = (l1.blk_x * l1.blk_y) as usize;
+            if plan.mirror {
+                let g1 = plan.pyramid.geom(min_level as i32);
+                let (off_y, _) = plan.pyramid.offsets(min_level as i32);
+                let base_y = (infos[0].1[0] + off_y) as i32;
+                let diag1 = f64::from(g1.width * g1.width + g1.height * g1.height).sqrt() as i32;
+                let step_row = if l1.height >= 8 { plan.step_row } else { 1 };
+                let mg = [l1.blk_x, l1.blk_y, l1.step_x, l1.step_y, 0, 0, 0, 0];
+                unsafe {
+                    self.launch(
+                        (chain, c"mirror_l1_splat1"),
+                        &[Arg::Mem(b1.out), Arg::Mem(b1.minsad), Arg::V8(mg)],
+                        nb1,
+                        Some(64),
+                        waits,
+                        null_mut(),
+                    )?;
+                    waits = &[];
+                    self.launch(
+                        (chain, c"mirror_l1_splat2"),
+                        &[
+                            Arg::Mem(b1.out),
+                            Arg::Mem(b1.minsad),
+                            Arg::Mem(b1.minidx),
+                            Arg::V8(mg),
+                        ],
+                        nb1,
+                        Some(64),
+                        &[],
+                        null_mut(),
+                    )?;
+                    self.launch(
+                        (chain, c"mirror_l1_verify"),
+                        &[
+                            Arg::Mem(b1.out),
+                            Arg::Mem(b1.minsad),
+                            Arg::Mem(b1.minidx),
+                            Arg::Mem(infos[1].0[0]),
+                            Arg::Mem(infos[0].0[0]),
+                            Arg::V8([
+                                l1.blk_x,
+                                l1.blk_y,
+                                l1.step_x,
+                                l1.step_y,
+                                l1.width as i32,
+                                l1.height as i32,
+                                (b1.slabs.out / 16) as i32,
+                                step_row,
+                            ]),
+                            Arg::V8([
+                                g1.width,
+                                g1.height,
+                                g1.pitch as i32,
+                                g1.pitch as i32,
+                                diag1.max(1),
+                                base_y,
+                                0,
+                                0,
+                            ]),
+                        ],
+                        nb1,
+                        Some(64),
+                        &[],
+                        null_mut(),
+                    )?;
+                }
+            }
+            let fw = plan.pyramid.width;
+            let fh = plan.pyramid.height;
+            let pitch = plan.pyramid.pitch as i32;
+            let diag0 = (plan.out_pel * f64::from(fw * fw + fh * fh).sqrt() as i32).max(1);
+            unsafe {
                 self.launch(
-                    (chain, c"packout"),
+                    (chain, c"upsample_bilateral"),
                     &[
-                        Arg::Mem(out0.out),
+                        Arg::Mem(b1.out),
+                        Arg::Mem(infos[0].0[0]),
+                        Arg::Mem(infos[1].0[0]),
                         Arg::Mem(words),
-                        Arg::Int(blocks as i32),
-                        Arg::V8(st),
+                        Arg::V8([
+                            plan.out_grid[0],
+                            plan.out_grid[1],
+                            plan.out_grid[2],
+                            plan.out_grid[3],
+                            plan.out_grid[4],
+                            plan.out_grid[5],
+                            fw,
+                            fh,
+                        ]),
+                        Arg::V8([
+                            l1.blk_x,
+                            l1.blk_y,
+                            l1.width as i32,
+                            l1.height as i32,
+                            l1.step_x,
+                            l1.step_y,
+                            pitch,
+                            pitch,
+                        ]),
+                        Arg::V8([
+                            plan.out_pel,
+                            diag0,
+                            (b1.slabs.out / 16) as i32,
+                            (words_slab / 8) as i32,
+                            out_dirs as i32,
+                            0,
+                            0,
+                            0,
+                        ]),
                     ],
-                    blocks * dirs,
+                    blocks * out_dirs,
                     Some(64),
-                    &[],
+                    waits,
                     null_mut(),
                 )?;
-            },
-            Some(refine) => {
-                for d in 0..dirs {
-                    let (src_slot, ref_slot) = if d == 0 { (0, 1) } else { (1, 0) };
-                    let offsets = (
-                        (d * out0.slabs.out / 16) as i32,
-                        (d * words_slab / 8) as i32,
-                    );
-                    unsafe {
-                        self.chain_refine(
-                            refine,
-                            (out0.out, words),
-                            offsets,
-                            (infos[src_slot].0, infos[ref_slot].0),
-                            (src_slot, ref_slot),
-                            stale,
-                        )?;
+            }
+        } else {
+            let out0 = bufs[0];
+            let mut st = out0.slabs.stride();
+            st[4] = both;
+            st[5] = (words_slab / 8) as i32;
+            match &plan.refine {
+                None => unsafe {
+                    self.launch(
+                        (chain, c"packout"),
+                        &[
+                            Arg::Mem(out0.out),
+                            Arg::Mem(words),
+                            Arg::Int(blocks as i32),
+                            Arg::V8(st),
+                        ],
+                        blocks * dirs,
+                        Some(64),
+                        &[],
+                        null_mut(),
+                    )?;
+                },
+                Some(refine) => {
+                    for d in 0..dirs {
+                        let (src_slot, ref_slot) = if d == 0 { (0, 1) } else { (1, 0) };
+                        let offsets = (
+                            (d * out0.slabs.out / 16) as i32,
+                            (d * words_slab / 8) as i32,
+                        );
+                        unsafe {
+                            self.chain_refine(
+                                refine,
+                                (out0.out, words),
+                                offsets,
+                                (infos[src_slot].0, infos[ref_slot].0),
+                                (src_slot, ref_slot),
+                                stale,
+                            )?;
+                        }
                     }
+                }
+            }
+            if plan.mirror {
+                let fw = plan.pyramid.width;
+                let fh = plan.pyramid.height;
+                let pitch = plan.pyramid.pitch as i32;
+                let diag = (plan.out_pel * f64::from(fw * fw + fh * fh).sqrt() as i32).max(1);
+                let step_row = if plan.out_grid[3] >= 8 {
+                    plan.step_row
+                } else {
+                    1
+                };
+                let mg = [
+                    plan.out_grid[0],
+                    plan.out_grid[1],
+                    plan.out_grid[4],
+                    plan.out_grid[5],
+                    plan.out_pel,
+                    0,
+                    0,
+                    0,
+                ];
+                unsafe {
+                    self.launch(
+                        (chain, c"mirror_splat1"),
+                        &[Arg::Mem(words), Arg::Mem(out0.minsad), Arg::V8(mg)],
+                        blocks,
+                        Some(64),
+                        &[],
+                        null_mut(),
+                    )?;
+                    self.launch(
+                        (chain, c"mirror_splat2"),
+                        &[
+                            Arg::Mem(words),
+                            Arg::Mem(out0.minsad),
+                            Arg::Mem(out0.minidx),
+                            Arg::V8(mg),
+                        ],
+                        blocks,
+                        Some(64),
+                        &[],
+                        null_mut(),
+                    )?;
+                    self.launch(
+                        (chain, c"mirror_verify"),
+                        &[
+                            Arg::Mem(words),
+                            Arg::Mem(out0.minsad),
+                            Arg::Mem(out0.minidx),
+                            Arg::Mem(infos[1].0[0]),
+                            Arg::Mem(infos[0].0[0]),
+                            Arg::V8([
+                                plan.out_grid[0],
+                                plan.out_grid[1],
+                                plan.out_grid[4],
+                                plan.out_grid[5],
+                                plan.out_grid[2],
+                                plan.out_grid[3],
+                                plan.out_pel,
+                                (words_slab / 8) as i32,
+                            ]),
+                            Arg::V8([fw, fh, pitch, pitch, diag, step_row, 0, 0]),
+                        ],
+                        blocks,
+                        Some(64),
+                        &[],
+                        null_mut(),
+                    )?;
                 }
             }
         }
         let mut tickets = Vec::new();
-        for d in 0..dirs {
+        for d in 0..out_dirs {
             let host = unsafe {
                 self.gpu.pinned(
                     self.unit.queue,
@@ -622,7 +818,7 @@ impl Session<'_, '_> {
             {
                 return None;
             }
-            if d + 1 == dirs {
+            if d + 1 == out_dirs {
                 self.pending.push(done as usize);
             } else {
                 unsafe { (self.gpu.cl.ReleaseEvent)(done) };
@@ -638,6 +834,7 @@ impl Session<'_, '_> {
         let programs = self.gpu.search_pair(
             Variant {
                 shift: lp.shift,
+                fast_flags: lp.fast_flags,
                 ..Variant::new(lp.width, lp.height, lp.satd)
             },
             lp.rmax,
@@ -649,7 +846,7 @@ impl Session<'_, '_> {
             self.launch_search(
                 mems,
                 (nb, lp.border),
-                if lp.q[32] == 0 { SWEEPS } else { 0 },
+                if lp.q[32] == 0 { lp.sweeps } else { 0 },
                 programs,
                 lp.width == 8 && lp.height == 8,
                 &[],
@@ -736,6 +933,7 @@ impl Session<'_, '_> {
         let program = self.gpu.program(Variant {
             shift: r.shift,
             dev: true,
+            fast_flags: r.fast_flags,
             ..Variant::new(4, 4, r.satd)
         })?;
         let mut geometry = r.geometry;
