@@ -68,7 +68,7 @@ fn memory() -> Option<usize> {
 fn budget() -> usize {
     static BUDGET: OnceLock<usize> = OnceLock::new();
     *BUDGET
-        .get_or_init(|| memory().map_or(1 << 30, |memory| (memory / 16).clamp(256 << 20, 1 << 30)))
+        .get_or_init(|| memory().map_or(1 << 30, |memory| (memory / 8).clamp(128 << 20, 4 << 30)))
 }
 
 pub type Read = unsafe extern "C" fn(*mut c_void, i32, *const *mut u8, *const isize) -> i32;
@@ -123,7 +123,7 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         let mut pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
-        let limit = (budget() / 4).min(128 << 20);
+        let limit = (budget() / 4).clamp(32 << 20, 512 << 20);
         if pool.1 + self.len <= limit {
             pool.1 += self.len;
             pool.0.push(Self {
@@ -641,8 +641,10 @@ impl Node {
     }
 
     pub fn window(&self) -> i32 {
+        let workers = threads();
+        let max_ahead = (workers * 4).clamp(READ_AHEAD as usize, 128);
         let frames = budget() / 4 / self.bytes().max(1);
-        let frames = frames.min(8 * threads()).clamp(8, READ_AHEAD as usize);
+        let frames = frames.min(8 * workers).clamp(4, max_ahead);
         i32::try_from(frames).unwrap_or(READ_AHEAD)
     }
 

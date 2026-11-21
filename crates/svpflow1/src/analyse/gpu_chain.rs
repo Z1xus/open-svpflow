@@ -1,6 +1,6 @@
 use super::{
     Arg, Buffer, CHAIN_PIN, CL_DEVICE_LOCAL_MEM_SIZE, CL_DEVICE_MAX_WORK_GROUP_SIZE, CL_FALSE,
-    CL_SUCCESS, CL_TRUE, Frame, Handle, RefineGpu, SWEEPS, SearchMems, Session, Uploaded, Variant,
+    CL_SUCCESS, Frame, Handle, RefineGpu, SWEEPS, SearchMems, Session, Uploaded, Variant,
     bytes, compact_params, recalc_args,
 };
 use crate::analyse::chain::{ChainPlan, LevelPlan, Pyramid, RANK_BLOCKS, RefinePlan};
@@ -788,7 +788,9 @@ impl Session<'_, '_> {
         let queue = self.unit.queue as Handle;
         let wait = up.event as Handle;
         let mut host: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut ranges: Vec<(usize, usize, usize, usize)> = Vec::new();
         for (plane, data) in host.iter_mut().enumerate() {
+            let mut total = 0usize;
             for level in first..plan.pyramid.levels {
                 let g = plan.pyramid.geom(level);
                 let (y, c) = plan.pyramid.offsets(level);
@@ -797,30 +799,59 @@ impl Session<'_, '_> {
                 } else {
                     (g.chroma_height, g.chroma_pitch, c)
                 };
-                let at = data.len();
                 let bytes = rows.max(0) as usize * pitch;
-                data.resize(at + bytes, 0);
-                let status = unsafe {
-                    (self.gpu.cl.EnqueueReadBuffer)(
-                        queue,
-                        up.mems[plane] as Handle,
-                        CL_TRUE,
-                        up.coarse[plane] + offset,
-                        bytes,
-                        data[at..].as_mut_ptr().cast(),
-                        1,
-                        (&raw const wait).cast(),
-                        std::ptr::null_mut(),
-                    )
-                };
-                if status != CL_SUCCESS {
-                    return None;
+                if bytes > 0 {
+                    ranges.push((plane, total, up.coarse[plane] + offset, bytes));
+                    total += bytes;
                 }
             }
             data.resize(
-                data.len() + plan.pyramid.slack(plan.pyramid.levels - 1, plane == 0),
+                total + plan.pyramid.slack(plan.pyramid.levels - 1, plane == 0),
                 0,
             );
+        }
+        let mut done: Handle = std::ptr::null_mut();
+        let total_reads = ranges.len();
+        for (idx, (plane, at, src_off, bytes)) in ranges.into_iter().enumerate() {
+            let is_first = idx == 0 && !wait.is_null();
+            let is_last = idx + 1 == total_reads;
+            let status = unsafe {
+                (self.gpu.cl.EnqueueReadBuffer)(
+                    queue,
+                    up.mems[plane] as Handle,
+                    CL_FALSE,
+                    src_off,
+                    bytes,
+                    host[plane][at..].as_mut_ptr().cast(),
+                    u32::from(is_first),
+                    if is_first {
+                        (&raw const wait).cast()
+                    } else {
+                        std::ptr::null()
+                    },
+                    if is_last {
+                        (&raw mut done).cast()
+                    } else {
+                        std::ptr::null_mut()
+                    },
+                )
+            };
+            if status != CL_SUCCESS {
+                unsafe { (self.gpu.cl.Finish)(queue) };
+                if !done.is_null() {
+                    unsafe { (self.gpu.cl.ReleaseEvent)(done) };
+                }
+                return None;
+            }
+        }
+        if !done.is_null() {
+            unsafe { (self.gpu.cl.Flush)(queue) };
+            let ok = unsafe { self.gpu.cl.core.wait_event(queue, done) };
+            unsafe { (self.gpu.cl.ReleaseEvent)(done) };
+            if !ok {
+                unsafe { (self.gpu.cl.Finish)(queue) };
+                return None;
+            }
         }
         let host = std::sync::Arc::new(host);
         up.host = Some(host.clone());

@@ -18,7 +18,7 @@ struct Params {
 @group(0) @binding(3) var vectors: texture_2d<f32>;
 @group(0) @binding(4) var vectors_ext: texture_2d<f32>;
 @group(0) @binding(5) var masks: texture_2d<f32>;
-@group(0) @binding(6) var<storage, read_write> output: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> output: array<u32>;
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 { return a + (b - a) * t; }
 fn lerp4(a: vec4f, b: vec4f, t: f32) -> vec4f { return a + (b - a) * t; }
@@ -134,11 +134,7 @@ fn round_half_up(value: f32) -> f32 {
   return select(whole, whole + 1.0, value - whole >= 0.5);
 }
 
-@compute @workgroup_size(16, 16)
-fn render(@builtin(global_invocation_id) id: vec3u) {
-  let x = i32(id.x);
-  let y = i32(id.y);
-  if (x >= p.width || y >= p.height) { return; }
+fn render_pixel(x: i32, y: i32) -> u32 {
   let gid = vec2f(f32(x), f32(y));
 
   let field_position = vec2f(f32(x * p.x_ratio - p.origin_x), f32(y * p.y_ratio - p.origin_y))
@@ -193,9 +189,47 @@ fn render(@builtin(global_invocation_id) id: vec3u) {
     result *= 255.0;
   }
   if (DITHER) { result += f32(bayer[(x % 8) * 8 + (y % 8)] - 32) / 65.0; }
-  let value = u32(clamp(round_half_up(result), 0.0, 255.0));
-  let index = p.out_base + u32(y) * p.out_stride + u32(x);
-  atomicOr(&output[index >> 2u], value << ((index & 3u) * 8u));
+  return u32(clamp(round_half_up(result), 0.0, 255.0));
+}
+
+@compute @workgroup_size(8, 8)
+fn render(@builtin(global_invocation_id) id: vec3u) {
+  let w_u = u32(p.width);
+  if ((p.out_base & 3u) == 0u && (w_u & 3u) == 0u) {
+    let x0 = i32(id.x) * 4;
+    let y = i32(id.y);
+    if (x0 >= p.width || y >= p.height) { return; }
+    var packed = 0u;
+    for (var lane = 0; lane < 4; lane++) {
+      packed |= render_pixel(x0 + lane, y) << (u32(lane) * 8u);
+    }
+    output[(p.out_base >> 2u) + id.y * (w_u >> 2u) + id.x] = packed;
+    return;
+  }
+  let row_words = p.out_stride;
+  if (id.x >= row_words) { return; }
+  let start_word = p.out_base >> 2u;
+  let end_byte = p.out_base + w_u * u32(p.height);
+  let end_word = (end_byte + 3u) >> 2u;
+  let word = start_word + id.y * row_words + id.x;
+  if (word >= end_word) { return; }
+  let base_byte = word * 4u;
+  var packed = 0u;
+  var existing = 0u;
+  if (base_byte < p.out_base) {
+    existing = output[word];
+  }
+  for (var lane = 0u; lane < 4u; lane++) {
+    let byte_pos = base_byte + lane;
+    let shift = lane * 8u;
+    if (byte_pos < p.out_base) {
+      packed |= existing & (255u << shift);
+    } else if (byte_pos < end_byte) {
+      let idx = byte_pos - p.out_base;
+      packed |= render_pixel(i32(idx % w_u), i32(idx / w_u)) << shift;
+    }
+  }
+  output[word] = packed;
 }
 
 @group(1) @binding(0) var packed_source: texture_2d<f32>;

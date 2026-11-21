@@ -45,6 +45,7 @@ int32_t osvp_error_callback(void);
 
 /* caps all library threads, 0 uses the cores. free all clips before the last context is destroyed */
 void osvp_set_threads(int32_t count);
+void *osvp_cl_context(void);
 
 osvp_context *osvp_create(const char *plugin_dir);
 void osvp_destroy(osvp_context *context);

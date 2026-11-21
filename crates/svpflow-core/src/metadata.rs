@@ -447,15 +447,36 @@ pub fn pack_nv12(
         copy_row(y, y_stride, &mut out, width, row, width);
     }
     let uv_base = width.saturating_mul(height);
-    for row in 0..height / 2 {
-        for col in 0..width / 2 {
-            let src = row.saturating_mul(uv_stride).saturating_add(col);
-            let dst = uv_base
-                .saturating_add(row.saturating_mul(width))
-                .saturating_add(col.saturating_mul(2));
-            if dst + 1 < out.len() {
-                out[dst] = u.get(src).copied().unwrap_or(0);
-                out[dst + 1] = v.get(src).copied().unwrap_or(0);
+    let chroma_w = width / 2;
+    let chroma_h = height / 2;
+    for row in 0..chroma_h {
+        let src_start = row.saturating_mul(uv_stride);
+        let dst_start = uv_base.saturating_add(row.saturating_mul(width));
+        let dst_end = dst_start.saturating_add(chroma_w * 2);
+        if dst_end <= out.len()
+            && src_start + chroma_w <= u.len()
+            && src_start + chroma_w <= v.len()
+        {
+            let u_row = &u[src_start..src_start + chroma_w];
+            let v_row = &v[src_start..src_start + chroma_w];
+            let dst_row = &mut out[dst_start..dst_end];
+            for (pair, (&cu, &cv)) in dst_row
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(u_row.iter().zip(v_row))
+            {
+                pair[0] = cu;
+                pair[1] = cv;
+            }
+        } else {
+            for col in 0..chroma_w {
+                let src = src_start.saturating_add(col);
+                let dst = dst_start.saturating_add(col.saturating_mul(2));
+                if dst + 1 < out.len() {
+                    out[dst] = u.get(src).copied().unwrap_or(0);
+                    out[dst + 1] = v.get(src).copied().unwrap_or(0);
+                }
             }
         }
     }

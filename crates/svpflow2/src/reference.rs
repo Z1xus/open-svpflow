@@ -753,18 +753,17 @@ impl FilterState {
                     let (w, h) = nvof.dimensions();
                     let current = fetch.get(self.clips.vec_src, k);
                     let next = fetch.get(self.clips.vec_src, k + 1);
-                    let packed = unsafe {
-                        (
-                            crate::core::pack_nv12_frame(api, current, w, h),
-                            crate::core::pack_nv12_frame(api, next, w, h),
+                    let result = nvof
+                        .generate_lazy(
+                            k,
+                            || unsafe { crate::core::pack_nv12_frame(api, current, w, h) },
+                            || unsafe { crate::core::pack_nv12_frame(api, next, w, h) },
+                            data,
                         )
-                    };
+                        .ok();
                     fetch.drop(current);
                     fetch.drop(next);
-                    let (Some(current), Some(next)) = packed else {
-                        return None;
-                    };
-                    nvof.generate(k, &current, &next, data).ok()?
+                    result?
                 }
             };
             return Some(f(&payload));

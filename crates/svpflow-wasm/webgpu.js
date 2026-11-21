@@ -13,7 +13,7 @@ struct Config {
 @group(0) @binding(2) var<storage, read> source1: array<u32>;
 @group(0) @binding(3) var<storage, read> motion: array<u32>;
 @group(0) @binding(4) var<storage, read> masks: array<u32>;
-@group(0) @binding(5) var<storage, read_write> output: array<atomic<u32>>;
+@group(0) @binding(5) var<storage, read_write> output: array<u32>;
 
 fn byte_at(data: ptr<storage, array<u32>, read>, index: u32) -> i32 {
   return i32(((*data)[index >> 2u] >> ((index & 3u) * 8u)) & 255u);
@@ -115,10 +115,7 @@ fn blend255(a: i32, b: i32, weight: i32) -> i32 { return clamp((a * (255-weight)
 fn blend256(a: i32, b: i32, weight: i32) -> i32 { return clamp((a * (256-weight) + b*weight) >> 8u, 0, 255); }
 fn between(value: i32, a: i32, b: i32) -> i32 { return clamp(value, min(a,b), max(a,b)); }
 
-@compute @workgroup_size(256)
-fn render(@builtin(global_invocation_id) id: vec3<u32>) {
-  let out_index = id.x;
-  if (out_index >= cfg.output_len) { return; }
+fn render_byte(out_index: u32) -> u32 {
   var chroma = false;
   var plane_offset = 0u;
   var source_offset = 0u;
@@ -138,7 +135,7 @@ fn render(@builtin(global_invocation_id) id: vec3<u32>) {
   let xdiv = select(1, 2, chroma);
   let ydiv = select(1, cfg.chroma_y_div, chroma);
   let bw = cfg.block_w / xdiv; let bh = cfg.block_h / ydiv;
-  if (bw <= 0 || bh <= 0) { return; }
+  if (bw <= 0 || bh <= 0) { return 0u; }
   let real_ox = cfg.origin_x / xdiv; let real_oy = cfg.origin_y / ydiv;
   let ox = select(0, real_ox, cfg.interpolate != 0u);
   let oy = select(0, real_oy, cfg.interpolate != 0u);
@@ -190,7 +187,22 @@ fn render(@builtin(global_invocation_id) id: vec3<u32>) {
     result = blend256(i0, i1, cfg.threshold);
     if (cfg.mask_planes == 3u) { result = blend255(result, blend256(cur0, cur1, cfg.threshold), alpha(2u, tx, ty, px, py, real_ox, real_oy, bw, bh)); }
   }
-  atomicOr(&output[out_index >> 2u], u32(result) << ((out_index & 3u) * 8u));
+  return u32(result);
+}
+
+@compute @workgroup_size(256)
+fn render(@builtin(global_invocation_id) id: vec3<u32>) {
+  let word = id.x;
+  let base = word * 4u;
+  if (base >= cfg.output_len) { return; }
+  var packed = 0u;
+  for (var lane = 0u; lane < 4u; lane++) {
+    let idx = base + lane;
+    if (idx < cfg.output_len) {
+      packed |= render_byte(idx) << (lane * 8u);
+    }
+  }
+  output[word] = packed;
 }
 `;
 
@@ -203,7 +215,7 @@ struct Params {
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> frames: array<u32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
-@group(0) @binding(3) var<storage, read_write> output: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> output: array<u32>;
 @group(0) @binding(4) var<storage, read> luma_lut: array<u32>;
 @group(0) @binding(5) var<storage, read> chroma_lut: array<u32>;
 
@@ -224,10 +236,7 @@ fn blend_at(pixel: u32) -> f32 {
   return value;
 }
 
-@compute @workgroup_size(256)
-fn blend(@builtin(global_invocation_id) id: vec3<u32>) {
-  let pixel = id.x;
-  if (pixel >= p.output_len) { return; }
+fn blend_byte(pixel: u32) -> u32 {
   var value = blend_at(pixel);
   if (p.grading != 0u) {
     value = floor(value + 0.5);
@@ -241,8 +250,22 @@ fn blend(@builtin(global_invocation_id) id: vec3<u32>) {
       value = f32(select(pair & 255u, pair >> 8u, pixel >= p.y_len + p.chroma_len));
     }
   }
-  let result = u32(clamp(floor(value + 0.5), 0.0, 255.0));
-  atomicOr(&output[pixel >> 2u], result << ((pixel & 3u) * 8u));
+  return u32(clamp(floor(value + 0.5), 0.0, 255.0));
+}
+
+@compute @workgroup_size(256)
+fn blend(@builtin(global_invocation_id) id: vec3<u32>) {
+  let word = id.x;
+  let base = word * 4u;
+  if (base >= p.output_len) { return; }
+  var packed = 0u;
+  for (var lane = 0u; lane < 4u; lane++) {
+    let idx = base + lane;
+    if (idx < p.output_len) {
+      packed |= blend_byte(idx) << (lane * 8u);
+    }
+  }
+  output[word] = packed;
 }
 `;
 
@@ -406,9 +429,8 @@ export class WebGpuRenderer {
     this.device.queue.writeBuffer(this.blendUniform, 0, params);
     this.device.queue.writeBuffer(this.batchWeights, 0, weights);
     const encoder = this.device.createCommandEncoder();
-    encoder.clearBuffer(this.output);
     const pass = encoder.beginComputePass();
-    pass.setPipeline(this.blendPipeline); pass.setBindGroup(0, this.blendBindGroup); pass.dispatchWorkgroups(Math.ceil(this.outputLength / 256)); pass.end();
+    pass.setPipeline(this.blendPipeline); pass.setBindGroup(0, this.blendBindGroup); pass.dispatchWorkgroups(Math.ceil(words(this.outputLength) / 256)); pass.end();
     encoder.copyBufferToBuffer(this.output, 0, this.readback, 0, this.outputBytes);
     this.device.queue.submit([encoder.finish()]);
     await this.readback.mapAsync(GPUMapMode.READ);
@@ -431,11 +453,10 @@ export class WebGpuRenderer {
   }
 
   #encodeRender(encoder) {
-    encoder.clearBuffer(this.output);
     const pass = encoder.beginComputePass();
     const mode = this.renderMode === 1 ? 1 : 0;
     pass.setPipeline(this.pipelines.get(mode)); pass.setBindGroup(0, this.bindGroups.get(mode));
-    pass.dispatchWorkgroups(Math.ceil(this.outputLength / 256)); pass.end();
+    pass.dispatchWorkgroups(Math.ceil(words(this.outputLength) / 256)); pass.end();
   }
 
   async render(mode, interpolate, readback = true) {
@@ -487,11 +508,6 @@ export class SmoothGpu {
     this.params = [0, 1, 2].map(() => device.createBuffer({size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST}));
     this.output = device.createBuffer({size: this.outputBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST});
     this.readback = device.createBuffer({size: this.outputBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
-    this.planes = [
-      [0, width],
-      [width * height, width / 2],
-      [width * height * 5 / 4, width / 2],
-    ];
   }
 
   #texture(width, height, format, usage) {
@@ -574,16 +590,24 @@ export class SmoothGpu {
     this.device.queue.writeTexture({texture: mask}, maskData.length ? maskData : new Uint8Array(grid[0] * grid[1] * 4), {bytesPerRow: grid[0] * 4}, grid);
     const params = smoother.gpu_params();
     const linear = smoother.gpu_linear();
-    encoder.clearBuffer(this.output);
-    const pass = encoder.beginComputePass();
+    const luma = this.width * this.height, chroma = luma / 4;
+    const bases = [0, luma, luma + chroma];
+    let pass = encoder.beginComputePass();
     for (let plane = 0; plane < 3; plane++) {
+      const planeBase = bases[plane];
+      if (plane === 2 && (planeBase & 3) !== 0) {
+        pass.end();
+        pass = encoder.beginComputePass();
+      }
       const bytes = new Uint8Array(96);
       bytes.set(params.subarray(plane * 88, plane * 88 + 88));
-      const view = new DataView(bytes.buffer);
-      view.setUint32(76, this.planes[plane][0], true);
-      view.setUint32(80, this.planes[plane][1], true);
-      this.device.queue.writeBuffer(this.params[plane], 0, bytes);
       const ints = new Int32Array(bytes.buffer, 0, 19);
+      const pw = ints[1], ph = ints[2];
+      const rowWords = Math.ceil(pw / 4);
+      const view = new DataView(bytes.buffer);
+      view.setUint32(76, planeBase, true);
+      view.setUint32(80, rowWords, true);
+      this.device.queue.writeBuffer(this.params[plane], 0, bytes);
       const source = s => plane === 0 && linear ? s.linear : s.texture;
       pass.setPipeline(this.#pipeline(ints));
       pass.setBindGroup(0, this.device.createBindGroup({layout: this.layout, entries: [
@@ -595,7 +619,10 @@ export class SmoothGpu {
         {binding: 5, resource: mask.createView()},
         {binding: 6, resource: {buffer: this.output}},
       ]}));
-      pass.dispatchWorkgroups(Math.ceil(ints[1] / 16), Math.ceil(ints[2] / 16));
+      const dispRows = ((planeBase & 3) === 0 && (pw & 3) === 0)
+        ? ph
+        : Math.ceil((((planeBase + pw * ph + 3) >> 2) - (planeBase >> 2)) / rowWords);
+      pass.dispatchWorkgroups(Math.ceil(rowWords / 8), Math.ceil(dispRows / 8));
     }
     pass.end();
     return ext === base ? [base, mask] : [base, ext, mask];

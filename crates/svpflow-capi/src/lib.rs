@@ -86,6 +86,11 @@ pub extern "C" fn osvp_set_threads(count: i32) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn osvp_cl_context() -> *mut c_void {
+    svpflow_host::context::any_shared()
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn osvp_create(plugin_dir: *const c_char) -> *mut Context {
     let directory = unsafe { plugin_dir.as_ref() }.map(|directory| {
         unsafe { CStr::from_ptr(directory) }

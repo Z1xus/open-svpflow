@@ -526,12 +526,15 @@ impl FilterState {
                         let api = unsafe { frame::PlaneApi::load(vsapi) };
                         api.and_then(|api| {
                             let (width, height) = nvof.dimensions();
-                            let current =
-                                unsafe { pack_nv12_frame(&api, source_8bit, width, height) }?;
-                            let next =
-                                unsafe { pack_nv12_frame(&api, next_source_8bit, width, height) }?;
-                            nvof.generate(source_frame, &current, &next, vector_data)
-                                .ok()
+                            nvof.generate_lazy(
+                                source_frame,
+                                || unsafe { pack_nv12_frame(&api, source_8bit, width, height) },
+                                || unsafe {
+                                    pack_nv12_frame(&api, next_source_8bit, width, height)
+                                },
+                                vector_data,
+                            )
+                            .ok()
                         })
                     };
                     if let Some(payload) = payload

@@ -33,6 +33,7 @@ const NV_PERF_MEDIUM: i32 = 10;
 const NV_PERF_FAST: i32 = 20;
 const CU_MEMORYTYPE_HOST: i32 = 1;
 const CU_MEMORYTYPE_ARRAY: i32 = 3;
+const CU_STREAM_NON_BLOCKING: u32 = 1;
 const CACHE_CAPACITY: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +71,12 @@ type CuCtxDestroy = unsafe extern "system" fn(CuContext) -> CuResult;
 type CuCtxPush = unsafe extern "system" fn(CuContext) -> CuResult;
 type CuCtxPop = unsafe extern "system" fn(*mut CuContext) -> CuResult;
 type CuMemcpy2D = unsafe extern "system" fn(*const CudaMemcpy2D) -> CuResult;
+type CuMemcpy2DAsync = unsafe extern "system" fn(*const CudaMemcpy2D, CuStream) -> CuResult;
+type CuStreamCreate = unsafe extern "system" fn(*mut CuStream, u32) -> CuResult;
+type CuStreamDestroy = unsafe extern "system" fn(CuStream) -> CuResult;
+type CuStreamSync = unsafe extern "system" fn(CuStream) -> CuResult;
+type CuMemAllocHost = unsafe extern "system" fn(*mut *mut c_void, usize) -> CuResult;
+type CuMemFreeHost = unsafe extern "system" fn(*mut c_void) -> CuResult;
 
 struct CudaApi {
     _lib: libloading::Library,
@@ -81,6 +88,12 @@ struct CudaApi {
     CtxPush: CuCtxPush,
     CtxPop: CuCtxPop,
     Memcpy2D: CuMemcpy2D,
+    Memcpy2DAsync: Option<CuMemcpy2DAsync>,
+    StreamCreate: Option<CuStreamCreate>,
+    StreamDestroy: Option<CuStreamDestroy>,
+    StreamSync: Option<CuStreamSync>,
+    MemAllocHost: Option<CuMemAllocHost>,
+    MemFreeHost: Option<CuMemFreeHost>,
 }
 
 impl CudaApi {
@@ -103,6 +116,11 @@ impl CudaApi {
                 }
             };
         }
+        macro_rules! opt {
+            ($name:literal) => {
+                unsafe { lib.get(concat!($name, "\0").as_bytes()).ok().map(|s| *s) }
+            };
+        }
         Ok(Self {
             Init: sym!("cuInit"),
             DeviceGetCount: sym!("cuDeviceGetCount"),
@@ -112,6 +130,12 @@ impl CudaApi {
             CtxPush: sym!("cuCtxPushCurrent_v2"),
             CtxPop: sym!("cuCtxPopCurrent_v2"),
             Memcpy2D: sym!("cuMemcpy2D_v2"),
+            Memcpy2DAsync: opt!("cuMemcpy2DAsync_v2"),
+            StreamCreate: opt!("cuStreamCreate"),
+            StreamDestroy: opt!("cuStreamDestroy_v2"),
+            StreamSync: opt!("cuStreamSynchronize"),
+            MemAllocHost: opt!("cuMemAllocHost_v2"),
+            MemFreeHost: opt!("cuMemFreeHost"),
             _lib: lib,
         })
     }
@@ -254,14 +278,62 @@ struct Buffer {
     stride: NvStrideInfo,
 }
 
+enum Staging {
+    Pinned(*mut u32, usize),
+    Heap(Vec<u32>),
+}
+
+impl Staging {
+    unsafe fn alloc(cuda: &CudaApi, count: usize) -> Self {
+        if let (Some(alloc), Some(_)) = (cuda.MemAllocHost, cuda.MemFreeHost) {
+            let mut ptr = std::ptr::null_mut();
+            let bytes = count.saturating_mul(size_of::<u32>()).max(4);
+            if unsafe { alloc(&raw mut ptr, bytes) } == CUDA_SUCCESS && !ptr.is_null() {
+                return Self::Pinned(ptr.cast(), count);
+            }
+        }
+        Self::Heap(vec![0u32; count])
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut c_void {
+        match self {
+            Self::Pinned(ptr, _) => (*ptr).cast(),
+            Self::Heap(vec) => vec.as_mut_ptr().cast(),
+        }
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Pinned(ptr, len) => unsafe { std::slice::from_raw_parts(*ptr, *len) },
+            Self::Heap(vec) => vec.as_slice(),
+        }
+    }
+
+    unsafe fn free(&mut self, cuda: &CudaApi) {
+        if let Self::Pinned(ptr, _) = *self {
+            if !ptr.is_null()
+                && let Some(free) = cuda.MemFreeHost
+            {
+                unsafe { free(ptr.cast()) };
+            }
+            *self = Self::Heap(Vec::new());
+        }
+    }
+}
+
 struct Session {
     cuda: CudaApi,
     nv: NvApi,
     context: CuContext,
+    stream: CuStream,
     handle: NvHandle,
     inputs: [Buffer; 2],
+    input_keys: [i64; 2],
+    luma_cache: [Vec<u8>; 2],
     output: Buffer,
     cost: Buffer,
+    flows: [Staging; 2],
+    costs: [Staging; 2],
     width: usize,
     height: usize,
     grid_width: usize,
@@ -325,11 +397,11 @@ impl NvofContext {
         Some(payload)
     }
 
-    pub(crate) fn generate(
+    pub(crate) fn generate_lazy(
         &self,
         frame: i32,
-        input: &[u8],
-        reference: &[u8],
+        load_current: impl FnOnce() -> Option<Vec<u8>>,
+        load_next: impl FnOnce() -> Option<Vec<u8>>,
         vector_data: metadata::VectorData,
     ) -> Result<Arc<Vec<u8>>, i32> {
         if let Some(payload) = self.cached(frame) {
@@ -337,7 +409,10 @@ impl NvofContext {
         }
         let payload = {
             let mut session = self.session.lock().map_err(|_| -1)?;
-            Arc::new(session.execute(input, reference, vector_data)?)
+            if let Some(payload) = self.cached(frame) {
+                return Ok(payload);
+            }
+            Arc::new(session.execute_lazy(frame, load_current, load_next, vector_data)?)
         };
         let mut cache = self.cache.lock().map_err(|_| -1)?;
         if let Some(pos) = cache.iter().position(|(key, _)| *key == frame) {
@@ -490,6 +565,26 @@ impl Session {
         let input1 = created.next().unwrap();
         let output = created.next().unwrap();
         let cost = created.next().unwrap();
+        let mut stream = std::ptr::null_mut();
+        if let (Some(create), Some(set_streams)) = (cuda.StreamCreate, nv.functions.SetStreams)
+            && unsafe { create(&raw mut stream, CU_STREAM_NON_BLOCKING) } == CUDA_SUCCESS
+            && !stream.is_null()
+            && unsafe { set_streams(handle, stream, stream) } != NV_SUCCESS
+        {
+            if let Some(destroy) = cuda.StreamDestroy {
+                unsafe { destroy(stream) };
+            }
+            stream = std::ptr::null_mut();
+        }
+        let count = grid_width.saturating_mul(grid_height);
+        let flows = [
+            unsafe { Staging::alloc(&cuda, count) },
+            unsafe { Staging::alloc(&cuda, count) },
+        ];
+        let costs = [
+            unsafe { Staging::alloc(&cuda, count) },
+            unsafe { Staging::alloc(&cuda, count) },
+        ];
 
         let mut popped = std::ptr::null_mut();
         unsafe { (cuda.CtxPop)(&raw mut popped) };
@@ -497,10 +592,15 @@ impl Session {
             cuda,
             nv,
             context,
+            stream,
             handle,
             inputs: [input0, input1],
+            input_keys: [i64::MIN; 2],
+            luma_cache: [Vec::new(), Vec::new()],
             output,
             cost,
+            flows,
+            costs,
             width,
             height,
             grid_width,
@@ -509,41 +609,110 @@ impl Session {
         })
     }
 
-    fn execute(
+    fn execute_lazy(
         &mut self,
-        input: &[u8],
-        reference: &[u8],
+        frame: i32,
+        load_current: impl FnOnce() -> Option<Vec<u8>>,
+        load_next: impl FnOnce() -> Option<Vec<u8>>,
         vector_data: metadata::VectorData,
     ) -> Result<Vec<u8>, i32> {
+        let k0 = i64::from(frame);
+        let k1 = k0 + 1;
+        let (s0, s1) = if self.input_keys[0] == k0 {
+            (0, 1)
+        } else if self.input_keys[1] == k0 || self.input_keys[0] == k1 {
+            (1, 0)
+        } else {
+            (0, 1)
+        };
+        let need0 = self.input_keys[s0] != k0;
+        let need1 = self.input_keys[s1] != k1;
         let required = self
             .width
             .saturating_mul(self.height + self.height.div_ceil(2));
-        if input.len() < required || reference.len() < required {
-            return Err(5);
-        }
+        let y_size = self.width.saturating_mul(self.height);
+        let cur_nv12 = if need0 {
+            let data = load_current().ok_or(5)?;
+            if data.len() < required {
+                return Err(5);
+            }
+            Some(data)
+        } else {
+            None
+        };
+        let nxt_nv12 = if need1 {
+            let data = load_next().ok_or(5)?;
+            if data.len() < required {
+                return Err(5);
+            }
+            Some(data)
+        } else {
+            None
+        };
         let status = unsafe { (self.cuda.CtxPush)(self.context) };
         if status != CUDA_SUCCESS {
             return Err(0x15_0000 + status);
         }
-        let result = unsafe { self.execute_current(input, reference, vector_data) };
+        let result = unsafe {
+            self.execute_slots(
+                (s0, k0, cur_nv12),
+                (s1, k1, nxt_nv12),
+                y_size,
+                vector_data,
+            )
+        };
         let mut popped = std::ptr::null_mut();
         unsafe { (self.cuda.CtxPop)(&raw mut popped) };
         result
     }
 
-    unsafe fn execute_current(
+    unsafe fn execute_slots(
         &mut self,
-        input: &[u8],
-        reference: &[u8],
+        (s0, k0, cur_nv12): (usize, i64, Option<Vec<u8>>),
+        (s1, k1, nxt_nv12): (usize, i64, Option<Vec<u8>>),
+        y_size: usize,
         vector_data: metadata::VectorData,
     ) -> Result<Vec<u8>, i32> {
-        unsafe {
-            self.upload(&self.inputs[0], input)?;
-            self.upload(&self.inputs[1], reference)?;
+        if let Some(ref nv12) = cur_nv12 {
+            self.input_keys[s0] = i64::MIN;
+            unsafe { self.upload(s0, nv12)? };
+            self.input_keys[s0] = k0;
+            self.luma_cache[s0].clear();
+            self.luma_cache[s0].extend_from_slice(&nv12[..y_size]);
         }
-        let current = unsafe { self.run_direction(0, 1, input)? };
-        let previous = if vector_data.flags & 1 != 0 {
-            Some(unsafe { self.run_direction(1, 0, reference)? })
+        if let Some(ref nv12) = nxt_nv12 {
+            self.input_keys[s1] = i64::MIN;
+            unsafe { self.upload(s1, nv12)? };
+            self.input_keys[s1] = k1;
+            self.luma_cache[s1].clear();
+            self.luma_cache[s1].extend_from_slice(&nv12[..y_size]);
+        }
+        unsafe {
+            self.enqueue_direction(s0, s1, 0)?;
+            self.sync_stream()?;
+        }
+        let bidir = vector_data.flags & 1 != 0;
+        if bidir {
+            unsafe { self.enqueue_direction(s1, s0, 1)? };
+        }
+        let current = pack_vectors(
+            self.flows[0].as_slice(),
+            self.costs[0].as_slice(),
+            &self.luma_cache[s0],
+            self.width,
+            self.height,
+            self.scale,
+        );
+        let previous = if bidir {
+            unsafe { self.sync_stream()? };
+            Some(pack_vectors(
+                self.flows[1].as_slice(),
+                self.costs[1].as_slice(),
+                &self.luma_cache[s1],
+                self.width,
+                self.height,
+                self.scale,
+            ))
         } else {
             None
         };
@@ -554,7 +723,35 @@ impl Session {
         ))
     }
 
-    unsafe fn upload(&self, buffer: &Buffer, nv12: &[u8]) -> Result<(), i32> {
+    unsafe fn memcpy_2d(&self, copy: &CudaMemcpy2D, err_base: i32) -> Result<(), i32> {
+        let status = if !self.stream.is_null()
+            && let Some(async_copy) = self.cuda.Memcpy2DAsync
+        {
+            unsafe { async_copy(copy, self.stream) }
+        } else {
+            unsafe { (self.cuda.Memcpy2D)(copy) }
+        };
+        if status == CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(err_base + status)
+        }
+    }
+
+    unsafe fn sync_stream(&self) -> Result<(), i32> {
+        if !self.stream.is_null()
+            && let Some(sync) = self.cuda.StreamSync
+        {
+            let status = unsafe { sync(self.stream) };
+            if status != CUDA_SUCCESS {
+                return Err(0x17_0000 + status);
+            }
+        }
+        Ok(())
+    }
+
+    unsafe fn upload(&self, slot: usize, nv12: &[u8]) -> Result<(), i32> {
+        let buffer = &self.inputs[slot];
         let y_size = self.width.saturating_mul(self.height);
         let y = CudaMemcpy2D {
             src_memory_type: CU_MEMORYTYPE_HOST,
@@ -566,10 +763,7 @@ impl Session {
             height: self.height,
             ..CudaMemcpy2D::default()
         };
-        let status = unsafe { (self.cuda.Memcpy2D)(&raw const y) };
-        if status != CUDA_SUCCESS {
-            return Err(0x15_0000 + status);
-        }
+        unsafe { self.memcpy_2d(&y, 0x15_0000)? };
         let uv = CudaMemcpy2D {
             src_memory_type: CU_MEMORYTYPE_HOST,
             src_host: unsafe { nv12.as_ptr().add(y_size) }.cast(),
@@ -581,19 +775,15 @@ impl Session {
             height: self.height.div_ceil(2),
             ..CudaMemcpy2D::default()
         };
-        let status = unsafe { (self.cuda.Memcpy2D)(&raw const uv) };
-        if status != CUDA_SUCCESS {
-            return Err(0x15_0000 + status);
-        }
-        Ok(())
+        unsafe { self.memcpy_2d(&uv, 0x15_0000) }
     }
 
-    unsafe fn run_direction(
-        &self,
+    unsafe fn enqueue_direction(
+        &mut self,
         input_index: usize,
         reference_index: usize,
-        luma: &[u8],
-    ) -> Result<Vec<metadata::DecodedVector>, i32> {
+        staging_slot: usize,
+    ) -> Result<(), i32> {
         let execute_in = NvExecuteInputV1 {
             input: self.inputs[input_index].handle,
             reference: self.inputs[reference_index].handle,
@@ -615,22 +805,13 @@ impl Session {
         if status != NV_SUCCESS {
             return Err(0x16_0000 + status);
         }
-
-        let count = self.grid_width.saturating_mul(self.grid_height);
-        let mut flows = vec![0u32; count];
-        let mut costs = vec![0u32; count];
+        let flow_ptr = self.flows[staging_slot].as_mut_ptr();
+        let cost_ptr = self.costs[staging_slot].as_mut_ptr();
         unsafe {
-            self.download(&self.output, flows.as_mut_ptr().cast(), 4, self.grid_width)?;
-            self.download(&self.cost, costs.as_mut_ptr().cast(), 4, self.grid_width)?;
+            self.download(&self.output, flow_ptr, 4, self.grid_width)?;
+            self.download(&self.cost, cost_ptr, 4, self.grid_width)?;
         }
-        Ok(pack_vectors(
-            &flows,
-            &costs,
-            luma,
-            self.width,
-            self.height,
-            self.scale,
-        ))
+        Ok(())
     }
 
     unsafe fn download(
@@ -651,12 +832,7 @@ impl Session {
             height: self.grid_height,
             ..CudaMemcpy2D::default()
         };
-        let status = unsafe { (self.cuda.Memcpy2D)(&raw const copy) };
-        if status == CUDA_SUCCESS {
-            Ok(())
-        } else {
-            Err(0x17_0000 + status)
-        }
+        unsafe { self.memcpy_2d(&copy, 0x17_0000) }
     }
 }
 
@@ -665,10 +841,19 @@ impl Drop for Session {
         unsafe {
             let pushed = (self.cuda.CtxPush)(self.context) == CUDA_SUCCESS;
             if pushed {
+                let _ = self.sync_stream();
+                for staging in self.flows.iter_mut().chain(self.costs.iter_mut()) {
+                    staging.free(&self.cuda);
+                }
                 for buffer in self.inputs.iter().chain([&self.output, &self.cost]) {
                     (self.nv.functions.DestroyBuffer.unwrap_unchecked())(buffer.handle);
                 }
                 (self.nv.functions.Destroy.unwrap_unchecked())(self.handle);
+                if !self.stream.is_null()
+                    && let Some(destroy) = self.cuda.StreamDestroy
+                {
+                    destroy(self.stream);
+                }
                 let mut popped = std::ptr::null_mut();
                 (self.cuda.CtxPop)(&raw mut popped);
             }
@@ -719,47 +904,117 @@ fn pack_vectors(
 ) -> Vec<metadata::DecodedVector> {
     let grid_width = width / 4;
     let grid_height = height / 4;
-    let divisor = if scale <= 1 {
-        8.0f32
+    let inv_divisor = if scale <= 1 {
+        0.125f32
     } else if scale <= 7 {
-        4.0f32
+        0.25f32
     } else {
-        2.0f32
+        0.5f32
     };
     let cost_shift = ((f64::from(scale.max(1)).log2() * 2.0) as u32).min(31);
-    let mut output = Vec::with_capacity(grid_width.saturating_mul(grid_height));
-    for gy in 0..grid_height {
-        for gx in 0..grid_width {
-            let index = gy.saturating_mul(grid_width).saturating_add(gx);
-            let flow = flows.get(index).copied().unwrap_or(0);
-            let raw = flow.to_le_bytes();
-            let x = i16::from_le_bytes([raw[0], raw[1]]);
-            let y = i16::from_le_bytes([raw[2], raw[3]]);
-            let dx = (f32::from(x) / divisor) as i16;
-            let dy = (f32::from(y) / divisor) as i16;
-            let mut sum = 0u16;
-            for row in gy.saturating_mul(4)..(gy + 1).saturating_mul(4).min(height) {
-                for col in gx.saturating_mul(4)..(gx + 1).saturating_mul(4).min(width) {
-                    sum = sum.wrapping_add(u16::from(
-                        luma.get(row.saturating_mul(width) + col)
-                            .copied()
-                            .unwrap_or(0),
-                    ));
+    let total = grid_width.saturating_mul(grid_height);
+    let mut output = vec![
+        metadata::DecodedVector {
+            dx: 0,
+            dy: 0,
+            score: 0,
+            luma: 0,
+        };
+        total
+    ];
+    let pack_band = |gy_start: usize, out_band: &mut [metadata::DecodedVector]| {
+        let rows = out_band.len() / grid_width.max(1);
+        for local_y in 0..rows {
+            let gy = gy_start + local_y;
+            let row_base = gy * grid_width;
+            let flow_row = &flows[row_base..row_base + grid_width];
+            let cost_row = &costs[row_base..row_base + grid_width];
+            let out_row = &mut out_band[local_y * grid_width..(local_y + 1) * grid_width];
+            let y0 = gy * 4;
+            let fast_rows = y0 + 4 <= height && (y0 + 3) * width + grid_width * 4 <= luma.len();
+            if fast_rows {
+                let r0 = &luma[y0 * width..y0 * width + grid_width * 4];
+                let r1 = &luma[(y0 + 1) * width..(y0 + 1) * width + grid_width * 4];
+                let r2 = &luma[(y0 + 2) * width..(y0 + 2) * width + grid_width * 4];
+                let r3 = &luma[(y0 + 3) * width..(y0 + 3) * width + grid_width * 4];
+                for gx in 0..grid_width {
+                    let flow = flow_row[gx];
+                    let x = (flow & 0xFFFF) as i16;
+                    let y = (flow >> 16) as i16;
+                    let dx = (f32::from(x) * inv_divisor) as i16;
+                    let dy = (f32::from(y) * inv_divisor) as i16;
+                    let c = gx * 4;
+                    let sum = u16::from(r0[c])
+                        .wrapping_add(u16::from(r0[c + 1]))
+                        .wrapping_add(u16::from(r0[c + 2]))
+                        .wrapping_add(u16::from(r0[c + 3]))
+                        .wrapping_add(u16::from(r1[c]))
+                        .wrapping_add(u16::from(r1[c + 1]))
+                        .wrapping_add(u16::from(r1[c + 2]))
+                        .wrapping_add(u16::from(r1[c + 3]))
+                        .wrapping_add(u16::from(r2[c]))
+                        .wrapping_add(u16::from(r2[c + 1]))
+                        .wrapping_add(u16::from(r2[c + 2]))
+                        .wrapping_add(u16::from(r2[c + 3]))
+                        .wrapping_add(u16::from(r3[c]))
+                        .wrapping_add(u16::from(r3[c + 1]))
+                        .wrapping_add(u16::from(r3[c + 2]))
+                        .wrapping_add(u16::from(r3[c + 3]));
+                    let raw1 = cost_row[gx]
+                        .wrapping_shl(cost_shift)
+                        .wrapping_add(u32::from(sum & 0xFFF0).wrapping_shl(20));
+                    out_row[gx] = metadata::DecodedVector {
+                        dx,
+                        dy,
+                        score: raw1 & 0x00FF_FFFF,
+                        luma: (raw1 >> 24) as u8,
+                    };
+                }
+            } else {
+                for gx in 0..grid_width {
+                    let flow = flow_row[gx];
+                    let x = (flow & 0xFFFF) as i16;
+                    let y = (flow >> 16) as i16;
+                    let dx = (f32::from(x) * inv_divisor) as i16;
+                    let dy = (f32::from(y) * inv_divisor) as i16;
+                    let mut sum = 0u16;
+                    for row in y0..(y0 + 4).min(height) {
+                        for col in gx * 4..(gx * 4 + 4).min(width) {
+                            sum = sum.wrapping_add(u16::from(
+                                luma.get(row * width + col).copied().unwrap_or(0),
+                            ));
+                        }
+                    }
+                    let raw1 = cost_row[gx]
+                        .wrapping_shl(cost_shift)
+                        .wrapping_add(u32::from(sum & 0xFFF0).wrapping_shl(20));
+                    out_row[gx] = metadata::DecodedVector {
+                        dx,
+                        dy,
+                        score: raw1 & 0x00FF_FFFF,
+                        luma: (raw1 >> 24) as u8,
+                    };
                 }
             }
-            let raw1 = costs
-                .get(index)
-                .copied()
-                .unwrap_or(0)
-                .wrapping_shl(cost_shift)
-                .wrapping_add(u32::from(sum & 0xFFF0).wrapping_shl(20));
-            output.push(metadata::DecodedVector {
-                dx,
-                dy,
-                score: raw1 & 0x00FF_FFFF,
-                luma: (raw1 >> 24) as u8,
-            });
         }
+    };
+    if grid_width > 0
+        && grid_height >= 64
+        && flows.len() >= total
+        && costs.len() >= total
+        && svpflow_core::threads::workers() >= 2
+    {
+        let bands = svpflow_core::threads::workers().min(4);
+        let chunk_rows = grid_height.div_ceil(bands);
+        let chunk_elems = chunk_rows * grid_width;
+        svpflow_core::threads::scope(|scope| {
+            for (idx, band) in output.chunks_mut(chunk_elems).enumerate() {
+                let gy_start = idx * chunk_rows;
+                scope.spawn(move |_| pack_band(gy_start, band));
+            }
+        });
+    } else if grid_width > 0 && flows.len() >= total && costs.len() >= total {
+        pack_band(0, &mut output);
     }
     output
 }
