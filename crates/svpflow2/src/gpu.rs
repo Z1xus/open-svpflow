@@ -2811,7 +2811,7 @@ kernel void render_frame(
         }
     }
     return;
-#endif
+#else
     int x = get_global_id(0), y = get_global_id(1);
     if (x >= p.width || y >= p.height) return;
 
@@ -2952,6 +2952,7 @@ kernel void render_frame(
     result += native_divide((float)(bayer[x%8][y%8]-32), 65.0f);
 # endif
     destination[y*destination_stride+x] = (uchar)clamp(round(result), 0.0f, 255.0f);
+#endif
 #endif
 }
 
