@@ -356,12 +356,25 @@ unsafe fn collect_state(
     }
     let super_info = unsafe { clip_info(clips.super_clip, api) };
     let source_8bit_mode = source_8bit_mode(mode, &clips);
+    let nvof_down = if mode == 1
+        && vdata == 0
+        && options.nvof_scale() >= 2
+        && video_info.width >= 640
+        && video_info.height >= 360
+        && unsafe { clip_info(clips.vec_src, api) }
+            .is_some_and(|info| info.width == video_info.width && info.height == video_info.height)
+    {
+        2
+    } else {
+        1
+    };
     let generated_vdata = generated_vector_data(
         mode,
         vdata,
         source_8bit_mode,
         &video_info,
         options.request_scene_mode(mode),
+        nvof_down,
     );
     let render_mode = if options.disables_render_for_identity_rate(&video_info.source()) {
         0
@@ -441,6 +454,7 @@ fn generated_vector_data(
     source_8bit_mode: bool,
     source: &vs::VideoInfo,
     scene_mode: i64,
+    nvof_scale: i32,
 ) -> Option<metadata::VectorData> {
     if vdata != 0 {
         match unsafe { metadata::vector_data(vdata) } {
@@ -448,10 +462,11 @@ fn generated_vector_data(
             metadata::VectorRecord::Missing | metadata::VectorRecord::Invalid => None,
         }
     } else if mode == 1 || source_8bit_mode {
-        Some(metadata::VectorData::generated_source_8bit(
+        Some(metadata::VectorData::generated_source_8bit_scaled(
             source.width,
             source.height,
             scene_mode,
+            if mode == 1 { nvof_scale } else { 1 },
         ))
     } else if mode == 2 {
         Some(metadata::VectorData::generated_rife(
@@ -620,17 +635,40 @@ unsafe fn init_nvof_runtime(
         unsafe { set_error(output, vsapi, strings::ERR_VEC_SRC_FORMAT.as_ptr().cast()) };
         return false;
     };
-    let scale = if info.width > 0 {
-        data.video_info.width / info.width
+    let base_scale = if info.width > 0 {
+        (data.video_info.width / info.width).max(1)
     } else {
         1
     };
+    let down = if base_scale == 1
+        && data.options.nvof_scale() >= 2
+        && info.width >= 640
+        && info.height >= 360
+        && info.width == data.video_info.width
+        && info.height == data.video_info.height
+    {
+        2
+    } else {
+        1
+    };
+    let nvof_w = if down == 2 {
+        (info.width / 2) & !3
+    } else {
+        info.width
+    };
+    let nvof_h = if down == 2 {
+        (info.height / 2) & !3
+    } else {
+        info.height
+    };
     match nvof::NvofContext::new(
-        info.width,
-        info.height,
-        scale.max(1),
+        nvof_w,
+        nvof_h,
+        base_scale * down,
         data.options.nvof_quality(),
         data.options.nvof_gpu_id(),
+        data.options.nvof_mirror(),
+        down,
     ) {
         Ok(context) => {
             data.nvof = Some(context);

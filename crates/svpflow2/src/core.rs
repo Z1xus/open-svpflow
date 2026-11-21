@@ -526,11 +526,14 @@ impl FilterState {
                         let api = unsafe { frame::PlaneApi::load(vsapi) };
                         api.and_then(|api| {
                             let (width, height) = nvof.dimensions();
+                            let down = nvof.downscale();
                             nvof.generate_lazy(
                                 source_frame,
-                                || unsafe { pack_nv12_frame(&api, source_8bit, width, height) },
                                 || unsafe {
-                                    pack_nv12_frame(&api, next_source_8bit, width, height)
+                                    pack_nv12_frame(&api, source_8bit, width, height, down)
+                                },
+                                || unsafe {
+                                    pack_nv12_frame(&api, next_source_8bit, width, height, down)
                                 },
                                 vector_data,
                             )
@@ -3492,9 +3495,26 @@ pub(crate) unsafe fn pack_nv12_frame(
     frame: vs::ConstRaw,
     width: usize,
     height: usize,
+    downscale: i32,
 ) -> Option<Vec<u8>> {
     if frame.is_null() {
         return None;
+    }
+    if downscale >= 2 {
+        let src_h = height.saturating_mul(2);
+        let src_ch = height;
+        let (y, y_stride, y_len) = unsafe { api.read_plane(frame, 0, src_h) }?;
+        let (u, uv_stride, u_len) = unsafe { api.read_plane(frame, 1, src_ch) }?;
+        let (v, _, v_len) = unsafe { api.read_plane(frame, 2, src_ch) }?;
+        return Some(metadata::pack_nv12_half(
+            unsafe { slice::from_raw_parts(y, y_len) },
+            unsafe { slice::from_raw_parts(u, u_len) },
+            unsafe { slice::from_raw_parts(v, v_len) },
+            width,
+            height,
+            y_stride,
+            uv_stride,
+        ));
     }
     let chroma_height = height / 2;
     let (y, y_stride, y_len) = unsafe { api.read_plane(frame, 0, height) }?;

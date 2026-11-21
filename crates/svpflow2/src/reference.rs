@@ -752,13 +752,14 @@ impl FilterState {
                         return None;
                     };
                     let (w, h) = nvof.dimensions();
+                    let down = nvof.downscale();
                     let current = fetch.get(self.clips.vec_src, k);
                     let next = fetch.get(self.clips.vec_src, k + 1);
                     let result = nvof
                         .generate_lazy(
                             k,
-                            || unsafe { crate::core::pack_nv12_frame(api, current, w, h) },
-                            || unsafe { crate::core::pack_nv12_frame(api, next, w, h) },
+                            || unsafe { crate::core::pack_nv12_frame(api, current, w, h, down) },
+                            || unsafe { crate::core::pack_nv12_frame(api, next, w, h, down) },
                             data,
                         )
                         .ok();

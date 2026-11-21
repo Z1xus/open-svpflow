@@ -339,6 +339,7 @@ struct Session {
     grid_width: usize,
     grid_height: usize,
     scale: i32,
+    mirror: bool,
 }
 
 unsafe impl Send for Session {}
@@ -348,6 +349,7 @@ pub(crate) struct NvofContext {
     cache: Mutex<Vec<(i32, Arc<Vec<u8>>)>>,
     width: usize,
     height: usize,
+    downscale: i32,
 }
 
 unsafe impl Send for NvofContext {}
@@ -369,23 +371,30 @@ impl NvofContext {
         scale: i32,
         quality: i64,
         gpu_id: i64,
+        mirror: bool,
+        downscale: i32,
     ) -> Result<Self, InitError> {
         let width = usize::try_from(width).map_err(|_| InitError::Failed(5))?;
         let height = usize::try_from(height).map_err(|_| InitError::Failed(5))?;
         if width < 4 || height < 4 {
             return Err(InitError::Failed(5));
         }
-        let session = unsafe { Session::new(width, height, scale, quality, gpu_id)? };
+        let session = unsafe { Session::new(width, height, scale, quality, gpu_id, mirror)? };
         Ok(Self {
             session: Mutex::new(session),
             cache: Mutex::new(Vec::new()),
             width,
             height,
+            downscale: downscale.max(1),
         })
     }
 
     pub(crate) const fn dimensions(&self) -> (usize, usize) {
         (self.width, self.height)
+    }
+
+    pub(crate) const fn downscale(&self) -> i32 {
+        self.downscale
     }
 
     pub(crate) fn cached(&self, frame: i32) -> Option<Arc<Vec<u8>>> {
@@ -436,6 +445,7 @@ impl Session {
         scale: i32,
         quality: i64,
         gpu_id: i64,
+        mirror: bool,
     ) -> Result<Self, InitError> {
         let cuda = unsafe { CudaApi::load()? };
         let status = unsafe { (cuda.Init)(0) };
@@ -462,7 +472,7 @@ impl Session {
             return Err(InitError::Failed(0x4_0000 + status));
         }
 
-        unsafe { Self::new_in_context(cuda, context, width, height, scale, quality) }
+        unsafe { Self::new_in_context(cuda, context, width, height, scale, quality, mirror) }
     }
 
     unsafe fn new_in_context(
@@ -472,6 +482,7 @@ impl Session {
         height: usize,
         scale: i32,
         quality: i64,
+        mirror: bool,
     ) -> Result<Self, InitError> {
         let Ok(width_u32) = u32::try_from(width) else {
             unsafe { (cuda.CtxDestroy)(context) };
@@ -579,11 +590,19 @@ impl Session {
         let count = grid_width.saturating_mul(grid_height);
         let flows = [
             unsafe { Staging::alloc(&cuda, count) },
-            unsafe { Staging::alloc(&cuda, count) },
+            if mirror {
+                Staging::Heap(Vec::new())
+            } else {
+                unsafe { Staging::alloc(&cuda, count) }
+            },
         ];
         let costs = [
             unsafe { Staging::alloc(&cuda, count) },
-            unsafe { Staging::alloc(&cuda, count) },
+            if mirror {
+                Staging::Heap(Vec::new())
+            } else {
+                unsafe { Staging::alloc(&cuda, count) }
+            },
         ];
 
         let mut popped = std::ptr::null_mut();
@@ -606,6 +625,7 @@ impl Session {
             grid_width,
             grid_height,
             scale: scale.max(1),
+            mirror,
         })
     }
 
@@ -692,7 +712,8 @@ impl Session {
             self.sync_stream()?;
         }
         let bidir = vector_data.flags & 1 != 0;
-        if bidir {
+        let run_bwd = bidir && !self.mirror;
+        if run_bwd {
             unsafe { self.enqueue_direction(s1, s0, 1)? };
         }
         let current = pack_vectors(
@@ -703,11 +724,19 @@ impl Session {
             self.height,
             self.scale,
         );
-        let previous = if bidir {
+        let previous = if run_bwd {
             unsafe { self.sync_stream()? };
             Some(pack_vectors(
                 self.flows[1].as_slice(),
                 self.costs[1].as_slice(),
+                &self.luma_cache[s1],
+                self.width,
+                self.height,
+                self.scale,
+            ))
+        } else if bidir {
+            Some(synthesize_backward(
+                &current,
                 &self.luma_cache[s1],
                 self.width,
                 self.height,
@@ -1016,6 +1045,159 @@ fn pack_vectors(
         });
     } else if grid_width > 0 && flows.len() >= total && costs.len() >= total {
         pack_band(0, &mut output);
+    }
+    output
+}
+
+fn synthesize_backward(
+    forward: &[metadata::DecodedVector],
+    luma: &[u8],
+    width: usize,
+    height: usize,
+    scale: i32,
+) -> Vec<metadata::DecodedVector> {
+    let grid_width = width / 4;
+    let grid_height = height / 4;
+    let total = grid_width.saturating_mul(grid_height);
+    let mut output = vec![metadata::DecodedVector::default(); total];
+    if grid_width == 0 || grid_height == 0 || forward.len() < total {
+        return output;
+    }
+    let fill_luma = |gy_start: usize, out_band: &mut [metadata::DecodedVector]| {
+        let rows = out_band.len() / grid_width;
+        for local_y in 0..rows {
+            let gy = gy_start + local_y;
+            let out_row = &mut out_band[local_y * grid_width..(local_y + 1) * grid_width];
+            let y0 = gy * 4;
+            if y0 + 4 <= height && (y0 + 3) * width + grid_width * 4 <= luma.len() {
+                let r0 = &luma[y0 * width..y0 * width + grid_width * 4];
+                let r1 = &luma[(y0 + 1) * width..(y0 + 1) * width + grid_width * 4];
+                let r2 = &luma[(y0 + 2) * width..(y0 + 2) * width + grid_width * 4];
+                let r3 = &luma[(y0 + 3) * width..(y0 + 3) * width + grid_width * 4];
+                for gx in 0..grid_width {
+                    let c = gx * 4;
+                    let sum = u16::from(r0[c])
+                        .wrapping_add(u16::from(r0[c + 1]))
+                        .wrapping_add(u16::from(r0[c + 2]))
+                        .wrapping_add(u16::from(r0[c + 3]))
+                        .wrapping_add(u16::from(r1[c]))
+                        .wrapping_add(u16::from(r1[c + 1]))
+                        .wrapping_add(u16::from(r1[c + 2]))
+                        .wrapping_add(u16::from(r1[c + 3]))
+                        .wrapping_add(u16::from(r2[c]))
+                        .wrapping_add(u16::from(r2[c + 1]))
+                        .wrapping_add(u16::from(r2[c + 2]))
+                        .wrapping_add(u16::from(r2[c + 3]))
+                        .wrapping_add(u16::from(r3[c]))
+                        .wrapping_add(u16::from(r3[c + 1]))
+                        .wrapping_add(u16::from(r3[c + 2]))
+                        .wrapping_add(u16::from(r3[c + 3]));
+                    out_row[gx].luma = (sum >> 4) as u8;
+                }
+            } else {
+                for gx in 0..grid_width {
+                    let mut sum = 0u16;
+                    for row in y0..(y0 + 4).min(height) {
+                        for col in gx * 4..(gx * 4 + 4).min(width) {
+                            sum = sum.wrapping_add(u16::from(
+                                luma.get(row * width + col).copied().unwrap_or(0),
+                            ));
+                        }
+                    }
+                    out_row[gx].luma = (sum >> 4) as u8;
+                }
+            }
+        }
+    };
+    fill_luma(0, &mut output);
+    let step = 16 * scale.max(1);
+    let round_bias = step / 2;
+    let max_x = i32::try_from(grid_width.saturating_sub(1)).unwrap_or(0);
+    let max_y = i32::try_from(grid_height.saturating_sub(1)).unwrap_or(0);
+    let mut best = vec![u32::MAX; total];
+    for gy in 0..grid_height {
+        let base = gy * grid_width;
+        let gy_i = i32::try_from(gy).unwrap_or(max_y);
+        for gx in 0..grid_width {
+            let v = forward[base + gx];
+            let dx_i = i32::from(v.dx);
+            let dy_i = i32::from(v.dy);
+            let ox = if dx_i >= 0 {
+                (dx_i + round_bias) / step
+            } else {
+                (dx_i - round_bias) / step
+            };
+            let oy = if dy_i >= 0 {
+                (dy_i + round_bias) / step
+            } else {
+                (dy_i - round_bias) / step
+            };
+            let gx_i = i32::try_from(gx).unwrap_or(max_x);
+            let tx = (gx_i + ox).clamp(0, max_x) as usize;
+            let ty = (gy_i + oy).clamp(0, max_y) as usize;
+            let dst = ty * grid_width + tx;
+            if v.score < best[dst] {
+                best[dst] = v.score;
+                output[dst].dx = v.dx.saturating_neg();
+                output[dst].dy = v.dy.saturating_neg();
+                output[dst].score = v.score;
+            }
+        }
+    }
+    for gy in 0..grid_height {
+        let base = gy * grid_width;
+        for gx in 0..grid_width {
+            let idx = base + gx;
+            if best[idx] != u32::MAX {
+                continue;
+            }
+            let mut pick = u32::MAX;
+            let mut src = idx;
+            if gx > 0 && best[idx - 1] < pick {
+                pick = best[idx - 1];
+                src = idx - 1;
+            }
+            if gy > 0 && best[idx - grid_width] < pick {
+                pick = best[idx - grid_width];
+                src = idx - grid_width;
+            }
+            if pick != u32::MAX {
+                best[idx] = pick;
+                output[idx].dx = output[src].dx;
+                output[idx].dy = output[src].dy;
+                output[idx].score = output[src].score;
+            }
+        }
+    }
+    for gy in (0..grid_height).rev() {
+        let base = gy * grid_width;
+        for gx in (0..grid_width).rev() {
+            let idx = base + gx;
+            if best[idx] != u32::MAX {
+                continue;
+            }
+            let mut pick = u32::MAX;
+            let mut src = idx;
+            if gx + 1 < grid_width && best[idx + 1] < pick {
+                pick = best[idx + 1];
+                src = idx + 1;
+            }
+            if gy + 1 < grid_height && best[idx + grid_width] < pick {
+                pick = best[idx + grid_width];
+                src = idx + grid_width;
+            }
+            if pick == u32::MAX {
+                let v = forward[idx];
+                output[idx].dx = v.dx.saturating_neg();
+                output[idx].dy = v.dy.saturating_neg();
+                output[idx].score = v.score;
+            } else {
+                best[idx] = pick;
+                output[idx].dx = output[src].dx;
+                output[idx].dy = output[src].dy;
+                output[idx].score = output[src].score;
+            }
+        }
     }
     output
 }

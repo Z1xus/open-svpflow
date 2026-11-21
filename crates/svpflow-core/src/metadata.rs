@@ -190,6 +190,37 @@ impl VectorData {
         }
     }
 
+    pub const fn generated_source_8bit_scaled(
+        width: i32,
+        height: i32,
+        scene_mode: i64,
+        scale: i32,
+    ) -> Self {
+        if scale <= 1 {
+            return Self::generated_source_8bit(width, height, scene_mode);
+        }
+        let scaled_w = (width / scale) & !3;
+        let scaled_h = (height / scale) & !3;
+        let block = 4 * scale;
+        Self {
+            flags: if scene_mode == 1 { 2 } else { 3 },
+            block: VectorShape {
+                width: block,
+                height: block,
+            },
+            shape: VectorShape { width, height },
+            grid: VectorShape {
+                width: scaled_w / 4,
+                height: scaled_h / 4,
+            },
+            marker: 4,
+            selector: 1,
+            delta: 1,
+            overlap_x: 0,
+            overlap_y: 0,
+        }
+    }
+
     pub const fn selector(&self) -> i32 {
         self.selector
     }
@@ -477,6 +508,153 @@ pub fn pack_nv12(
                     out[dst] = u.get(src).copied().unwrap_or(0);
                     out[dst + 1] = v.get(src).copied().unwrap_or(0);
                 }
+            }
+        }
+    }
+    out
+}
+
+#[allow(
+    unsafe_code,
+    clippy::cast_ptr_alignment,
+    clippy::cast_possible_truncation
+)]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+fn box_row_2x2(r0: &[u8], r1: &[u8], dst: &mut [u8]) {
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm_storeu_si128, _mm256_add_epi16, _mm256_and_si256, _mm256_avg_epu8,
+        _mm256_castsi256_si128, _mm256_loadu_si256, _mm256_packus_epi16, _mm256_permute4x64_epi64,
+        _mm256_set1_epi16, _mm256_srli_epi16,
+    };
+    let count = dst.len().min(r0.len() / 2).min(r1.len() / 2);
+    let mut col = 0;
+    unsafe {
+        let mask = _mm256_set1_epi16(0x00FF);
+        let one = _mm256_set1_epi16(1);
+        while col + 16 <= count {
+            let top = _mm256_loadu_si256(r0.as_ptr().add(2 * col).cast::<__m256i>());
+            let bot = _mm256_loadu_si256(r1.as_ptr().add(2 * col).cast::<__m256i>());
+            let vert = _mm256_avg_epu8(top, bot);
+            let even = _mm256_and_si256(vert, mask);
+            let odd = _mm256_srli_epi16::<8>(vert);
+            let avg = _mm256_srli_epi16::<1>(_mm256_add_epi16(_mm256_add_epi16(even, odd), one));
+            let packed = _mm256_permute4x64_epi64::<0xD8>(_mm256_packus_epi16(avg, avg));
+            _mm_storeu_si128(
+                dst.as_mut_ptr().add(col).cast::<__m128i>(),
+                _mm256_castsi256_si128(packed),
+            );
+            col += 16;
+        }
+    }
+    while col < count {
+        let sum = u16::from(r0[2 * col])
+            + u16::from(r0[2 * col + 1])
+            + u16::from(r1[2 * col])
+            + u16::from(r1[2 * col + 1])
+            + 2;
+        dst[col] = (sum >> 2) as u8;
+        col += 1;
+    }
+}
+
+#[allow(unsafe_code, clippy::cast_possible_truncation)]
+#[cfg(target_arch = "aarch64")]
+fn box_row_2x2(r0: &[u8], r1: &[u8], dst: &mut [u8]) {
+    use std::arch::aarch64::{vld1q_u8, vrhaddq_u8, vst1q_u8, vuzp1q_u8, vuzp2q_u8};
+    let count = dst.len().min(r0.len() / 2).min(r1.len() / 2);
+    let mut col = 0;
+    unsafe {
+        while col + 16 <= count {
+            let v0 = vrhaddq_u8(
+                vld1q_u8(r0.as_ptr().add(2 * col)),
+                vld1q_u8(r1.as_ptr().add(2 * col)),
+            );
+            let v1 = vrhaddq_u8(
+                vld1q_u8(r0.as_ptr().add(2 * col + 16)),
+                vld1q_u8(r1.as_ptr().add(2 * col + 16)),
+            );
+            let even = vuzp1q_u8(v0, v1);
+            let odd = vuzp2q_u8(v0, v1);
+            vst1q_u8(dst.as_mut_ptr().add(col), vrhaddq_u8(even, odd));
+            col += 16;
+        }
+    }
+    while col < count {
+        let sum = u16::from(r0[2 * col])
+            + u16::from(r0[2 * col + 1])
+            + u16::from(r1[2 * col])
+            + u16::from(r1[2 * col + 1])
+            + 2;
+        dst[col] = (sum >> 2) as u8;
+        col += 1;
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "avx2"),
+    target_arch = "aarch64"
+)))]
+fn box_row_2x2(r0: &[u8], r1: &[u8], dst: &mut [u8]) {
+    let count = dst.len().min(r0.len() / 2).min(r1.len() / 2);
+    for col in 0..count {
+        let sum = u16::from(r0[2 * col])
+            + u16::from(r0[2 * col + 1])
+            + u16::from(r1[2 * col])
+            + u16::from(r1[2 * col + 1])
+            + 2;
+        dst[col] = (sum >> 2) as u8;
+    }
+}
+
+pub fn pack_nv12_half(
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    width: usize,
+    height: usize,
+    y_stride: usize,
+    uv_stride: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; width.saturating_mul(height).saturating_mul(3) / 2];
+    let src_w = width.saturating_mul(2);
+    for row in 0..height {
+        let s0 = (2 * row).saturating_mul(y_stride);
+        let s1 = (2 * row + 1).saturating_mul(y_stride);
+        let d0 = row.saturating_mul(width);
+        if s1.saturating_add(src_w) <= y.len() && d0.saturating_add(width) <= out.len() {
+            box_row_2x2(
+                &y[s0..s0 + src_w],
+                &y[s1..s1 + src_w],
+                &mut out[d0..d0 + width],
+            );
+        }
+    }
+    let uv_base = width.saturating_mul(height);
+    let chroma_w = width / 2;
+    let chroma_h = height / 2;
+    let mut u_tmp = vec![0u8; chroma_w];
+    let mut v_tmp = vec![0u8; chroma_w];
+    let src_cw = chroma_w.saturating_mul(2);
+    for row in 0..chroma_h {
+        let s0 = (2 * row).saturating_mul(uv_stride);
+        let s1 = (2 * row + 1).saturating_mul(uv_stride);
+        let dst_start = uv_base.saturating_add(row.saturating_mul(width));
+        let dst_end = dst_start.saturating_add(chroma_w * 2);
+        if s1.saturating_add(src_cw) <= u.len()
+            && s1.saturating_add(src_cw) <= v.len()
+            && dst_end <= out.len()
+        {
+            box_row_2x2(&u[s0..s0 + src_cw], &u[s1..s1 + src_cw], &mut u_tmp);
+            box_row_2x2(&v[s0..s0 + src_cw], &v[s1..s1 + src_cw], &mut v_tmp);
+            for (pair, (&cu, &cv)) in out[dst_start..dst_end]
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(u_tmp.iter().zip(&v_tmp))
+            {
+                pair[0] = cu;
+                pair[1] = cv;
             }
         }
     }
