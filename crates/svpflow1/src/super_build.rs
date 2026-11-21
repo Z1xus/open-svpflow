@@ -617,7 +617,9 @@ fn avg_u8(a: u8, b: u8) -> u8 {
 fn avg_u8_slice(out: &mut [u8], a: &[u8], b: &[u8]) {
     let n = out.len().min(a.len()).min(b.len());
     #[cfg(target_arch = "x86_64")]
-    let done = if std::is_x86_feature_detected!("avx2") {
+    let done = if std::is_x86_feature_detected!("avx512bw") {
+        unsafe { avg_u8_avx512(&mut out[..n], &a[..n], &b[..n]) }
+    } else if std::is_x86_feature_detected!("avx2") {
         unsafe { avg_u8_avx2(&mut out[..n], &a[..n], &b[..n]) }
     } else {
         unsafe { avg_u8_sse2(&mut out[..n], &a[..n], &b[..n]) }
@@ -635,6 +637,23 @@ fn avg_u8_slice(out: &mut [u8], a: &[u8], b: &[u8]) {
     for i in done..n {
         out[i] = avg_u8(a[i], b[i]);
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn avg_u8_avx512(out: &mut [u8], a: &[u8], b: &[u8]) -> usize {
+    use std::arch::x86_64::{_mm512_avg_epu8, _mm512_loadu_si512, _mm512_storeu_si512};
+    let n = out.len();
+    let mut i = 0;
+    while i + 64 <= n {
+        unsafe {
+            let va = _mm512_loadu_si512(a.as_ptr().add(i).cast());
+            let vb = _mm512_loadu_si512(b.as_ptr().add(i).cast());
+            _mm512_storeu_si512(out.as_mut_ptr().add(i).cast(), _mm512_avg_epu8(va, vb));
+        }
+        i += 64;
+    }
+    i + unsafe { avg_u8_avx2(&mut out[i..], &a[i..], &b[i..]) }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -936,34 +955,566 @@ fn vertical_filter(filter: ReduceFilter, out: &mut [u8], rows: [&[u8]; 6]) {
         }
     };
     let (m2, m1, c0, p1, p2, p3) = (row(-2), row(-1), row(0), row(1), row(2), row(3));
-    macro_rules! run {
-        ($f:expr) => {
-            for x in 0..n {
-                let t = |r: &[u8]| u16::from(r[x]);
-                out[x] = ($f)(t(m2), t(m1), t(c0), t(p1), t(p2), t(p3)) as u8;
-            }
-        };
-    }
     match filter {
         ReduceFilter::Average => {
-            run!(|_, m1: u16, c0: u16, p1: u16, _, _| (m1 + 2 * c0 + p1 + 2) >> 2)
+            fir4_u8::<1, 2, 1, 0, 2, 2>(out, [m1, c0, p1, p1]);
         }
         ReduceFilter::Bilinear => {
-            run!(|_, m1: u16, c0: u16, p1: u16, p2: u16, _| (m1 + 3 * (c0 + p1) + p2 + 4) >> 3);
+            fir4_u8::<1, 3, 3, 1, 4, 3>(out, [m1, c0, p1, p2]);
         }
-        ReduceFilter::Quadratic => run!(|m2: u16, m1: u16, c0: u16, p1: u16, p2: u16, p3: u16| (m2
-            + 9 * (m1 + p2)
-            + 22 * (c0 + p1)
-            + p3
-            + 32)
-            >> 6),
-        ReduceFilter::Cubic => run!(|m2: u16, m1: u16, c0: u16, p1: u16, p2: u16, p3: u16| (m2
-            + 5 * (m1 + p2)
-            + 10 * (c0 + p1)
-            + p3
-            + 16)
-            >> 5),
+        ReduceFilter::Quadratic => {
+            fir6_u8::<1, 9, 22, 22, 9, 1, 32, 6>(out, [m2, m1, c0, p1, p2, p3]);
+        }
+        ReduceFilter::Cubic => {
+            fir6_u8::<1, 5, 10, 10, 5, 1, 16, 5>(out, [m2, m1, c0, p1, p2, p3]);
+        }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn pair_weight(a: i8, b: i8) -> i16 {
+    i16::from_le_bytes([a as u8, b as u8])
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+#[inline]
+fn srai_epi16_avx512<const SHIFT: i32>(
+    v: std::arch::x86_64::__m512i,
+) -> std::arch::x86_64::__m512i {
+    use std::arch::x86_64::_mm512_srai_epi16;
+    match SHIFT {
+        2 => _mm512_srai_epi16::<2>(v),
+        3 => _mm512_srai_epi16::<3>(v),
+        4 => _mm512_srai_epi16::<4>(v),
+        5 => _mm512_srai_epi16::<5>(v),
+        _ => _mm512_srai_epi16::<6>(v),
+    }
+}
+
+fn fir4_u8<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 4],
+) {
+    let n = out.len();
+    #[cfg(target_arch = "x86_64")]
+    let done = if std::is_x86_feature_detected!("avx512bw") {
+        unsafe { fir4_avx512::<W0, W1, W2, W3, BIAS, SHIFT>(out, taps) }
+    } else if std::is_x86_feature_detected!("avx2") {
+        unsafe { fir4_avx2::<W0, W1, W2, W3, BIAS, SHIFT>(out, taps) }
+    } else if std::is_x86_feature_detected!("ssse3") {
+        unsafe { fir4_ssse3::<W0, W1, W2, W3, BIAS, SHIFT>(out, taps) }
+    } else {
+        0
+    };
+    #[cfg(target_arch = "aarch64")]
+    let done = unsafe { fir4_neon::<W0, W1, W2, W3, BIAS, SHIFT>(out, taps) };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let done = 0usize;
+    let [t0, t1, t2, t3] = taps;
+    for i in done..n {
+        let sum = i32::from(W0) * i32::from(t0[i])
+            + i32::from(W1) * i32::from(t1[i])
+            + i32::from(W2) * i32::from(t2[i])
+            + i32::from(W3) * i32::from(t3[i])
+            + i32::from(BIAS);
+        out[i] = (sum >> SHIFT).clamp(0, 255) as u8;
+    }
+}
+
+fn fir6_u8<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const W4: i8,
+    const W5: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 6],
+) {
+    let n = out.len();
+    #[cfg(target_arch = "x86_64")]
+    let done = if std::is_x86_feature_detected!("avx512bw") {
+        unsafe { fir6_avx512::<W0, W1, W2, W3, W4, W5, BIAS, SHIFT>(out, taps) }
+    } else if std::is_x86_feature_detected!("avx2") {
+        unsafe { fir6_avx2::<W0, W1, W2, W3, W4, W5, BIAS, SHIFT>(out, taps) }
+    } else if std::is_x86_feature_detected!("ssse3") {
+        unsafe { fir6_ssse3::<W0, W1, W2, W3, W4, W5, BIAS, SHIFT>(out, taps) }
+    } else {
+        0
+    };
+    #[cfg(target_arch = "aarch64")]
+    let done = unsafe { fir6_neon::<W0, W1, W2, W3, W4, W5, BIAS, SHIFT>(out, taps) };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let done = 0usize;
+    let [t0, t1, t2, t3, t4, t5] = taps;
+    for i in done..n {
+        let sum = i32::from(W0) * i32::from(t0[i])
+            + i32::from(W1) * i32::from(t1[i])
+            + i32::from(W2) * i32::from(t2[i])
+            + i32::from(W3) * i32::from(t3[i])
+            + i32::from(W4) * i32::from(t4[i])
+            + i32::from(W5) * i32::from(t5[i])
+            + i32::from(BIAS);
+        out[i] = (sum >> SHIFT).clamp(0, 255) as u8;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn fir4_avx512<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 4],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm512_add_epi16, _mm512_loadu_si512, _mm512_maddubs_epi16, _mm512_packus_epi16,
+        _mm512_set1_epi16, _mm512_storeu_si512, _mm512_unpackhi_epi8, _mm512_unpacklo_epi8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3] = taps;
+    let wa = _mm512_set1_epi16(pair_weight(W0, W1));
+    let wb = _mm512_set1_epi16(pair_weight(W2, W3));
+    let bias = _mm512_set1_epi16(BIAS);
+    let mut i = 0;
+    while i + 64 <= n {
+        unsafe {
+            let v0 = _mm512_loadu_si512(t0.as_ptr().add(i).cast());
+            let v1 = _mm512_loadu_si512(t1.as_ptr().add(i).cast());
+            let v2 = _mm512_loadu_si512(t2.as_ptr().add(i).cast());
+            let v3 = _mm512_loadu_si512(t3.as_ptr().add(i).cast());
+            let lo = _mm512_add_epi16(
+                _mm512_add_epi16(
+                    _mm512_maddubs_epi16(_mm512_unpacklo_epi8(v0, v1), wa),
+                    _mm512_maddubs_epi16(_mm512_unpacklo_epi8(v2, v3), wb),
+                ),
+                bias,
+            );
+            let hi = _mm512_add_epi16(
+                _mm512_add_epi16(
+                    _mm512_maddubs_epi16(_mm512_unpackhi_epi8(v0, v1), wa),
+                    _mm512_maddubs_epi16(_mm512_unpackhi_epi8(v2, v3), wb),
+                ),
+                bias,
+            );
+            let packed = _mm512_packus_epi16(
+                srai_epi16_avx512::<SHIFT>(lo),
+                srai_epi16_avx512::<SHIFT>(hi),
+            );
+            _mm512_storeu_si512(out.as_mut_ptr().add(i).cast(), packed);
+        }
+        i += 64;
+    }
+    i + unsafe {
+        fir4_avx2::<W0, W1, W2, W3, BIAS, SHIFT>(&mut out[i..], taps.map(|t| &t[i..]))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fir4_avx2<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 4],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm256_add_epi16, _mm256_loadu_si256, _mm256_maddubs_epi16, _mm256_packus_epi16,
+        _mm256_set1_epi16, _mm256_srai_epi16, _mm256_storeu_si256, _mm256_unpackhi_epi8,
+        _mm256_unpacklo_epi8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3] = taps;
+    let wa = _mm256_set1_epi16(pair_weight(W0, W1));
+    let wb = _mm256_set1_epi16(pair_weight(W2, W3));
+    let bias = _mm256_set1_epi16(BIAS);
+    let mut i = 0;
+    while i + 32 <= n {
+        unsafe {
+            let v0 = _mm256_loadu_si256(t0.as_ptr().add(i).cast());
+            let v1 = _mm256_loadu_si256(t1.as_ptr().add(i).cast());
+            let v2 = _mm256_loadu_si256(t2.as_ptr().add(i).cast());
+            let v3 = _mm256_loadu_si256(t3.as_ptr().add(i).cast());
+            let lo = _mm256_add_epi16(
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(_mm256_unpacklo_epi8(v0, v1), wa),
+                    _mm256_maddubs_epi16(_mm256_unpacklo_epi8(v2, v3), wb),
+                ),
+                bias,
+            );
+            let hi = _mm256_add_epi16(
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(_mm256_unpackhi_epi8(v0, v1), wa),
+                    _mm256_maddubs_epi16(_mm256_unpackhi_epi8(v2, v3), wb),
+                ),
+                bias,
+            );
+            let packed = _mm256_packus_epi16(
+                _mm256_srai_epi16::<SHIFT>(lo),
+                _mm256_srai_epi16::<SHIFT>(hi),
+            );
+            _mm256_storeu_si256(out.as_mut_ptr().add(i).cast(), packed);
+        }
+        i += 32;
+    }
+    i + unsafe {
+        fir4_ssse3::<W0, W1, W2, W3, BIAS, SHIFT>(&mut out[i..], taps.map(|t| &t[i..]))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn fir4_ssse3<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 4],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm_add_epi16, _mm_loadu_si128, _mm_maddubs_epi16, _mm_packus_epi16, _mm_set1_epi16,
+        _mm_srai_epi16, _mm_storeu_si128, _mm_unpackhi_epi8, _mm_unpacklo_epi8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3] = taps;
+    let wa = _mm_set1_epi16(pair_weight(W0, W1));
+    let wb = _mm_set1_epi16(pair_weight(W2, W3));
+    let bias = _mm_set1_epi16(BIAS);
+    let mut i = 0;
+    while i + 16 <= n {
+        unsafe {
+            let v0 = _mm_loadu_si128(t0.as_ptr().add(i).cast());
+            let v1 = _mm_loadu_si128(t1.as_ptr().add(i).cast());
+            let v2 = _mm_loadu_si128(t2.as_ptr().add(i).cast());
+            let v3 = _mm_loadu_si128(t3.as_ptr().add(i).cast());
+            let lo = _mm_add_epi16(
+                _mm_add_epi16(
+                    _mm_maddubs_epi16(_mm_unpacklo_epi8(v0, v1), wa),
+                    _mm_maddubs_epi16(_mm_unpacklo_epi8(v2, v3), wb),
+                ),
+                bias,
+            );
+            let hi = _mm_add_epi16(
+                _mm_add_epi16(
+                    _mm_maddubs_epi16(_mm_unpackhi_epi8(v0, v1), wa),
+                    _mm_maddubs_epi16(_mm_unpackhi_epi8(v2, v3), wb),
+                ),
+                bias,
+            );
+            let packed =
+                _mm_packus_epi16(_mm_srai_epi16::<SHIFT>(lo), _mm_srai_epi16::<SHIFT>(hi));
+            _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), packed);
+        }
+        i += 16;
+    }
+    i
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn fir6_avx512<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const W4: i8,
+    const W5: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 6],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm512_add_epi16, _mm512_loadu_si512, _mm512_maddubs_epi16, _mm512_packus_epi16,
+        _mm512_set1_epi16, _mm512_storeu_si512, _mm512_unpackhi_epi8, _mm512_unpacklo_epi8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3, t4, t5] = taps;
+    let wa = _mm512_set1_epi16(pair_weight(W0, W1));
+    let wb = _mm512_set1_epi16(pair_weight(W2, W3));
+    let wc = _mm512_set1_epi16(pair_weight(W4, W5));
+    let bias = _mm512_set1_epi16(BIAS);
+    let mut i = 0;
+    while i + 64 <= n {
+        unsafe {
+            let v0 = _mm512_loadu_si512(t0.as_ptr().add(i).cast());
+            let v1 = _mm512_loadu_si512(t1.as_ptr().add(i).cast());
+            let v2 = _mm512_loadu_si512(t2.as_ptr().add(i).cast());
+            let v3 = _mm512_loadu_si512(t3.as_ptr().add(i).cast());
+            let v4 = _mm512_loadu_si512(t4.as_ptr().add(i).cast());
+            let v5 = _mm512_loadu_si512(t5.as_ptr().add(i).cast());
+            let lo = _mm512_add_epi16(
+                _mm512_add_epi16(
+                    _mm512_maddubs_epi16(_mm512_unpacklo_epi8(v0, v1), wa),
+                    _mm512_maddubs_epi16(_mm512_unpacklo_epi8(v2, v3), wb),
+                ),
+                _mm512_add_epi16(
+                    _mm512_maddubs_epi16(_mm512_unpacklo_epi8(v4, v5), wc),
+                    bias,
+                ),
+            );
+            let hi = _mm512_add_epi16(
+                _mm512_add_epi16(
+                    _mm512_maddubs_epi16(_mm512_unpackhi_epi8(v0, v1), wa),
+                    _mm512_maddubs_epi16(_mm512_unpackhi_epi8(v2, v3), wb),
+                ),
+                _mm512_add_epi16(
+                    _mm512_maddubs_epi16(_mm512_unpackhi_epi8(v4, v5), wc),
+                    bias,
+                ),
+            );
+            let packed = _mm512_packus_epi16(
+                srai_epi16_avx512::<SHIFT>(lo),
+                srai_epi16_avx512::<SHIFT>(hi),
+            );
+            _mm512_storeu_si512(out.as_mut_ptr().add(i).cast(), packed);
+        }
+        i += 64;
+    }
+    i + unsafe {
+        fir6_avx2::<W0, W1, W2, W3, W4, W5, BIAS, SHIFT>(&mut out[i..], taps.map(|t| &t[i..]))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fir6_avx2<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const W4: i8,
+    const W5: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 6],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm256_add_epi16, _mm256_loadu_si256, _mm256_maddubs_epi16, _mm256_packus_epi16,
+        _mm256_set1_epi16, _mm256_srai_epi16, _mm256_storeu_si256, _mm256_unpackhi_epi8,
+        _mm256_unpacklo_epi8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3, t4, t5] = taps;
+    let wa = _mm256_set1_epi16(pair_weight(W0, W1));
+    let wb = _mm256_set1_epi16(pair_weight(W2, W3));
+    let wc = _mm256_set1_epi16(pair_weight(W4, W5));
+    let bias = _mm256_set1_epi16(BIAS);
+    let mut i = 0;
+    while i + 32 <= n {
+        unsafe {
+            let v0 = _mm256_loadu_si256(t0.as_ptr().add(i).cast());
+            let v1 = _mm256_loadu_si256(t1.as_ptr().add(i).cast());
+            let v2 = _mm256_loadu_si256(t2.as_ptr().add(i).cast());
+            let v3 = _mm256_loadu_si256(t3.as_ptr().add(i).cast());
+            let v4 = _mm256_loadu_si256(t4.as_ptr().add(i).cast());
+            let v5 = _mm256_loadu_si256(t5.as_ptr().add(i).cast());
+            let lo = _mm256_add_epi16(
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(_mm256_unpacklo_epi8(v0, v1), wa),
+                    _mm256_maddubs_epi16(_mm256_unpacklo_epi8(v2, v3), wb),
+                ),
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(_mm256_unpacklo_epi8(v4, v5), wc),
+                    bias,
+                ),
+            );
+            let hi = _mm256_add_epi16(
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(_mm256_unpackhi_epi8(v0, v1), wa),
+                    _mm256_maddubs_epi16(_mm256_unpackhi_epi8(v2, v3), wb),
+                ),
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(_mm256_unpackhi_epi8(v4, v5), wc),
+                    bias,
+                ),
+            );
+            let packed = _mm256_packus_epi16(
+                _mm256_srai_epi16::<SHIFT>(lo),
+                _mm256_srai_epi16::<SHIFT>(hi),
+            );
+            _mm256_storeu_si256(out.as_mut_ptr().add(i).cast(), packed);
+        }
+        i += 32;
+    }
+    i + unsafe {
+        fir6_ssse3::<W0, W1, W2, W3, W4, W5, BIAS, SHIFT>(&mut out[i..], taps.map(|t| &t[i..]))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn fir6_ssse3<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const W4: i8,
+    const W5: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 6],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm_add_epi16, _mm_loadu_si128, _mm_maddubs_epi16, _mm_packus_epi16, _mm_set1_epi16,
+        _mm_srai_epi16, _mm_storeu_si128, _mm_unpackhi_epi8, _mm_unpacklo_epi8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3, t4, t5] = taps;
+    let wa = _mm_set1_epi16(pair_weight(W0, W1));
+    let wb = _mm_set1_epi16(pair_weight(W2, W3));
+    let wc = _mm_set1_epi16(pair_weight(W4, W5));
+    let bias = _mm_set1_epi16(BIAS);
+    let mut i = 0;
+    while i + 16 <= n {
+        unsafe {
+            let v0 = _mm_loadu_si128(t0.as_ptr().add(i).cast());
+            let v1 = _mm_loadu_si128(t1.as_ptr().add(i).cast());
+            let v2 = _mm_loadu_si128(t2.as_ptr().add(i).cast());
+            let v3 = _mm_loadu_si128(t3.as_ptr().add(i).cast());
+            let v4 = _mm_loadu_si128(t4.as_ptr().add(i).cast());
+            let v5 = _mm_loadu_si128(t5.as_ptr().add(i).cast());
+            let lo = _mm_add_epi16(
+                _mm_add_epi16(
+                    _mm_maddubs_epi16(_mm_unpacklo_epi8(v0, v1), wa),
+                    _mm_maddubs_epi16(_mm_unpacklo_epi8(v2, v3), wb),
+                ),
+                _mm_add_epi16(
+                    _mm_maddubs_epi16(_mm_unpacklo_epi8(v4, v5), wc),
+                    bias,
+                ),
+            );
+            let hi = _mm_add_epi16(
+                _mm_add_epi16(
+                    _mm_maddubs_epi16(_mm_unpackhi_epi8(v0, v1), wa),
+                    _mm_maddubs_epi16(_mm_unpackhi_epi8(v2, v3), wb),
+                ),
+                _mm_add_epi16(
+                    _mm_maddubs_epi16(_mm_unpackhi_epi8(v4, v5), wc),
+                    bias,
+                ),
+            );
+            let packed =
+                _mm_packus_epi16(_mm_srai_epi16::<SHIFT>(lo), _mm_srai_epi16::<SHIFT>(hi));
+            _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), packed);
+        }
+        i += 16;
+    }
+    i
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn fir4_neon<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 4],
+) -> usize {
+    use std::arch::aarch64::{
+        vcombine_u8, vdupq_n_s16, vld1_u8, vmlaq_n_s16, vmovl_u8, vqmovun_s16,
+        vreinterpretq_s16_u16, vshrq_n_s16, vst1q_u8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3] = taps;
+    let bias = unsafe { vdupq_n_s16(BIAS) };
+    let mut i = 0;
+    while i + 16 <= n {
+        unsafe {
+            let eval = |off: usize| {
+                let mut acc = bias;
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t0.as_ptr().add(off)))), i16::from(W0));
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t1.as_ptr().add(off)))), i16::from(W1));
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t2.as_ptr().add(off)))), i16::from(W2));
+                if W3 != 0 {
+                    acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t3.as_ptr().add(off)))), i16::from(W3));
+                }
+                vqmovun_s16(vshrq_n_s16::<SHIFT>(acc))
+            };
+            let lo = eval(i);
+            let hi = eval(i + 8);
+            vst1q_u8(out.as_mut_ptr().add(i), vcombine_u8(lo, hi));
+        }
+        i += 16;
+    }
+    i
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn fir6_neon<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const W4: i8,
+    const W5: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 6],
+) -> usize {
+    use std::arch::aarch64::{
+        vcombine_u8, vdupq_n_s16, vld1_u8, vmlaq_n_s16, vmovl_u8, vqmovun_s16,
+        vreinterpretq_s16_u16, vshrq_n_s16, vst1q_u8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3, t4, t5] = taps;
+    let bias = unsafe { vdupq_n_s16(BIAS) };
+    let mut i = 0;
+    while i + 16 <= n {
+        unsafe {
+            let eval = |off: usize| {
+                let mut acc = bias;
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t0.as_ptr().add(off)))), i16::from(W0));
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t1.as_ptr().add(off)))), i16::from(W1));
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t2.as_ptr().add(off)))), i16::from(W2));
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t3.as_ptr().add(off)))), i16::from(W3));
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t4.as_ptr().add(off)))), i16::from(W4));
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t5.as_ptr().add(off)))), i16::from(W5));
+                vqmovun_s16(vshrq_n_s16::<SHIFT>(acc))
+            };
+            let lo = eval(i);
+            let hi = eval(i + 8);
+            vst1q_u8(out.as_mut_ptr().add(i), vcombine_u8(lo, hi));
+        }
+        i += 16;
+    }
+    i
 }
 
 #[derive(Default)]
@@ -1191,15 +1742,6 @@ impl HalfPel {
             Self::Wiener => (2, 4),
         }
     }
-
-    fn apply(self, t: [i32; 6]) -> u8 {
-        let [m2, m1, c0, p1, p2, p3] = t;
-        let value = match self {
-            Self::CatmullRom => (-(m1 + p2) + (c0 + p1) * 9 + 8) >> 4,
-            Self::Wiener => (m2 + (-m1 + (c0 << 2) + (p1 << 2) - p2) * 5 + p3 + 16) >> 5,
-        };
-        value.clamp(0, 255) as u8
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1212,7 +1754,7 @@ struct Interp {
 impl Interp {
     fn pair(self, canvas: &mut Canvas<'_>, dst: usize, first: usize, second: usize) {
         let span = self.width.div_ceil(SSE_CHUNK) * SSE_CHUNK;
-        let (mut a, mut b) = (vec![0u8; span], vec![0u8; span]);
+        let (mut a, mut b, mut out) = (Vec::new(), Vec::new(), Vec::new());
         for y in 0..self.height {
             let row = y * self.pitch;
             let (target, left, right) = (dst + row, first + row, second + row);
@@ -1223,12 +1765,15 @@ impl Interp {
                 avg_u8_slice(&mut rest[..span], lhs, rhs);
                 continue;
             }
+            if a.is_empty() {
+                a.resize(span, 0);
+                b.resize(span, 0);
+                out.resize(span, 0);
+            }
             canvas.fetch((first + row) as isize, &mut a);
             canvas.fetch((second + row) as isize, &mut b);
-            for (x, y) in a.iter_mut().zip(&b) {
-                *x = ((u16::from(*x) + u16::from(*y) + 1) >> 1) as u8;
-            }
-            canvas.store(dst + row, &a);
+            avg_u8_slice(&mut out, &a, &b);
+            canvas.store(dst + row, &out);
         }
     }
 
@@ -1240,18 +1785,47 @@ impl Interp {
 
     fn horizontal(self, canvas: &mut Canvas<'_>, dst: usize, src: usize, kernel: HalfPel) {
         let (lead, tail) = kernel.edges();
-        let w = self.width;
+        let (w, h, p) = (self.width, self.height, self.pitch);
         let inner = w.saturating_sub(tail).saturating_sub(lead);
+        if w > lead + tail
+            && h > 0
+            && src + (h - 1) * p + w <= dst
+            && dst + (h - 1) * p + w <= canvas.frame.len()
+        {
+            let (sources, rest) = canvas.frame.split_at_mut(dst);
+            for y in 0..h {
+                let row = y * p;
+                let src_row = &sources[src + row..][..w];
+                let dst_row = &mut rest[row..][..w];
+                let taps: [&[u8]; 6] = match kernel {
+                    HalfPel::CatmullRom => [
+                        &src_row[1..=inner],
+                        &src_row[..inner],
+                        &src_row[1..=inner],
+                        &src_row[2..2 + inner],
+                        &src_row[3..3 + inner],
+                        &src_row[1..=inner],
+                    ],
+                    HalfPel::Wiener => std::array::from_fn(|k| &src_row[k..k + inner]),
+                };
+                apply_half_pel(kernel, &mut dst_row[lead..lead + inner], taps);
+                for i in (0..lead).chain(lead + inner..w - 1) {
+                    dst_row[i] = avg_u8(src_row[i], src_row[i + 1]);
+                }
+                dst_row[w - 1] = src_row[w - 1];
+            }
+            return;
+        }
         let mut padded = vec![0u8; w + 5];
         let mut out = vec![0u8; w];
-        for y in 0..self.height {
-            let row = y * self.pitch;
+        for y in 0..h {
+            let row = y * p;
             canvas.fetch((src + row) as isize - 2, &mut padded);
             let taps: [&[u8]; 6] = std::array::from_fn(|k| &padded[lead + k..][..inner]);
             apply_half_pel(kernel, &mut out[lead..lead + inner], taps);
             let pixel = &padded[2..];
             for i in (0..lead).chain(lead + inner..w.saturating_sub(1)) {
-                out[i] = ((u16::from(pixel[i]) + u16::from(pixel[i + 1]) + 1) >> 1) as u8;
+                out[i] = avg_u8(pixel[i], pixel[i + 1]);
             }
             out[w - 1] = pixel[w - 1];
             canvas.store(dst + row, &out);
@@ -1260,14 +1834,52 @@ impl Interp {
 
     fn vertical(self, canvas: &mut Canvas<'_>, dst: usize, src: usize, kernel: HalfPel) {
         let (lead, tail) = kernel.edges();
-        let (w, h, p) = (self.width, self.height, self.pitch as isize);
+        let (w, h, p) = (self.width, self.height, self.pitch);
+        if w > 0
+            && h > lead + tail
+            && src + (h - 1) * p + w <= dst
+            && dst + (h - 1) * p + w <= canvas.frame.len()
+        {
+            let (sources, rest) = canvas.frame.split_at_mut(dst);
+            let srow = |j: usize| &sources[src + j * p..][..w];
+            for j in 0..h {
+                let d = &mut rest[j * p..][..w];
+                if j + 1 == h {
+                    d.copy_from_slice(srow(j));
+                } else if j < lead || j >= h - tail {
+                    vertical_average(d, srow(j), srow(j + 1));
+                } else {
+                    let taps: [&[u8]; 6] = match kernel {
+                        HalfPel::CatmullRom => [
+                            srow(j),
+                            srow(j - 1),
+                            srow(j),
+                            srow(j + 1),
+                            srow(j + 2),
+                            srow(j),
+                        ],
+                        HalfPel::Wiener => [
+                            srow(j - 2),
+                            srow(j - 1),
+                            srow(j),
+                            srow(j + 1),
+                            srow(j + 2),
+                            srow(j + 3),
+                        ],
+                    };
+                    apply_half_pel(kernel, d, taps);
+                }
+            }
+            return;
+        }
+        let p_isize = p as isize;
         let mut rows = [const { Vec::new() }; 6];
         let mut out = vec![0u8; w];
         for j in 0..h {
-            let base = (src + j * self.pitch) as isize;
+            let base = (src + j * p) as isize;
             for (k, row) in rows.iter_mut().enumerate() {
                 row.resize(w, 0);
-                canvas.fetch(base + (k as isize - 2) * p, row);
+                canvas.fetch(base + (k as isize - 2) * p_isize, row);
             }
             if j + 1 == h {
                 out.copy_from_slice(&rows[2]);
@@ -1276,7 +1888,7 @@ impl Interp {
             } else {
                 apply_half_pel(kernel, &mut out, std::array::from_fn(|k| &rows[k][..w]));
             }
-            canvas.store(dst + j * self.pitch, &out);
+            canvas.store(dst + j * p, &out);
         }
     }
 }
@@ -1284,8 +1896,8 @@ impl Interp {
 fn apply_half_pel(kernel: HalfPel, out: &mut [u8], taps: [&[u8]; 6]) {
     let n = out.len();
     let [m2, m1, c0, p1, p2, p3] = taps.map(|t| &t[..n]);
-    for i in 0..n {
-        let t = |r: &[u8]| i32::from(r[i]);
-        out[i] = kernel.apply([t(m2), t(m1), t(c0), t(p1), t(p2), t(p3)]);
+    match kernel {
+        HalfPel::CatmullRom => fir4_u8::<-1, 9, 9, -1, 8, 4>(out, [m1, c0, p1, p2]),
+        HalfPel::Wiener => fir6_u8::<1, -5, 20, 20, -5, 1, 16, 5>(out, [m2, m1, c0, p1, p2, p3]),
     }
 }

@@ -6,10 +6,10 @@ use core::arch::x86_64::{__m128i, _mm_unpacklo_epi64};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use core::arch::x86_64::{
     __m256i, _mm256_abs_epi16, _mm256_add_epi16, _mm256_add_epi32, _mm256_add_epi64,
-    _mm256_castsi128_si256, _mm256_castsi256_si128, _mm256_cvtepu8_epi16, _mm256_extracti128_si256,
-    _mm256_hadd_epi16, _mm256_hsub_epi16, _mm256_inserti128_si256, _mm256_loadu_si256,
-    _mm256_madd_epi16, _mm256_max_epi16, _mm256_sad_epu8, _mm256_set1_epi16, _mm256_setzero_si256,
-    _mm256_sub_epi16,
+    _mm256_castsi128_si256, _mm256_castsi256_si128, _mm256_extracti128_si256,
+    _mm256_inserti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+    _mm256_max_epi16, _mm256_sad_epu8, _mm256_set_m128i, _mm256_set1_epi32, _mm256_setr_epi8,
+    _mm256_setzero_si256, _mm256_srli_epi32, _mm256_sub_epi16,
 };
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
@@ -154,8 +154,67 @@ pub(crate) fn block_average(block: &[u8], pitch: usize, shape: Shape) -> i32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
 unsafe fn contiguous_sum(block: &[u8]) -> u32 {
+    if block.len() >= 64 && std::arch::is_x86_feature_detected!("avx512bw") {
+        return unsafe { contiguous_sum_avx512(block) };
+    }
+    if block.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe { contiguous_sum_avx2(block) };
+    }
+    unsafe { contiguous_sum_sse2(block) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn contiguous_sum_avx512(block: &[u8]) -> u32 {
+    use core::arch::x86_64::{
+        _mm512_add_epi64, _mm512_loadu_si512, _mm512_reduce_add_epi64, _mm512_sad_epu8,
+        _mm512_setzero_si512,
+    };
+    let zero = _mm512_setzero_si512();
+    let mut acc = zero;
+    let (chunks, rem) = block.as_chunks::<64>();
+    for chunk in chunks {
+        let value = unsafe { _mm512_loadu_si512(chunk.as_ptr().cast()) };
+        acc = _mm512_add_epi64(acc, _mm512_sad_epu8(value, zero));
+    }
+    let total = _mm512_reduce_add_epi64(acc) as u32;
+    if rem.is_empty() {
+        total
+    } else {
+        total + unsafe { contiguous_sum_sse2(rem) }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn contiguous_sum_avx2(block: &[u8]) -> u32 {
+    use core::arch::x86_64::{
+        _mm256_add_epi64, _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_loadu_si256,
+        _mm256_sad_epu8, _mm256_setzero_si256,
+    };
+    let zero = _mm256_setzero_si256();
+    let mut acc = zero;
+    let (chunks, rem) = block.as_chunks::<32>();
+    for chunk in chunks {
+        let value = unsafe { _mm256_loadu_si256(chunk.as_ptr().cast()) };
+        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(value, zero));
+    }
+    let sum = _mm_add_epi64(
+        _mm256_castsi256_si128(acc),
+        _mm256_extracti128_si256::<1>(acc),
+    );
+    let total = _mm_cvtsi128_si32(_mm_add_epi32(sum, _mm_shuffle_epi32::<0b1110>(sum))) as u32;
+    if rem.is_empty() {
+        total
+    } else {
+        total + unsafe { contiguous_sum_sse2(rem) }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn contiguous_sum_sse2(block: &[u8]) -> u32 {
     let mut acc = _mm_setzero_si128();
     for chunk in block.as_chunks::<16>().0 {
         let value = unsafe { _mm_loadu_si128(chunk.as_ptr().cast()) };
@@ -176,8 +235,13 @@ fn rows_sum<const W: usize>(block: &[u8], pitch: usize, height: usize) -> u32 {
 
 fn sad<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    if (W == 8 || W == 16) && H.is_multiple_of(2) {
+    if (W == 8 || W == 16 || W == 32) && H.is_multiple_of(2) {
         assert!(src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
+        if W == 32 && std::arch::is_x86_feature_detected!("avx512bw") {
+            return unsafe {
+                sad_rows_pitched_avx512::<32>(src.as_ptr(), W, reference.as_ptr(), pitch, H)
+            };
+        }
         return unsafe { sad_until::<W, H>(src.as_ptr(), reference.as_ptr(), pitch, |_| false) };
     }
     #[cfg(target_arch = "x86_64")]
@@ -268,8 +332,175 @@ pub(crate) fn sad_pitched(shape: Shape, a: &[u8], a_pitch: usize, b: &[u8], b_pi
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
 unsafe fn sad_rows_pitched<const W: usize>(
+    src: *const u8,
+    src_pitch: usize,
+    reference: *const u8,
+    reference_pitch: usize,
+    height: usize,
+) -> u32 {
+    if W >= 16 && height >= 2 && std::arch::is_x86_feature_detected!("avx512bw") {
+        return unsafe {
+            sad_rows_pitched_avx512::<W>(src, src_pitch, reference, reference_pitch, height)
+        };
+    }
+    if W >= 16 && std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe {
+            sad_rows_pitched_avx2::<W>(src, src_pitch, reference, reference_pitch, height)
+        };
+    }
+    unsafe { sad_rows_pitched_sse2::<W>(src, src_pitch, reference, reference_pitch, height) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn sad_rows_pitched_avx512<const W: usize>(
+    src: *const u8,
+    src_pitch: usize,
+    reference: *const u8,
+    reference_pitch: usize,
+    height: usize,
+) -> u32 {
+    use core::arch::x86_64::{
+        _mm256_castsi128_si256, _mm256_inserti128_si256, _mm256_loadu_si256, _mm512_add_epi64,
+        _mm512_castsi256_si512, _mm512_inserti64x4, _mm512_reduce_add_epi64, _mm512_sad_epu8,
+        _mm512_setzero_si512,
+    };
+    let mut acc = _mm512_setzero_si512();
+    let mut row = 0;
+    if W == 32 {
+        while row + 2 <= height {
+            let (a, b) = unsafe {
+                let s0 = _mm256_loadu_si256(src.add(row * src_pitch).cast());
+                let s1 = _mm256_loadu_si256(src.add((row + 1) * src_pitch).cast());
+                let r0 = _mm256_loadu_si256(reference.add(row * reference_pitch).cast());
+                let r1 = _mm256_loadu_si256(reference.add((row + 1) * reference_pitch).cast());
+                (
+                    _mm512_inserti64x4::<1>(_mm512_castsi256_si512(s0), s1),
+                    _mm512_inserti64x4::<1>(_mm512_castsi256_si512(r0), r1),
+                )
+            };
+            acc = _mm512_add_epi64(acc, _mm512_sad_epu8(a, b));
+            row += 2;
+        }
+    } else if W == 16 {
+        while row + 4 <= height {
+            let (a, b) = unsafe {
+                let s01 = _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_loadu_si128(src.add(row * src_pitch).cast())),
+                    _mm_loadu_si128(src.add((row + 1) * src_pitch).cast()),
+                );
+                let s23 = _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_loadu_si128(src.add((row + 2) * src_pitch).cast())),
+                    _mm_loadu_si128(src.add((row + 3) * src_pitch).cast()),
+                );
+                let r01 = _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_loadu_si128(
+                        reference.add(row * reference_pitch).cast(),
+                    )),
+                    _mm_loadu_si128(reference.add((row + 1) * reference_pitch).cast()),
+                );
+                let r23 = _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_loadu_si128(
+                        reference.add((row + 2) * reference_pitch).cast(),
+                    )),
+                    _mm_loadu_si128(reference.add((row + 3) * reference_pitch).cast()),
+                );
+                (
+                    _mm512_inserti64x4::<1>(_mm512_castsi256_si512(s01), s23),
+                    _mm512_inserti64x4::<1>(_mm512_castsi256_si512(r01), r23),
+                )
+            };
+            acc = _mm512_add_epi64(acc, _mm512_sad_epu8(a, b));
+            row += 4;
+        }
+    }
+    let total = _mm512_reduce_add_epi64(acc) as u32;
+    if row < height {
+        total
+            + unsafe {
+                sad_rows_pitched_avx2::<W>(
+                    src.add(row * src_pitch),
+                    src_pitch,
+                    reference.add(row * reference_pitch),
+                    reference_pitch,
+                    height - row,
+                )
+            }
+    } else {
+        total
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sad_rows_pitched_avx2<const W: usize>(
+    src: *const u8,
+    src_pitch: usize,
+    reference: *const u8,
+    reference_pitch: usize,
+    height: usize,
+) -> u32 {
+    use core::arch::x86_64::{
+        _mm256_add_epi64, _mm256_castsi128_si256, _mm256_castsi256_si128, _mm256_extracti128_si256,
+        _mm256_inserti128_si256, _mm256_loadu_si256, _mm256_sad_epu8, _mm256_setzero_si256,
+    };
+    let mut acc = _mm256_setzero_si256();
+    let mut row = 0;
+    if W == 32 {
+        while row < height {
+            let (a, b) = unsafe {
+                (
+                    _mm256_loadu_si256(src.add(row * src_pitch).cast()),
+                    _mm256_loadu_si256(reference.add(row * reference_pitch).cast()),
+                )
+            };
+            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(a, b));
+            row += 1;
+        }
+    } else if W == 16 {
+        while row + 2 <= height {
+            let (a, b) = unsafe {
+                let s = _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_loadu_si128(src.add(row * src_pitch).cast())),
+                    _mm_loadu_si128(src.add((row + 1) * src_pitch).cast()),
+                );
+                let r = _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_loadu_si128(
+                        reference.add(row * reference_pitch).cast(),
+                    )),
+                    _mm_loadu_si128(reference.add((row + 1) * reference_pitch).cast()),
+                );
+                (s, r)
+            };
+            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(a, b));
+            row += 2;
+        }
+    }
+    let sum = _mm_add_epi64(
+        _mm256_castsi256_si128(acc),
+        _mm256_extracti128_si256::<1>(acc),
+    );
+    let total = _mm_cvtsi128_si32(_mm_add_epi32(sum, _mm_shuffle_epi32::<0b1110>(sum))) as u32;
+    if row < height {
+        total
+            + unsafe {
+                sad_rows_pitched_sse2::<W>(
+                    src.add(row * src_pitch),
+                    src_pitch,
+                    reference.add(row * reference_pitch),
+                    reference_pitch,
+                    height - row,
+                )
+            }
+    } else {
+        total
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn sad_rows_pitched_sse2<const W: usize>(
     src: *const u8,
     src_pitch: usize,
     reference: *const u8,
@@ -444,6 +675,12 @@ fn satd_rows32<const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u3
             )
         })
         .sum();
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+    {
+        return unsafe { satd_rows32_avx512::<H>(src, reference, pitch) };
+    }
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     return unsafe { satd_rows32_avx2::<H>(src, reference, pitch) };
     #[allow(unreachable_code)]
@@ -461,9 +698,83 @@ fn satd_rows32<const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u3
         .sum()
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn satd_rows32_avx512<const H: usize>(
+    src: &[u8],
+    reference: &[u8],
+    pitch: usize,
+) -> u32 {
+    use core::arch::x86_64::{
+        _mm512_add_epi32, _mm512_madd_epi16, _mm512_reduce_add_epi32, _mm512_set1_epi32,
+        _mm512_setzero_si512,
+    };
+    assert!(src.len() >= 32 * H && reference.len() >= (H - 1) * pitch + 32);
+    let (s, r) = (src.as_ptr(), reference.as_ptr());
+    let mut acc = _mm512_setzero_si512();
+    let one = _mm512_set1_epi32(1);
+    for row in (0..H).step_by(2) {
+        let s0 = unsafe { s.add(row * 32) };
+        let r0 = unsafe { r.add(row * pitch) };
+        let (s1, r1) = if row + 1 < H {
+            unsafe { (s.add((row + 1) * 32), r.add((row + 1) * pitch)) }
+        } else {
+            (s0, r0)
+        };
+        let block = unsafe {
+            let sw = widen_rows_avx512([
+                s0,
+                s0.add(8),
+                s0.add(16),
+                s0.add(24),
+                s1,
+                s1.add(8),
+                s1.add(16),
+                s1.add(24),
+            ]);
+            let rw = widen_rows_avx512([
+                r0,
+                r0.add(8),
+                r0.add(16),
+                r0.add(24),
+                r1,
+                r1.add(8),
+                r1.add(16),
+                r1.add(24),
+            ]);
+            satd_8x8_from_avx512(sw, rw)
+        };
+        let term = _mm512_madd_epi16(block, one);
+        if row + 1 < H {
+            acc = _mm512_add_epi32(acc, term);
+        } else {
+            use core::arch::x86_64::_mm512_mask_add_epi32;
+            acc = _mm512_mask_add_epi32(acc, 0x00ff, acc, term);
+        }
+    }
+    _mm512_reduce_add_epi32(acc) as u32
+}
+
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 const fn rows_per_tile(width: usize) -> usize {
     if width == 8 { 8 } else { 4 }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn hmul_avx2() -> __m256i {
+    _mm256_setr_epi8(
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1,
+        1, -1, 1, -1,
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn widen_16_avx2(row: __m128i, hmul: __m256i) -> __m256i {
+    _mm256_maddubs_epi16(_mm256_set_m128i(row, row), hmul)
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -473,17 +784,17 @@ unsafe fn load_tile<const W: usize>(
     stride: usize,
     ty: usize,
     tx: usize,
+    hmul: __m256i,
 ) -> [__m256i; 4] {
     std::array::from_fn(|y| {
-        if W == 8 {
+        let row = if W == 8 {
             let low = unsafe { _mm_loadl_epi64(base.add((ty + y) * stride + tx).cast()) };
             let high = unsafe { _mm_loadl_epi64(base.add((ty + y + 4) * stride + tx).cast()) };
-            _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(low, high))
+            _mm_unpacklo_epi64(low, high)
         } else {
-            _mm256_cvtepu8_epi16(unsafe {
-                _mm_loadu_si128(base.add((ty + y) * stride + tx).cast())
-            })
-        }
+            unsafe { _mm_loadu_si128(base.add((ty + y) * stride + tx).cast()) }
+        };
+        widen_16_avx2(row, hmul)
     })
 }
 
@@ -493,17 +804,15 @@ unsafe fn load_tile<const W: usize>(
 fn tile_maxima([r0, r1, r2, r3]: [__m256i; 4]) -> __m256i {
     let (s0, d0) = (_mm256_add_epi16(r0, r1), _mm256_sub_epi16(r0, r1));
     let (s1, d1) = (_mm256_add_epi16(r2, r3), _mm256_sub_epi16(r2, r3));
-    let pair = |a: __m256i, b: __m256i| {
-        let sums = _mm256_hadd_epi16(a, b);
-        let diffs = _mm256_hsub_epi16(a, b);
-        (
-            _mm256_abs_epi16(_mm256_hadd_epi16(sums, diffs)),
-            _mm256_abs_epi16(_mm256_hsub_epi16(sums, diffs)),
-        )
+    let fold = |v: __m256i| {
+        let a = _mm256_abs_epi16(v);
+        _mm256_max_epi16(a, _mm256_srli_epi32::<16>(a))
     };
-    let (x0, y0) = pair(s0, d0);
-    let (x1, y1) = pair(s1, d1);
-    _mm256_add_epi16(_mm256_max_epi16(x0, x1), _mm256_max_epi16(y0, y1))
+    let m0 = fold(_mm256_add_epi16(s0, s1));
+    let m1 = fold(_mm256_sub_epi16(s0, s1));
+    let m2 = fold(_mm256_add_epi16(d0, d1));
+    let m3 = fold(_mm256_sub_epi16(d0, d1));
+    _mm256_add_epi16(_mm256_add_epi16(m0, m1), _mm256_add_epi16(m2, m3))
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -527,16 +836,15 @@ unsafe fn satd_avx2<const W: usize, const H: usize>(
     pitch: usize,
 ) -> u32 {
     assert!(src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
+    let hmul = hmul_avx2();
+    let one = _mm256_set1_epi32(1);
     let mut acc = _mm256_setzero_si256();
     for ty in (0..H).step_by(rows_per_tile(W)) {
         for tx in (0..W).step_by(16) {
-            let s = unsafe { load_tile::<W>(src.as_ptr(), W, ty, tx) };
-            let r = unsafe { load_tile::<W>(reference.as_ptr(), pitch, ty, tx) };
+            let s = unsafe { load_tile::<W>(src.as_ptr(), W, ty, tx, hmul) };
+            let r = unsafe { load_tile::<W>(reference.as_ptr(), pitch, ty, tx, hmul) };
             let diff = std::array::from_fn(|k| _mm256_sub_epi16(s[k], r[k]));
-            acc = _mm256_add_epi32(
-                acc,
-                _mm256_madd_epi16(tile_maxima(diff), _mm256_set1_epi16(1)),
-            );
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(tile_maxima(diff), one));
         }
     }
     horizontal_sum(acc)
@@ -551,18 +859,19 @@ unsafe fn satd_8x4_tiles(
     reference: [Option<*const u8>; 2],
     pitch: usize,
 ) -> __m256i {
+    let hmul = hmul_avx2();
     let load = |base: [Option<*const u8>; 2], stride: usize, y: usize| {
         let half = |ptr: Option<*const u8>| {
             ptr.map_or(_mm_setzero_si128(), |ptr| unsafe {
                 _mm_loadl_epi64(ptr.add(y * stride).cast())
             })
         };
-        _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(half(base[0]), half(base[1])))
+        widen_16_avx2(_mm_unpacklo_epi64(half(base[0]), half(base[1])), hmul)
     };
     let diff = std::array::from_fn(|y| {
         _mm256_sub_epi16(load(src, src_pitch, y), load(reference, pitch, y))
     });
-    _mm256_madd_epi16(tile_maxima(diff), _mm256_set1_epi16(1))
+    _mm256_madd_epi16(tile_maxima(diff), _mm256_set1_epi32(1))
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -718,19 +1027,26 @@ unsafe fn widen_8x8_avx512(base: *const u8, stride: usize) -> [core::arch::x86_6
 #[inline]
 unsafe fn widen_rows_avx512(rows: [*const u8; 8]) -> [core::arch::x86_64::__m512i; 2] {
     use core::arch::x86_64::{
-        _mm256_mask_set1_epi64, _mm256_set1_epi64x, _mm256_setr_epi8, _mm512_broadcast_i64x4,
-        _mm512_maddubs_epi16, _mm512_mask_set1_epi64, _mm512_zextsi256_si512,
+        _mm_unpacklo_epi64, _mm256_set_m128i, _mm256_setr_epi8, _mm512_broadcast_i64x4,
+        _mm512_castsi256_si512, _mm512_inserti64x4, _mm512_maddubs_epi16,
     };
-    macro_rules! row {
-        ($y:expr) => {
-            unsafe { rows[$y].cast::<i64>().read_unaligned() }
-        };
-    }
     macro_rules! gather {
         ($a:expr, $b:expr, $c:expr, $d:expr) => {{
-            let low = _mm256_mask_set1_epi64(_mm256_set1_epi64x(row!($a)), 0b0101, row!($b));
-            let wide = _mm512_mask_set1_epi64(_mm512_zextsi256_si512(low), 0b1010_0000, row!($c));
-            _mm512_mask_set1_epi64(wide, 0b0101_0000, row!($d))
+            let ba = unsafe {
+                _mm_unpacklo_epi64(
+                    _mm_loadl_epi64(rows[$b].cast()),
+                    _mm_loadl_epi64(rows[$a].cast()),
+                )
+            };
+            let dc = unsafe {
+                _mm_unpacklo_epi64(
+                    _mm_loadl_epi64(rows[$d].cast()),
+                    _mm_loadl_epi64(rows[$c].cast()),
+                )
+            };
+            let lo = _mm256_set_m128i(ba, ba);
+            let hi = _mm256_set_m128i(dc, dc);
+            _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi)
         }};
     }
     let hmul = _mm512_broadcast_i64x4(_mm256_setr_epi8(
@@ -820,6 +1136,24 @@ unsafe fn sad_until<const W: usize, const H: usize>(
     stop: impl Fn(u32) -> bool,
 ) -> u32 {
     let mut acc = _mm256_setzero_si256();
+    if W == 32 {
+        for row in 0..H {
+            let (a, b) = unsafe {
+                (
+                    _mm256_loadu_si256(src.add(row * W).cast()),
+                    _mm256_loadu_si256(reference.add(row * pitch).cast()),
+                )
+            };
+            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(a, b));
+            if row + 1 == H / 2 {
+                let total = sad_total(acc);
+                if stop(total) {
+                    return total;
+                }
+            }
+        }
+        return sad_total(acc);
+    }
     for row in (0..H).step_by(2) {
         let (a, b) = unsafe {
             let r0 = reference.add(row * pitch);
@@ -1179,33 +1513,19 @@ unsafe fn satd_avx512<const W: usize, const H: usize>(
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2")]
 unsafe fn satd_4x4_pair_avx2(src: [&[u8]; 2], reference: [&[u8]; 2], pitch: usize) -> u32 {
-    use core::arch::x86_64::{
-        _mm256_set_m128i, _mm256_set1_epi32, _mm256_srli_epi32, _mm256_unpackhi_epi64,
-        _mm256_unpacklo_epi64,
+    use core::arch::x86_64::{_mm_cvtsi32_si128, _mm_unpacklo_epi32};
+    let hmul = hmul_avx2();
+    let load = |pair: [&[u8]; 2], stride: usize, y: usize| {
+        let a = _mm_cvtsi32_si128(unsafe {
+            pair[0].as_ptr().add(y * stride).cast::<i32>().read_unaligned()
+        });
+        let b = _mm_cvtsi32_si128(unsafe {
+            pair[1].as_ptr().add(y * stride).cast::<i32>().read_unaligned()
+        });
+        widen_16_avx2(_mm_unpacklo_epi32(a, b), hmul)
     };
-    let s: [[__m128i; 2]; 2] = src.map(|p| unsafe { rows_4x4(p.as_ptr(), 4) });
-    let r: [[__m128i; 2]; 2] = reference.map(|p| unsafe { rows_4x4(p.as_ptr(), pitch) });
-    let even = _mm256_sub_epi16(
-        _mm256_set_m128i(s[1][0], s[0][0]),
-        _mm256_set_m128i(r[1][0], r[0][0]),
-    );
-    let odd = _mm256_sub_epi16(
-        _mm256_set_m128i(s[1][1], s[0][1]),
-        _mm256_set_m128i(r[1][1], r[0][1]),
-    );
-    let columns = |v: __m256i| {
-        let swapped = _mm256_unpackhi_epi64(v, v);
-        _mm256_unpacklo_epi64(_mm256_add_epi16(v, swapped), _mm256_sub_epi16(v, swapped))
-    };
-    let a = columns(_mm256_add_epi16(even, odd));
-    let b = columns(_mm256_sub_epi16(even, odd));
-    let sums = _mm256_abs_epi16(_mm256_hadd_epi16(a, b));
-    let diffs = _mm256_abs_epi16(_mm256_hsub_epi16(a, b));
-    let maxima = _mm256_add_epi16(
-        _mm256_max_epi16(sums, _mm256_srli_epi32::<16>(sums)),
-        _mm256_max_epi16(diffs, _mm256_srli_epi32::<16>(diffs)),
-    );
-    horizontal_sum(_mm256_madd_epi16(maxima, _mm256_set1_epi32(1)))
+    let diff = std::array::from_fn(|y| _mm256_sub_epi16(load(src, 4, y), load(reference, pitch, y)));
+    horizontal_sum(_mm256_madd_epi16(tile_maxima(diff), _mm256_set1_epi32(1)))
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -1359,9 +1679,10 @@ mod simd128 {
 mod neon {
     use core::arch::aarch64::{
         int16x8_t, uint16x4_t, vabd_u8, vabdq_u8, vabsq_s16, vadd_u16, vaddlv_u16, vaddlvq_u8,
-        vaddq_s16, vaddvq_u32, vcombine_s16, vdup_n_u16, vdupq_n_u16, vdupq_n_u32, vget_low_s16,
-        vld1_u8, vld1q_u8, vpadal_u8, vpadalq_u8, vpadalq_u16, vreinterpret_u16_s16,
-        vreinterpretq_s16_u16, vsubl_u8, vsubq_s16, vuzp1q_s16, vuzp2q_s16,
+        vaddq_s16, vaddvq_u32, vcombine_s16, vdup_n_u16, vdup_n_u32, vdupq_n_u16, vdupq_n_u32,
+        vget_low_s16, vld1_lane_u32, vld1_u8, vld1q_lane_u32, vld1q_u8, vmaxq_s16, vpadal_u8,
+        vpadalq_u8, vpadalq_u16, vreinterpret_u8_u32, vreinterpret_u16_s16, vreinterpretq_s16_u16,
+        vreinterpretq_u8_u32, vsubl_u8, vsubq_s16, vuzp1q_s16, vuzp2q_s16,
     };
 
     fn span(width: usize, height: usize, pitch: usize) -> usize {
@@ -1395,15 +1716,19 @@ mod neon {
         let (s, r) = (src.as_ptr(), reference.as_ptr());
         unsafe {
             if width == 4 && height == 4 {
-                let mut a = [0u8; 16];
-                let mut b = [0u8; 16];
-                for y in 0..4 {
-                    std::ptr::copy_nonoverlapping(s.add(y * sp), a.as_mut_ptr().add(y * 4), 4);
-                    std::ptr::copy_nonoverlapping(r.add(y * rp), b.as_mut_ptr().add(y * 4), 4);
-                }
+                let mut a = vdupq_n_u32(0);
+                let mut b = vdupq_n_u32(0);
+                a = vld1q_lane_u32::<0>(s.cast(), a);
+                a = vld1q_lane_u32::<1>(s.add(sp).cast(), a);
+                a = vld1q_lane_u32::<2>(s.add(2 * sp).cast(), a);
+                a = vld1q_lane_u32::<3>(s.add(3 * sp).cast(), a);
+                b = vld1q_lane_u32::<0>(r.cast(), b);
+                b = vld1q_lane_u32::<1>(r.add(rp).cast(), b);
+                b = vld1q_lane_u32::<2>(r.add(2 * rp).cast(), b);
+                b = vld1q_lane_u32::<3>(r.add(3 * rp).cast(), b);
                 return u32::from(vaddlvq_u8(vabdq_u8(
-                    vld1q_u8(a.as_ptr()),
-                    vld1q_u8(b.as_ptr()),
+                    vreinterpretq_u8_u32(a),
+                    vreinterpretq_u8_u32(b),
                 )));
             }
             if width == 8 {
@@ -1449,21 +1774,16 @@ mod neon {
     }
 
     #[inline]
-    unsafe fn horizontal_pair(v: int16x8_t) -> uint16x4_t {
+    unsafe fn horizontal_max(v: int16x8_t) -> uint16x4_t {
         unsafe {
             let even = vuzp1q_s16(v, v);
             let odd = vuzp2q_s16(v, v);
             let sums = vaddq_s16(even, odd);
             let diffs = vsubq_s16(even, odd);
-            let u = vcombine_s16(vget_low_s16(sums), vget_low_s16(diffs));
-            let e2 = vuzp1q_s16(u, u);
-            let o2 = vuzp2q_s16(u, u);
-            let p = vabsq_s16(vaddq_s16(e2, o2));
-            let m = vabsq_s16(vsubq_s16(e2, o2));
-            vadd_u16(
-                vreinterpret_u16_s16(vget_low_s16(p)),
-                vreinterpret_u16_s16(vget_low_s16(m)),
-            )
+            let au = vabsq_s16(vcombine_s16(vget_low_s16(sums), vget_low_s16(diffs)));
+            let e2 = vuzp1q_s16(au, au);
+            let o2 = vuzp2q_s16(au, au);
+            vreinterpret_u16_s16(vget_low_s16(vmaxq_s16(e2, o2)))
         }
     }
 
@@ -1480,29 +1800,32 @@ mod neon {
         unsafe {
             let mut total = 0u32;
             if width == 4 {
+                let zero = vdup_n_u32(0);
                 for ty in (0..height).step_by(4) {
-                    let mut d = [vdupq_n_u16(0); 4];
-                    for k in 0..4 {
-                        let mut a = [0u8; 8];
-                        let mut b = [0u8; 8];
-                        std::ptr::copy_nonoverlapping(s.add((ty + k) * sp), a.as_mut_ptr(), 4);
-                        std::ptr::copy_nonoverlapping(r.add((ty + k) * rp), b.as_mut_ptr(), 4);
-                        d[k] = vsubl_u8(vld1_u8(a.as_ptr()), vld1_u8(b.as_ptr()));
-                    }
-                    let d = d.map(|v| vreinterpretq_s16_u16(v));
+                    let d: [int16x8_t; 4] = std::array::from_fn(|k| {
+                        let a = vreinterpret_u8_u32(vld1_lane_u32::<0>(
+                            s.add((ty + k) * sp).cast(),
+                            zero,
+                        ));
+                        let b = vreinterpret_u8_u32(vld1_lane_u32::<0>(
+                            r.add((ty + k) * rp).cast(),
+                            zero,
+                        ));
+                        vreinterpretq_s16_u16(vsubl_u8(a, b))
+                    });
                     let (a, b) = (vaddq_s16(d[0], d[1]), vaddq_s16(d[2], d[3]));
                     let (c, e) = (vsubq_s16(d[0], d[1]), vsubq_s16(d[2], d[3]));
                     let sum0 = vadd_u16(
-                        horizontal_pair(vaddq_s16(a, b)),
-                        horizontal_pair(vsubq_s16(a, b)),
+                        horizontal_max(vaddq_s16(a, b)),
+                        horizontal_max(vsubq_s16(a, b)),
                     );
                     let sum1 = vadd_u16(
-                        horizontal_pair(vaddq_s16(c, e)),
-                        horizontal_pair(vsubq_s16(c, e)),
+                        horizontal_max(vaddq_s16(c, e)),
+                        horizontal_max(vsubq_s16(c, e)),
                     );
                     total += vaddlv_u16(vadd_u16(sum0, sum1));
                 }
-                return total / 2;
+                return total;
             }
             for ty in (0..height).step_by(4) {
                 for tx in (0..width).step_by(8) {
@@ -1512,17 +1835,17 @@ mod neon {
                     let (a, b) = (vaddq_s16(d[0], d[1]), vaddq_s16(d[2], d[3]));
                     let (c, e) = (vsubq_s16(d[0], d[1]), vsubq_s16(d[2], d[3]));
                     let sum0 = vadd_u16(
-                        horizontal_pair(vaddq_s16(a, b)),
-                        horizontal_pair(vsubq_s16(a, b)),
+                        horizontal_max(vaddq_s16(a, b)),
+                        horizontal_max(vsubq_s16(a, b)),
                     );
                     let sum1 = vadd_u16(
-                        horizontal_pair(vaddq_s16(c, e)),
-                        horizontal_pair(vsubq_s16(c, e)),
+                        horizontal_max(vaddq_s16(c, e)),
+                        horizontal_max(vsubq_s16(c, e)),
                     );
                     total += vaddlv_u16(vadd_u16(sum0, sum1));
                 }
             }
-            total / 2
+            total
         }
     }
 }
