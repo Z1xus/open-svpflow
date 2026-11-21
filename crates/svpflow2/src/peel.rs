@@ -642,6 +642,7 @@ impl State {
             match context.layer_fit(
                 i64::from(chunk),
                 chunks_last,
+                1,
                 params,
                 gpu.grid,
                 limit,
@@ -865,7 +866,8 @@ unsafe extern "system" fn get_frame(
                     let active_gpu = gpu.filter(|gpu| !gpu.context.cpu_render());
                     let mut missing = match active_gpu {
                         Some(gpu) => {
-                            let mut missing = gpu.context.layer_hold(chunk, chunks, &mut held.gpu);
+                            let mut missing =
+                                gpu.context.layer_hold(chunk, chunks, 1, &mut held.gpu);
                             // the cpu fit needs this chunk when the gpu fit fails
                             missing.push(chunk);
                             missing

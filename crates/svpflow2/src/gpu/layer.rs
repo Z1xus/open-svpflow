@@ -165,8 +165,17 @@ impl GpuContext {
         Some(model)
     }
 
-    pub fn layer_hold(&self, chunk: i32, last: i32, held: &mut LayerHeld) -> Vec<i32> {
-        let near = (chunk - 1).max(0)..=(chunk + 1).min(last);
+    pub fn layer_hold(
+        &self,
+        chunk: i32,
+        last: i32,
+        step: i32,
+        held: &mut LayerHeld,
+    ) -> Vec<i32> {
+        let step = step.max(1);
+        let near = [chunk - step, chunk, chunk + step]
+            .into_iter()
+            .filter(|&c| c >= 0 && c <= last);
         let Ok(state) = self.layer.lock() else {
             return near.collect();
         };
@@ -362,6 +371,7 @@ impl GpuContext {
         &self,
         chunk: i64,
         last: i64,
+        step: i64,
         params: &[KernelParams; 3],
         grid: (usize, usize),
         limit: f32,
@@ -373,15 +383,19 @@ impl GpuContext {
         if self.depth > 8 {
             return Ok(None);
         }
-        self.fit_chunk(chunk, last, params, grid, limit, proof, strict, held, pairs)
-            .map(Some)
-            .ok_or(Failed)
+        self.fit_chunk(
+            chunk, last, step, params, grid, limit, proof, strict, held, pairs,
+        )
+        .map(Some)
+        .ok_or(Failed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fit_chunk(
         &self,
         chunk: i64,
         last: i64,
+        step: i64,
         params: &[KernelParams; 3],
         grid: (usize, usize),
         limit: f32,
@@ -416,9 +430,11 @@ impl GpuContext {
             return Some(fit);
         }
         unsafe { self.layer_setup(&mut state) }?;
+        let step = step.max(1);
+        let keys = [chunk - step, chunk, chunk + step];
         let mut parts = [None, None, None];
         let mut kept_pairs = Vec::new();
-        for (slot, key) in parts.iter_mut().zip([chunk - 1, chunk, chunk + 1]) {
+        for (slot, key) in parts.iter_mut().zip(keys) {
             if key < 0 || key > last {
                 continue;
             }
@@ -434,9 +450,10 @@ impl GpuContext {
             let pairs = pairs(key)?;
             let reused = (state.stats.len() >= stats_cap)
                 .then(|| {
-                    state.stats.iter().position(|(k, sums, _)| {
-                        !(chunk - 1..=chunk + 1).contains(k) && Arc::strong_count(sums) == 1
-                    })
+                    state
+                        .stats
+                        .iter()
+                        .position(|(k, sums, _)| !keys.contains(k) && Arc::strong_count(sums) == 1)
                 })
                 .flatten()
                 .map(|index| state.stats.remove(index).1);

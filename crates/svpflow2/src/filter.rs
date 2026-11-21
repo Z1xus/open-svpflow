@@ -434,7 +434,7 @@ unsafe fn collect_state(
         quality_cache: std::sync::Mutex::new(Vec::new()),
         quality_cells: std::sync::Mutex::new(Vec::new()),
         motion_cache: std::sync::Mutex::new(Vec::new()),
-        repeat_cache: std::sync::Mutex::new(Vec::new()),
+        repeat_cache: std::sync::Mutex::new(Box::new([(i32::MIN, false); 512])),
         still_cache: std::sync::Mutex::default(),
         layers: std::sync::Mutex::default(),
         image: None,

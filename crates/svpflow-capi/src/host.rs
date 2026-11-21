@@ -324,8 +324,9 @@ struct Cache {
 
 impl Cache {
     fn limit(&self) -> usize {
-        // scale cache with frame size so 1080p stays lean while 4k peel fits its 3-chunk window
-        self.frame_max.saturating_mul(80).clamp(256 << 20, budget())
+        self.frame_max
+            .saturating_mul(160)
+            .clamp(256 << 20, budget())
     }
 }
 
@@ -560,7 +561,7 @@ pub fn busy() -> bool {
         .filter(|entry| Arc::strong_count(&entry.cell) > 1)
         .map(|entry| entry.bytes)
         .sum();
-    used > budget() / 2
+    used > cache.limit() * 3 / 4
 }
 
 pub struct Host {
@@ -642,10 +643,10 @@ impl Node {
 
     pub fn window(&self) -> i32 {
         let workers = threads();
-        let max_ahead = (workers * 4).clamp(READ_AHEAD as usize, 128);
+        let max_ahead = (workers * 3).clamp(24, (READ_AHEAD as usize * 3) / 4);
         let frames = budget() / 4 / self.bytes().max(1);
-        let frames = frames.min(8 * workers).clamp(4, max_ahead);
-        i32::try_from(frames).unwrap_or(READ_AHEAD)
+        let frames = frames.min(6 * workers).clamp(4, max_ahead);
+        i32::try_from(frames).unwrap_or(24)
     }
 
     fn bytes(&self) -> usize {
@@ -729,7 +730,7 @@ impl Node {
         if let Some(index) = state.ahead.iter().position(|(frame, _)| *frame == n) {
             return Ok(state.ahead.swap_remove(index).1);
         }
-        let reach = self.window() + 16;
+        let reach = (self.window() * 5).clamp(128, 256);
         let first = if n < state.next || n - state.next > reach {
             n
         } else {

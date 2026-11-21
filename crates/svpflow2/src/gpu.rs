@@ -3162,55 +3162,37 @@ inline float fuse_slot(
     float ref_f0 = 0.0f;
     float ref_b0 = 0.0f;
 # endif
-# if ALGO != 1 && ALGO != 2
-    int zero_mv = sf.x == 0.0f && sf.y == 0.0f && sb.x == 0.0f && sb.y == 0.0f;
-    if (zero_mv) {
-        float rf = linear_source_sample_f(source_f, &p, vector.x, vector.w, 0.0f);
-        float rb = linear_source_sample_f(source_b, &p, vector.z, vector.y, 0.0f);
-# if ALGO == 13
-        if (rf == rb && ref_f0 == rf && ref_b0 == rb) {
-# else
-        if (rf == rb) {
-# endif
-            float value = blend_round(rf, &p, 0, x, y);
-            float wsum = 0.0f;
-            for (int step = 0; step < steps.count; step++) wsum += steps.weight[step];
-            return total + wsum * value;
-        }
-    }
-# endif
     int is_chroma = p.x_ratio > 1 || p.y_ratio > 1;
     float travel = fmax(fmax(fabs(sf.x), fabs(sf.y)), fmax(fabs(sb.x), fabs(sb.y)));
     int want = fast_blend_want(travel, is_chroma);
-    if (steps.count == 2 && want > 2 && fabs((float)(steps.phase[1] - steps.phase[0])) > 1.0f) {
-        int half_n = want >> 1;
-        float inv_h = 1.0f / (float)half_n;
-        float p0 = (float)steps.phase[0];
-        float p1 = (float)steps.phase[1];
-        float dp = fabs(p1 - p0) * 0.5f;
-        float lo0 = clamp(p0 - dp, 0.0f, 256.0f), hi0 = clamp(p0 + dp, 0.0f, 256.0f);
-        float lo1 = clamp(p1 - dp, 0.0f, 256.0f), hi1 = clamp(p1 + dp, 0.0f, 256.0f);
-        float w0 = steps.weight[0] * inv_h;
-        float w1 = steps.weight[1] * inv_h;
-        for (int b = 0; b < half_n; b++) {
-            float u = ((float)b + 0.5f) * inv_h;
-            float r0 = fast_blend_tap(source_f, source_b, &p, vector, mask, ref_f0, ref_b0, mix(lo0, hi0, u), is_chroma);
-            total += w0 * blend_round(r0, &p, 0, x, y);
-            float r1 = fast_blend_tap(source_f, source_b, &p, vector, mask, ref_f0, ref_b0, mix(lo1, hi1, u), is_chroma);
-            total += w1 * blend_round(r1, &p, 0, x, y);
-        }
-        return total;
-    }
-    int buckets = min(want, steps.count);
+    int fb_sub = steps.count == 2 && want > 2
+        && fabs((float)(steps.phase[1] - steps.phase[0])) > 1.0f;
+    int buckets = fb_sub ? want : min(want, steps.count);
     for (int b = 0; b < buckets; b++) {
-        int s0 = (b * steps.count) / buckets;
-        int s1 = ((b + 1) * steps.count) / buckets;
-        float wsum = 0.0f, psum = 0.0f;
-        for (int s = s0; s < s1; s++) {
-            wsum += steps.weight[s];
-            psum += steps.weight[s] * (float)steps.phase[s];
+        float wsum;
+        float pf;
+        if (fb_sub) {
+            int half_n = buckets >> 1;
+            int side = b >= half_n;
+            int sub = side ? (b - half_n) : b;
+            float u = ((float)sub + 0.5f) / (float)half_n;
+            float p0 = (float)steps.phase[0];
+            float p1 = (float)steps.phase[1];
+            float dp = fabs(p1 - p0) * 0.5f;
+            float pc = side ? p1 : p0;
+            pf = mix(clamp(pc - dp, 0.0f, 256.0f), clamp(pc + dp, 0.0f, 256.0f), u);
+            wsum = steps.weight[side] / (float)half_n;
+        } else {
+            int s0 = (b * steps.count) / buckets;
+            int s1 = ((b + 1) * steps.count) / buckets;
+            wsum = 0.0f;
+            float psum = 0.0f;
+            for (int s = s0; s < s1; s++) {
+                wsum += steps.weight[s];
+                psum += steps.weight[s] * (float)steps.phase[s];
+            }
+            pf = wsum > 0.0f ? (psum / wsum) : (float)steps.phase[s0];
         }
-        float pf = wsum > 0.0f ? (psum / wsum) : (float)steps.phase[s0];
         float result = fast_blend_tap(source_f, source_b, &p, vector, mask, ref_f0, ref_b0, pf, is_chroma);
         total += wsum * blend_round(result, &p, 0, x, y);
     }
@@ -3235,32 +3217,34 @@ inline float fuse_slot(
     float ref_f0 = 0.0f;
 #endif
 #if ALGO != 1 && ALGO != 2
-    int zero_mv = sf.x == 0.0f && sf.y == 0.0f && sb.x == 0.0f && sb.y == 0.0f;
+    if (steps.count > 2 && sf.x == 0.0f && sf.y == 0.0f && sb.x == 0.0f && sb.y == 0.0f) {
+        int zero_mv = 1;
 #if ADAPTIVE && ALGO == 23 && !FAST_OCC
-    float2 ef = full_step(&p, ext.x, ext.w);
-    float2 eb = full_step(&p, ext.z, ext.y);
-    zero_mv = zero_mv && ef.x == 0.0f && ef.y == 0.0f && eb.x == 0.0f && eb.y == 0.0f;
+        float2 ef = full_step(&p, ext.x, ext.w);
+        float2 eb = full_step(&p, ext.z, ext.y);
+        zero_mv = ef.x == 0.0f && ef.y == 0.0f && eb.x == 0.0f && eb.y == 0.0f;
 #endif
-    if (zero_mv) {
-        float rf = source_sample(source_f, &p, vector.x, vector.w, 0);
-        float rb = source_sample(source_b, &p, vector.z, vector.y, 0);
+        if (zero_mv) {
+            float rf = source_sample(source_f, &p, vector.x, vector.w, 0);
+            float rb = source_sample(source_b, &p, vector.z, vector.y, 0);
 #if ADAPTIVE && ALGO == 23 && !FAST_OCC
-        float rff = linear_source_sample(source_f, &p, ext.x, ext.w, 0);
-        float rbb = linear_source_sample(source_b, &p, ext.z, ext.y, 0);
-        int same = rf == rb && rff == rf && rbb == rb;
+            float rff = linear_source_sample(source_f, &p, ext.x, ext.w, 0);
+            float rbb = linear_source_sample(source_b, &p, ext.z, ext.y, 0);
+            int same = rf == rb && rff == rf && rbb == rb;
 #elif ALGO == 13 || ALGO == 22
-        int same = rf == rb && ref_f0 == rf && ref_b0 == rb;
+            int same = rf == rb && ref_f0 == rf && ref_b0 == rb;
 #else
-        int same = rf == rb;
+            int same = rf == rb;
 #endif
-        if (same) {
-            float value = blend_round(rf, &p, 0, x, y);
-            for (int step = 0; step < steps.count; step++) {
+            if (same) {
+                float value = blend_round(rf, &p, 0, x, y);
+                for (int step = 0; step < steps.count; step++) {
 #pragma OPENCL FP_CONTRACT OFF
-                float term = steps.weight[step] * value;
-                total = term + total;
+                    float term = steps.weight[step] * value;
+                    total = term + total;
+                }
+                return total;
             }
-            return total;
         }
     }
 #endif
@@ -3414,25 +3398,40 @@ kernel void blend_frame(
 #endif
 #if STILL
     int is_kept = kept;
-    if (is_kept && !can_layer && kept_f == kept_b) {
-        float value = blend_round(kept_f, &p, 0, x, y);
+    if (is_kept && !can_layer) {
+        if (kept_f == kept_b) {
+            float value = blend_round(kept_f, &p, 0, x, y);
 #if HOLD
-        if (weight < 1.0f) value = round(mix(held, value, weight));
+            if (weight < 1.0f) value = round(mix(held, value, weight));
 #endif
-        if (steps.gamma != 1.0f) value = curve[(int)value];
-        for (int step = 0; step < steps.count; step++) {
+            if (steps.gamma != 1.0f) value = curve[(int)value];
+            for (int step = 0; step < steps.count; step++) {
 #pragma OPENCL FP_CONTRACT OFF
-            float term = steps.weight[step] * value;
-            total = term + total;
+                float term = steps.weight[step] * value;
+                total = term + total;
+            }
+            *sum = total;
+            return;
+        }
+#if FAST_BLEND
+        for (int step = 0; step < steps.count; step++) {
+            float time = native_divide((float)steps.phase[step], 256.0f);
+            float value = blend_round(mix(kept_f, kept_b, time), &p, 0, x, y);
+#if HOLD
+            if (weight < 1.0f) value = round(mix(held, value, weight));
+#endif
+            if (steps.gamma != 1.0f) value = curve[(int)value];
+            total += steps.weight[step] * value;
         }
         *sum = total;
         return;
+#endif
     }
 #else
     int is_kept = 0;
 #endif
 
-#if !LAYER
+#if !LAYER && !FAST_BLEND
     if (!is_kept) {
         int zero_mv = zsf.x == 0.0f && zsf.y == 0.0f && zsb.x == 0.0f && zsb.y == 0.0f;
 #if ALGO == 23 && !FAST_BLEND
@@ -3525,91 +3524,94 @@ kernel void blend_frame(
             l_base_b = clamp(native_divide(l_own_b - loff, l_model.x), 0.0f, 255.0f);
         }
 #if FAST_BLEND
-        if (!is_kept) {
-            int fb_chroma = p.x_ratio > 1 || p.y_ratio > 1;
-            float fb_travel = fmax(fmax(fabs(zsf.x), fabs(zsf.y)), fmax(fabs(zsb.x), fabs(zsb.y)));
-            int fb_want = fast_blend_want(fb_travel, fb_chroma);
-            int fb_sub = steps.count == 2 && fb_want > 2
-                && fabs((float)(steps.phase[1] - steps.phase[0])) > 1.0f;
-            int fb_buckets = fb_sub ? fb_want : min(fb_want, steps.count);
-            float4 fb_mask = (float4)(0.0f);
+        int fb_chroma = p.x_ratio > 1 || p.y_ratio > 1;
+        float fb_travel = fmax(fmax(fabs(zsf.x), fabs(zsf.y)), fmax(fabs(zsb.x), fabs(zsb.y)));
+        int fb_want = fast_blend_want(fb_travel, fb_chroma);
+        int fb_sub = steps.count == 2 && fb_want > 2
+            && fabs((float)(steps.phase[1] - steps.phase[0])) > 1.0f;
+        int fb_buckets = fb_sub ? fb_want : min(fb_want, steps.count);
+        float4 fb_mask = (float4)(0.0f);
 #if ALGO >= 21
-            float2 fb_dv = zsf + zsb;
-            float fb_occ = clamp(native_sqrt(fb_dv.x * fb_dv.x + fb_dv.y * fb_dv.y) * 0.25f, 0.0f, 1.0f);
-            fb_mask = (float4)(0.0f, fb_occ, fb_occ, 0.0f);
+        float2 fb_dv = zsf + zsb;
+        float fb_occ = clamp(native_sqrt(fb_dv.x * fb_dv.x + fb_dv.y * fb_dv.y) * 0.25f, 0.0f, 1.0f);
+        fb_mask = (float4)(0.0f, fb_occ, fb_occ, 0.0f);
 #endif
-            for (int b = 0; b < fb_buckets; b++) {
-                float wsum;
-                float pf;
-                int sad_idx;
-                if (fb_sub) {
-                    int half_n = fb_buckets >> 1;
-                    int side = b >= half_n;
-                    int sub = side ? (b - half_n) : b;
-                    float u = ((float)sub + 0.5f) / (float)half_n;
-                    float p0 = (float)steps.phase[0];
-                    float p1 = (float)steps.phase[1];
-                    float dp = fabs(p1 - p0) * 0.5f;
-                    float pc = side ? p1 : p0;
-                    pf = mix(clamp(pc - dp, 0.0f, 256.0f), clamp(pc + dp, 0.0f, 256.0f), u);
-                    wsum = steps.weight[side] / (float)half_n;
-                    sad_idx = side;
-                } else {
-                    int s0 = (b * steps.count) / fb_buckets;
-                    int s1 = ((b + 1) * steps.count) / fb_buckets;
-                    sad_idx = (s0 + s1 - 1) >> 1;
-                    wsum = 0.0f;
-                    float psum = 0.0f;
-                    for (int s = s0; s < s1; s++) {
-                        wsum += steps.weight[s];
-                        psum += steps.weight[s] * (float)steps.phase[s];
-                    }
-                    pf = wsum > 0.0f ? (psum / wsum) : (float)steps.phase[s0];
+        for (int b = 0; b < fb_buckets; b++) {
+            float wsum;
+            float pf;
+            int sad_idx;
+            if (fb_sub) {
+                int half_n = fb_buckets >> 1;
+                int side = b >= half_n;
+                int sub = side ? (b - half_n) : b;
+                float u = ((float)sub + 0.5f) / (float)half_n;
+                float p0 = (float)steps.phase[0];
+                float p1 = (float)steps.phase[1];
+                float dp = fabs(p1 - p0) * 0.5f;
+                float pc = side ? p1 : p0;
+                pf = mix(clamp(pc - dp, 0.0f, 256.0f), clamp(pc + dp, 0.0f, 256.0f), u);
+                wsum = steps.weight[side] / (float)half_n;
+                sad_idx = side;
+            } else {
+                int s0 = (b * steps.count) / fb_buckets;
+                int s1 = ((b + 1) * steps.count) / fb_buckets;
+                sad_idx = (s0 + s1 - 1) >> 1;
+                wsum = 0.0f;
+                float psum = 0.0f;
+                for (int s = s0; s < s1; s++) {
+                    wsum += steps.weight[s];
+                    psum += steps.weight[s] * (float)steps.phase[s];
                 }
-                float result;
-                int layered = 0;
-                float time = pf * 0.00390625f;
-                if (gap <= layer_reach(&p, step_f*time, step_b*(1.0f-time))) {
-                    layered = 1;
-                    if (l_opaque) {
-                        result = mix(l_own_f, l_own_b, time);
-                    } else {
-                        float2 at_f = clamp(at + step_f*time, (float2)(0.0f, 0.0f), top);
-                        float2 at_b = clamp(at + step_b*(1.0f-time), (float2)(0.0f, 0.0f), top);
-                        float2 moved_f = layer_scene(raw_f, layer, &p, at_f, 1);
-                        float2 moved_b = layer_scene(raw_b, layer, &p, at_b, 1);
-                        layer_agree(raw_f, raw_b, layer, &p, at_f, at_b, &moved_f, &moved_b);
-                        float base = mix(l_base_f, l_base_b, time);
-                        float scene;
-# if ALGO == 1
-                        scene = moved_b.y > 0.5f ? moved_b.x : (moved_f.y > 0.5f ? moved_f.x : base);
-# elif ALGO == 2
-                        scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
-# else
-                        if (moved_f.y > 0.5f && moved_b.y > 0.5f) scene = median3(moved_f.x, moved_b.x, base);
-                        else scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
-# endif
-                        result = l_model.x*scene + layer_offset(&p, l_model);
-                    }
-                } else {
-                    result = fast_blend_tap(source_f, source_b, &p, vector, fb_mask, ref_f0, ref_b0, pf, fb_chroma);
-#if HAS_SAD
-                    float4 m = layer_sample(masks, field_position, sad_idx);
-                    result = mix(result, mix(ref_f0, ref_b0, steps.sad_blend[sad_idx]), fmax(m.w, m.x));
-#endif
-                }
-                float value = blend_round(result, &p, layered, x, y);
-#if HOLD
-                if (weight < 1.0f) value = round(mix(held, value, weight));
-#endif
-                if (steps.gamma != 1.0f) value = curve[(int)value];
-                total += wsum * value;
+                pf = wsum > 0.0f ? (psum / wsum) : (float)steps.phase[s0];
             }
-            *sum = total;
-            return;
-        }
+            float result;
+            int layered = 0;
+            float time = pf * 0.00390625f;
+            if (gap <= layer_reach(&p, step_f*time, step_b*(1.0f-time))) {
+                layered = 1;
+                if (l_opaque) {
+                    result = mix(l_own_f, l_own_b, time);
+                } else {
+                    float2 at_f = clamp(at + step_f*time, (float2)(0.0f, 0.0f), top);
+                    float2 at_b = clamp(at + step_b*(1.0f-time), (float2)(0.0f, 0.0f), top);
+                    float2 moved_f = layer_scene(raw_f, layer, &p, at_f, 1);
+                    float2 moved_b = layer_scene(raw_b, layer, &p, at_b, 1);
+                    layer_agree(raw_f, raw_b, layer, &p, at_f, at_b, &moved_f, &moved_b);
+                    float base = mix(l_base_f, l_base_b, time);
+                    float scene;
+# if ALGO == 1
+                    scene = moved_b.y > 0.5f ? moved_b.x : (moved_f.y > 0.5f ? moved_f.x : base);
+# elif ALGO == 2
+                    scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
+# else
+                    if (moved_f.y > 0.5f && moved_b.y > 0.5f) scene = median3(moved_f.x, moved_b.x, base);
+                    else scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
+# endif
+                    result = l_model.x*scene + layer_offset(&p, l_model);
+                }
+            } else
+#if STILL
+            if (kept) {
+                result = mix(kept_f, kept_b, time);
+            } else
 #endif
-#if !(FAST_BLEND && !STILL)
+            {
+                result = fast_blend_tap(source_f, source_b, &p, vector, fb_mask, ref_f0, ref_b0, pf, fb_chroma);
+#if HAS_SAD
+                float4 m = layer_sample(masks, field_position, sad_idx);
+                result = mix(result, mix(ref_f0, ref_b0, steps.sad_blend[sad_idx]), fmax(m.w, m.x));
+#endif
+            }
+            float value = blend_round(result, &p, layered, x, y);
+#if HOLD
+            if (weight < 1.0f) value = round(mix(held, value, weight));
+#endif
+            if (steps.gamma != 1.0f) value = curve[(int)value];
+            total += wsum * value;
+        }
+        *sum = total;
+        return;
+#else
 #if ALGO == 23
         ext = field_sample(vectors_ext, field_position, CUBIC);
 #endif
@@ -3674,7 +3676,6 @@ kernel void blend_frame(
 #endif
 
 #if FAST_BLEND
-    if (!is_kept) {
     int fb_chroma = p.x_ratio > 1 || p.y_ratio > 1;
     float fb_travel = fmax(fmax(fabs(zsf.x), fabs(zsf.y)), fmax(fabs(zsb.x), fabs(zsb.y)));
     int fb_want = fast_blend_want(fb_travel, fb_chroma);
@@ -3729,15 +3730,12 @@ kernel void blend_frame(
     }
     *sum = total;
     return;
-    }
-#endif
-
-#if !(FAST_BLEND && !STILL)
+#else
 #if ALGO == 23
     ext = field_sample(vectors_ext, field_position, CUBIC);
 #endif
 
-#if ADAPTIVE && !FAST_BLEND
+#if ADAPTIVE
     if (!is_kept) {
     float atravel = fmax(fmax(fabs(zsf.x), fabs(zsf.y)), fmax(fabs(zsb.x), fabs(zsb.y)));
     int awant = atravel < 0.25f ? 1 : (atravel < 1.5f ? 2 : (atravel < 4.0f ? 4 : (atravel < 8.0f ? 8 : steps.count)));
@@ -3859,6 +3857,80 @@ kernel void blend_source(
     float term = weight * value;
     global float *sum = sums + position.y*stride + position.x;
     *sum = term + (overwrite ? 0.0f : *sum);
+}
+
+kernel void blend_sources4(
+    global float *sums, int stride,
+    read_only image2d_t s0, read_only image2d_t s1, read_only image2d_t s2, read_only image2d_t s3,
+    float4 w, int count, float gamma, int luma)
+{
+#pragma OPENCL FP_CONTRACT OFF
+    int overwrite = stride < 0;
+    stride = abs(stride);
+    int2 position = (int2)(get_global_id(0), get_global_id(1));
+    int curved = gamma != 1.0f && position.y < luma;
+    global float *sum = sums + position.y * stride + position.x;
+    float total = overwrite ? 0.0f : *sum;
+    float v0 = round(255.0f * read_imagef(s0, nearest_sampler, position).x);
+    if (curved) v0 = powr(v0 / 255.0f, gamma);
+    total = (w.x * v0) + total;
+    if (count > 1) {
+        float v1 = round(255.0f * read_imagef(s1, nearest_sampler, position).x);
+        if (curved) v1 = powr(v1 / 255.0f, gamma);
+        total = (w.y * v1) + total;
+    }
+    if (count > 2) {
+        float v2 = round(255.0f * read_imagef(s2, nearest_sampler, position).x);
+        if (curved) v2 = powr(v2 / 255.0f, gamma);
+        total = (w.z * v2) + total;
+    }
+    if (count > 3) {
+        float v3 = round(255.0f * read_imagef(s3, nearest_sampler, position).x);
+        if (curved) v3 = powr(v3 / 255.0f, gamma);
+        total = (w.w * v3) + total;
+    }
+    *sum = total;
+}
+
+kernel void blend_sources_resolve5(
+    global uchar *destination, int width,
+    read_only image2d_t s0, read_only image2d_t s1, read_only image2d_t s2,
+    read_only image2d_t s3, read_only image2d_t s4,
+    float4 w0, float w4, int count, float divisor, float gamma, int luma)
+{
+    int x = get_global_id(0), y = get_global_id(1);
+    int2 position = (int2)(x, y);
+    int curved = gamma != 1.0f && y < luma;
+    float total = 0.0f;
+    {
+#pragma OPENCL FP_CONTRACT OFF
+        float v0 = round(255.0f * read_imagef(s0, nearest_sampler, position).x);
+        if (curved) v0 = powr(v0 / 255.0f, gamma);
+        total = (w0.x * v0) + total;
+        if (count > 1) {
+            float v1 = round(255.0f * read_imagef(s1, nearest_sampler, position).x);
+            if (curved) v1 = powr(v1 / 255.0f, gamma);
+            total = (w0.y * v1) + total;
+        }
+        if (count > 2) {
+            float v2 = round(255.0f * read_imagef(s2, nearest_sampler, position).x);
+            if (curved) v2 = powr(v2 / 255.0f, gamma);
+            total = (w0.z * v2) + total;
+        }
+        if (count > 3) {
+            float v3 = round(255.0f * read_imagef(s3, nearest_sampler, position).x);
+            if (curved) v3 = powr(v3 / 255.0f, gamma);
+            total = (w0.w * v3) + total;
+        }
+        if (count > 4) {
+            float v4 = round(255.0f * read_imagef(s4, nearest_sampler, position).x);
+            if (curved) v4 = powr(v4 / 255.0f, gamma);
+            total = (w4 * v4) + total;
+        }
+    }
+    float value = total / divisor;
+    if (curved) value = 255.0f * powr(fmax(value, 0.0f), 1.0f / gamma);
+    destination[y * width + x] = (uchar)clamp(rint(value), 0.0f, 255.0f);
 }
 
 kernel void blend_resolve_source(
