@@ -11,14 +11,28 @@ pub(crate) struct SuperOpts {
     pub(crate) full: bool,
     pub(crate) rc: bool,
     pub(crate) lean: bool,
+    fast_flags: u8,
     pub(crate) levels: i32,
     pub(crate) width: i32,
     pub(crate) height: i32,
 }
 
 impl SuperOpts {
+    pub(crate) const fn fast(self) -> u8 {
+        self.fast_flags & 0x03
+    }
+
+    pub(crate) const fn fast_box(self) -> bool {
+        self.fast_flags & 0x04 != 0
+    }
+
     pub(crate) fn from_opt(opt: Option<&Value>, width: i32, height: i32) -> Result<Self, String> {
-        let pel = opt.and_then(|v| v.int_at(&["pel"])).unwrap_or(2) as i32;
+        let fast = opt
+            .and_then(|v| v.int_at(&["fast"]))
+            .unwrap_or(0)
+            .clamp(0, 3) as u8;
+        let explicit_pel = opt.and_then(|v| v.int_at(&["pel"]));
+        let pel = explicit_pel.unwrap_or(if fast >= 2 { 1 } else { 2 }) as i32;
         if !matches!(pel, 1 | 2 | 4) {
             return Err("SVSuper: pel has to be 1 or 2 or 4".into());
         }
@@ -26,10 +40,12 @@ impl SuperOpts {
         if !(0..=2).contains(&gpu) {
             return Err("SVSuper: gpu has to be 0 or 1 or 2".into());
         }
-        let scale_down = opt
-            .and_then(|v| v.int_at(&["scale", "down"]))
+        let explicit_scale_down = opt.and_then(|v| v.int_at(&["scale", "down"]));
+        let fast_box = fast >= 1 && explicit_scale_down.is_none();
+        let scale_down = explicit_scale_down
             .unwrap_or(i64::from(DEFAULT_SCALE_DOWN)) as i32;
-        let mut scale_up = opt.and_then(|v| v.int_at(&["scale", "up"])).unwrap_or(2) as i32;
+        let explicit_scale_up = opt.and_then(|v| v.int_at(&["scale", "up"]));
+        let mut scale_up = explicit_scale_up.unwrap_or(if fast >= 1 { 0 } else { 2 }) as i32;
 
         if gpu != 0 {
             scale_up = 0;
@@ -55,6 +71,7 @@ impl SuperOpts {
             full,
             rc,
             lean,
+            fast_flags: fast | (u8::from(fast_box) << 2),
             levels,
             width,
             height,
@@ -70,6 +87,7 @@ impl SuperOpts {
             full: true,
             rc: false,
             lean: false,
+            fast_flags: 0,
             levels: params.levels,
             width: params.width,
             height: params.height,
