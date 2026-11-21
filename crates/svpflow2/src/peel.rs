@@ -1,5 +1,5 @@
 use std::ffi::CStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use svpflow_core::layer::{self, Fit, Stats};
 use svpflow_core::smooth::{FieldShape, VectorField};
@@ -10,7 +10,11 @@ use crate::gpu::{GpuContext, KernelParams, LayerPair, UploadPlane};
 use crate::{filter, frame, metadata, video_format, vs};
 
 const STATS_CAP: usize = 4;
-const FIT_CAP: usize = 6;
+const FIT_CAP: usize = 4;
+
+struct KeptFrame(vs::ConstRaw);
+
+unsafe impl Send for KeptFrame {}
 
 type Kept<T> = Vec<(i32, Arc<T>)>;
 type Vectors<'a> = (&'a [u16], &'a [u16]);
@@ -28,16 +32,24 @@ fn keep<T>(kept: &mut Kept<T>, key: i32, value: &Arc<T>, cap: usize) {
     kept.push((key, Arc::clone(value)));
 }
 
-fn half(bits: u16) -> f32 {
-    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
-    let exponent = i32::from((bits >> 10) & 0x1f);
-    let fraction = f32::from(bits & 0x3ff) / 1024.0;
-    sign * match exponent {
-        0 => fraction * 2f32.powi(-14),
-        31 if fraction > 0.0 => f32::NAN,
-        31 => f32::INFINITY,
-        _ => (1.0 + fraction) * 2f32.powi(exponent - 15),
-    }
+fn half_table() -> &'static [f32] {
+    static TABLE: OnceLock<Box<[f32]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = vec![0.0f32; 65536].into_boxed_slice();
+        for bits in 0u16..=u16::MAX {
+            let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+            let exponent = i32::from((bits >> 10) & 0x1f);
+            let fraction = f32::from(bits & 0x3ff) / 1024.0;
+            table[usize::from(bits)] = sign
+                * match exponent {
+                    0 => fraction * 2f32.powi(-14),
+                    31 if fraction > 0.0 => f32::NAN,
+                    31 => f32::INFINITY,
+                    _ => (1.0 + fraction) * 2f32.powi(exponent - 15),
+                };
+        }
+        table
+    })
 }
 
 unsafe fn uploads(
@@ -133,6 +145,7 @@ pub(crate) struct Chunks<'a> {
     pub(crate) size: (usize, usize),
     pub(crate) last: i32,
     pub(crate) ratio: usize,
+    pub(crate) asked: &'a [i32],
 }
 
 impl Chunks<'_> {
@@ -140,14 +153,21 @@ impl Chunks<'_> {
         &self,
         context: &GpuContext,
         chunk: i64,
+        keep: bool,
         motions: &(dyn Fn(i32, &[u8]) -> Option<engine::MotionSet> + Sync),
     ) -> Option<Vec<LayerPair>> {
-        let (sources, vectors) = frames(i32::try_from(chunk).ok()?, self.last);
+        let chunk = i32::try_from(chunk)
+            .ok()
+            .filter(|key| self.asked.contains(key))?;
+        let (sources, vectors) = frames(chunk, self.last);
         let (start, first) = (*sources.start(), *vectors.start());
         let sources: Vec<_> = sources.map(|k| (self.get)(self.source, k)).collect();
         let vectors: Vec<_> = vectors.map(|k| (self.get)(self.vectors, k)).collect();
-        // a fit reads this chunk and the two beside it
-        context.keep_frames(3 * sources.len());
+        // keep 2 chunks when linear f32 textures are allocated, 3 when packed-only (4k)
+        if keep {
+            let chunks = if context.is_linear() { 2 } else { 3 };
+            context.keep_frames(chunks * sources.len());
+        }
         let made = (|| {
             let planes: Vec<_> = sources
                 .iter()
@@ -197,6 +217,9 @@ impl Chunks<'_> {
     }
 
     fn stats(&self, chunk: i32) -> Option<Stats> {
+        if !self.asked.contains(&chunk) {
+            return None;
+        }
         let (sources, vectors) = frames(chunk, self.last);
         let sources: Vec<_> = sources.map(|k| (self.get)(self.source, k)).collect();
         let vectors: Vec<_> = vectors.map(|k| (self.get)(self.vectors, k)).collect();
@@ -256,10 +279,6 @@ impl Layers {
         find(&self.fits, chunk)
     }
 
-    fn store(&mut self, chunk: i32, fit: &Arc<Fit>) {
-        keep(&mut self.fits, chunk, fit, FIT_CAP);
-    }
-
     pub(crate) fn hold(&self, chunk: i32, last: i32, held: &mut Held) -> Vec<i32> {
         if let Some(fit) = find(&self.fits, chunk) {
             pin(&mut held.fits, chunk, fit);
@@ -288,13 +307,16 @@ impl Layers {
         if let Some(fit) = find(&held.fits, chunk).or_else(|| find(&self.fits, chunk)) {
             return Some(fit);
         }
+        let mut whole = true;
         let parts = [chunk - 1, chunk, chunk + 1].map(|key| {
             if key < 0 || key > chunks.last / layer::CHUNK {
                 return None;
             }
             let stats = find(&held.stats, key)
                 .or_else(|| find(&self.stats, key))
-                .or_else(|| chunks.stats(key).map(Arc::new))?;
+                .or_else(|| chunks.stats(key).map(Arc::new));
+            whole &= stats.is_some();
+            let stats = stats?;
             keep(&mut self.stats, key, &stats, STATS_CAP);
             Some(stats)
         });
@@ -307,7 +329,9 @@ impl Layers {
             strict,
             chunks.ratio,
         )?);
-        keep(&mut self.fits, chunk, &fit, FIT_CAP);
+        if whole {
+            keep(&mut self.fits, chunk, &fit, FIT_CAP);
+        }
         Some(fit)
     }
 }
@@ -322,6 +346,7 @@ struct Gpu {
 pub(crate) struct Holds {
     cpu: Held,
     gpu: crate::gpu::LayerHeld,
+    asked: Vec<i32>,
 }
 
 enum Kind {
@@ -331,6 +356,7 @@ enum Kind {
         proof: f32,
         last: i32,
         layers: Mutex<Layers>,
+        frames: Mutex<Vec<(i32, KeptFrame)>>,
         gpu: Option<Box<Gpu>>,
     },
     Peel,
@@ -457,6 +483,7 @@ pub(crate) unsafe extern "system" fn create_layer(
                 proof: layer::proof((info.fps_num, info.fps_den)),
                 last: info.num_frames - 2,
                 layers: Mutex::default(),
+                frames: Mutex::default(),
                 gpu,
             },
             clips: [nodes[0], nodes[1], std::ptr::null_mut()],
@@ -588,16 +615,14 @@ impl State {
         limit: f32,
         proof: f32,
         held: &crate::gpu::LayerHeld,
-        layers: &Mutex<Layers>,
-    ) -> Option<Arc<Fit>> {
-        let mut layers = layers.lock().ok()?;
-        if let Some(fit) = layers.ready(chunk) {
-            return Some(fit);
-        }
+    ) -> Option<Fit> {
         let context = &gpu.context;
         let data = chunks.data;
-        let mut pairs =
-            |key: i64| chunks.uploaded(context, key, &|_, payload| Some(decoded(payload, data)));
+        let mut pairs = |key: i64| {
+            chunks.uploaded(context, key, false, &|_, payload| {
+                Some(decoded(payload, data))
+            })
+        };
         let (made, model) = loop {
             let mark = context.mark();
             let chunks_last = i64::from(chunks.last / layer::CHUNK);
@@ -625,13 +650,55 @@ impl State {
                 _ => return None,
             }
         };
+        let table = half_table();
         let model = |at: usize| {
             let m = &model[at * 4..at * 4 + 4];
-            (half(m[0]), half(m[1]), [half(m[2]), half(m[3])])
+            (
+                table[usize::from(m[0])],
+                table[usize::from(m[1])],
+                [table[usize::from(m[2])], table[usize::from(m[3])]],
+            )
         };
-        let fit = Arc::new(layer::assemble(self.size, self.ratio, model, made.gaps()));
-        layers.store(chunk, &fit);
-        Some(fit)
+        Some(layer::assemble(self.size, self.ratio, model, made.gaps()))
+    }
+
+    unsafe fn layer_cached(
+        api: &frame::PlaneApi,
+        frames: &Mutex<Vec<(i32, KeptFrame)>>,
+        chunk: i32,
+        core: vs::Raw,
+    ) -> Option<vs::ConstRaw> {
+        let kept = frames.lock().ok()?;
+        let found = kept.iter().find(|(key, _)| *key == chunk)?;
+        unsafe { api.copy(found.1.0, core) }.map(vs::Raw::cast_const)
+    }
+
+    unsafe fn layer_store(
+        api: &frame::PlaneApi,
+        frames: &Mutex<Vec<(i32, KeptFrame)>>,
+        chunk: i32,
+        frame: vs::ConstRaw,
+        core: vs::Raw,
+    ) -> vs::ConstRaw {
+        let Some(clone) = (unsafe { api.copy(frame, core) }) else {
+            return frame;
+        };
+        let mut evicted = None;
+        if let Ok(mut kept) = frames.lock() {
+            if let Some(pos) = kept.iter().position(|(key, _)| *key == chunk) {
+                evicted = Some(kept.remove(pos).1);
+            } else if kept.len() >= FIT_CAP {
+                evicted = Some(kept.remove(0).1);
+            }
+            kept.push((chunk, KeptFrame(frame)));
+        } else {
+            unsafe { api.free(clone.cast_const()) };
+            return frame;
+        }
+        if let Some(old) = evicted {
+            unsafe { api.free(old.0) };
+        }
+        clone.cast_const()
     }
 
     unsafe fn layer(
@@ -721,6 +788,14 @@ unsafe extern "system" fn init_filter(
 
 unsafe extern "system" fn free_filter(instance_data: vs::Raw, _: vs::Raw, vsapi: vs::ConstRaw) {
     let state = unsafe { Box::from_raw(instance_data.cast::<State>()) };
+    if let Kind::Layer { frames, .. } = &state.kind
+        && let Some(free) = unsafe { vs::table_fn::<vs::FreeFrame>(vsapi, vs::FREE_FRAME) }
+        && let Ok(mut kept) = frames.lock()
+    {
+        for (_, frame) in kept.drain(..) {
+            unsafe { free(frame.0) };
+        }
+    }
     unsafe { vs::free_nodes(state.clips, vsapi) };
 }
 
@@ -756,32 +831,54 @@ unsafe extern "system" fn get_frame(
                 proof,
                 last,
                 layers,
+                frames: cached_frames,
                 gpu,
             } => {
                 let chunk = n.min(*last) / layer::CHUNK;
                 let mut held = held.unwrap_or_default();
                 let gpu = gpu.as_ref();
                 if !ready {
+                    if let Some(frame) =
+                        unsafe { State::layer_cached(&api, cached_frames, chunk, core) }
+                    {
+                        return Some(frame);
+                    }
                     if let Some(fit) = layers.lock().ok()?.ready(chunk) {
-                        return unsafe { state.layer(&api, &fit, core) };
+                        let built = unsafe { state.layer(&api, &fit, core) }?;
+                        return Some(unsafe {
+                            State::layer_store(&api, cached_frames, chunk, built, core)
+                        });
                     }
                     let chunks = last / layer::CHUNK;
-                    let mut missing = gpu
-                        .map(|gpu| gpu.context.layer_hold(chunk, chunks, &mut held.gpu))
-                        .unwrap_or_default();
-                    missing.extend(layers.lock().ok()?.hold(chunk, chunks, &mut held.cpu));
+                    let active_gpu = gpu.filter(|gpu| !gpu.context.cpu_render());
+                    let mut missing = match active_gpu {
+                        Some(gpu) => {
+                            let mut missing = gpu.context.layer_hold(chunk, chunks, &mut held.gpu);
+                            // the cpu fit needs this chunk when the gpu fit fails
+                            missing.push(chunk);
+                            missing
+                        }
+                        None => layers.lock().ok()?.hold(chunk, chunks, &mut held.cpu),
+                    };
                     missing.sort_unstable();
                     missing.dedup();
                     if !missing.is_empty() {
-                        for chunk in missing {
+                        for &chunk in &missing {
                             let (sources, vectors) = frames(chunk, *last);
                             sources.for_each(|k| request_node(request, first, k, frame_ctx));
                             vectors.for_each(|k| request_node(request, second, k, frame_ctx));
                         }
+                        held.asked = missing;
                         unsafe { *frame_data = Box::into_raw(held).cast() };
                         waiting.set(true);
                         return None;
                     }
+                }
+                let mut layers = layers.lock().ok()?;
+                if let Some(frame) =
+                    unsafe { State::layer_cached(&api, cached_frames, chunk, core) }
+                {
+                    return Some(frame);
                 }
                 let chunks = Chunks {
                     api: &api,
@@ -792,22 +889,27 @@ unsafe extern "system" fn get_frame(
                     size: state.size,
                     last: *last,
                     ratio: state.ratio,
+                    asked: &held.asked,
                 };
                 if let Some(gpu) = gpu {
                     gpu.context.retry();
                 }
-                let fit = gpu
-                    .filter(|gpu| !gpu.context.cpu_render())
-                    .and_then(|gpu| unsafe {
-                        state.fit_gpu(gpu, &chunks, chunk, *limit, *proof, &held.gpu, layers)
-                    })
-                    .or_else(|| {
-                        layers
-                            .lock()
-                            .ok()?
-                            .fit(&chunks, chunk, *limit, *proof, true, &held.cpu)
-                    })?;
-                unsafe { state.layer(&api, &fit, core) }
+                let built = if let Some(fit) =
+                    gpu.filter(|gpu| !gpu.context.cpu_render())
+                        .and_then(|gpu| unsafe {
+                            state.fit_gpu(gpu, &chunks, chunk, *limit, *proof, &held.gpu)
+                        }) {
+                    unsafe { state.layer(&api, &fit, core) }?
+                } else {
+                    let fit = layers.fit(&chunks, chunk, *limit, *proof, true, &held.cpu)?;
+                    let built = unsafe { state.layer(&api, &fit, core) }?;
+                    // a partial fit must not outlive the gpu failure
+                    if layers.ready(chunk).is_none() {
+                        return Some(built);
+                    }
+                    built
+                };
+                Some(unsafe { State::layer_store(&api, cached_frames, chunk, built, core) })
             }
             Kind::Peel => {
                 if !ready {
@@ -822,12 +924,12 @@ unsafe extern "system" fn get_frame(
                         planes(&api, frames[0], (state.size.1, state.size.1 / state.ratio))
                     }?;
                     let fit = unsafe { fit(&api, frames[1], state.size, state.ratio) }?;
+                    if fit.empty() {
+                        return unsafe { api.copy(frames[0], core) }.map(vs::Raw::cast_const);
+                    }
                     unsafe {
-                        let empty = fit.empty();
                         state.changed(&api, frames[0], core, |plane, target, pitch| {
-                            if !empty {
-                                fit.peel(plane, target, pitch, raw[plane]);
-                            }
+                            fit.peel(plane, target, pitch, raw[plane]);
                         })
                     }
                 })();
@@ -849,6 +951,13 @@ unsafe extern "system" fn get_frame(
                 }
                 let frames = wanted.map(|(node, k)| get_node(get, node, k, frame_ctx));
                 let made = (|| {
+                    let fit = unsafe { fit(&api, frames[3], state.size, state.ratio) }?;
+                    if frames[0].is_null() {
+                        return None;
+                    }
+                    if fit.empty() {
+                        return unsafe { api.copy(frames[0], core) }.map(vs::Raw::cast_const);
+                    }
                     let sources = layer::Frames {
                         first: unsafe {
                             planes(&api, frames[1], (state.size.1, state.size.1 / state.ratio))
@@ -858,16 +967,9 @@ unsafe extern "system" fn get_frame(
                         }?,
                         time,
                     };
-                    let fit = unsafe { fit(&api, frames[3], state.size, state.ratio) }?;
-                    if frames[0].is_null() {
-                        return None;
-                    }
                     unsafe {
-                        let empty = fit.empty();
                         state.changed(&api, frames[0], core, |plane, target, pitch| {
-                            if !empty {
-                                fit.unpeel(plane, target, pitch, &sources);
-                            }
+                            fit.unpeel(plane, target, pitch, &sources);
                         })
                     }
                 })();

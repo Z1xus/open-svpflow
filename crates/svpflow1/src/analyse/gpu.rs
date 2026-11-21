@@ -200,6 +200,7 @@ impl Drop for Permit<'_> {
 }
 
 const POOLED: usize = 3 * UNITS;
+const POOL_BUDGET: usize = 128 << 20;
 
 struct Uploaded {
     mems: [usize; 3],
@@ -257,9 +258,15 @@ impl Drop for CachedFrame {
                 (gpu.cl.ReleaseEvent)(uploaded.event as Handle);
             }
             let mut pool = gpu.pool.lock().ok();
+            let mut pooled_bytes: usize = pool
+                .as_ref()
+                .map_or(0, |pool| pool.iter().map(|&(_, s)| s).sum());
             for (mem, size) in uploaded.mems.into_iter().zip(uploaded.sizes) {
                 match pool.as_mut() {
-                    Some(pool) if pool.len() < POOLED => pool.push((mem, size)),
+                    Some(pool) if pool.len() < POOLED && pooled_bytes + size <= POOL_BUDGET => {
+                        pool.push((mem, size));
+                        pooled_bytes += size;
+                    }
                     _ => unsafe {
                         (gpu.cl.ReleaseMemObject)(mem as Handle);
                     },

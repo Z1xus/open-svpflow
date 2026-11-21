@@ -106,12 +106,14 @@ pub struct GpuContext {
     frame_bytes: std::sync::atomic::AtomicUsize,
     frame_budget: usize,
     fuse_fits: bool,
+    cover_layer: bool,
     image_pool: std::sync::Arc<ImagePool>,
     still: std::sync::Mutex<StillState>,
     hold: ClMem,
     layer: std::sync::Mutex<layer::LayerState>,
     blend_pool: std::sync::Mutex<Vec<blend::Buffers>>,
     blend_slots: std::sync::Arc<blend::Slots>,
+    blending: std::sync::atomic::AtomicBool,
     readbacks: std::sync::Arc<blend::Slots>,
     blend_units: std::sync::Mutex<Vec<Unit>>,
     pins: std::sync::Mutex<Vec<Pin>>,
@@ -161,6 +163,7 @@ unsafe impl Send for PooledImages {}
 type ImagePool = std::sync::Mutex<Vec<PooledImages>>;
 
 const RECENT_FRAMES: usize = 2;
+const IMAGE_POOL_CAP: usize = 3;
 const FRAME_BUDGET_SHARE: usize = 4;
 const EVICTED_KEYS: usize = 32;
 
@@ -594,6 +597,22 @@ impl GpuContext {
             let vram = unsafe { vram::Vram::open(&cl, device) };
             let fuse_fits = unsafe { device_size(&cl, device, CL_DEVICE_MAX_PARAMETER_SIZE) }
                 .is_some_and(|size| size >= blend::FUSED_ARG_BYTES);
+            // only nvidia is tested with this kernel
+            let nvidia = ["NVIDIA", "GeForce", "Quadro"]
+                .iter()
+                .any(|name| device_name.contains(name));
+            let cover_layer = nvidia && cl.CreateImage.is_some() && {
+                let mut cerr = 0;
+                let kernel = unsafe {
+                    (cl.CreateKernel)(program, c"cover_finish_layer".as_ptr(), &raw mut cerr)
+                };
+                if cerr == CL_SUCCESS && !kernel.is_null() {
+                    unsafe { (cl.ReleaseKernel)(kernel) };
+                    true
+                } else {
+                    false
+                }
+            };
             let blend_slots = std::sync::Arc::new(blend::Slots::new(units.len()));
             let readbacks = std::sync::Arc::new(blend::Slots::new(2 * units.len()));
             return Ok(Self {
@@ -617,6 +636,7 @@ impl GpuContext {
                 frame_bytes: std::sync::atomic::AtomicUsize::new(0),
                 frame_budget,
                 fuse_fits,
+                cover_layer,
                 image_pool: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 still: std::sync::Mutex::new(StillState {
                     queue: std::ptr::null_mut(),
@@ -629,6 +649,7 @@ impl GpuContext {
                 blend_pool: std::sync::Mutex::new(Vec::new()),
                 readbacks,
                 blend_slots,
+                blending: std::sync::atomic::AtomicBool::new(false),
                 blend_units: std::sync::Mutex::new(Vec::new()),
                 pins: std::sync::Mutex::new(Vec::new()),
                 dst_pool: std::sync::Mutex::new(Vec::new()),
@@ -648,6 +669,10 @@ impl GpuContext {
             });
         }
         Err("no usable GPU device".into())
+    }
+
+    pub fn is_linear(&self) -> bool {
+        self.linear
     }
 
     pub fn device_name(&self) -> &str {
@@ -728,9 +753,12 @@ impl GpuContext {
                     evicted.remove(at);
                     let bytes = self.frame_bytes.load(std::sync::atomic::Ordering::Relaxed);
                     let floor = self.frame_floor.load(std::sync::atomic::Ordering::Relaxed);
-                    let most = (svpflow_core::threads::workers()
-                        .min(2 * self.units.len())
-                        .max(floor)
+                    let limit = if self.blending.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.blend_slots.total()
+                    } else {
+                        2 * self.units.len()
+                    };
+                    let most = (svpflow_core::threads::workers().min(limit).max(floor)
                         + RECENT_FRAMES)
                         .min((self.frame_budget / bytes.max(1)).max(RECENT_FRAMES));
                     let _ = self.super_cap.fetch_update(
@@ -803,7 +831,10 @@ impl GpuContext {
             release_event: self.cl.ReleaseEvent,
             release: self.cl.ReleaseMemObject,
             pool: std::sync::Arc::clone(&self.image_pool),
-            pool_cap: self.super_cap.load(std::sync::atomic::Ordering::Relaxed),
+            pool_cap: self
+                .super_cap
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(IMAGE_POOL_CAP),
             dims,
             luma: (width, height),
         };
@@ -3066,6 +3097,28 @@ kernel void cover_finish(global const int *points, global const uchar *table, wr
     }
     write_imagef(mask, (int2)(x, y), (float4)(0.0f, level[1] / 255.0f, level[0] / 255.0f, 0.0f));
 }
+
+#if defined(__OPENCL_C_VERSION__) && __OPENCL_C_VERSION__ >= 120
+kernel void cover_finish_layer(global const int *points, global const uchar *table,
+    write_only image2d_array_t mask, int width, int height, int area, int top, float scale, int layer)
+{
+    int x = get_global_id(0), y = get_global_id(1);
+    int stride = width + 2;
+    float level[2];
+    for (int set = 0; set < 2; set++) {
+        global const int *grid = points + set * stride * (height + 2);
+        int sum = 0;
+        for (int row = 0; row < 3; row++)
+            for (int column = 0; column < 3; column++)
+                sum += grid[(y + row) * stride + x + column];
+        int covered = min(sum >> 3, area);
+        level[set] = covered < 0
+            ? floor(fmin(255.0f, (float)(area - covered) * scale * 256.0f / (float)area))
+            : (float)table[min(covered, top)];
+    }
+    write_imagef(mask, (int4)(x, y, layer, 0), (float4)(0.0f, level[1] / 255.0f, level[0] / 255.0f, 0.0f));
+}
+#endif
 ";
 
 unsafe fn device_size(cl: &OpenCl, device: ClDeviceId, param: ClUint) -> Option<usize> {

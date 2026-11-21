@@ -151,7 +151,18 @@ impl Pooled for u16 {
 
 static EXPAND_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
 static WIDE_POOL: std::sync::Mutex<Vec<Vec<u16>>> = std::sync::Mutex::new(Vec::new());
-const EXPAND_POOL_CAP: usize = 48;
+const EXPAND_POOL_CAP: usize = 12;
+const EXPAND_POOL_BYTES: usize = 64 << 20;
+const EXPAND_CACHE_BYTES: usize = 128 << 20;
+
+fn expand_cache_cap<T>(width: usize, height: usize) -> usize {
+    let bytes = width
+        .saturating_mul(height)
+        .saturating_mul(6)
+        .saturating_mul(size_of::<T>())
+        .max(1);
+    (EXPAND_CACHE_BYTES / bytes).clamp(4, EXPAND_CACHE_CAP / size_of::<T>())
+}
 
 pub(crate) fn clear_expand_pool() {
     if let Ok(mut pool) = EXPAND_POOL.lock() {
@@ -179,8 +190,14 @@ fn pooled_buffer<T: Pooled>(len: usize) -> Vec<T> {
 impl<T: Pooled> Drop for SuperExpand<T> {
     fn drop(&mut self) {
         if let Ok(mut pool) = T::pool().lock() {
+            let mut bytes: usize = pool
+                .iter()
+                .map(|buf| buf.capacity().saturating_mul(size_of::<T>()))
+                .sum();
             for buffer in [&mut self.y, &mut self.u, &mut self.v] {
-                if pool.len() < EXPAND_POOL_CAP {
+                let add = buffer.capacity().saturating_mul(size_of::<T>());
+                if pool.len() < EXPAND_POOL_CAP && bytes.saturating_add(add) <= EXPAND_POOL_BYTES {
+                    bytes += add;
                     pool.push(std::mem::take(buffer));
                 }
             }
@@ -1277,7 +1294,11 @@ impl FilterState {
         let (chroma_x_div, chroma_y_div) = video_format::chroma_divisors(&self.video_info);
         let chroma_x_div = usize::try_from(chroma_x_div).ok()?;
         let chroma_y_div = usize::try_from(chroma_y_div).ok()?;
-        let cell = cache_cell(&self.expand_cache, key, EXPAND_CACHE_CAP)?;
+        let cell = cache_cell(
+            &self.expand_cache,
+            key,
+            expand_cache_cap::<u8>(width, height),
+        )?;
         cell.get_or_init(|| {
             let (y, y_stride) = expand_plane(planes.y, width, height)?;
             let (u, uv_stride) =
@@ -1304,7 +1325,7 @@ impl FilterState {
         let (chroma_x_div, chroma_y_div) = video_format::chroma_divisors(&self.video_info);
         let chroma_x_div = usize::try_from(chroma_x_div).ok()?;
         let chroma_y_div = usize::try_from(chroma_y_div).ok()?;
-        let cell = cache_cell(T::cache(self), key, EXPAND_CACHE_CAP / size_of::<T>())?;
+        let cell = cache_cell(T::cache(self), key, expand_cache_cap::<T>(width, height))?;
         cell.get_or_init(|| {
             let (y, y_stride) = expand_source(y, width, height)?;
             let (u, uv_stride) = expand_source(u, width / chroma_x_div, height / chroma_y_div)?;

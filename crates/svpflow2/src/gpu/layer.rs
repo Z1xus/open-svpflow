@@ -418,11 +418,25 @@ impl GpuContext {
                 continue;
             }
             let pairs = pairs(key)?;
-            let mem = unsafe { self.create_buffer(bytes) }.or_else(|| {
-                state.release_cached();
-                unsafe { self.create_buffer(bytes) }
-            })?;
-            let sums = Arc::new(Owned(mem, self.cl.ReleaseMemObject));
+            // reuse an expired stats buffer before allocating a new one
+            let reused = (state.stats.len() >= stats_cap)
+                .then(|| {
+                    state.stats.iter().position(|(k, sums, _)| {
+                        !(chunk - 1..=chunk + 1).contains(k) && Arc::strong_count(sums) == 1
+                    })
+                })
+                .flatten()
+                .map(|index| state.stats.remove(index).1);
+            let sums = if let Some(sums) = reused {
+                sums
+            } else {
+                let mem = unsafe { self.create_buffer(bytes) }.or_else(|| {
+                    state.release_cached();
+                    unsafe { self.create_buffer(bytes) }
+                })?;
+                Arc::new(Owned(mem, self.cl.ReleaseMemObject))
+            };
+            let mem = sums.0;
             let stats = pairs
                 .chunks(4)
                 .enumerate()

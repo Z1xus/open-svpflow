@@ -27,6 +27,7 @@ const RUN: i32 = 3;
 pub(crate) struct Held {
     cpu: crate::peel::Held,
     gpu: crate::gpu::LayerHeld,
+    asked: Vec<i32>,
     pub(crate) more: bool,
 }
 
@@ -204,18 +205,23 @@ impl FilterState {
             return;
         };
         let (chunk, chunks) = (n / layer::CHUNK, last / layer::CHUNK);
-        let mut missing = self
-            .gpu
-            .as_ref()
-            .map(|gpu| gpu.layer_hold(chunk, chunks, &mut held.gpu))
-            .unwrap_or_default();
-        if crate::video_format::is_cpu_source(&self.video_info)
+        let gpu_active =
+            self.render_mode == 2 && self.gpu.as_ref().is_some_and(|gpu| !gpu.cpu_render());
+        let mut missing = if gpu_active {
+            self.gpu
+                .as_ref()
+                .map(|gpu| gpu.layer_hold(chunk, chunks, &mut held.gpu))
+                .unwrap_or_default()
+        } else if crate::video_format::is_cpu_source(&self.video_info)
             && let Ok(layers) = self.layers.lock()
         {
-            missing.extend(layers.hold(chunk, chunks, &mut held.cpu));
-        }
+            layers.hold(chunk, chunks, &mut held.cpu)
+        } else {
+            Vec::new()
+        };
         missing.sort_unstable();
         missing.dedup();
+        held.asked.extend(&missing);
         for c in missing {
             let (sources, vectors) = crate::peel::frames(c, last);
             wanted.extend(sources.map(|k| (self.clips.source, k)));
@@ -236,7 +242,7 @@ impl FilterState {
             return None;
         }
         let get = |node, k| fetch.get(node, k);
-        let chunks = self.chunks(api, &get, data, last);
+        let chunks = self.chunks(api, &get, data, last, &held.asked);
         let mut layers = self.layers.lock().ok()?;
         layers.fit(&chunks, n / layer::CHUNK, limit, proof, false, &held.cpu)
     }
@@ -247,6 +253,7 @@ impl FilterState {
         get: &'a dyn Fn(vs::Raw, i32) -> vs::ConstRaw,
         data: &'a metadata::VectorData,
         last: i32,
+        asked: &'a [i32],
     ) -> crate::peel::Chunks<'a> {
         crate::peel::Chunks {
             api,
@@ -260,6 +267,7 @@ impl FilterState {
             ),
             last,
             ratio: self.chroma().0 as usize,
+            asked,
         }
     }
 
@@ -377,7 +385,7 @@ impl FilterState {
         );
         let cap = self.field_cap(shape);
         let get = |node, k| fetch.get(node, k);
-        let chunks = self.chunks(api, &get, vector_data, last);
+        let chunks = self.chunks(api, &get, vector_data, last, &held.asked);
         let fields = &self.field_cache;
         let motions = |k: i32, payload: &[u8]| {
             let cell = crate::core::cache_cell(fields, i64::from(k), cap)?;
@@ -388,7 +396,7 @@ impl FilterState {
             });
             Some(motion(k, field.as_ref()?))
         };
-        let pairs = |chunk: i64| chunks.uploaded(gpu, chunk, &motions);
+        let pairs = |chunk: i64| chunks.uploaded(gpu, chunk, true, &motions);
         gpu.layer_fit(
             i64::from(n / layer::CHUNK),
             i64::from(last / layer::CHUNK),
@@ -476,6 +484,7 @@ impl FilterState {
                 area,
                 still,
                 layer,
+                cover,
             );
             return std::ptr::null();
         }
@@ -999,8 +1008,10 @@ impl FilterState {
         let algo = params.algo;
         let gpu_cover = !cpu
             && self.render_mode == 2
-            && self.gpu.is_some()
-            && blend.is_none()
+            && self
+                .gpu
+                .as_ref()
+                .is_some_and(|gpu| blend.is_none() || gpu.supports_blend_cover())
             && algo > 20
             && !neither
             && params.sad.is_none();
@@ -1218,7 +1229,11 @@ impl FilterState {
                 }
             }
             let fit = self.layer_cpu(api, fetch, n, vector_data, held);
-            if fit.is_none() && self.layer_plan().is_some() {
+            // a gpu failure can leave this chunk without cpu frames
+            if fit.is_none()
+                && self.layer_plan().is_some()
+                && held.asked.contains(&(n / layer::CHUNK))
+            {
                 unsafe { api.free(output.cast_const()) };
                 return std::ptr::null();
             }

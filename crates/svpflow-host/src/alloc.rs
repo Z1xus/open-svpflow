@@ -4,7 +4,7 @@ use std::sync::Mutex;
 const MIN: usize = 64 << 10;
 const MAX: usize = 64 << 20;
 const SLOTS: usize = 32;
-const BUDGET: usize = 128 << 20;
+const BUDGET: usize = 64 << 20;
 
 #[derive(Clone, Copy)]
 struct Slot {

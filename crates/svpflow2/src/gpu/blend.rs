@@ -6,7 +6,7 @@ use svpflow_host::opencl::ImageDesc;
 
 use super::{
     CL_FALSE, CL_MEM_READ_WRITE, CL_RGBA, CL_SUCCESS, CL_UNORM_INT8, ClEvent, ClImageFormat,
-    ClKernel, ClMem, ClUint, GpuBuf, GpuContext, KernelParams, Layer, StillMask, SuperEntry,
+    ClKernel, ClMem, ClUint, Cover, GpuBuf, GpuContext, KernelParams, Layer, StillMask, SuperEntry,
     SuperHandle, Unit, UploadPlane, layer::LAYER_VARIANT,
 };
 
@@ -19,6 +19,7 @@ pub(super) const FUSED_ARG_BYTES: usize = (size_of::<ClMem>() + size_of::<i32>()
     + size_of::<KernelParams>();
 const CL_MEM_OBJECT_IMAGE2D_ARRAY: u32 = 0x10F3;
 const MAX_STEPS: usize = 16;
+const BLEND_VRAM_BUDGET: usize = 128 << 20;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -92,6 +93,7 @@ struct Counts {
     free: usize,
     total: usize,
     debt: usize,
+    cap: usize,
 }
 
 pub(super) struct Slots(Mutex<Counts>, Condvar);
@@ -103,6 +105,7 @@ impl Slots {
                 free: count,
                 total: count,
                 debt: 0,
+                cap: count,
             }),
             Condvar::new(),
         )
@@ -132,8 +135,23 @@ impl Slots {
         true
     }
 
+    pub(super) fn cap(&self, limit: usize) {
+        let limit = limit.max(1);
+        let mut counts = self.counts();
+        counts.cap = limit;
+        while counts.total > limit {
+            counts.total -= 1;
+            if counts.free > 0 {
+                counts.free -= 1;
+            } else {
+                counts.debt += 1;
+            }
+        }
+    }
+
     pub(super) fn restore(&self, count: usize) {
         let mut counts = self.counts();
+        let count = count.min(counts.cap);
         let back = count.saturating_sub(counts.total);
         let paid = back.min(counts.debt);
         counts.debt -= paid;
@@ -371,10 +389,11 @@ impl GpuContext {
     }
 
     fn release_job(&self, job: BlendJob, keep: bool) {
-        let unit = job.unit.into_inner();
+        let mut unit = job.unit.into_inner();
         if !keep {
             unsafe { self.note((self.cl.Finish)(unit.queue)) };
         }
+        unit.held.clear();
         drop(job.pending);
         match self.blend_pool.lock() {
             Ok(mut pool) if keep && pool.len() < self.blend_slots.total() => pool.push(job.buffers),
@@ -398,6 +417,12 @@ impl GpuContext {
         }
         let rows = height + chroma_height;
         let len = width.checked_mul(rows).filter(|&len| len > 0)?;
+        // keep large blend jobs under a fixed vram budget while staying double-buffered
+        self.blending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let per_job = len.saturating_mul(size_of::<f32>() + 1).max(1);
+        self.blend_slots
+            .cap((BLEND_VRAM_BUDGET / per_job).max(2).min(self.units.len()));
         let slot = self.blend_slots.take()?;
         let unit = self.blend_unit()?;
         let reused = self.blend_pool.lock().ok().and_then(|mut pool| {
@@ -700,6 +725,7 @@ impl GpuContext {
         area: Option<(&[u8], &[u8])>,
         still: Option<StillMask>,
         layer: Option<&Arc<Layer>>,
+        cover: Option<&Cover<'_>>,
     ) -> Option<()> {
         let key = (motion_key, linear, motion_width, motion_height);
         let joins = job.pending.borrow().group.as_ref().is_some_and(|group| {
@@ -789,8 +815,13 @@ impl GpuContext {
         }
         let mut pending = job.pending.borrow_mut();
         let group = pending.group.as_mut()?;
+        let step = group.steps.count as usize;
         let needs_coverage = params[0].algorithm >= 21;
-        if needs_coverage || params[0].has_sad != 0 {
+        if let Some(cover) = cover.filter(|_| needs_coverage && params[0].has_sad == 0) {
+            let mut unit = job.unit.borrow_mut();
+            let layers = unsafe { self.mask_layers(&mut unit, motion_width, motion_height) }?;
+            unsafe { self.bind_cover_layer(&mut unit, layers, cover, i32::try_from(step).ok()?) }?;
+        } else if needs_coverage || params[0].has_sad != 0 {
             Self::pack_masks(
                 &mut group.masks,
                 motion_width * motion_height,
@@ -799,7 +830,6 @@ impl GpuContext {
                 area,
             )?;
         }
-        let step = group.steps.count as usize;
         group.steps.phase[step] = params[0].phase;
         group.steps.sad_blend[step] = params[0].sad_blend;
         group.steps.weight[step] = job.weight.get();

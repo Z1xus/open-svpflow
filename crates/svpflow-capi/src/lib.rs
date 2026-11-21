@@ -184,6 +184,19 @@ pub unsafe extern "C" fn osvp_map(
     }
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn osvp_map_pass(
+    context: *const Context,
+    info: *const VideoInfo,
+    input: *const Clip,
+    need: Need,
+    render: Render,
+    release: Option<Release>,
+    user: *mut c_void,
+) -> *mut Clip {
+    unsafe { osvp_map(context, info, input, need, render, release, user) }
+}
+
 unsafe fn vectors(
     host: &Arc<Host>,
     source: &Arc<Node>,
@@ -191,6 +204,7 @@ unsafe fn vectors(
     analyse_opt: *const c_char,
     smooth_opt: *const c_char,
     half: bool,
+    render: bool,
 ) -> Result<Map, CString> {
     let missing = || c"the plugin returned no clip".to_owned();
     let call = |name: &CStr, values: Vec<(&CStr, Value)>| {
@@ -234,20 +248,24 @@ unsafe fn vectors(
                 ),
             ],
         )?;
-        let gpu = (sdata >> 48) & 0xFF;
-        let options = CString::new(format!("{{pel:1,gpu:{gpu}}}")).unwrap_or_default();
-        supers = call(
-            c"Super",
-            vec![(c"clip", clip(source)), (c"opt", Value::Data(options))],
-        )?;
+        if render {
+            let gpu = (sdata >> 48) & 0xFF;
+            let options = CString::new(format!("{{pel:1,gpu:{gpu}}}")).unwrap_or_default();
+            supers = call(
+                c"Super",
+                vec![(c"clip", clip(source)), (c"opt", Value::Data(options))],
+            )?;
+        }
     }
     let mut input = Map::default();
     input.set(c"clip", clip(source));
-    input.set(c"super", clip(&supers.node(c"clip").ok_or_else(missing)?));
-    input.set(
-        c"sdata",
-        Value::Int(supers.int(c"data").ok_or_else(missing)?),
-    );
+    if render {
+        input.set(c"super", clip(&supers.node(c"clip").ok_or_else(missing)?));
+        input.set(
+            c"sdata",
+            Value::Int(supers.int(c"data").ok_or_else(missing)?),
+        );
+    }
     input.set(c"vectors", clip(&found.node(c"clip").ok_or_else(missing)?));
     input.set(
         c"vdata",
@@ -277,7 +295,7 @@ pub unsafe extern "C" fn osvp_smooth_fps(
 ) -> *mut Clip {
     let (host, source) = unsafe { (&(*context).0, &(*source).node) };
     let half = half_analysis != 0;
-    let input = unsafe { vectors(host, source, super_opt, analyse_opt, smooth_opt, half) };
+    let input = unsafe { vectors(host, source, super_opt, analyse_opt, smooth_opt, half, true) };
     finish(host, c"SmoothFps", input)
 }
 
@@ -303,8 +321,8 @@ pub unsafe extern "C" fn osvp_smooth_fps_blend(
         _ => &[],
     };
     let half = half_analysis != 0;
-    let input = unsafe { vectors(host, source, super_opt, analyse_opt, smooth_opt, half) }.map(
-        |mut input| {
+    let input = unsafe { vectors(host, source, super_opt, analyse_opt, smooth_opt, half, true) }
+        .map(|mut input| {
             for &weight in weights {
                 input.set(c"weights", Value::Float(weight));
             }
@@ -312,8 +330,7 @@ pub unsafe extern "C" fn osvp_smooth_fps_blend(
             input.set(c"fpsden", Value::Int(fps_den));
             input.set(c"gamma", Value::Float(gamma));
             input
-        },
-    );
+        });
     finish(host, c"SmoothFpsBlend", input)
 }
 
@@ -384,7 +401,17 @@ pub unsafe extern "C" fn osvp_layer(
 ) -> *mut Clip {
     let (host, source) = unsafe { (&(*context).0, &(*source).node) };
     let half = half_analysis != 0;
-    let found = unsafe { vectors(host, source, super_opt, analyse_opt, std::ptr::null(), half) };
+    let found = unsafe {
+        vectors(
+            host,
+            source,
+            super_opt,
+            analyse_opt,
+            std::ptr::null(),
+            half,
+            false,
+        )
+    };
     let input = found.and_then(|found| {
         let missing = || c"the plugin returned no clip".to_owned();
         let mut input = Map::default();

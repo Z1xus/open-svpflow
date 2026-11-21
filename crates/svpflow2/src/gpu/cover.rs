@@ -14,6 +14,7 @@ pub struct Cover<'a> {
 
 pub(super) struct UnitCover {
     kernels: Option<[ClKernel; 3]>,
+    finish_layer: ClKernel,
     vectors: (ClMem, usize),
     points: (ClMem, usize),
     table: (ClMem, usize),
@@ -27,6 +28,7 @@ impl Default for UnitCover {
         let none = (std::ptr::null_mut(), 0);
         Self {
             kernels: None,
+            finish_layer: std::ptr::null_mut(),
             vectors: none,
             points: none,
             table: none,
@@ -38,10 +40,17 @@ impl Default for UnitCover {
 }
 
 impl GpuContext {
+    pub fn supports_blend_cover(&self) -> bool {
+        self.cover_layer
+    }
+
     pub(super) unsafe fn release_cover(&self, cover: &UnitCover) {
         unsafe {
             for kernel in cover.kernels.into_iter().flatten() {
                 (self.cl.ReleaseKernel)(kernel);
+            }
+            if !cover.finish_layer.is_null() {
+                (self.cl.ReleaseKernel)(cover.finish_layer);
             }
             for (mem, _) in [cover.vectors, cover.points, cover.table] {
                 if !mem.is_null() {
@@ -49,6 +58,21 @@ impl GpuContext {
                 }
             }
         }
+    }
+
+    unsafe fn cover_layer_kernel(&self, cover: &mut UnitCover) -> Option<ClKernel> {
+        if !cover.finish_layer.is_null() {
+            return Some(cover.finish_layer);
+        }
+        let mut err = 0;
+        let kernel = unsafe {
+            (self.cl.CreateKernel)(self.program, c"cover_finish_layer".as_ptr(), &raw mut err)
+        };
+        if err != CL_SUCCESS || kernel.is_null() {
+            return None;
+        }
+        cover.finish_layer = kernel;
+        Some(kernel)
     }
 
     unsafe fn cover_kernels(&self, cover: &mut UnitCover) -> Option<[ClKernel; 3]> {
@@ -123,13 +147,16 @@ impl GpuContext {
         (status == CL_SUCCESS).then_some(())
     }
 
-    pub(super) unsafe fn bind_cover(&self, unit: &mut Unit, cover: &Cover<'_>) -> Option<ClMem> {
+    unsafe fn scatter_cover(
+        &self,
+        unit: &mut Unit,
+        cover: &Cover<'_>,
+        kernels: [ClKernel; 3],
+    ) -> Option<(ClMem, ClMem)> {
         let layout = cover.layout;
         let (width, height) = (layout.size.0 as usize, layout.size.1 as usize);
         let (grid_w, grid_h) = (layout.grid.0 as usize, layout.grid.1 as usize);
         let queue = unit.queue;
-        let kernels = unsafe { self.cover_kernels(&mut unit.cover) }?;
-        let mask = unsafe { self.ensure_image(&mut unit.mask, width, height, CL_UNORM_INT8) }?;
         let state = &mut unit.cover;
         let vectors_bytes = 2 * grid_w * grid_h * 2 * size_of::<i16>();
         let vectors_old = state.vectors.0;
@@ -148,9 +175,9 @@ impl GpuContext {
         let table_old = state.table.0;
         let table = unsafe { self.ensure_buffer(&mut state.table, layout.table.len()) }?;
         if state.table_host != layout.table || table != table_old {
-            state.table_host.clone_from(&layout.table);
             let staged = layout.table.clone();
             unsafe { self.write_buffer(queue, table, staged.as_ptr().cast(), staged.len()) }?;
+            state.table_host.clone_from(&layout.table);
             unit.held.push(Box::new(staged));
         }
         let stride = width + 2;
@@ -190,7 +217,22 @@ impl GpuContext {
                 ],
                 &[grid_w, grid_h, 2],
             )?;
-            let top = i32::try_from(layout.table.len()).ok()? - 1;
+        }
+        Some((points, table))
+    }
+
+    pub(super) unsafe fn bind_cover(&self, unit: &mut Unit, cover: &Cover<'_>) -> Option<ClMem> {
+        let layout = cover.layout;
+        let (width, height) = (layout.size.0 as usize, layout.size.1 as usize);
+        let queue = unit.queue;
+        let kernels = unsafe { self.cover_kernels(&mut unit.cover) }?;
+        let mask = unsafe { self.ensure_image(&mut unit.mask, width, height, CL_UNORM_INT8) }?;
+        let (points, table) = unsafe { self.scatter_cover(unit, cover, kernels) }?;
+        let ptr = |value: &ClMem| (size_of::<ClMem>(), std::ptr::from_ref(value).cast());
+        let int = |value: &i32| (size_of::<i32>(), std::ptr::from_ref(value).cast());
+        let top = i32::try_from(layout.table.len()).ok()? - 1;
+        let [w, h] = [layout.size.0, layout.size.1];
+        unsafe {
             self.launch(
                 queue,
                 kernels[2],
@@ -208,5 +250,43 @@ impl GpuContext {
             )?;
         }
         Some(mask)
+    }
+
+    pub(super) unsafe fn bind_cover_layer(
+        &self,
+        unit: &mut Unit,
+        mask: ClMem,
+        cover: &Cover<'_>,
+        layer: i32,
+    ) -> Option<()> {
+        let layout = cover.layout;
+        let (width, height) = (layout.size.0 as usize, layout.size.1 as usize);
+        let queue = unit.queue;
+        let kernels = unsafe { self.cover_kernels(&mut unit.cover) }?;
+        let finish = unsafe { self.cover_layer_kernel(&mut unit.cover) }?;
+        let (points, table) = unsafe { self.scatter_cover(unit, cover, kernels) }?;
+        let ptr = |value: &ClMem| (size_of::<ClMem>(), std::ptr::from_ref(value).cast());
+        let int = |value: &i32| (size_of::<i32>(), std::ptr::from_ref(value).cast());
+        let top = i32::try_from(layout.table.len()).ok()? - 1;
+        let [w, h] = [layout.size.0, layout.size.1];
+        unsafe {
+            self.launch(
+                queue,
+                finish,
+                &[
+                    ptr(&points),
+                    ptr(&table),
+                    ptr(&mask),
+                    int(&w),
+                    int(&h),
+                    int(&layout.area),
+                    int(&top),
+                    (size_of::<f32>(), (&raw const layout.scale).cast()),
+                    int(&layer),
+                ],
+                &[width, height],
+            )?;
+        }
+        Some(())
     }
 }

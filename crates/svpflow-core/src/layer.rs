@@ -577,38 +577,70 @@ impl Layer<'_> {
         (raw.sample(x, y, size), false)
     }
 
-    pub fn peel(&self, plane: usize, output: &mut [u8], pitch: usize, raw: Plane) {
+    fn identity(&self, plane: usize, x: usize, y: usize) -> bool {
+        if plane == 0 {
+            return self.luma[y * self.pitch.0 + x] == 4096
+                && self.luma[(self.size.1 + y) * self.pitch.0 + x] == 0;
+        }
+        if self.chroma[plane - 1][y * self.pitch.1 + x] != 0 {
+            return false;
+        }
+        let ratio = self.ratio;
+        let mut total = 0i32;
+        for dy in 0..ratio {
+            let row = (y * ratio + dy) * self.pitch.0 + x * ratio;
+            for dx in 0..ratio {
+                total += i32::from(self.luma[row + dx]);
+            }
+        }
+        i32::try_from(ratio * ratio).ok() == Some(total / 4096) && total % 4096 == 0
+    }
+
+    fn for_each_active(&self, plane: usize, mut f: impl FnMut(usize, usize)) {
         let (width, height) = self.plane(plane);
-        for (y, row) in output.chunks_mut(pitch).take(height).enumerate() {
-            for (x, out) in row[..width].iter_mut().enumerate() {
-                if self.gap(plane, x, y) <= 0.0 && self.texel(plane, x, y) != (1.0, 0.0) {
-                    *out = pixel(self.scene(plane, raw, x as f32, y as f32, true).0);
+        let cell = CELL / self.ratio(plane);
+        let (cols, rows) = (width.div_ceil(cell), height.div_ceil(cell));
+        let cover_base = self.size.1 / self.ratio * self.pitch.1;
+        for cy in 0..rows {
+            let cover_row = &self.chroma[1][cover_base + cy * self.pitch.1..][..cols];
+            if !cover_row.iter().any(|&distance| distance <= 1) {
+                continue;
+            }
+            let (y0, y1) = (cy * cell, ((cy + 1) * cell).min(height));
+            for (cx, &distance) in cover_row.iter().enumerate() {
+                if distance > 1 {
+                    continue;
+                }
+                let (x0, x1) = (cx * cell, ((cx + 1) * cell).min(width));
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        if !self.identity(plane, x, y) {
+                            f(x, y);
+                        }
+                    }
                 }
             }
         }
     }
 
+    pub fn peel(&self, plane: usize, output: &mut [u8], pitch: usize, raw: Plane) {
+        self.for_each_active(plane, |x, y| {
+            output[y * pitch + x] = pixel(self.scene(plane, raw, x as f32, y as f32, true).0);
+        });
+    }
+
     pub fn unpeel(&self, plane: usize, output: &mut [u8], pitch: usize, frames: &Frames) {
-        let (width, height) = self.plane(plane);
-        for (y, row) in output.chunks_mut(pitch).take(height).enumerate() {
-            for (x, out) in row[..width].iter_mut().enumerate() {
-                if self.gap(plane, x, y) > 0.0 {
-                    continue;
-                }
-                let (a, b) = self.texel(plane, x, y);
-                if (a, b) == (1.0, 0.0) {
-                    continue;
-                }
-                let own = (frames.first[plane].at(x, y), frames.second[plane].at(x, y));
-                if a.abs() < MIN || (own.0 - own.1).abs() <= SAME {
-                    *out = pixel(mix(own.0, own.1, frames.time));
-                    continue;
-                }
-                let under = |own: f32| ((own - b) / a).clamp(0.0, 255.0);
-                let scene = median(f32::from(*out), under(own.0), under(own.1));
-                *out = pixel(a * scene + b);
+        self.for_each_active(plane, |x, y| {
+            let (a, b) = self.texel(plane, x, y);
+            let own = (frames.first[plane].at(x, y), frames.second[plane].at(x, y));
+            if a.abs() < MIN || (own.0 - own.1).abs() <= SAME {
+                output[y * pitch + x] = pixel(mix(own.0, own.1, frames.time));
+                return;
             }
-        }
+            let under = |own: f32| ((own - b) / a).clamp(0.0, 255.0);
+            let scene = median(f32::from(output[y * pitch + x]), under(own.0), under(own.1));
+            output[y * pitch + x] = pixel(a * scene + b);
+        });
     }
 
     pub fn render(

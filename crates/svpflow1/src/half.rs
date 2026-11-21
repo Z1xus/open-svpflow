@@ -268,7 +268,49 @@ unsafe extern "system" fn double_frame(
     unsafe { run(n, activation, instance_data, frame_ctx, core, vsapi, double) }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn halve_row_avx2(to: &mut [u8], top: &[u8], bottom: &[u8]) {
+    use std::arch::x86_64::{
+        _mm_storeu_si128, _mm256_add_epi16, _mm256_castsi256_si128, _mm256_loadu_si256,
+        _mm256_maddubs_epi16, _mm256_packus_epi16, _mm256_permute4x64_epi64, _mm256_set1_epi8,
+        _mm256_set1_epi16, _mm256_srli_epi16,
+    };
+    let width = to.len();
+    let ones = _mm256_set1_epi8(1);
+    let two = _mm256_set1_epi16(2);
+    let mut x = 0;
+    while x + 16 <= width {
+        unsafe {
+            let t = _mm256_loadu_si256(top.as_ptr().add(x * 2).cast());
+            let b = _mm256_loadu_si256(bottom.as_ptr().add(x * 2).cast());
+            let ts = _mm256_maddubs_epi16(t, ones);
+            let bs = _mm256_maddubs_epi16(b, ones);
+            let sum = _mm256_add_epi16(_mm256_add_epi16(ts, bs), two);
+            let avg = _mm256_srli_epi16(sum, 2);
+            let packed = _mm256_packus_epi16(avg, avg);
+            let ordered = _mm256_permute4x64_epi64(packed, 0xD8);
+            _mm_storeu_si128(
+                to.as_mut_ptr().add(x).cast(),
+                _mm256_castsi256_si128(ordered),
+            );
+        }
+        x += 16;
+    }
+    for ((to, top), bottom) in to[x..]
+        .iter_mut()
+        .zip(top[x * 2..].as_chunks::<2>().0)
+        .zip(bottom[x * 2..].as_chunks::<2>().0)
+    {
+        let sum =
+            u16::from(top[0]) + u16::from(top[1]) + u16::from(bottom[0]) + u16::from(bottom[1]);
+        *to = ((sum + 2) >> 2) as u8;
+    }
+}
+
 unsafe fn halve(state: &State, api: &Api, source: vs::ConstRaw, output: vs::Raw) {
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::arch::is_x86_feature_detected!("avx2");
     let (x_div, y_div) = video_format::chroma_divisors(&state.vi);
     for plane in 0..3 {
         let (x_div, y_div) = if plane == 0 { (1, 1) } else { (x_div, y_div) };
@@ -288,6 +330,11 @@ unsafe fn halve(state: &State, api: &Api, source: vs::ConstRaw, output: vs::Raw)
         };
         for (to, from) in to.chunks_mut(to_pitch).zip(from.chunks(from_pitch * 2)) {
             let (top, bottom) = from.split_at(from_pitch);
+            #[cfg(target_arch = "x86_64")]
+            if avx2 {
+                unsafe { halve_row_avx2(&mut to[..width], top, bottom) };
+                continue;
+            }
             for ((to, top), bottom) in to[..width]
                 .iter_mut()
                 .zip(top.as_chunks::<2>().0)
