@@ -771,6 +771,7 @@ impl GpuContext {
         layer: Option<&Arc<Layer>>,
         cover: Option<&Cover<'_>>,
     ) -> Option<()> {
+        let layer = layer.filter(|l| !l.is_empty());
         let key = (motion_key, linear, motion_width, motion_height);
         let joins = job.pending.borrow().group.as_ref().is_some_and(|group| {
             group.key == key
@@ -843,7 +844,7 @@ impl GpuContext {
             } else {
                 self.variant_kernel(&mut unit.variant_kernels, variant)
             };
-            let upload_algo = if job.fast_blend() > 0 && still.is_none() && layer.is_none() {
+            let upload_algo = if job.fast_blend() > 0 && still.is_none() {
                 params[0].algorithm.min(21)
             } else {
                 params[0].algorithm

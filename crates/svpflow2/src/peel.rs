@@ -154,19 +154,29 @@ impl Chunks<'_> {
         context: &GpuContext,
         chunk: i64,
         keep: bool,
+        half: bool,
         motions: &(dyn Fn(i32, &[u8]) -> Option<engine::MotionSet> + Sync),
     ) -> Option<Vec<LayerPair>> {
         let chunk = i32::try_from(chunk)
             .ok()
             .filter(|key| self.asked.contains(key))?;
-        let (sources, vectors) = frames(chunk, self.last);
+        let (mut sources, mut vectors) = frames(chunk, self.last);
+        let full = usize::try_from(*sources.end() - *sources.start() + 1).unwrap_or(0);
+        if half {
+            let count = *vectors.end() - *vectors.start() + 1;
+            if count >= 8 {
+                let first = *vectors.start() + (count - 6) / 2;
+                vectors = first..=(first + 5);
+                sources = first..=(first + 6);
+            }
+        }
         let (start, first) = (*sources.start(), *vectors.start());
         let sources: Vec<_> = sources.map(|k| (self.get)(self.source, k)).collect();
         let vectors: Vec<_> = vectors.map(|k| (self.get)(self.vectors, k)).collect();
         // keep 2 chunks when linear f32 textures are allocated, 3 when packed-only (4k)
         if keep {
             let chunks = if context.is_linear() { 2 } else { 3 };
-            context.keep_frames(chunks * sources.len());
+            context.keep_frames(chunks * full);
         }
         let made = (|| {
             let planes: Vec<_> = sources
@@ -190,9 +200,11 @@ impl Chunks<'_> {
                         *slot = motions(k, payload)
                             .filter(|m| m[..4].iter().all(|field| field.len() >= count))
                             .map(|m| {
-                                (0..count)
-                                    .flat_map(|i| [m[2][i], m[1][i], m[0][i], m[3][i]])
-                                    .collect::<Vec<u16>>()
+                                let mut out = Vec::with_capacity(count * 4);
+                                crate::gpu::interleave4_u16(
+                                    &mut out, count, &m[2], &m[1], &m[0], &m[3],
+                                );
+                                out
                             });
                     });
                 }
@@ -619,7 +631,7 @@ impl State {
         let context = &gpu.context;
         let data = chunks.data;
         let mut pairs = |key: i64| {
-            chunks.uploaded(context, key, false, &|_, payload| {
+            chunks.uploaded(context, key, false, false, &|_, payload| {
                 Some(decoded(payload, data))
             })
         };

@@ -1928,6 +1928,7 @@ impl GpuContext {
         cover: Option<&Cover<'_>>,
         fast: (u8, bool),
     ) -> Option<()> {
+        let layer = layer.filter(|l| !l.is_empty());
         let _readback = self.readbacks.take()?;
         let mut unit = self.acquire();
         let use_quad = fast.1 && self.depth == 8 && still.is_none() && layer.is_none();
@@ -2843,25 +2844,27 @@ kernel void render_frame(
     layered = gap <= layer_reach(&p, step_f*time, step_b*(1.0f-time));
     if (layered) {
         float4 model = read_imagef(layer, linear_sampler, layer_luma(&p, at));
-        float2 moved_f = layer_scene(raw_f, layer, &p, at_f, 1);
-        float2 moved_b = layer_scene(raw_b, layer, &p, at_b, 1);
-        layer_agree(raw_f, raw_b, layer, &p, at_f, at_b, &moved_f, &moved_b);
-        float2 base_f = layer_scene(raw_f, layer, &p, at, 0);
-        float2 base_b = layer_scene(raw_b, layer, &p, at, 0);
-        float base = mix(base_f.x, base_b.x, time);
-        float scene;
-# if ALGO == 1
-        scene = moved_b.y > 0.5f ? moved_b.x : (moved_f.y > 0.5f ? moved_f.x : base);
-# elif ALGO == 2
-        scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
-# else
-        if (moved_f.y > 0.5f && moved_b.y > 0.5f) scene = median3(moved_f.x, moved_b.x, base);
-        else scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
-# endif
         float own_f = layer_raw(raw_f, &p, at), own_b = layer_raw(raw_b, &p, at);
-        result = fabs(model.x) < LAYER_MIN || (gap <= LAYER_NEAR && !layer_plain(&p, model) && fabs(own_f-own_b) <= LAYER_SAME)
-            ? mix(own_f, own_b, time)
-            : model.x*scene + layer_offset(&p, model);
+        if (fabs(model.x) < LAYER_MIN || (gap <= LAYER_NEAR && !layer_plain(&p, model) && fabs(own_f-own_b) <= LAYER_SAME)) {
+            result = mix(own_f, own_b, time);
+        } else {
+            float2 moved_f = layer_scene(raw_f, layer, &p, at_f, 1);
+            float2 moved_b = layer_scene(raw_b, layer, &p, at_b, 1);
+            layer_agree(raw_f, raw_b, layer, &p, at_f, at_b, &moved_f, &moved_b);
+            float2 base_f = layer_scene(raw_f, layer, &p, at, 0);
+            float2 base_b = layer_scene(raw_b, layer, &p, at, 0);
+            float base = mix(base_f.x, base_b.x, time);
+            float scene;
+# if ALGO == 1
+            scene = moved_b.y > 0.5f ? moved_b.x : (moved_f.y > 0.5f ? moved_f.x : base);
+# elif ALGO == 2
+            scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
+# else
+            if (moved_f.y > 0.5f && moved_b.y > 0.5f) scene = median3(moved_f.x, moved_b.x, base);
+            else scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
+# endif
+            result = model.x*scene + layer_offset(&p, model);
+        }
     } else
 #endif
     {
@@ -3141,8 +3144,9 @@ inline float fuse_slot(
     float occ = clamp(native_sqrt(dv.x * dv.x + dv.y * dv.y) * 0.25f, 0.0f, 1.0f);
     mask = (float4)(0.0f, occ, occ, 0.0f);
 # endif
+# if ALGO != 1 && ALGO != 2
     int zero_mv = sf.x == 0.0f && sf.y == 0.0f && sb.x == 0.0f && sb.y == 0.0f;
-    if (zero_mv && ALGO != 1 && ALGO != 2) {
+    if (zero_mv) {
         float rf = linear_source_sample_f(source_f, &p, vector.x, vector.w, 0.0f);
         float rb = linear_source_sample_f(source_b, &p, vector.z, vector.y, 0.0f);
         if (rf == rb) {
@@ -3152,6 +3156,7 @@ inline float fuse_slot(
             return total + wsum * value;
         }
     }
+# endif
     int is_chroma = p.x_ratio > 1 || p.y_ratio > 1;
     int cap = (FAST_BLEND >= 2 || is_chroma) ? 1 : 2;
     float travel = fmax(fmax(fabs(sf.x), fabs(sf.y)), fmax(fabs(sb.x), fabs(sb.y)));
@@ -3206,9 +3211,14 @@ inline float fuse_slot(
 #else
     float4 ext = (float4)(0.0f);
 #endif
-    int has_base = ALGO == 13 || ALGO == 22;
-    float ref_b0 = has_base ? base_sample(source_b, &p) : 0.0f;
-    float ref_f0 = has_base ? base_sample(source_f, &p) : 0.0f;
+#if ALGO == 13 || ALGO == 22
+    float ref_b0 = base_sample(source_b, &p);
+    float ref_f0 = base_sample(source_f, &p);
+#else
+    float ref_b0 = 0.0f;
+    float ref_f0 = 0.0f;
+#endif
+#if ALGO != 1 && ALGO != 2
     int zero_mv = sf.x == 0.0f && sf.y == 0.0f && sb.x == 0.0f && sb.y == 0.0f;
 #if ADAPTIVE && ALGO == 23 && !FAST_OCC
     float2 ef = full_step(&p, ext.x, ext.w);
@@ -3222,10 +3232,12 @@ inline float fuse_slot(
         float rff = linear_source_sample(source_f, &p, ext.x, ext.w, 0);
         float rbb = linear_source_sample(source_b, &p, ext.z, ext.y, 0);
         int same = rf == rb && rff == rf && rbb == rb;
+#elif ALGO == 13 || ALGO == 22
+        int same = rf == rb && ref_f0 == rf && ref_b0 == rb;
 #else
-        int same = rf == rb && (!has_base || (ref_f0 == rf && ref_b0 == rb));
+        int same = rf == rb;
 #endif
-        if (same && ALGO != 1 && ALGO != 2) {
+        if (same) {
             float value = blend_round(rf, &p, 0, x, y);
             for (int step = 0; step < steps.count; step++) {
 #pragma OPENCL FP_CONTRACT OFF
@@ -3235,6 +3247,7 @@ inline float fuse_slot(
             return total;
         }
     }
+#endif
 #if ADAPTIVE
     float4 mask = (float4)(0.0f);
 #if ALGO >= 21
@@ -3349,9 +3362,13 @@ kernel void blend_frame(
         (float2)(x*p.x_ratio-p.origin_x, y*p.y_ratio-p.origin_y),
         (float2)(p.block_w, p.block_h));
     float4 vector = field_sample(vectors, field_position, CUBIC);
-    int has_base = ALGO == 13 || ALGO == 22 || HAS_SAD;
-    float ref_b0 = has_base ? base_sample(source_b, &p) : 0.0f;
-    float ref_f0 = has_base ? base_sample(source_f, &p) : 0.0f;
+#if ALGO == 13 || ALGO == 22 || HAS_SAD
+    float ref_b0 = base_sample(source_b, &p);
+    float ref_f0 = base_sample(source_f, &p);
+#else
+    float ref_b0 = 0.0f;
+    float ref_f0 = 0.0f;
+#endif
     float4 ext = (float4)(0.0f);
     global float *sum = sums + (p.offset_y+y)*stride + p.offset_x + x;
     float total = overwrite ? 0.0f : *sum;
@@ -3374,12 +3391,10 @@ kernel void blend_frame(
     float gap = layer_gap(cover, &p, at);
     float2 zsf = step_f, zsb = step_b;
     int can_layer = gap <= layer_reach(&p, step_f, step_b);
-    int can_layer_zero = gap <= 16.0f;
 #else
     float2 zsf = full_step(&p, vector.x, vector.w);
     float2 zsb = full_step(&p, vector.z, vector.y);
     int can_layer = 0;
-    int can_layer_zero = 0;
 #endif
 #if STILL
     int is_kept = kept;
@@ -3401,7 +3416,8 @@ kernel void blend_frame(
     int is_kept = 0;
 #endif
 
-    if (!can_layer_zero && !is_kept) {
+#if !LAYER
+    if (!is_kept) {
         int zero_mv = zsf.x == 0.0f && zsf.y == 0.0f && zsb.x == 0.0f && zsb.y == 0.0f;
 #if ALGO == 23 && !FAST_BLEND
         if (zero_mv) {
@@ -3411,15 +3427,40 @@ kernel void blend_frame(
             zero_mv = zef.x == 0.0f && zef.y == 0.0f && zeb.x == 0.0f && zeb.y == 0.0f;
         }
 #endif
-        if (zero_mv && ALGO != 1 && ALGO != 2) {
+#if (ALGO == 1 || ALGO == 2) && !HAS_SAD
+        if (zero_mv) {
+            float rf = source_sample(source_f, &p, vector.x, vector.w, 0);
+            float rb = source_sample(source_b, &p, vector.z, vector.y, 0);
+            float res = ALGO == 1 ? (rb + rf * 0.00001f) : (rf + rb * 0.00001f);
+            float value = blend_round(res, &p, 0, x, y);
+#if HOLD
+            if (weight < 1.0f) value = round(mix(held, value, weight));
+#endif
+            if (steps.gamma != 1.0f) value = curve[(int)value];
+            for (int step = 0; step < steps.count; step++) {
+#pragma OPENCL FP_CONTRACT OFF
+                float term = steps.weight[step] * value;
+                total = term + total;
+            }
+            *sum = total;
+            return;
+        }
+#elif ALGO != 1 && ALGO != 2
+        if (zero_mv) {
             float rf = source_sample(source_f, &p, vector.x, vector.w, 0);
             float rb = source_sample(source_b, &p, vector.z, vector.y, 0);
 #if ALGO == 23 && !FAST_BLEND
             float rff = linear_source_sample(source_f, &p, ext.x, ext.w, 0);
             float rbb = linear_source_sample(source_b, &p, ext.z, ext.y, 0);
-            int same = rf == rb && rff == rf && rbb == rb && (!HAS_SAD || (ref_f0 == rf && ref_b0 == rb));
+#if HAS_SAD
+            int same = rf == rb && rff == rf && rbb == rb && ref_f0 == rf && ref_b0 == rb;
 #else
-            int same = rf == rb && (!has_base || (ref_f0 == rf && ref_b0 == rb));
+            int same = rf == rb && rff == rf && rbb == rb;
+#endif
+#elif ALGO == 13 || ALGO == 22 || HAS_SAD
+            int same = rf == rb && ref_f0 == rf && ref_b0 == rb;
+#else
+            int same = rf == rb;
 #endif
             if (same) {
                 float value = blend_round(rf, &p, 0, x, y);
@@ -3436,10 +3477,185 @@ kernel void blend_frame(
                 return;
             }
         }
+#endif
     }
+#endif
+
+#if LAYER
+    if (can_layer) {
+        float4 l_model = read_imagef(layer, linear_sampler, layer_luma(&p, at));
+        float l_own_f = layer_raw(raw_f, &p, at);
+        float l_own_b = layer_raw(raw_b, &p, at);
+        int l_opaque = fabs(l_model.x) < LAYER_MIN
+            || (gap <= LAYER_NEAR && !layer_plain(&p, l_model) && fabs(l_own_f - l_own_b) <= LAYER_SAME);
+        if (l_opaque && gap <= 16.0f && l_own_f == l_own_b) {
+            float value = blend_round(l_own_f, &p, 1, x, y);
+#if HOLD
+            if (weight < 1.0f) value = round(mix(held, value, weight));
+#endif
+            if (steps.gamma != 1.0f) value = curve[(int)value];
+            for (int step = 0; step < steps.count; step++) {
+#pragma OPENCL FP_CONTRACT OFF
+                float term = steps.weight[step] * value;
+                total = term + total;
+            }
+            *sum = total;
+            return;
+        }
+        float l_base_f = 0.0f, l_base_b = 0.0f;
+        if (!l_opaque) {
+            float loff = layer_offset(&p, l_model);
+            l_base_f = clamp(native_divide(l_own_f - loff, l_model.x), 0.0f, 255.0f);
+            l_base_b = clamp(native_divide(l_own_b - loff, l_model.x), 0.0f, 255.0f);
+        }
+#if FAST_BLEND
+        if (!is_kept) {
+            int fb_chroma = p.x_ratio > 1 || p.y_ratio > 1;
+            int fb_cap = (FAST_BLEND >= 2 || fb_chroma) ? 1 : 2;
+            float fb_travel = fmax(fmax(fabs(zsf.x), fabs(zsf.y)), fmax(fabs(zsb.x), fabs(zsb.y)));
+            int fb_want = fb_travel < 0.5f ? 1 : fb_cap;
+            int fb_buckets = min(fb_want, steps.count);
+            float4 fb_mask = (float4)(0.0f);
+#if ALGO >= 21
+            float2 fb_dv = zsf + zsb;
+            float fb_occ = clamp(native_sqrt(fb_dv.x * fb_dv.x + fb_dv.y * fb_dv.y) * 0.25f, 0.0f, 1.0f);
+            fb_mask = (float4)(0.0f, fb_occ, fb_occ, 0.0f);
+#endif
+            for (int b = 0; b < fb_buckets; b++) {
+                float wsum;
+                float pf;
+                int sad_idx;
+                float j = ign_noise(x + b * 7, y + b * 13);
+                if (steps.count == 2) {
+                    float p0 = (float)steps.phase[0];
+                    float p1 = (float)steps.phase[1];
+                    float dp = (p1 - p0) * 0.5f;
+                    float lo = fb_buckets == 1 ? clamp(p0 - dp, 0.0f, 256.0f)
+                        : clamp((b == 0 ? p0 : p1) - dp, 0.0f, 256.0f);
+                    float hi = fb_buckets == 1 ? clamp(p1 + dp, 0.0f, 256.0f)
+                        : clamp((b == 0 ? p0 : p1) + dp, 0.0f, 256.0f);
+                    wsum = fb_buckets == 1 ? (steps.weight[0] + steps.weight[1]) : steps.weight[b];
+                    pf = mix(lo, hi, j);
+                    sad_idx = b;
+                } else {
+                    int s0 = (b * steps.count) / fb_buckets;
+                    int s1 = ((b + 1) * steps.count) / fb_buckets;
+                    sad_idx = (s0 + s1 - 1) >> 1;
+                    wsum = 0.0f;
+                    for (int s = s0; s < s1; s++) wsum += steps.weight[s];
+                    pf = s1 - s0 > 1
+                        ? mix((float)steps.phase[s0], (float)steps.phase[s1 - 1], j)
+                        : (float)steps.phase[s0];
+                }
+                float result;
+                int layered = 0;
+                float time = pf * 0.00390625f;
+                if (gap <= layer_reach(&p, step_f*time, step_b*(1.0f-time))) {
+                    layered = 1;
+                    if (l_opaque) {
+                        result = mix(l_own_f, l_own_b, time);
+                    } else {
+                        float2 at_f = clamp(at + step_f*time, (float2)(0.0f, 0.0f), top);
+                        float2 at_b = clamp(at + step_b*(1.0f-time), (float2)(0.0f, 0.0f), top);
+                        float2 moved_f = layer_scene(raw_f, layer, &p, at_f, 1);
+                        float2 moved_b = layer_scene(raw_b, layer, &p, at_b, 1);
+                        layer_agree(raw_f, raw_b, layer, &p, at_f, at_b, &moved_f, &moved_b);
+                        float base = mix(l_base_f, l_base_b, time);
+                        float scene;
+# if ALGO == 1
+                        scene = moved_b.y > 0.5f ? moved_b.x : (moved_f.y > 0.5f ? moved_f.x : base);
+# elif ALGO == 2
+                        scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
+# else
+                        if (moved_f.y > 0.5f && moved_b.y > 0.5f) scene = median3(moved_f.x, moved_b.x, base);
+                        else scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
+# endif
+                        result = l_model.x*scene + layer_offset(&p, l_model);
+                    }
+                } else {
+                    result = fast_blend_tap(source_f, source_b, &p, vector, fb_mask, pf, fb_chroma);
+#if HAS_SAD
+                    float4 m = layer_sample(masks, field_position, sad_idx);
+                    result = mix(result, mix(ref_f0, ref_b0, steps.sad_blend[sad_idx]), fmax(m.w, m.x));
+#endif
+                }
+                float value = blend_round(result, &p, layered, x, y);
+#if HOLD
+                if (weight < 1.0f) value = round(mix(held, value, weight));
+#endif
+                if (steps.gamma != 1.0f) value = curve[(int)value];
+                total += wsum * value;
+            }
+            *sum = total;
+            return;
+        }
+#endif
+#if !(FAST_BLEND && !STILL)
+#if ALGO == 23
+        ext = field_sample(vectors_ext, field_position, CUBIC);
+#endif
+        for (int step = 0; step < steps.count; step++) {
+            p.phase = steps.phase[step];
+            p.sad_blend = steps.sad_blend[step];
+            float time = native_divide((float)p.phase, 256.0f);
+            float result;
+            int layered = gap <= layer_reach(&p, step_f*time, step_b*(1.0f-time));
+            if (layered) {
+                if (l_opaque) {
+                    result = mix(l_own_f, l_own_b, time);
+                } else {
+                    float2 at_f = clamp(at + step_f*time, (float2)(0.0f, 0.0f), top);
+                    float2 at_b = clamp(at + step_b*(1.0f-time), (float2)(0.0f, 0.0f), top);
+                    float2 moved_f = layer_scene(raw_f, layer, &p, at_f, 1);
+                    float2 moved_b = layer_scene(raw_b, layer, &p, at_b, 1);
+                    layer_agree(raw_f, raw_b, layer, &p, at_f, at_b, &moved_f, &moved_b);
+                    float base = mix(l_base_f, l_base_b, time);
+                    float scene;
+# if ALGO == 1
+                    scene = moved_b.y > 0.5f ? moved_b.x : (moved_f.y > 0.5f ? moved_f.x : base);
+# elif ALGO == 2
+                    scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
+# else
+                    if (moved_f.y > 0.5f && moved_b.y > 0.5f)
+                        scene = median3(moved_f.x, moved_b.x, base);
+                    else scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
+# endif
+                    result = l_model.x*scene + layer_offset(&p, l_model);
+                }
+            } else
+#if STILL
+            if (kept) {
+                result = mix(kept_f, kept_b, time);
+            } else
+#endif
+            {
+#if ALGO >= 21 || HAS_SAD
+                float4 mask = layer_sample(masks, field_position, step);
+#else
+                float4 mask = (float4)(0.0f);
+#endif
+                result = blend_value(
+                    source_f, source_b, &p, vector, mask, ext, ref_f0, ref_b0, time);
+            }
+            float value = blend_round(result, &p, layered, x, y);
+#if HOLD
+            if (weight < 1.0f) value = round(mix(held, value, weight));
+#endif
+            {
+#pragma OPENCL FP_CONTRACT OFF
+                if (steps.gamma != 1.0f) value = curve[(int)value];
+                float term = steps.weight[step] * value;
+                total = term + total;
+            }
+        }
+        *sum = total;
+        return;
+#endif
+    }
+#endif
 
 #if FAST_BLEND
-    if (!can_layer && !is_kept) {
+    if (!is_kept) {
     int fb_chroma = p.x_ratio > 1 || p.y_ratio > 1;
     int fb_cap = (FAST_BLEND >= 2 || fb_chroma) ? 1 : 2;
     float fb_travel = fmax(fmax(fabs(zsf.x), fabs(zsf.y)), fmax(fabs(zsb.x), fabs(zsb.y)));
@@ -3451,65 +3667,56 @@ kernel void blend_frame(
     float fb_occ = clamp(native_sqrt(fb_dv.x * fb_dv.x + fb_dv.y * fb_dv.y) * 0.25f, 0.0f, 1.0f);
     fb_mask = (float4)(0.0f, fb_occ, fb_occ, 0.0f);
 #endif
-    if (steps.count == 2) {
-        float p0 = (float)steps.phase[0];
-        float p1 = (float)steps.phase[1];
-        float dp = (p1 - p0) * 0.5f;
-        for (int b = 0; b < fb_buckets; b++) {
+    for (int b = 0; b < fb_buckets; b++) {
+        float wsum;
+        float pf;
+        int sad_idx;
+        float j = ign_noise(x + b * 7, y + b * 13);
+        if (steps.count == 2) {
+            float p0 = (float)steps.phase[0];
+            float p1 = (float)steps.phase[1];
+            float dp = (p1 - p0) * 0.5f;
             float lo = fb_buckets == 1 ? clamp(p0 - dp, 0.0f, 256.0f)
                 : clamp((b == 0 ? p0 : p1) - dp, 0.0f, 256.0f);
             float hi = fb_buckets == 1 ? clamp(p1 + dp, 0.0f, 256.0f)
                 : clamp((b == 0 ? p0 : p1) + dp, 0.0f, 256.0f);
-            float wsum = fb_buckets == 1 ? (steps.weight[0] + steps.weight[1]) : steps.weight[b];
-            float j = ign_noise(x + b * 7, y + b * 13);
-            float pf = mix(lo, hi, j);
-            float result = fast_blend_tap(source_f, source_b, &p, vector, fb_mask, pf, fb_chroma);
-#if HAS_SAD
-            float4 m = layer_sample(masks, field_position, b);
-            result = mix(result, mix(ref_f0, ref_b0, steps.sad_blend[b]), fmax(m.w, m.x));
-#endif
-            float value = blend_round(result, &p, 0, x, y);
-#if HOLD
-            if (weight < 1.0f) value = round(mix(held, value, weight));
-#endif
-            if (steps.gamma != 1.0f) value = curve[(int)value];
-            total += wsum * value;
-        }
-    } else {
-        for (int b = 0; b < fb_buckets; b++) {
+            wsum = fb_buckets == 1 ? (steps.weight[0] + steps.weight[1]) : steps.weight[b];
+            pf = mix(lo, hi, j);
+            sad_idx = b;
+        } else {
             int s0 = (b * steps.count) / fb_buckets;
             int s1 = ((b + 1) * steps.count) / fb_buckets;
-            int mid = (s0 + s1 - 1) >> 1;
-            float wsum = 0.0f;
+            sad_idx = (s0 + s1 - 1) >> 1;
+            wsum = 0.0f;
             for (int s = s0; s < s1; s++) wsum += steps.weight[s];
-            float j = ign_noise(x + b * 7, y + b * 13);
-            float pf = s1 - s0 > 1
+            pf = s1 - s0 > 1
                 ? mix((float)steps.phase[s0], (float)steps.phase[s1 - 1], j)
                 : (float)steps.phase[s0];
-            float result = fast_blend_tap(source_f, source_b, &p, vector, fb_mask, pf, fb_chroma);
-#if HAS_SAD
-            float4 m = layer_sample(masks, field_position, mid);
-            result = mix(result, mix(ref_f0, ref_b0, steps.sad_blend[mid]), fmax(m.w, m.x));
-#endif
-            float value = blend_round(result, &p, 0, x, y);
-#if HOLD
-            if (weight < 1.0f) value = round(mix(held, value, weight));
-#endif
-            if (steps.gamma != 1.0f) value = curve[(int)value];
-            total += wsum * value;
         }
+        float result = fast_blend_tap(source_f, source_b, &p, vector, fb_mask, pf, fb_chroma);
+#if HAS_SAD
+        float4 m = layer_sample(masks, field_position, sad_idx);
+        result = mix(result, mix(ref_f0, ref_b0, steps.sad_blend[sad_idx]), fmax(m.w, m.x));
+#endif
+        float value = blend_round(result, &p, 0, x, y);
+#if HOLD
+        if (weight < 1.0f) value = round(mix(held, value, weight));
+#endif
+        if (steps.gamma != 1.0f) value = curve[(int)value];
+        total += wsum * value;
     }
     *sum = total;
     return;
     }
 #endif
 
+#if !(FAST_BLEND && !STILL)
 #if ALGO == 23
     ext = field_sample(vectors_ext, field_position, CUBIC);
 #endif
 
-#if ADAPTIVE
-    if (!can_layer && !is_kept) {
+#if ADAPTIVE && !FAST_BLEND
+    if (!is_kept) {
     float atravel = fmax(fmax(fabs(zsf.x), fabs(zsf.y)), fmax(fabs(zsb.x), fabs(zsb.y)));
     int awant = atravel < 0.25f ? 1 : (atravel < 1.5f ? 2 : (atravel < 4.0f ? 4 : (atravel < 8.0f ? 8 : steps.count)));
     int abuckets = min(awant, steps.count);
@@ -3555,49 +3762,22 @@ kernel void blend_frame(
         p.sad_blend = steps.sad_blend[step];
         float time = native_divide((float)p.phase, 256.0f);
         float result;
-        int layered = 0;
-#if LAYER
-        float2 at_f = clamp(at + step_f*time, (float2)(0.0f, 0.0f), top);
-        float2 at_b = clamp(at + step_b*(1.0f-time), (float2)(0.0f, 0.0f), top);
-        layered = gap <= layer_reach(&p, step_f*time, step_b*(1.0f-time));
-        if (layered) {
-            float4 model = read_imagef(layer, linear_sampler, layer_luma(&p, at));
-            float2 moved_f = layer_scene(raw_f, layer, &p, at_f, 1);
-            float2 moved_b = layer_scene(raw_b, layer, &p, at_b, 1);
-            layer_agree(raw_f, raw_b, layer, &p, at_f, at_b, &moved_f, &moved_b);
-            float2 base_f = layer_scene(raw_f, layer, &p, at, 0);
-            float2 base_b = layer_scene(raw_b, layer, &p, at, 0);
-            float base = mix(base_f.x, base_b.x, time);
-            float scene;
-# if ALGO == 1
-            scene = moved_b.y > 0.5f ? moved_b.x : (moved_f.y > 0.5f ? moved_f.x : base);
-# elif ALGO == 2
-            scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
-# else
-            if (moved_f.y > 0.5f && moved_b.y > 0.5f)
-                scene = median3(moved_f.x, moved_b.x, base);
-            else scene = moved_f.y > 0.5f ? moved_f.x : (moved_b.y > 0.5f ? moved_b.x : base);
-# endif
-            float own_f = layer_raw(raw_f, &p, at), own_b = layer_raw(raw_b, &p, at);
-            result = fabs(model.x) < LAYER_MIN
-                    || (gap <= LAYER_NEAR && !layer_plain(&p, model) && fabs(own_f-own_b) <= LAYER_SAME)
-                ? mix(own_f, own_b, time)
-                : model.x*scene + layer_offset(&p, model);
-        } else
-#endif
 #if STILL
         if (kept) {
             result = mix(kept_f, kept_b, time);
         } else
 #endif
         {
-            float4 mask = ALGO >= 21 || HAS_SAD
-                ? layer_sample(masks, field_position, step) : (float4)(0.0f);
+#if ALGO >= 21 || HAS_SAD
+            float4 mask = layer_sample(masks, field_position, step);
+#else
+            float4 mask = (float4)(0.0f);
+#endif
             result = blend_value(
                 source_f, source_b, &p, vector, mask, ext, ref_f0, ref_b0, time);
         }
 
-        float value = blend_round(result, &p, layered, x, y);
+        float value = blend_round(result, &p, 0, x, y);
 #if HOLD
         if (weight < 1.0f) value = round(mix(held, value, weight));
 #endif
@@ -3609,6 +3789,7 @@ kernel void blend_frame(
         }
     }
     *sum = total;
+#endif
 }
 #endif
 #endif
@@ -3706,19 +3887,14 @@ inline float layer_error(const float *t, float n, float2 m) {
 
 inline void layer_terms(
     float *v, read_only image2d_t first, read_only image2d_t second,
-    read_only image2d_t vectors, const Params *p, int channels)
+    read_only image2d_t vectors, const Params *p, int channels,
+    float2 at, float2 top, float2 field_position, float ia, float ib)
 {
-    int x = get_global_id(0), y = get_global_id(1);
-    float2 at = (float2)(x, y), top = (float2)(p->width-1, p->height-1);
-    float2 field_position = native_divide(
-        (float2)(x*p->x_ratio-p->origin_x, y*p->y_ratio-p->origin_y),
-        (float2)(p->block_w, p->block_h));
     float4 vector = p->cubic ? cubic_sample(vectors, field_position)
         : read_imagef(vectors, field_sampler, field_position);
     float2 step_f = full_step(p, vector.x, vector.w);
     float2 step_b = full_step(p, vector.z, vector.y);
     float2 zero = (float2)(0.0f, 0.0f);
-    float ia = layer_raw(first, p, at), ib = layer_raw(second, p, at);
     float pb = layer_raw(first, p, clamp(at+step_f, zero, top));
     float pa = layer_raw(second, p, clamp(at+step_b, zero, top));
     v[0] = pb + pa;
@@ -3734,33 +3910,60 @@ inline void layer_terms(
 kernel void layer_stats(
     global float *sums,
     read_only image2d_t f0, read_only image2d_t f1, read_only image2d_t f2,
-    read_only image2d_t f3, read_only image2d_t f4,
+    read_only image2d_t f3, read_only image2d_t f4, read_only image2d_t f5,
+    read_only image2d_t f6,
     read_only image2d_t m0, read_only image2d_t m1, read_only image2d_t m2,
-    read_only image2d_t m3, Params p, int base, int channels, int reset, int pairs)
+    read_only image2d_t m3, read_only image2d_t m4, read_only image2d_t m5,
+    Params p, int base, int channels, int reset, int pairs)
 {
     int x = get_global_id(0), y = get_global_id(1);
     if (x >= p.width || y >= p.height) return;
-    global float *sum = sums + base + (y*p.width+x)*channels;
+    int plane_n = p.width * p.height;
+    global float *sum = sums + base + y * p.width + x;
+    float2 at = (float2)(x, y), top = (float2)(p.width-1, p.height-1);
+    float2 field_position = native_divide(
+        (float2)(x*p.x_ratio-p.origin_x, y*p.y_ratio-p.origin_y),
+        (float2)(p.block_w, p.block_h));
     float v[6], total[6];
-    layer_terms(v, f0, f1, m0, &p, channels);
-    for (int c = 0; c < channels; c++) total[c] = reset ? v[c] : sum[c] + v[c];
+    float ia = layer_raw(f0, &p, at);
+    float ib = layer_raw(f1, &p, at);
+    layer_terms(v, f0, f1, m0, &p, channels, at, top, field_position, ia, ib);
+    for (int c = 0; c < channels; c++) total[c] = reset ? v[c] : sum[c * plane_n] + v[c];
     if (pairs > 1) {
-        layer_terms(v, f1, f2, m1, &p, channels);
+        ia = ib;
+        ib = layer_raw(f2, &p, at);
+        layer_terms(v, f1, f2, m1, &p, channels, at, top, field_position, ia, ib);
         for (int c = 0; c < channels; c++) total[c] += v[c];
     }
     if (pairs > 2) {
-        layer_terms(v, f2, f3, m2, &p, channels);
+        ia = ib;
+        ib = layer_raw(f3, &p, at);
+        layer_terms(v, f2, f3, m2, &p, channels, at, top, field_position, ia, ib);
         for (int c = 0; c < channels; c++) total[c] += v[c];
     }
     if (pairs > 3) {
-        layer_terms(v, f3, f4, m3, &p, channels);
+        ia = ib;
+        ib = layer_raw(f4, &p, at);
+        layer_terms(v, f3, f4, m3, &p, channels, at, top, field_position, ia, ib);
         for (int c = 0; c < channels; c++) total[c] += v[c];
     }
-    for (int c = 0; c < channels; c++) sum[c] = total[c];
+    if (pairs > 4) {
+        ia = ib;
+        ib = layer_raw(f5, &p, at);
+        layer_terms(v, f4, f5, m4, &p, channels, at, top, field_position, ia, ib);
+        for (int c = 0; c < channels; c++) total[c] += v[c];
+    }
+    if (pairs > 5) {
+        ia = ib;
+        ib = layer_raw(f6, &p, at);
+        layer_terms(v, f5, f6, m5, &p, channels, at, top, field_position, ia, ib);
+        for (int c = 0; c < channels; c++) total[c] += v[c];
+    }
+    for (int c = 0; c < channels; c++) sum[c * plane_n] = total[c];
 }
 
 inline float2 layer_pick(
-    global const float **parts, const int *counts, int at, const float *own, int n_cur,
+    global const float **parts, const int *counts, int idx, int plane_n, const float *own, int n_cur,
     float limit, int strict, float proof, int *from, int *to)
 {
     float2 model = (float2)(1.0f, 0.0f);
@@ -3771,7 +3974,7 @@ inline float2 layer_pick(
         float n = 0.0f;
         for (int part = lo; part <= hi; part++) {
             if (!counts[part]) continue;
-            for (int c = 0; c < 6; c++) t[c] += parts[part][at+c];
+            for (int c = 0; c < 6; c++) t[c] += parts[part][c * plane_n + idx];
             n += counts[part];
         }
         float2 m = layer_model(t, n, limit, strict);
@@ -3794,25 +3997,35 @@ kernel void layer_fit(
     float limit, int chroma_w, int chroma_h, int strict, float proof)
 {
     int x = get_global_id(0), y = get_global_id(1);
-    int at = (y*width+x)*6;
-    int second = chroma_w*chroma_h*2;
-    int at_u = width*height*6 + ((y/(height/chroma_h))*chroma_w + x/(width/chroma_w))*2;
+    int luma_n = width * height;
+    int idx = y * width + x;
+    float seen_total = (n_prev ? prev[5 * luma_n + idx] : 0.0f)
+        + cur[5 * luma_n + idx]
+        + (n_next ? next[5 * luma_n + idx] : 0.0f);
+    if (seen_total < proof) {
+        write_imagef(fit, (int2)(x, y), (float4)(1.0f, 0.0f, 0.0f, 0.0f));
+        return;
+    }
+    int chroma_n = chroma_w * chroma_h;
+    int u_base = luma_n * 6;
+    int v_base = u_base + chroma_n * 2;
+    int c_idx = (y / (height / chroma_h)) * chroma_w + x / (width / chroma_w);
     global const float *parts[3] = {prev, cur, next};
     int counts[3] = {n_prev, n_cur, n_next};
     float own[6];
-    for (int c = 0; c < 6; c++) own[c] = cur[at+c];
+    for (int c = 0; c < 6; c++) own[c] = cur[c * luma_n + idx];
     int from = 1, to = 1;
-    float2 model = layer_pick(parts, counts, at, own, n_cur, limit*limit, strict, proof, &from, &to);
+    float2 model = layer_pick(parts, counts, idx, luma_n, own, n_cur, limit*limit, strict, proof, &from, &to);
     int near = 0;
     for (int part = 0; part < 3 && strict; part += 2) {
         if (!counts[part]) continue;
         float t[6];
-        for (int c = 0; c < 6; c++) t[c] = parts[part][at+c];
+        for (int c = 0; c < 6; c++) t[c] = parts[part][c * luma_n + idx];
         float2 m = layer_model(t, counts[part], limit*limit, 1);
         near |= layer_set((float4)(m.x, m.y, 0.0f, 0.0f));
     }
     if (model.x == 1.0f && model.y == 0.0f && near)
-        model = layer_pick(parts, counts, at, own, n_cur, limit*limit, 0, proof, &from, &to);
+        model = layer_pick(parts, counts, idx, luma_n, own, n_cur, limit*limit, 0, proof, &from, &to);
     float2 offset = (float2)(0.0f, 0.0f);
     if (model.x != 1.0f || model.y != 0.0f) {
         float t[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -3820,8 +4033,8 @@ kernel void layer_fit(
         for (int part = from; part <= to; part++) {
             if (!counts[part]) continue;
             for (int c = 0; c < 2; c++) {
-                t[c] += parts[part][at_u+c];
-                t[2+c] += parts[part][at_u+second+c];
+                t[c] += parts[part][u_base + c * chroma_n + c_idx];
+                t[2+c] += parts[part][v_base + c * chroma_n + c_idx];
             }
             n += counts[part];
         }
@@ -3967,7 +4180,7 @@ unsafe fn device_size(cl: &OpenCl, device: ClDeviceId, param: ClUint) -> Option<
         .filter(|&size| status == CL_SUCCESS && size > 0)
 }
 
-fn interleave4_u16(
+pub(crate) fn interleave4_u16(
     dst_vec: &mut Vec<u16>,
     count: usize,
     c0: &[u16],

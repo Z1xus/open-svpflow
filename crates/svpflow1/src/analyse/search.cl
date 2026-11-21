@@ -59,31 +59,6 @@ inline uint funnel(uint lo, uint hi, uint sft) {
     asm("shf.r.wrap.b32 %0,%1,%2,%3;" : "=r"(r) : "r"(lo), "r"(hi), "r"(sft));
     return r;
 }
-inline uint prmt(uint a, uint b, uint sel) {
-    uint r;
-    asm("prmt.b32 %0,%1,%2,%3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
-    return r;
-}
-inline uint vadd2_s(uint a, uint b) {
-    uint r;
-    asm("vadd2.s32.s32.s32 %0,%1,%2,%3;" : "=r"(r) : "r"(a), "r"(b), "r"(0u));
-    return r;
-}
-inline uint vsub2_s(uint a, uint b) {
-    uint r;
-    asm("vsub2.s32.s32.s32 %0,%1,%2,%3;" : "=r"(r) : "r"(a), "r"(b), "r"(0u));
-    return r;
-}
-inline uint vabs2_s(uint a) {
-    uint r;
-    asm("vabsdiff2.s32.s32.s32 %0,%1,%2,%3;" : "=r"(r) : "r"(a), "r"(0u), "r"(0u));
-    return r;
-}
-inline uint vmax2_add(uint a, uint b, uint c) {
-    uint r;
-    asm("vmax2.u32.u32.u32.add %0,%1,%2,%3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
-    return r;
-}
 inline uint ldg_u8(__global const uchar *p) {
     uint r;
     asm("ld.global.nc.u8 %0,[%1];" : "=r"(r) : "l"(p));
@@ -476,46 +451,6 @@ inline void sad_slow(__global const uchar *gy, __global const uchar *gu, __globa
 #define TCOL(t, r) ((t) % (W / 4))
 #define TPIX(t, y, x) ((((t) / (W / 4)) * 4 + (y)) * W + ((t) % (W / 4)) * 4 + (x))
 #endif
-#ifdef NV
-inline uint had4x4_half_packed(uint a0, uint b0, uint a1, uint b1, uint a2, uint b2, uint a3, uint b3) {
-    uint s0 = vadd2_s(a0, a1), d0 = vsub2_s(a0, a1);
-    uint s1 = vadd2_s(a2, a3), d1 = vsub2_s(a2, a3);
-    a0 = vadd2_s(s0, s1); a1 = vsub2_s(s0, s1);
-    a2 = vadd2_s(d0, d1); a3 = vsub2_s(d0, d1);
-    s0 = vadd2_s(b0, b1); d0 = vsub2_s(b0, b1);
-    s1 = vadd2_s(b2, b3); d1 = vsub2_s(b2, b3);
-    b0 = vadd2_s(s0, s1); b1 = vsub2_s(s0, s1);
-    b2 = vadd2_s(d0, d1); b3 = vsub2_s(d0, d1);
-    uint sum = 0, p, q, ap, aq;
-    p = vadd2_s(a0, b0); q = vsub2_s(a0, b0); ap = vabs2_s(p); aq = vabs2_s(q);
-    sum = vmax2_add(prmt(ap, aq, 0x5410u), prmt(ap, aq, 0x7632u), sum);
-    p = vadd2_s(a1, b1); q = vsub2_s(a1, b1); ap = vabs2_s(p); aq = vabs2_s(q);
-    sum = vmax2_add(prmt(ap, aq, 0x5410u), prmt(ap, aq, 0x7632u), sum);
-    p = vadd2_s(a2, b2); q = vsub2_s(a2, b2); ap = vabs2_s(p); aq = vabs2_s(q);
-    sum = vmax2_add(prmt(ap, aq, 0x5410u), prmt(ap, aq, 0x7632u), sum);
-    p = vadd2_s(a3, b3); q = vsub2_s(a3, b3); ap = vabs2_s(p); aq = vabs2_s(q);
-    sum = vmax2_add(prmt(ap, aq, 0x5410u), prmt(ap, aq, 0x7632u), sum);
-    return sum;
-}
-inline uint had4x4_half_u32(uint s0, uint s1, uint s2, uint s3, uint r0, uint r1, uint r2, uint r3) {
-    uint a0 = vsub2_s(prmt(s0, 0u, 0x4140u), prmt(r0, 0u, 0x4140u));
-    uint b0 = vsub2_s(prmt(s0, 0u, 0x4342u), prmt(r0, 0u, 0x4342u));
-    uint a1 = vsub2_s(prmt(s1, 0u, 0x4140u), prmt(r1, 0u, 0x4140u));
-    uint b1 = vsub2_s(prmt(s1, 0u, 0x4342u), prmt(r1, 0u, 0x4342u));
-    uint a2 = vsub2_s(prmt(s2, 0u, 0x4140u), prmt(r2, 0u, 0x4140u));
-    uint b2 = vsub2_s(prmt(s2, 0u, 0x4342u), prmt(r2, 0u, 0x4342u));
-    uint a3 = vsub2_s(prmt(s3, 0u, 0x4140u), prmt(r3, 0u, 0x4140u));
-    uint b3 = vsub2_s(prmt(s3, 0u, 0x4342u), prmt(r3, 0u, 0x4342u));
-    return had4x4_half_packed(a0, b0, a1, b1, a2, b2, a3, b3);
-}
-inline int had4x4_half(int *d) {
-    uint a0 = prmt((uint)d[0], (uint)d[1], 0x5410u), b0 = prmt((uint)d[2], (uint)d[3], 0x5410u);
-    uint a1 = prmt((uint)d[4], (uint)d[5], 0x5410u), b1 = prmt((uint)d[6], (uint)d[7], 0x5410u);
-    uint a2 = prmt((uint)d[8], (uint)d[9], 0x5410u), b2 = prmt((uint)d[10], (uint)d[11], 0x5410u);
-    uint a3 = prmt((uint)d[12], (uint)d[13], 0x5410u), b3 = prmt((uint)d[14], (uint)d[15], 0x5410u);
-    return (int)had4x4_half_packed(a0, b0, a1, b1, a2, b2, a3, b3);
-}
-#else
 inline int had4x4_half(int *d) {
     int t[16];
     #pragma unroll
@@ -544,7 +479,6 @@ inline uint had4x4_half_u32(uint s0, uint s1, uint s2, uint s3, uint r0, uint r1
     d[12] = d3.x; d[13] = d3.y; d[14] = d3.z; d[15] = d3.w;
     return (uint)had4x4_half(d);
 }
-#endif
 
 inline void satd_at(__global const uchar *gy, __global const uchar *gu, __global const uchar *gv,
                     __global const uchar *ry, __global const uchar *ru, __global const uchar *rv,

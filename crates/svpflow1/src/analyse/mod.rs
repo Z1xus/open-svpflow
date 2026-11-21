@@ -95,9 +95,17 @@ pub(crate) fn analyse(
             return words;
         }
         #[cfg(not(target_arch = "wasm32"))]
+        let prefer_cpu_overlap = !params.super_params.lean
+            && params.super_params.pel == 1
+            && params.stages.len() == 1
+            && params.stages[0].blk_x * params.stages[0].blk_y <= 14_000
+            && svpflow_core::threads::workers() >= 6;
+        #[cfg(not(target_arch = "wasm32"))]
         let plan = keys
             .filter(|_| {
-                params.gpu_mode == 1 && gpu::refine_gpu().is_some_and(gpu::RefineGpu::chain_ready)
+                !prefer_cpu_overlap
+                    && params.gpu_mode == 1
+                    && gpu::refine_gpu().is_some_and(gpu::RefineGpu::chain_ready)
             })
             .and_then(|_| chain::ChainPlan::new(params, first, second));
         #[cfg(target_arch = "wasm32")]
@@ -118,13 +126,19 @@ pub(crate) fn analyse(
             .as_ref()
             .map(|r| [r[0].view(params), r[1].view(params)]);
         let [first, second] = views.as_ref().map_or([first, second], |v| [&v[0], &v[1]]);
-        let exact_dontv_gpu = params.gpu_mode == 1
+        #[cfg(not(target_arch = "wasm32"))]
+        let allow_gpu_refine = !prefer_cpu_overlap;
+        #[cfg(target_arch = "wasm32")]
+        let allow_gpu_refine = true;
+        let exact_dontv_gpu = allow_gpu_refine
+            && params.gpu_mode == 1
             && params.stages[0].settings(params, 0, false).search_param == 0
             && params.stages[0].settings(params, 0, false).search_type
                 == field::SearchType::Exhaustive
             && matches!(params.stages[0].layout.width, 8 | 16 | 32)
             && matches!(params.stages[0].layout.height, 8 | 16 | 32);
-        let gpu = (keys.is_some()
+        let gpu = (allow_gpu_refine
+            && keys.is_some()
             && (params.stages[0].gpu_searchable(params)
                 || exact_dontv_gpu
                 || params.stages.len() > 1

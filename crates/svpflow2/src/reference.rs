@@ -373,7 +373,8 @@ impl FilterState {
             let none = |_| None::<std::sync::Arc<VectorField>>;
             engine::motions(field, true, true, true, false, (false, false), none, k)
         };
-        let kernel = engine::gpu_params(
+        let fast_peel = self.options.fast() >= 2;
+        let mut kernel = engine::gpu_params(
             params,
             vector_data,
             (width, height),
@@ -383,6 +384,11 @@ impl FilterState {
             false,
             false,
         );
+        if fast_peel {
+            for plane in &mut kernel {
+                plane.cubic = 0;
+            }
+        }
         let cap = self.field_cap(shape);
         let get = |node, k| fetch.get(node, k);
         let chunks = self.chunks(api, &get, vector_data, last, &held.asked);
@@ -396,7 +402,12 @@ impl FilterState {
             });
             Some(motion(k, field.as_ref()?))
         };
-        let pairs = |chunk: i64| chunks.uploaded(gpu, chunk, true, &motions);
+        let pairs = |chunk: i64| chunks.uploaded(gpu, chunk, true, fast_peel, &motions);
+        let proof = if fast_peel {
+            (proof * 0.5).max(2.0)
+        } else {
+            proof
+        };
         gpu.layer_fit(
             i64::from(n / layer::CHUNK),
             i64::from(last / layer::CHUNK),

@@ -173,7 +173,6 @@ impl BlendState {
             || self.plan.weights.len() <= 5
             || self.inner.options.dedup().is_some()
             || self.inner.options.mask_still().is_some()
-            || self.inner.options.mask_peel().is_some()
         {
             return self.plan.window(n).collect();
         }

@@ -255,7 +255,11 @@ unsafe fn vectors(
         )?;
         if render {
             let gpu = (sdata >> 48) & 0xFF;
-            let options = CString::new(format!("{{pel:1,gpu:{gpu}}}")).unwrap_or_default();
+            let options = if gpu == 1 {
+                c"{pel:1,lean:true,gpu:1}".to_owned()
+            } else {
+                CString::new(format!("{{pel:1,gpu:{gpu}}}")).unwrap_or_default()
+            };
             supers = call(
                 c"Super",
                 vec![(c"clip", clip(source)), (c"opt", Value::Data(options))],

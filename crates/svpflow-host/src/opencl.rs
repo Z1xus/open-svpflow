@@ -225,36 +225,8 @@ impl OpenCl {
     }
 
     pub unsafe fn wait_event(&self, queue: Handle, event: Handle) -> bool {
-        unsafe { (self.Flush)(queue) };
-        let mut spins = 0u32;
-        loop {
-            let mut status: ClInt = 1;
-            let got = unsafe {
-                (self.GetEventInfo)(
-                    event,
-                    CL_EVENT_COMMAND_EXECUTION_STATUS,
-                    size_of::<ClInt>(),
-                    (&raw mut status).cast(),
-                    core::ptr::null_mut(),
-                )
-            };
-            if got != CL_SUCCESS || status < 0 {
-                return false;
-            }
-            if status == CL_COMPLETE {
-                return true;
-            }
-            spins = spins.saturating_add(1);
-            if spins <= 32 {
-                core::hint::spin_loop();
-            } else if spins <= 40 {
-                std::thread::yield_now();
-            } else if spins <= 60 {
-                std::thread::sleep(std::time::Duration::from_micros(10));
-            } else {
-                std::thread::sleep(std::time::Duration::from_micros(40));
-            }
-        }
+        let _ = queue;
+        unsafe { (self.WaitForEvents)(1, &raw const event) == CL_SUCCESS }
     }
 
     pub unsafe fn load() -> Result<Self, String> {

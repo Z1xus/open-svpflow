@@ -809,7 +809,9 @@ unsafe fn apply_request_flags(mode: i32, data: &mut FilterData) {
     let metadata::VectorRecord::Ready(vectors) = data.vector_data() else {
         return;
     };
-    data.request_super = matches!(data.render_mode, 1 | 2) && !vectors.marker_is_one();
+    let super_data = metadata::super_data(data.sdata);
+    let needs_super = data.render_mode == 1 || (data.render_mode == 2 && super_data.scale() > 1);
+    data.request_super = needs_super && !vectors.marker_is_one() && !super_data.lean();
 }
 
 unsafe fn validate_cubic(data: &FilterData, output: vs::Raw, vsapi: vs::ConstRaw) -> bool {
