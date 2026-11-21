@@ -134,6 +134,11 @@ pub(crate) fn analyse(
                     data: [level.y.data(), level.u.data(), level.v.data()],
                     pitch: [level.y.pitch, level.u.pitch, level.v.pitch],
                     base: [level.y.base(), level.u.base(), level.v.base()],
+                    width: [
+                        level.y.width.max(0) as usize,
+                        level.u.width.max(0) as usize,
+                        level.v.width.max(0) as usize,
+                    ],
                     height: [level.y.height, level.u.height, level.v.height],
                     pel: level.y.pel(),
                     expand: params.super_params.gpu == 1 && params.super_params.flags & 2 == 0,
@@ -339,6 +344,11 @@ fn run_chain<'o>(
                 },
                 pitch: [level.y.pitch, level.u.pitch, level.v.pitch],
                 base: [level.y.base(), level.u.base(), level.v.base()],
+                width: [
+                    level.y.width.max(0) as usize,
+                    level.u.width.max(0) as usize,
+                    level.v.width.max(0) as usize,
+                ],
                 height: [level.y.height, level.u.height, level.v.height],
                 pel: level.y.pel(),
                 expand: params.super_params.gpu == 1 && params.super_params.flags & 2 == 0,

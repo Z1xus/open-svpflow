@@ -3,10 +3,13 @@ use core::ffi::{CStr, c_void};
 use std::ffi::CString;
 use std::sync::{Mutex, OnceLock};
 
+use svpflow_host::context::{
+    SharedSource, plane_fingerprint, publish_source, purge_sources, unpublish_mems,
+};
+use svpflow_host::hardware::GpuProfile;
 use svpflow_host::opencl::{
-    CL_DEVICE_TYPE_GPU, CL_EVENT_COMMAND_EXECUTION_STATUS, CL_FALSE, CL_MAP_READ,
-    CL_MEM_ALLOC_HOST_PTR, CL_MEM_READ_WRITE, CL_SUCCESS, CL_TRUE, ClInt, ClUint, FnKernelInfo,
-    Handle, OpenCl as CoreCl,
+    CL_DEVICE_TYPE_GPU, CL_FALSE, CL_MAP_READ, CL_MEM_ALLOC_HOST_PTR, CL_MEM_READ_WRITE,
+    CL_SUCCESS, CL_TRUE, ClInt, ClUint, FnKernelInfo, Handle, OpenCl as CoreCl,
 };
 
 type FnFillBuffer = unsafe extern "C" fn(
@@ -61,7 +64,6 @@ const CL_KERNEL_COMPILE_WORK_GROUP_SIZE: ClUint = 0x11B1;
 const CHUNK: usize = 16384;
 const RECORD: usize = 12;
 const RECORD_BYTES: usize = RECORD * size_of::<i32>();
-const UNITS: usize = 4;
 static ZERO: u8 = 0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -171,6 +173,7 @@ pub(crate) struct RefineGpu {
     cl: OpenCl,
     context: usize,
     device: usize,
+    pool_budget: usize,
     programs: Mutex<Vec<(Variant, usize)>>,
     search_programs: Mutex<Vec<(SearchKey, usize)>>,
     units: Vec<Mutex<Unit>>,
@@ -198,9 +201,6 @@ impl Drop for Permit<'_> {
         self.0.admitted.notify_all();
     }
 }
-
-const POOLED: usize = 3 * UNITS;
-const POOL_BUDGET: usize = 128 << 20;
 
 struct Uploaded {
     mems: [usize; 3],
@@ -257,13 +257,19 @@ impl Drop for CachedFrame {
                 (gpu.cl.WaitForEvents)(1, (&raw const uploaded.event).cast::<Handle>());
                 (gpu.cl.ReleaseEvent)(uploaded.event as Handle);
             }
+            let reusable = unsafe { unpublish_mems(&gpu.cl.core, uploaded.mems) };
             let mut pool = gpu.pool.lock().ok();
             let mut pooled_bytes: usize = pool
                 .as_ref()
                 .map_or(0, |pool| pool.iter().map(|&(_, s)| s).sum());
+            let pooled_cap = 3 * gpu.units.len();
             for (mem, size) in uploaded.mems.into_iter().zip(uploaded.sizes) {
                 match pool.as_mut() {
-                    Some(pool) if pool.len() < POOLED && pooled_bytes + size <= POOL_BUDGET => {
+                    Some(pool)
+                        if reusable
+                            && pool.len() < pooled_cap
+                            && pooled_bytes + size <= gpu.pool_budget =>
+                    {
                         pool.push((mem, size));
                         pooled_bytes += size;
                     }
@@ -280,6 +286,7 @@ pub(crate) struct Planes<'a> {
     pub(crate) data: [&'a [u8]; 3],
     pub(crate) pitch: [usize; 3],
     pub(crate) base: [usize; 3],
+    pub(crate) width: [usize; 3],
     pub(crate) height: [i32; 3],
     pub(crate) pel: i32,
     pub(crate) expand: bool,
@@ -296,6 +303,7 @@ pub(crate) fn refine_gpu() -> Option<&'static RefineGpu> {
 }
 
 pub(crate) fn trim() {
+    purge_sources();
     if let Some(Some(gpu)) = GPU.get()
         && let Ok(mut pool) = gpu.pool.lock()
     {
@@ -380,8 +388,11 @@ impl RefineGpu {
             if context.is_null() {
                 continue;
             }
-            let mut units = Vec::with_capacity(UNITS);
-            for _ in 0..UNITS {
+            let profile = unsafe { GpuProfile::probe(&cl.core, device) };
+            let unit_count = profile.analyse_units(svpflow_core::threads::workers());
+            let pool_budget = profile.pool_budget_bytes();
+            let mut units = Vec::with_capacity(unit_count);
+            for _ in 0..unit_count {
                 let queue = unsafe { (cl.CreateCommandQueue)(context, device, 0, &raw mut err) };
                 if err == CL_SUCCESS && !queue.is_null() {
                     units.push(Mutex::new(Unit {
@@ -397,6 +408,7 @@ impl RefineGpu {
                 cl,
                 context: context as usize,
                 device: device as usize,
+                pool_budget,
                 programs: Mutex::new(Vec::new()),
                 search_programs: Mutex::new(Vec::new()),
                 cache: Mutex::new(Cache::default()),
@@ -908,7 +920,7 @@ impl Session<'_, '_> {
             cache.live.retain(|e| e.strong_count() > 0);
             cache.live.push(std::sync::Arc::downgrade(&entry));
             cache.recent.push_back(entry.clone());
-            if cache.recent.len() > 2 * UNITS {
+            if cache.recent.len() > 2 * gpu.units.len() {
                 cache.recent.pop_front();
             }
             (entry, guard)
@@ -1086,6 +1098,40 @@ impl Session<'_, '_> {
                     unsafe { (cl.ReleaseMemObject)(m as Handle) };
                 }
                 return None;
+            }
+        }
+        if planes.base == [0, 0, 0]
+            && (planes.pel == 1 || expand.is_some())
+            && planes.width[0] > 0
+            && planes.height[0] > 0
+            && planes.width[1] > 0
+            && planes.height[1] > 0
+            && planes.width[1] == planes.width[2]
+            && planes.height[1] == planes.height[2]
+        {
+            unsafe { (cl.Flush)(self.unit.queue as Handle) };
+            let h0 = planes.height[0] as usize;
+            let h1 = planes.height[1] as usize;
+            let hash = plane_fingerprint([
+                (planes.data[0], planes.pitch[0], planes.width[0], h0),
+                (planes.data[1], planes.pitch[1], planes.width[1], h1),
+                (planes.data[2], planes.pitch[2], planes.width[2], h1),
+            ]);
+            unsafe {
+                publish_source(
+                    &cl.core,
+                    self.gpu.context as Handle,
+                    hash,
+                    SharedSource {
+                        mems: mems.map(|m| m as Handle),
+                        pitches: planes.pitch,
+                        width: planes.width[0],
+                        height: h0,
+                        chroma_width: planes.width[1],
+                        chroma_height: h1,
+                        event,
+                    },
+                );
             }
         }
         Some(Uploaded {
@@ -1569,29 +1615,13 @@ impl Session<'_, '_> {
             return true;
         }
         let cl = &self.gpu.cl;
-        unsafe { (cl.Flush)(self.unit.queue as Handle) };
+        let queue = self.unit.queue as Handle;
+        unsafe { (cl.Flush)(queue) };
         let mut ok = true;
         for event in self.pending.drain(..) {
             let event = event as Handle;
-            loop {
-                let mut status: ClInt = 1;
-                let got = unsafe {
-                    (cl.GetEventInfo)(
-                        event,
-                        CL_EVENT_COMMAND_EXECUTION_STATUS,
-                        size_of::<ClInt>(),
-                        (&raw mut status).cast(),
-                        std::ptr::null_mut(),
-                    )
-                };
-                if got != CL_SUCCESS || status < 0 {
-                    ok = false;
-                    break;
-                }
-                if status == 0 {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_micros(50));
+            if ok && !unsafe { cl.wait_event(queue, event) } {
+                ok = false;
             }
             unsafe { (cl.ReleaseEvent)(event) };
         }

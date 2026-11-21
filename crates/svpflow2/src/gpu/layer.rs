@@ -404,6 +404,7 @@ impl GpuContext {
         }
         unsafe { self.layer_setup(&mut state) }?;
         let mut parts = [None, None, None];
+        let mut kept_pairs = Vec::new();
         for (slot, key) in parts.iter_mut().zip([chunk - 1, chunk, chunk + 1]) {
             if key < 0 || key > last {
                 continue;
@@ -418,7 +419,6 @@ impl GpuContext {
                 continue;
             }
             let pairs = pairs(key)?;
-            // reuse an expired stats buffer before allocating a new one
             let reused = (state.stats.len() >= stats_cap)
                 .then(|| {
                     state.stats.iter().position(|(k, sums, _)| {
@@ -443,11 +443,12 @@ impl GpuContext {
                 .try_for_each(|(index, group)| unsafe {
                     self.layer_stats(&mut state, mem, group, params, grid, index == 0)
                 });
-            if unsafe { self.note((self.cl.Finish)(state.queue)) } != CL_SUCCESS || stats.is_none()
-            {
+            if stats.is_none() {
+                unsafe { self.note((self.cl.Finish)(state.queue)) };
                 return None;
             }
             let count = i32::try_from(pairs.len() * 2).ok()?;
+            kept_pairs.push(pairs);
             let over = (state.stats.len() + 1).saturating_sub(stats_cap);
             state.stats.drain(..over);
             state.stats.push((key, Arc::clone(&sums), count));
@@ -507,8 +508,10 @@ impl GpuContext {
                     std::ptr::null_mut(),
                 )) == CL_SUCCESS;
             if !ready {
+                self.note((self.cl.Finish)(state.queue));
                 return None;
             }
+            drop(kept_pairs);
             for gap in &mut gaps {
                 *gap = if *gap == 0 { 255 } else { 0 };
             }

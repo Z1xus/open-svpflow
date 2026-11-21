@@ -13,6 +13,8 @@ pub mod avs;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod context;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod hardware;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod opencl;
 pub mod vs3;
 pub mod vs4;

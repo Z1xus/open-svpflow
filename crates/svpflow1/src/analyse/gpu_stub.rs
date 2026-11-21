@@ -11,6 +11,7 @@ pub(crate) struct Planes<'a> {
     pub(crate) data: [&'a [u8]; 3],
     pub(crate) pitch: [usize; 3],
     pub(crate) base: [usize; 3],
+    pub(crate) width: [usize; 3],
     pub(crate) height: [i32; 3],
     pub(crate) pel: i32,
     pub(crate) expand: bool,

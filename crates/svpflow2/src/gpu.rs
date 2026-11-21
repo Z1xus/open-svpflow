@@ -3,12 +3,16 @@
 use core::ffi::c_void;
 use std::ffi::CString;
 
+use svpflow_host::context::{
+    has_shared_sources, lookup_source, mark_source_event, plane_fingerprint,
+};
+use svpflow_host::hardware::GpuProfile;
 use svpflow_host::opencl::{
-    CL_DEVICE_TYPE_GPU, CL_EVENT_COMMAND_EXECUTION_STATUS, CL_FALSE, CL_MAP_READ,
-    CL_MEM_ALLOC_HOST_PTR, CL_MEM_COPY_HOST_PTR, CL_MEM_OBJECT_ALLOCATION_FAILURE,
-    CL_MEM_READ_WRITE, CL_OUT_OF_HOST_MEMORY, CL_OUT_OF_RESOURCES, CL_SUCCESS, CL_TRUE,
-    ClImageFormat, ClInt, ClUint, FnCreateImage, FnCreateImage2D, FnEnqueueReadBufferRect,
-    FnEnqueueWriteImage, FnGetProgramBuildInfo, FnRelease, FnWaitForEvents, OpenCl as CoreCl,
+    CL_DEVICE_TYPE_GPU, CL_FALSE, CL_MAP_READ, CL_MEM_ALLOC_HOST_PTR, CL_MEM_COPY_HOST_PTR,
+    CL_MEM_OBJECT_ALLOCATION_FAILURE, CL_MEM_READ_WRITE, CL_OUT_OF_HOST_MEMORY,
+    CL_OUT_OF_RESOURCES, CL_SUCCESS, CL_TRUE, ClImageFormat, ClInt, ClUint, FnCreateImage,
+    FnCreateImage2D, FnEnqueueReadBufferRect, FnEnqueueWriteImage, FnGetProgramBuildInfo,
+    FnRelease, FnWaitForEvents, OpenCl as CoreCl,
 };
 
 #[allow(non_snake_case)]
@@ -87,6 +91,7 @@ pub struct GpuContext {
     cl: OpenCl,
     context: ClContext,
     device: ClDeviceId,
+    profile: GpuProfile,
     program: ClProgram,
     variants: &'static std::sync::Mutex<Vec<(u32, ClProgram)>>,
     device_name: String,
@@ -135,6 +140,7 @@ type SuperCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<SuperE
 
 struct CacheResources {
     kernel: ClKernel,
+    copy_kernel: ClKernel,
     queue: ClCommandQueue,
 }
 
@@ -383,6 +389,9 @@ impl Drop for GpuContext {
             for resources in &self.cache_resources {
                 if let Ok(cache) = resources.lock() {
                     (self.cl.ReleaseKernel)(cache.kernel);
+                    if !cache.copy_kernel.is_null() {
+                        (self.cl.ReleaseKernel)(cache.copy_kernel);
+                    }
                     (self.cl.ReleaseCommandQueue)(cache.queue);
                 }
             }
@@ -513,9 +522,12 @@ impl GpuContext {
             else {
                 continue;
             };
+            let profile = unsafe { GpuProfile::probe(&cl.core, device) };
+            let workers = svpflow_core::threads::workers();
+            let target_units = profile.render_units(num_units, workers);
             let mut err = 0;
-            let mut units = Vec::with_capacity(num_units);
-            for _ in 0..num_units {
+            let mut units = Vec::with_capacity(target_units);
+            for _ in 0..target_units {
                 let name = CString::new("render_frame").map_err(|_| "nul")?;
                 let mut errs = [0; 3];
                 let kernel = unsafe { (cl.CreateKernel)(program, name.as_ptr(), &raw mut errs[0]) };
@@ -546,6 +558,14 @@ impl GpuContext {
             let mut kerr = 0;
             let linear_kernel =
                 unsafe { (cl.CreateKernel)(program, linear_name.as_ptr(), &raw mut kerr) };
+            let mut cerr = 0;
+            let copy_kernel =
+                unsafe { (cl.CreateKernel)(program, c"copy_planes_to_packed".as_ptr(), &raw mut cerr) };
+            let copy_kernel = if cerr == CL_SUCCESS {
+                copy_kernel
+            } else {
+                std::ptr::null_mut()
+            };
             let cache_queue = unsafe { (cl.CreateCommandQueue)(context, device, 0, &raw mut err) };
             if kerr != CL_SUCCESS
                 || linear_kernel.is_null()
@@ -555,6 +575,9 @@ impl GpuContext {
                 unsafe {
                     if !linear_kernel.is_null() {
                         (cl.ReleaseKernel)(linear_kernel);
+                    }
+                    if !copy_kernel.is_null() {
+                        (cl.ReleaseKernel)(copy_kernel);
                     }
                     if !cache_queue.is_null() {
                         (cl.ReleaseCommandQueue)(cache_queue);
@@ -571,17 +594,31 @@ impl GpuContext {
             }
             let mut cache_resources = vec![std::sync::Mutex::new(CacheResources {
                 kernel: linear_kernel,
+                copy_kernel,
                 queue: cache_queue,
             })];
-            for _ in 1..UPLOAD_QUEUES {
+            let upload_queues = profile.upload_queues(workers).max(UPLOAD_QUEUES);
+            for _ in 1..upload_queues {
                 let mut kerr = 0;
                 let kernel =
                     unsafe { (cl.CreateKernel)(program, linear_name.as_ptr(), &raw mut kerr) };
+                let mut cerr = 0;
+                let copy = unsafe {
+                    (cl.CreateKernel)(program, c"copy_planes_to_packed".as_ptr(), &raw mut cerr)
+                };
+                let copy = if cerr == CL_SUCCESS {
+                    copy
+                } else {
+                    std::ptr::null_mut()
+                };
                 let queue = unsafe { (cl.CreateCommandQueue)(context, device, 0, &raw mut err) };
                 if kerr != CL_SUCCESS || kernel.is_null() || err != CL_SUCCESS || queue.is_null() {
                     unsafe {
                         if !kernel.is_null() {
                             (cl.ReleaseKernel)(kernel);
+                        }
+                        if !copy.is_null() {
+                            (cl.ReleaseKernel)(copy);
                         }
                         if !queue.is_null() {
                             (cl.ReleaseCommandQueue)(queue);
@@ -589,7 +626,11 @@ impl GpuContext {
                     }
                     break;
                 }
-                cache_resources.push(std::sync::Mutex::new(CacheResources { kernel, queue }));
+                cache_resources.push(std::sync::Mutex::new(CacheResources {
+                    kernel,
+                    copy_kernel: copy,
+                    queue,
+                }));
             }
             let device_name = unsafe { device_name(&cl, device) };
             let total = unsafe { device_size(&cl, device, CL_DEVICE_GLOBAL_MEM_SIZE) };
@@ -597,11 +638,7 @@ impl GpuContext {
             let vram = unsafe { vram::Vram::open(&cl, device) };
             let fuse_fits = unsafe { device_size(&cl, device, CL_DEVICE_MAX_PARAMETER_SIZE) }
                 .is_some_and(|size| size >= blend::FUSED_ARG_BYTES);
-            // only nvidia is tested with this kernel
-            let nvidia = ["NVIDIA", "GeForce", "Quadro"]
-                .iter()
-                .any(|name| device_name.contains(name));
-            let cover_layer = nvidia && cl.CreateImage.is_some() && {
+            let cover_layer = cl.CreateImage.is_some() && {
                 let mut cerr = 0;
                 let kernel = unsafe {
                     (cl.CreateKernel)(program, c"cover_finish_layer".as_ptr(), &raw mut cerr)
@@ -619,6 +656,7 @@ impl GpuContext {
                 cl,
                 context,
                 device,
+                profile,
                 program,
                 variants,
                 depth,
@@ -839,42 +877,149 @@ impl GpuContext {
             luma: (width, height),
         };
         let resources = self.upload_resources()?;
+        let mut device_copied = false;
+        if self.depth == 8 && !resources.copy_kernel.is_null() && has_shared_sources() {
+            let hash = plane_fingerprint([
+                (planes[0].data, planes[0].stride, planes[0].width, planes[0].height),
+                (planes[1].data, planes[1].stride, planes[1].width, planes[1].height),
+                (planes[2].data, planes[2].stride, planes[2].width, planes[2].height),
+            ]);
+            if let Some(shared) = unsafe { lookup_source(self.context, hash) } {
+                let dims_match = shared.width == width
+                    && shared.height == height
+                    && shared.chroma_width == planes[1].width
+                    && shared.chroma_height == planes[1].height
+                    && shared.chroma_width == planes[2].width
+                    && shared.chroma_height == planes[2].height
+                    && shared.pitches[1] == shared.pitches[2];
+                if dims_match {
+                    let ck = resources.copy_kernel;
+                    let w_i = i32::try_from(width).ok();
+                    let h_i = i32::try_from(height).ok();
+                    let cw_i = i32::try_from(planes[1].width).ok();
+                    let ch_i = i32::try_from(planes[1].height).ok();
+                    let yp_i = i32::try_from(shared.pitches[0]).ok();
+                    let uvp_i = i32::try_from(shared.pitches[1]).ok();
+                    if let (Some(w_i), Some(h_i), Some(cw_i), Some(ch_i), Some(yp_i), Some(uvp_i)) =
+                        (w_i, h_i, cw_i, ch_i, yp_i, uvp_i)
+                    {
+                        let waits = u32::from(!shared.event.is_null());
+                        let wait_ptr = if waits == 0 {
+                            std::ptr::null()
+                        } else {
+                            (&raw const shared.event).cast()
+                        };
+                        let global = [width.max(planes[1].width), height.max(planes[1].height)];
+                        let mut copy_done: ClEvent = std::ptr::null_mut();
+                        let ok = unsafe {
+                            (self.cl.SetKernelArg)(ck, 0, size_of::<ClMem>(), (&raw const shared.mems[0]).cast()) == CL_SUCCESS
+                                && self.set_i32(ck, 1, yp_i)
+                                && (self.cl.SetKernelArg)(ck, 2, size_of::<ClMem>(), (&raw const shared.mems[1]).cast()) == CL_SUCCESS
+                                && (self.cl.SetKernelArg)(ck, 3, size_of::<ClMem>(), (&raw const shared.mems[2]).cast()) == CL_SUCCESS
+                                && self.set_i32(ck, 4, uvp_i)
+                                && (self.cl.SetKernelArg)(ck, 5, size_of::<ClMem>(), (&raw const packed).cast()) == CL_SUCCESS
+                                && self.set_i32(ck, 6, w_i)
+                                && self.set_i32(ck, 7, h_i)
+                                && self.set_i32(ck, 8, cw_i)
+                                && self.set_i32(ck, 9, ch_i)
+                                && self.note((self.cl.EnqueueNDRangeKernel)(
+                                    resources.queue,
+                                    ck,
+                                    2,
+                                    std::ptr::null(),
+                                    global.as_ptr(),
+                                    std::ptr::null(),
+                                    waits,
+                                    wait_ptr,
+                                    (&raw mut copy_done).cast(),
+                                )) == CL_SUCCESS
+                        };
+                        if ok {
+                            device_copied = true;
+                            unsafe {
+                                (self.cl.Flush)(resources.queue);
+                                mark_source_event(self.context, hash, copy_done);
+                            }
+                            if self.linear {
+                                if !copy_done.is_null() {
+                                    unsafe { (self.cl.ReleaseEvent)(copy_done) };
+                                }
+                            } else {
+                                entry.ready = copy_done;
+                            }
+                        } else if !copy_done.is_null() {
+                            unsafe { (self.cl.ReleaseEvent)(copy_done) };
+                        }
+                    }
+                }
+                unsafe {
+                    for mem in shared.mems {
+                        if !mem.is_null() {
+                            (self.cl.ReleaseMemObject)(mem);
+                        }
+                    }
+                    if !shared.event.is_null() {
+                        (self.cl.ReleaseEvent)(shared.event);
+                    }
+                }
+            }
+        }
+        let mut write_done: ClEvent = std::ptr::null_mut();
+        if !device_copied {
+            unsafe {
+                self.enqueue_plane_at(resources.queue, packed, planes[0], 0, 0, std::ptr::null_mut())?;
+                self.enqueue_plane_at(resources.queue, packed, planes[1], 0, height, std::ptr::null_mut())?;
+                self.enqueue_plane_at(
+                    resources.queue,
+                    packed,
+                    planes[2],
+                    planes[1].width,
+                    height,
+                    &raw mut write_done,
+                )?;
+            }
+        }
         unsafe {
-            self.enqueue_plane_at(resources.queue, packed, planes[0], 0, 0)?;
-            self.enqueue_plane_at(resources.queue, packed, planes[1], 0, height)?;
-            self.enqueue_plane_at(resources.queue, packed, planes[2], planes[1].width, height)?;
-            if !self.linear {
-                return Some(entry);
-            }
-            if (self.cl.SetKernelArg)(
-                resources.kernel,
-                0,
-                size_of::<ClMem>(),
-                (&raw const entry.mems[3]).cast(),
-            ) != CL_SUCCESS
-                || (self.cl.SetKernelArg)(
+            if self.linear {
+                if (self.cl.SetKernelArg)(
                     resources.kernel,
-                    1,
+                    0,
                     size_of::<ClMem>(),
-                    (&raw const entry.mems[0]).cast(),
+                    (&raw const entry.mems[3]).cast(),
                 ) != CL_SUCCESS
-            {
-                return None;
+                    || (self.cl.SetKernelArg)(
+                        resources.kernel,
+                        1,
+                        size_of::<ClMem>(),
+                        (&raw const entry.mems[0]).cast(),
+                    ) != CL_SUCCESS
+                {
+                    if !write_done.is_null() {
+                        self.wait_event(resources.queue, write_done);
+                    }
+                    return None;
+                }
+                let global = [width, height];
+                if self.note((self.cl.EnqueueNDRangeKernel)(
+                    resources.queue,
+                    resources.kernel,
+                    2,
+                    std::ptr::null(),
+                    global.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    (&raw mut entry.ready).cast(),
+                )) != CL_SUCCESS
+                    || (self.cl.Flush)(resources.queue) != CL_SUCCESS
+                {
+                    if !write_done.is_null() {
+                        self.wait_event(resources.queue, write_done);
+                    }
+                    return None;
+                }
             }
-            let global = [width, height];
-            if self.note((self.cl.EnqueueNDRangeKernel)(
-                resources.queue,
-                resources.kernel,
-                2,
-                std::ptr::null(),
-                global.as_ptr(),
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                (&raw mut entry.ready).cast(),
-            )) != CL_SUCCESS
-                || (self.cl.Flush)(resources.queue) != CL_SUCCESS
-            {
+            if !write_done.is_null() && !self.wait_event(resources.queue, write_done) {
                 return None;
             }
         }
@@ -888,6 +1033,7 @@ impl GpuContext {
         plane: UploadPlane<'_>,
         x: usize,
         y: usize,
+        event: *mut ClEvent,
     ) -> Option<()> {
         let bytes = if self.depth > 8 { 2 } else { 1 };
         if plane.data.len()
@@ -904,7 +1050,7 @@ impl GpuContext {
             self.note((self.cl.EnqueueWriteImage)(
                 q,
                 mem,
-                CL_TRUE,
+                CL_FALSE,
                 origin.as_ptr(),
                 region.as_ptr(),
                 plane.stride,
@@ -912,7 +1058,7 @@ impl GpuContext {
                 plane.data.as_ptr().cast(),
                 0,
                 std::ptr::null(),
-                std::ptr::null_mut(),
+                event.cast(),
             ))
         };
         (rc == CL_SUCCESS).then_some(())
@@ -1258,26 +1404,7 @@ impl GpuContext {
     }
 
     unsafe fn wait_event(&self, queue: ClCommandQueue, event: ClEvent) -> bool {
-        unsafe { (self.cl.Flush)(queue) };
-        let done = loop {
-            let mut status: ClInt = 1;
-            let got = unsafe {
-                (self.cl.GetEventInfo)(
-                    event,
-                    CL_EVENT_COMMAND_EXECUTION_STATUS,
-                    size_of::<ClInt>(),
-                    (&raw mut status).cast(),
-                    std::ptr::null_mut(),
-                )
-            };
-            if got != CL_SUCCESS || status < 0 {
-                break false;
-            }
-            if status == 0 {
-                break true;
-            }
-            std::thread::sleep(std::time::Duration::from_micros(50));
-        };
+        let done = unsafe { self.cl.wait_event(queue, event) };
         if !done {
             unsafe { self.note((self.cl.Finish)(queue)) };
         }
@@ -1679,6 +1806,9 @@ impl GpuContext {
     }
 
     unsafe fn take_pin(&self, q: ClCommandQueue, size: usize) -> Option<Pin> {
+        if !self.profile.use_pinned_staging() {
+            return None;
+        }
         let pooled = self.pins.lock().ok()?.pop();
         if let Some(pin) = pooled {
             if pin.size >= size {
@@ -1979,10 +2109,36 @@ unsafe fn copy_avx2(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn copy_avx512(src: *const u8, dst: *mut u8, len: usize) {
+    use std::arch::x86_64::{__m512i, _mm_sfence, _mm512_loadu_si512, _mm512_stream_si512};
+    let head = dst.align_offset(64).min(len);
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, head);
+        let mut at = head;
+        while at + 64 <= len {
+            _mm512_stream_si512(
+                dst.add(at).cast::<__m512i>(),
+                _mm512_loadu_si512(src.add(at).cast()),
+            );
+            at += 64;
+        }
+        _mm_sfence();
+        std::ptr::copy_nonoverlapping(src.add(at), dst.add(at), len - at);
+    }
+}
+
 unsafe fn copy_stream(src: *const u8, dst: *mut u8, len: usize) {
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
-        return unsafe { copy_avx2(src, dst, len) };
+    {
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            return unsafe { copy_avx512(src, dst, len) };
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { copy_avx2(src, dst, len) };
+        }
     }
     unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
 }
@@ -3047,6 +3203,25 @@ kernel void layer_cover(read_only image2d_t fit, global uchar *cover, int width,
         }
     }
     cover[cy*((width+7)/8) + cx] = found;
+}
+
+kernel void copy_planes_to_packed(
+    global const uchar *src_y, int y_pitch,
+    global const uchar *src_u, global const uchar *src_v, int uv_pitch,
+    write_only image2d_t packed,
+    int w, int h, int cw, int ch)
+{
+    int x = get_global_id(0), y = get_global_id(1);
+    if (x < w && y < h) {
+        float v = (float)src_y[y * y_pitch + x] / 255.0f;
+        write_imagef(packed, (int2)(x, y), (float4)(v, 0.0f, 0.0f, 0.0f));
+    }
+    if (x < cw && y < ch) {
+        float vu = (float)src_u[y * uv_pitch + x] / 255.0f;
+        float vv = (float)src_v[y * uv_pitch + x] / 255.0f;
+        write_imagef(packed, (int2)(x, h + y), (float4)(vu, 0.0f, 0.0f, 0.0f));
+        write_imagef(packed, (int2)(cw + x, h + y), (float4)(vv, 0.0f, 0.0f, 0.0f));
+    }
 }
 
 kernel void cover_clear(global int *points, int count)

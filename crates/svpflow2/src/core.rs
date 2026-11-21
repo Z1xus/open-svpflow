@@ -152,8 +152,13 @@ impl Pooled for u16 {
 static EXPAND_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
 static WIDE_POOL: std::sync::Mutex<Vec<Vec<u16>>> = std::sync::Mutex::new(Vec::new());
 const EXPAND_POOL_CAP: usize = 12;
-const EXPAND_POOL_BYTES: usize = 64 << 20;
-const EXPAND_CACHE_BYTES: usize = 128 << 20;
+fn expand_pool_budget() -> usize {
+    (svpflow_host::hardware::total_ram_bytes() / 64).clamp(32 << 20, 256 << 20)
+}
+
+fn expand_cache_budget() -> usize {
+    (svpflow_host::hardware::total_ram_bytes() / 32).clamp(64 << 20, 512 << 20)
+}
 
 fn expand_cache_cap<T>(width: usize, height: usize) -> usize {
     let bytes = width
@@ -161,7 +166,10 @@ fn expand_cache_cap<T>(width: usize, height: usize) -> usize {
         .saturating_mul(6)
         .saturating_mul(size_of::<T>())
         .max(1);
-    (EXPAND_CACHE_BYTES / bytes).clamp(4, EXPAND_CACHE_CAP / size_of::<T>())
+    let max_entries = (EXPAND_CACHE_CAP / size_of::<T>())
+        .max(svpflow_core::threads::workers().saturating_mul(2))
+        .min(64);
+    (expand_cache_budget() / bytes).clamp(4, max_entries)
 }
 
 pub(crate) fn clear_expand_pool() {
@@ -194,9 +202,10 @@ impl<T: Pooled> Drop for SuperExpand<T> {
                 .iter()
                 .map(|buf| buf.capacity().saturating_mul(size_of::<T>()))
                 .sum();
+            let pool_budget = expand_pool_budget();
             for buffer in [&mut self.y, &mut self.u, &mut self.v] {
                 let add = buffer.capacity().saturating_mul(size_of::<T>());
-                if pool.len() < EXPAND_POOL_CAP && bytes.saturating_add(add) <= EXPAND_POOL_BYTES {
+                if pool.len() < EXPAND_POOL_CAP && bytes.saturating_add(add) <= pool_budget {
                     bytes += add;
                     pool.push(std::mem::take(buffer));
                 }
