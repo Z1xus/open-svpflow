@@ -1006,7 +1006,9 @@ impl FilterState {
         let time = engine::render_time(phase, use_fwd, use_bwd);
         let neither = !use_fwd && !use_bwd;
         let algo = params.algo;
+        let adaptive_blend = blend.is_some_and(crate::gpu::BlendJob::is_adaptive);
         let gpu_cover = !cpu
+            && !adaptive_blend
             && self.render_mode == 2
             && self
                 .gpu
@@ -1019,7 +1021,7 @@ impl FilterState {
             cover_bwd,
             cover_fwd,
             sad: sad_masks,
-        } = engine::masks(field, params, time, neither, !gpu_cover);
+        } = engine::masks(field, params, time, neither, !gpu_cover && !adaptive_blend);
         let want_extended = neighbors_ok && algo == 23 && !neither;
         let (zerox, zeroy) = (self.options.debug_zerox(), self.options.debug_zeroy());
         let motion_key = engine::motion_key(n, use_fwd, use_bwd, want_extended, (zerox, zeroy));

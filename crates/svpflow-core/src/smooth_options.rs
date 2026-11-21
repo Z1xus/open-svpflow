@@ -65,6 +65,7 @@ pub struct RenderOptions {
     pub linear: bool,
     pub dither: bool,
     pub dedup: f64,
+    pub adaptive: bool,
 }
 
 #[allow(dead_code)]
@@ -245,6 +246,10 @@ impl Options {
 
     pub const fn dither(&self) -> bool {
         self.render.dither
+    }
+
+    pub const fn adaptive_blend(&self) -> bool {
+        self.render.adaptive
     }
 
     pub fn dedup(&self) -> Option<f64> {
@@ -601,6 +606,7 @@ impl Default for RenderOptions {
             linear: true,
             dither: false,
             dedup: 0.0,
+            adaptive: false,
         }
     }
 }
@@ -727,6 +733,7 @@ impl RenderOptions {
             linear: value.bool_at(&["linear"]).unwrap_or(true),
             dither: value.bool_at(&["dither"]).unwrap_or(false),
             dedup: value.float_at(&["dedup"]).unwrap_or(0.0),
+            adaptive: value.bool_at(&["adaptive"]).unwrap_or(false),
         }
     }
 }

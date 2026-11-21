@@ -172,7 +172,13 @@ impl BlendState {
         let free_frame = unsafe { vs::table_fn::<vs::FreeFrame>(vsapi, vs::FREE_FRAME) };
         let sizes = self.sizes()?;
         let [(width, height), chroma, _] = sizes;
-        let job = gpu.blend_begin(width.max(chroma.0 * 2), height, chroma.1, self.plan.gamma)?;
+        let job = gpu.blend_begin(
+            width.max(chroma.0 * 2),
+            height,
+            chroma.1,
+            self.plan.gamma,
+            self.inner.options.adaptive_blend(),
+        )?;
         for (frame, weight) in self.plan.window(n) {
             job.start(weight);
             let rendered = unsafe {
@@ -274,7 +280,22 @@ impl BlendState {
         let Plan { gamma, divisor, .. } = self.plan;
         let curved = |plane| plane == 0 && gamma.to_bits() != 1.0_f32.to_bits();
         let mut sums = sizes.map(|(width, height)| vec![0.0f32; width * height]);
-        for (frame, weight) in self.plan.window(n) {
+        let entries: Vec<(i32, f32)> = if self.inner.options.adaptive_blend()
+            && self.plan.weights.len() > 7
+        {
+            let stride = if self.plan.weights.len() > 31 { 3 } else { 2 };
+            let raw: Vec<(i32, f32)> = self.plan.window(n).collect();
+            raw.chunks(stride)
+                .map(|chunk| {
+                    let mid = chunk[chunk.len() / 2].0;
+                    let wsum: f32 = chunk.iter().map(|&(_, w)| w).sum();
+                    (mid, wsum)
+                })
+                .collect()
+        } else {
+            self.plan.window(n).collect()
+        };
+        for (frame, weight) in entries {
             let rendered = unsafe {
                 self.inner
                     .get_frame(frame, None, frame_ctx, core, vsapi, held)

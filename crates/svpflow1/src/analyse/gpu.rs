@@ -1100,7 +1100,8 @@ impl Session<'_, '_> {
                 return None;
             }
         }
-        if planes.base == [0, 0, 0]
+        if planes.lean
+            && planes.base == [0, 0, 0]
             && (planes.pel == 1 || expand.is_some())
             && planes.width[0] > 0
             && planes.height[0] > 0
@@ -1123,6 +1124,7 @@ impl Session<'_, '_> {
                     self.gpu.context as Handle,
                     hash,
                     SharedSource {
+                        y_ptr: planes.data[0].as_ptr() as usize,
                         mems: mems.map(|m| m as Handle),
                         pitches: planes.pitch,
                         width: planes.width[0],

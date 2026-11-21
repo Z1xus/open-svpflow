@@ -3,9 +3,7 @@
 use core::ffi::c_void;
 use std::ffi::CString;
 
-use svpflow_host::context::{
-    has_shared_sources, lookup_source, mark_source_event, plane_fingerprint,
-};
+use svpflow_host::context::{finish_source, has_shared_ptr, lookup_source, plane_fingerprint};
 use svpflow_host::hardware::GpuProfile;
 use svpflow_host::opencl::{
     CL_DEVICE_TYPE_GPU, CL_FALSE, CL_MAP_READ, CL_MEM_ALLOC_HOST_PTR, CL_MEM_COPY_HOST_PTR,
@@ -87,6 +85,7 @@ const CL_UNORM_INT16: ClUint = 0x10D3;
 const CL_HALF_FLOAT: ClUint = 0x10DD;
 const CL_FLOAT: ClUint = 0x10DE;
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct GpuContext {
     cl: OpenCl,
     context: ClContext,
@@ -111,6 +110,7 @@ pub struct GpuContext {
     frame_bytes: std::sync::atomic::AtomicUsize,
     frame_budget: usize,
     fuse_fits: bool,
+    fuse_ext_fits: bool,
     cover_layer: bool,
     image_pool: std::sync::Arc<ImagePool>,
     still: std::sync::Mutex<StillState>,
@@ -636,8 +636,9 @@ impl GpuContext {
             let total = unsafe { device_size(&cl, device, CL_DEVICE_GLOBAL_MEM_SIZE) };
             let frame_budget = total.unwrap_or(usize::MAX) / FRAME_BUDGET_SHARE;
             let vram = unsafe { vram::Vram::open(&cl, device) };
-            let fuse_fits = unsafe { device_size(&cl, device, CL_DEVICE_MAX_PARAMETER_SIZE) }
-                .is_some_and(|size| size >= blend::FUSED_ARG_BYTES);
+            let max_param = unsafe { device_size(&cl, device, CL_DEVICE_MAX_PARAMETER_SIZE) };
+            let fuse_fits = max_param.is_some_and(|size| size >= blend::FUSED_ARG_BYTES);
+            let fuse_ext_fits = max_param.is_some_and(|size| size >= blend::FUSED_EXT_ARG_BYTES);
             let cover_layer = cl.CreateImage.is_some() && {
                 let mut cerr = 0;
                 let kernel = unsafe {
@@ -674,6 +675,7 @@ impl GpuContext {
                 frame_bytes: std::sync::atomic::AtomicUsize::new(0),
                 frame_budget,
                 fuse_fits,
+                fuse_ext_fits,
                 cover_layer,
                 image_pool: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 still: std::sync::Mutex::new(StillState {
@@ -878,13 +880,17 @@ impl GpuContext {
         };
         let resources = self.upload_resources()?;
         let mut device_copied = false;
-        if self.depth == 8 && !resources.copy_kernel.is_null() && has_shared_sources() {
+        if self.depth == 8
+            && !resources.copy_kernel.is_null()
+            && unsafe { has_shared_ptr(self.context, planes[0].data.as_ptr() as usize) }
+        {
             let hash = plane_fingerprint([
                 (planes[0].data, planes[0].stride, planes[0].width, planes[0].height),
                 (planes[1].data, planes[1].stride, planes[1].width, planes[1].height),
                 (planes[2].data, planes[2].stride, planes[2].width, planes[2].height),
             ]);
             if let Some(shared) = unsafe { lookup_source(self.context, hash) } {
+                let mut copy_done: ClEvent = std::ptr::null_mut();
                 let dims_match = shared.width == width
                     && shared.height == height
                     && shared.chroma_width == planes[1].width
@@ -910,7 +916,6 @@ impl GpuContext {
                             (&raw const shared.event).cast()
                         };
                         let global = [width.max(planes[1].width), height.max(planes[1].height)];
-                        let mut copy_done: ClEvent = std::ptr::null_mut();
                         let ok = unsafe {
                             (self.cl.SetKernelArg)(ck, 0, size_of::<ClMem>(), (&raw const shared.mems[0]).cast()) == CL_SUCCESS
                                 && self.set_i32(ck, 1, yp_i)
@@ -936,20 +941,21 @@ impl GpuContext {
                         };
                         if ok {
                             device_copied = true;
-                            unsafe {
-                                (self.cl.Flush)(resources.queue);
-                                mark_source_event(self.context, hash, copy_done);
-                            }
-                            if self.linear {
-                                if !copy_done.is_null() {
-                                    unsafe { (self.cl.ReleaseEvent)(copy_done) };
-                                }
-                            } else {
-                                entry.ready = copy_done;
-                            }
+                            unsafe { (self.cl.Flush)(resources.queue) };
                         } else if !copy_done.is_null() {
                             unsafe { (self.cl.ReleaseEvent)(copy_done) };
+                            copy_done = std::ptr::null_mut();
                         }
+                    }
+                }
+                unsafe { finish_source(self.context, shared.mems[0], copy_done) };
+                if device_copied {
+                    if self.linear {
+                        if !copy_done.is_null() {
+                            unsafe { (self.cl.ReleaseEvent)(copy_done) };
+                        }
+                    } else {
+                        entry.ready = copy_done;
                     }
                 }
                 unsafe {
@@ -1368,7 +1374,7 @@ impl GpuContext {
                 program
             } else {
                 let source = format!(
-                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define STILL {}\n#define LAYER {}\n#define HOLD {}\n#define FUSE {}\n#define DEPTH {}\n{}",
+                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define STILL {}\n#define LAYER {}\n#define HOLD {}\n#define FUSE {}\n#define ADAPTIVE {}\n#define DEPTH {}\n{}",
                     variant & 0xFF,
                     (variant >> 8) & 1,
                     (variant >> 9) & 1,
@@ -1380,6 +1386,7 @@ impl GpuContext {
                     (variant >> 15) & 1,
                     (variant >> 16) & 1,
                     (variant >> 17) & 1,
+                    (variant >> 18) & 1,
                     self.depth,
                     KERNEL_SRC
                 );
@@ -2315,6 +2322,9 @@ pub(crate) const KERNEL_SRC: &str = r"
 #ifndef FUSE
 #define FUSE 0
 #endif
+#ifndef ADAPTIVE
+#define ADAPTIVE 0
+#endif
 #define LAYER_MIN 0.2f
 #define LAYER_GROUP 3
 #define LAYER_FILL 4.0f
@@ -2789,7 +2799,11 @@ inline float blend_round(float result, const Params *p, int layered, int x, int 
 #if FUSE
 inline float fuse_slot(
     read_only image2d_t source, read_only image2d_t source_f, read_only image2d_t source_b,
-    read_only image2d_t vectors, Params p, Steps steps, float total, int x, int y)
+    read_only image2d_t vectors,
+#if ADAPTIVE && ALGO == 23
+    read_only image2d_t vectors_ext,
+#endif
+    Params p, Steps steps, float total, int x, int y)
 {
     if (steps.source != 0.0f) {
 #pragma OPENCL FP_CONTRACT OFF
@@ -2803,14 +2817,77 @@ inline float fuse_slot(
         (float2)(x*p.x_ratio-p.origin_x, y*p.y_ratio-p.origin_y),
         (float2)(p.block_w, p.block_h));
     float4 vector = field_sample(vectors, field_position, CUBIC);
-    float ref_b0 = ALGO == 13 ? base_sample(source_b, &p) : 0.0f;
-    float ref_f0 = ALGO == 13 ? base_sample(source_f, &p) : 0.0f;
+#if ADAPTIVE && ALGO == 23
+    float4 ext = field_sample(vectors_ext, field_position, CUBIC);
+#else
+    float4 ext = (float4)(0.0f);
+#endif
+    int has_base = ALGO == 13 || ALGO == 22;
+    float ref_b0 = has_base ? base_sample(source_b, &p) : 0.0f;
+    float ref_f0 = has_base ? base_sample(source_f, &p) : 0.0f;
+    float2 sf = full_step(&p, vector.x, vector.w);
+    float2 sb = full_step(&p, vector.z, vector.y);
+    int zero_mv = sf.x == 0.0f && sf.y == 0.0f && sb.x == 0.0f && sb.y == 0.0f;
+#if ADAPTIVE && ALGO == 23
+    float2 ef = full_step(&p, ext.x, ext.w);
+    float2 eb = full_step(&p, ext.z, ext.y);
+    zero_mv = zero_mv && ef.x == 0.0f && ef.y == 0.0f && eb.x == 0.0f && eb.y == 0.0f;
+#endif
+    if (zero_mv) {
+        float rf = source_sample(source_f, &p, vector.x, vector.w, 0);
+        float rb = source_sample(source_b, &p, vector.z, vector.y, 0);
+#if ADAPTIVE && ALGO == 23
+        float rff = linear_source_sample(source_f, &p, ext.x, ext.w, 0);
+        float rbb = linear_source_sample(source_b, &p, ext.z, ext.y, 0);
+        int same = rf == rb && rff == rf && rbb == rb;
+#else
+        int same = rf == rb && (!has_base || (ref_f0 == rf && ref_b0 == rb));
+#endif
+        if (same && ALGO != 1 && ALGO != 2) {
+            float value = blend_round(rf, &p, 0, x, y);
+            for (int step = 0; step < steps.count; step++) {
+#pragma OPENCL FP_CONTRACT OFF
+                float term = steps.weight[step] * value;
+                total = term + total;
+            }
+            return total;
+        }
+    }
+#if ADAPTIVE
+    float4 mask = (float4)(0.0f);
+#if ALGO >= 21
+    float2 dv = sf + sb;
+    float occ = clamp(native_sqrt(dv.x * dv.x + dv.y * dv.y) * 0.25f, 0.0f, 1.0f);
+    mask = (float4)(0.0f, occ, occ, 0.0f);
+#endif
+    float travel = fmax(fmax(fabs(sf.x), fabs(sf.y)), fmax(fabs(sb.x), fabs(sb.y)));
+    int want = travel < 0.25f ? 1 : (travel < 1.5f ? 2 : (travel < 4.0f ? 4 : (travel < 8.0f ? 8 : steps.count)));
+    int buckets = min(want, steps.count);
+    for (int b = 0; b < buckets; b++) {
+        int s0 = (b * steps.count) / buckets;
+        int s1 = ((b + 1) * steps.count) / buckets;
+        int mid = (s0 + s1 - 1) >> 1;
+        float wsum = 0.0f;
+        for (int s = s0; s < s1; s++) wsum += steps.weight[s];
+        p.phase = steps.phase[mid];
+        p.sad_blend = steps.sad_blend[mid];
+        float time = native_divide((float)p.phase, 256.0f);
+        float result = blend_value(source_f, source_b, &p, vector, mask, ext, ref_f0, ref_b0, time);
+        float value = blend_round(result, &p, 0, x, y);
+        {
+#pragma OPENCL FP_CONTRACT OFF
+            float term = wsum * value;
+            total = term + total;
+        }
+    }
+    return total;
+#else
     for (int step = 0; step < steps.count; step++) {
         p.phase = steps.phase[step];
         p.sad_blend = steps.sad_blend[step];
         float time = native_divide((float)p.phase, 256.0f);
         float result = blend_value(
-            source_f, source_b, &p, vector, (float4)(0.0f), (float4)(0.0f), ref_f0, ref_b0, time);
+            source_f, source_b, &p, vector, (float4)(0.0f), ext, ref_f0, ref_b0, time);
         float value = blend_round(result, &p, 0, x, y);
         {
 #pragma OPENCL FP_CONTRACT OFF
@@ -2819,6 +2896,7 @@ inline float fuse_slot(
         }
     }
     return total;
+#endif
 }
 
 kernel void blend_frame(
@@ -2831,16 +2909,30 @@ kernel void blend_frame(
     read_only image2d_t vectors2,
     read_only image2d_t source3, read_only image2d_t forward3, read_only image2d_t backward3,
     read_only image2d_t vectors3,
-    Params p, Steps steps0, Steps steps1, Steps steps2, Steps steps3)
+    Params p, Steps steps0, Steps steps1, Steps steps2, Steps steps3
+#if ADAPTIVE && ALGO == 23
+    , read_only image2d_t ext0, read_only image2d_t ext1,
+    read_only image2d_t ext2, read_only image2d_t ext3
+#endif
+    )
 {
     int x = get_global_id(0), y = get_global_id(1);
     if (x >= p.width || y >= p.height) return;
+    int overwrite = stride < 0;
+    stride = abs(stride);
     global float *sum = sums + (p.offset_y+y)*stride + p.offset_x + x;
-    float total = *sum;
+    float total = overwrite ? 0.0f : *sum;
+#if ADAPTIVE && ALGO == 23
+    total = fuse_slot(source0, forward0, backward0, vectors0, ext0, p, steps0, total, x, y);
+    total = fuse_slot(source1, forward1, backward1, vectors1, ext1, p, steps1, total, x, y);
+    total = fuse_slot(source2, forward2, backward2, vectors2, ext2, p, steps2, total, x, y);
+    total = fuse_slot(source3, forward3, backward3, vectors3, ext3, p, steps3, total, x, y);
+#else
     total = fuse_slot(source0, forward0, backward0, vectors0, p, steps0, total, x, y);
     total = fuse_slot(source1, forward1, backward1, vectors1, p, steps1, total, x, y);
     total = fuse_slot(source2, forward2, backward2, vectors2, p, steps2, total, x, y);
     total = fuse_slot(source3, forward3, backward3, vectors3, p, steps3, total, x, y);
+#endif
     *sum = total;
 }
 #else
@@ -2868,6 +2960,8 @@ kernel void blend_frame(
     int x = get_global_id(0), y = get_global_id(1);
     if (x >= p.width || y >= p.height) return;
 
+    int overwrite = stride < 0;
+    stride = abs(stride);
     float2 field_position = native_divide(
         (float2)(x*p.x_ratio-p.origin_x, y*p.y_ratio-p.origin_y),
         (float2)(p.block_w, p.block_h));
@@ -2877,7 +2971,7 @@ kernel void blend_frame(
     float ref_f0 = has_base ? base_sample(source_f, &p) : 0.0f;
     float4 ext = ALGO == 23 ? field_sample(vectors_ext, field_position, CUBIC) : (float4)(0.0f);
     global float *sum = sums + (p.offset_y+y)*stride + p.offset_x + x;
-    float total = *sum;
+    float total = overwrite ? 0.0f : *sum;
 #if STILL
     int kept = STILL_AT(still, p, x, y);
     float kept_f = 0.0f, kept_b = 0.0f;
@@ -2895,6 +2989,82 @@ kernel void blend_frame(
     float2 step_f = full_step(&p, vector.x, vector.w);
     float2 step_b = full_step(&p, vector.z, vector.y);
     float gap = layer_gap(cover, &p, at);
+#endif
+
+#if !LAYER && !STILL
+    float2 zsf = full_step(&p, vector.x, vector.w);
+    float2 zsb = full_step(&p, vector.z, vector.y);
+    int zero_mv = zsf.x == 0.0f && zsf.y == 0.0f && zsb.x == 0.0f && zsb.y == 0.0f;
+#if ALGO == 23
+    float2 zef = full_step(&p, ext.x, ext.w);
+    float2 zeb = full_step(&p, ext.z, ext.y);
+    zero_mv = zero_mv && zef.x == 0.0f && zef.y == 0.0f && zeb.x == 0.0f && zeb.y == 0.0f;
+#endif
+    if (zero_mv && ALGO != 1 && ALGO != 2) {
+        float rf = source_sample(source_f, &p, vector.x, vector.w, 0);
+        float rb = source_sample(source_b, &p, vector.z, vector.y, 0);
+#if ALGO == 23
+        float rff = linear_source_sample(source_f, &p, ext.x, ext.w, 0);
+        float rbb = linear_source_sample(source_b, &p, ext.z, ext.y, 0);
+        int same = rf == rb && rff == rf && rbb == rb && (!HAS_SAD || (ref_f0 == rf && ref_b0 == rb));
+#else
+        int same = rf == rb && (!has_base || (ref_f0 == rf && ref_b0 == rb));
+#endif
+        if (same) {
+            float value = blend_round(rf, &p, 0, x, y);
+#if HOLD
+            if (weight < 1.0f) value = round(mix(held, value, weight));
+#endif
+            if (steps.gamma != 1.0f) value = curve[(int)value];
+            for (int step = 0; step < steps.count; step++) {
+#pragma OPENCL FP_CONTRACT OFF
+                float term = steps.weight[step] * value;
+                total = term + total;
+            }
+            *sum = total;
+            return;
+        }
+    }
+#endif
+
+#if ADAPTIVE && !LAYER && !STILL
+    float atravel = fmax(fmax(fabs(zsf.x), fabs(zsf.y)), fmax(fabs(zsb.x), fabs(zsb.y)));
+    int awant = atravel < 0.25f ? 1 : (atravel < 1.5f ? 2 : (atravel < 4.0f ? 4 : (atravel < 8.0f ? 8 : steps.count)));
+    int abuckets = min(awant, steps.count);
+    float4 amask = (float4)(0.0f);
+#if ALGO >= 21
+    float2 adv = zsf + zsb;
+    float aocc = clamp(native_sqrt(adv.x * adv.x + adv.y * adv.y) * 0.25f, 0.0f, 1.0f);
+    amask = (float4)(0.0f, aocc, aocc, 0.0f);
+#endif
+    for (int b = 0; b < abuckets; b++) {
+        int s0 = (b * steps.count) / abuckets;
+        int s1 = ((b + 1) * steps.count) / abuckets;
+        int mid = (s0 + s1 - 1) >> 1;
+        float wsum = 0.0f;
+        for (int s = s0; s < s1; s++) wsum += steps.weight[s];
+        p.phase = steps.phase[mid];
+        p.sad_blend = steps.sad_blend[mid];
+        float time = native_divide((float)p.phase, 256.0f);
+#if HAS_SAD
+        float4 m = layer_sample(masks, field_position, mid);
+        amask.x = m.x;
+        amask.w = m.w;
+#endif
+        float result = blend_value(source_f, source_b, &p, vector, amask, ext, ref_f0, ref_b0, time);
+        float value = blend_round(result, &p, 0, x, y);
+#if HOLD
+        if (weight < 1.0f) value = round(mix(held, value, weight));
+#endif
+        {
+#pragma OPENCL FP_CONTRACT OFF
+            if (steps.gamma != 1.0f) value = curve[(int)value];
+            float term = wsum * value;
+            total = term + total;
+        }
+    }
+    *sum = total;
+    return;
 #endif
 
     for (int step = 0; step < steps.count; step++) {
@@ -2995,12 +3165,14 @@ kernel void blend_source(
     float gamma, int luma)
 {
 #pragma OPENCL FP_CONTRACT OFF
+    int overwrite = stride < 0;
+    stride = abs(stride);
     int2 position = (int2)(get_global_id(0), get_global_id(1));
     float value = round(255.0f * read_imagef(source, nearest_sampler, position).x);
     if (gamma != 1.0f && position.y < luma) value = powr(value / 255.0f, gamma);
     float term = weight * value;
     global float *sum = sums + position.y*stride + position.x;
-    *sum = term + *sum;
+    *sum = term + (overwrite ? 0.0f : *sum);
 }
 
 kernel void blend_resolve_source(

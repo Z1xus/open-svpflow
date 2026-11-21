@@ -12,11 +12,13 @@ use super::{
 
 pub(super) const BLEND_VARIANT: u32 = 1 << 13;
 const FUSE_VARIANT: u32 = 1 << 17;
+pub(super) const ADAPTIVE_VARIANT: u32 = 1 << 18;
 const MAX_SLOTS: usize = 4;
 pub(super) const FUSED_ARG_BYTES: usize = (size_of::<ClMem>() + size_of::<i32>())
     .next_multiple_of(align_of::<ClMem>())
     + MAX_SLOTS * (4 * size_of::<ClMem>() + size_of::<Steps>())
     + size_of::<KernelParams>();
+pub(super) const FUSED_EXT_ARG_BYTES: usize = FUSED_ARG_BYTES + MAX_SLOTS * size_of::<ClMem>();
 const CL_MEM_OBJECT_IMAGE2D_ARRAY: u32 = 0x10F3;
 const MAX_STEPS: usize = 16;
 const BLEND_VRAM_BUDGET: usize = 128 << 20;
@@ -193,6 +195,9 @@ pub struct BlendJob {
     luma: usize,
     gamma: f32,
     fuse: bool,
+    fuse_ext: bool,
+    adaptive: bool,
+    dirty: Cell<bool>,
     weight: Cell<f32>,
     taken: Cell<bool>,
     failed: Cell<bool>,
@@ -211,6 +216,10 @@ impl BlendJob {
 
     pub fn failed(&self) -> bool {
         self.failed.get()
+    }
+
+    pub fn is_adaptive(&self) -> bool {
+        self.adaptive
     }
 }
 
@@ -411,6 +420,7 @@ impl GpuContext {
         height: usize,
         chroma_height: usize,
         gamma: f32,
+        adaptive: bool,
     ) -> Option<BlendJob> {
         if self.depth > 8 || self.cl.CreateImage.is_none() {
             return None;
@@ -461,6 +471,9 @@ impl GpuContext {
             luma: height,
             gamma,
             fuse: self.fuse_fits && gamma.to_bits() == 1.0_f32.to_bits(),
+            fuse_ext: self.fuse_ext_fits && gamma.to_bits() == 1.0_f32.to_bits(),
+            adaptive,
+            dirty: Cell::new(false),
             weight: Cell::new(0.0),
             taken: Cell::new(false),
             failed: Cell::new(false),
@@ -520,7 +533,13 @@ impl GpuContext {
         let mut unit = job.unit.borrow_mut();
         let kernel =
             self.variant_kernel(&mut unit.variant_kernels, first.variant | FUSE_VARIANT)?;
-        let stride = i32::try_from(job.width).ok()?;
+        let stride_val = i32::try_from(job.width).ok()?;
+        let stride = if job.dirty.get() {
+            stride_val
+        } else {
+            -stride_val
+        };
+        let needs_ext = first.params[0].algorithm == 23 && job.adaptive;
         let mut waits: Vec<ClEvent> = Vec::new();
         let mut args = Vec::with_capacity(MAX_SLOTS);
         for slot in 0..MAX_SLOTS {
@@ -539,7 +558,7 @@ impl GpuContext {
             if group.is_some() {
                 waits.extend([shape.sources[0][0].1, shape.sources[1][0].1]);
             }
-            args.push((source, shape.sources, shape.fields.0, steps));
+            args.push((source, shape.sources, shape.fields.0, shape.fields.1, steps));
         }
         waits.retain(|event| !event.is_null());
         waits.dedup();
@@ -556,7 +575,7 @@ impl GpuContext {
                 {
                     return None;
                 }
-                for (at, (source, sources, vectors, steps)) in args.iter().enumerate() {
+                for (at, (source, sources, vectors, ext, steps)) in args.iter().enumerate() {
                     let base = 2 + 4 * at as ClUint;
                     for (offset, image) in
                         [*source, sources[0][plane].0, sources[1][plane].0, *vectors]
@@ -574,6 +593,9 @@ impl GpuContext {
                         (&raw const *steps).cast(),
                     ) != CL_SUCCESS
                     {
+                        return None;
+                    }
+                    if needs_ext && !set_mem(23 + at as ClUint, *ext) {
                         return None;
                     }
                 }
@@ -612,6 +634,7 @@ impl GpuContext {
             }
             (self.cl.Flush)(queue);
         }
+        job.dirty.set(true);
         for slot in slots {
             if let Some(group) = slot.group {
                 pending.frames.extend(group.frames);
@@ -630,7 +653,12 @@ impl GpuContext {
         let mut unit = job.unit.borrow_mut();
         let (width, height) = (group.key.2, group.key.3);
         let layers = unsafe { self.mask_layers(&mut unit, width, height) }?;
-        let stride = i32::try_from(job.width).ok()?;
+        let stride_val = i32::try_from(job.width).ok()?;
+        let stride = if job.dirty.get() {
+            stride_val
+        } else {
+            -stride_val
+        };
         let mut waits = Self::source_waits(group.sources[0][0], group.sources[1][0]);
         waits.extend(group.still.map(|StillMask(_, ready)| ready));
         waits.retain(|ready| !ready.is_null());
@@ -705,6 +733,7 @@ impl GpuContext {
             }
             (self.cl.Flush)(unit.queue);
         }
+        job.dirty.set(true);
         job.failed.set(false);
         Some(())
     }
@@ -734,16 +763,21 @@ impl GpuContext {
                 && group.layer.is_some() == layer.is_some()
                 && (group.steps.count as usize) < MAX_STEPS
                 && shared(group.params) == shared(params)
-                && Arc::ptr_eq(&group.frames[0], &src0.entry)
-                && Arc::ptr_eq(&group.frames[1], &src1.entry)
         });
         if !joins {
             let variant = Self::variant(&params[0], false)
                 | BLEND_VARIANT
                 | self.mask_variant(still)
-                | if layer.is_some() { LAYER_VARIANT } else { 0 };
-            let fused = job.fuse
-                && matches!(params[0].algorithm, 1 | 2 | 11 | 13)
+                | if layer.is_some() { LAYER_VARIANT } else { 0 }
+                | if job.adaptive { ADAPTIVE_VARIANT } else { 0 };
+            let algo = params[0].algorithm;
+            let adaptive_fuse = job.adaptive
+                && match algo {
+                    21 | 22 => job.fuse,
+                    23 => job.fuse_ext,
+                    _ => false,
+                };
+            let fused = (job.fuse && matches!(algo, 1 | 2 | 11 | 13) || adaptive_fuse)
                 && params[0].has_sad == 0
                 && still.is_none()
                 && layer.is_none();
@@ -816,7 +850,7 @@ impl GpuContext {
         let mut pending = job.pending.borrow_mut();
         let group = pending.group.as_mut()?;
         let step = group.steps.count as usize;
-        let needs_coverage = params[0].algorithm >= 21;
+        let needs_coverage = params[0].algorithm >= 21 && !job.adaptive;
         if let Some(cover) = cover.filter(|_| needs_coverage && params[0].has_sad == 0) {
             let mut unit = job.unit.borrow_mut();
             let layers = unsafe { self.mask_layers(&mut unit, motion_width, motion_height) }?;
@@ -893,7 +927,12 @@ impl GpuContext {
         weight: f32,
     ) -> Option<()> {
         let [source, _, _] = self.blend_kernels(unit)?;
-        let stride = i32::try_from(job.width).ok()?;
+        let stride_val = i32::try_from(job.width).ok()?;
+        let stride = if job.dirty.get() {
+            stride_val
+        } else {
+            -stride_val
+        };
         let luma = i32::try_from(job.luma).ok()?;
         let image = entry.mems[1];
         let ready: ClEvent = entry.ready;
@@ -935,6 +974,7 @@ impl GpuContext {
             }
             (self.cl.Flush)(unit.queue);
         }
+        job.dirty.set(true);
         Some(())
     }
 
