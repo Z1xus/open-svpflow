@@ -6,10 +6,12 @@ use std::sync::{Mutex, OnceLock};
 use svpflow_host::context::{
     SharedSource, plane_fingerprint, publish_source, purge_sources, unpublish_mems,
 };
-use svpflow_host::hardware::GpuProfile;
+use svpflow_host::hardware::{GpuProfile, GpuVendor};
 use svpflow_host::opencl::{
-    CL_DEVICE_TYPE_GPU, CL_FALSE, CL_MAP_READ, CL_MEM_ALLOC_HOST_PTR, CL_MEM_READ_WRITE,
-    CL_SUCCESS, CL_TRUE, ClInt, ClUint, FnKernelInfo, Handle, OpenCl as CoreCl,
+    CL_DEVICE_EXTENSIONS, CL_DEVICE_TYPE_GPU, CL_FALSE,
+    CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, CL_MAP_READ, CL_MEM_ALLOC_HOST_PTR,
+    CL_MEM_READ_WRITE, CL_SUCCESS, CL_TRUE, ClInt, ClUint, FnKernelInfo, FnRelease, Handle,
+    OpenCl as CoreCl,
 };
 
 type FnFillBuffer = unsafe extern "C" fn(
@@ -24,11 +26,25 @@ type FnFillBuffer = unsafe extern "C" fn(
     *mut Handle,
 ) -> ClInt;
 
+type FnKernelSubGroupInfo = unsafe extern "C" fn(
+    Handle,
+    Handle,
+    ClUint,
+    usize,
+    *const c_void,
+    usize,
+    *mut c_void,
+    *mut usize,
+) -> ClInt;
+
 #[allow(non_snake_case)]
 struct OpenCl {
     core: CoreCl,
     GetKernelWorkGroupInfo: FnKernelInfo,
+    GetKernelSubGroupInfo: Option<FnKernelSubGroupInfo>,
     EnqueueFillBuffer: FnFillBuffer,
+    ReleaseKernel: Option<FnRelease>,
+    ReleaseProgram: Option<FnRelease>,
 }
 
 impl std::ops::Deref for OpenCl {
@@ -44,7 +60,10 @@ impl OpenCl {
         let core = unsafe { CoreCl::load()? };
         Ok(Self {
             GetKernelWorkGroupInfo: unsafe { core.symbol("clGetKernelWorkGroupInfo\0")? },
+            GetKernelSubGroupInfo: unsafe { core.symbol("clGetKernelSubGroupInfo\0").ok() },
             EnqueueFillBuffer: unsafe { core.symbol("clEnqueueFillBuffer\0")? },
+            ReleaseKernel: unsafe { core.symbol("clReleaseKernel\0").ok() },
+            ReleaseProgram: unsafe { core.symbol("clReleaseProgram\0").ok() },
             core,
         })
     }
@@ -61,7 +80,106 @@ use chain::ChainBuffers;
 
 const CL_DEVICE_MAX_WORK_GROUP_SIZE: ClUint = 0x1004;
 const CL_DEVICE_LOCAL_MEM_SIZE: ClUint = 0x1023;
+const CL_DEVICE_OPENCL_C_VERSION: ClUint = 0x103D;
 const CL_KERNEL_COMPILE_WORK_GROUP_SIZE: ClUint = 0x11B1;
+const CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE: ClUint = 0x2033;
+
+const SG_KHR: u8 = 1 << 0;
+const SG_SHUFFLE: u8 = 1 << 1;
+const SG_BALLOT: u8 = 1 << 2;
+const SG_INTEL: u8 = 1 << 3;
+const SG_INTEL_REQD: u8 = 1 << 4;
+
+#[derive(Clone, Copy)]
+struct SearchCaps {
+    vendor: GpuVendor,
+    flags: u8,
+    cl_std: u8,
+}
+
+impl SearchCaps {
+    fn has(self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+
+    fn subgroups(self) -> bool {
+        self.vendor != GpuVendor::Nvidia
+            && ((self.vendor == GpuVendor::Intel
+                && self.has(SG_INTEL)
+                && self.has(SG_INTEL_REQD))
+                || (self.has(SG_KHR) && self.has(SG_SHUFFLE)))
+    }
+}
+
+unsafe fn device_str(cl: &CoreCl, device: Handle, param: ClUint) -> String {
+    let mut len = 0usize;
+    if unsafe {
+        (cl.GetDeviceInfo)(
+            device,
+            param,
+            0,
+            std::ptr::null_mut(),
+            &raw mut len,
+        )
+    } != CL_SUCCESS
+        || len == 0
+    {
+        return String::new();
+    }
+    let mut buf = vec![0u8; len];
+    if unsafe {
+        (cl.GetDeviceInfo)(
+            device,
+            param,
+            len,
+            buf.as_mut_ptr().cast(),
+            std::ptr::null_mut(),
+        )
+    } != CL_SUCCESS
+    {
+        return String::new();
+    }
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+impl SearchCaps {
+    unsafe fn probe(cl: &CoreCl, device: Handle, profile: GpuProfile) -> Self {
+        let exts = unsafe { device_str(cl, device, CL_DEVICE_EXTENSIONS) };
+        let cl_c = unsafe { device_str(cl, device, CL_DEVICE_OPENCL_C_VERSION) };
+        let has = |name: &str| exts.split_whitespace().any(|e| e == name);
+        let mut flags = 0u8;
+        if has("cl_khr_subgroups") {
+            flags |= SG_KHR;
+        }
+        if has("cl_khr_subgroup_shuffle") {
+            flags |= SG_SHUFFLE;
+        }
+        if has("cl_khr_subgroup_ballot") {
+            flags |= SG_BALLOT;
+        }
+        if has("cl_intel_subgroups") {
+            flags |= SG_INTEL;
+        }
+        if has("cl_intel_required_subgroup_size") {
+            flags |= SG_INTEL_REQD;
+        }
+        let cl_std = if cl_c.starts_with("OpenCL C 3.") {
+            3
+        } else if cl_c.starts_with("OpenCL C 2.") {
+            2
+        } else {
+            1
+        };
+        Self {
+            vendor: profile.vendor,
+            flags,
+            cl_std,
+        }
+    }
+}
 const CHUNK: usize = 16384;
 const RECORD: usize = 12;
 const RECORD_BYTES: usize = RECORD * size_of::<i32>();
@@ -111,7 +229,6 @@ fn fast_defines(flags: u8, satd: bool) -> String {
 enum Arg {
     Mem(Handle),
     Int(i32),
-    Long(i64),
     V4([i32; 4]),
     V8([i32; 8]),
 }
@@ -193,6 +310,7 @@ pub(crate) struct RefineGpu {
     cl: OpenCl,
     context: usize,
     device: usize,
+    caps: SearchCaps,
     pool_budget: usize,
     programs: Mutex<Vec<(Variant, usize)>>,
     search_programs: Mutex<Vec<(SearchKey, usize)>>,
@@ -409,6 +527,7 @@ impl RefineGpu {
                 continue;
             }
             let profile = unsafe { GpuProfile::probe(&cl.core, device) };
+            let caps = unsafe { SearchCaps::probe(&cl.core, device, profile) };
             let unit_count = profile.analyse_units(svpflow_core::threads::workers());
             let pool_budget = profile.pool_budget_bytes();
             let mut units = Vec::with_capacity(unit_count);
@@ -428,6 +547,7 @@ impl RefineGpu {
                 cl,
                 context: context as usize,
                 device: device as usize,
+                caps,
                 pool_budget,
                 programs: Mutex::new(Vec::new()),
                 search_programs: Mutex::new(Vec::new()),
@@ -470,16 +590,60 @@ impl RefineGpu {
         Some(program)
     }
 
+    fn verify_subgroup_size(&self, program: usize, bpw: usize) -> bool {
+        let cl = &self.cl;
+        let device = self.device as Handle;
+        let mut err = 0;
+        let kernel =
+            unsafe { (cl.CreateKernel)(program as Handle, c"search".as_ptr(), &raw mut err) };
+        if err != CL_SUCCESS || kernel.is_null() {
+            return false;
+        }
+        let local_range = [32 * bpw, 1usize, 1usize];
+        let mut sg = 0usize;
+        let got_sg = cl.GetKernelSubGroupInfo.is_some_and(|f| unsafe {
+            f(
+                kernel,
+                device,
+                CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE,
+                size_of_val(&local_range),
+                local_range.as_ptr().cast(),
+                size_of::<usize>(),
+                (&raw mut sg).cast(),
+                std::ptr::null_mut(),
+            ) == CL_SUCCESS
+        });
+        if !got_sg {
+            let ok = unsafe {
+                (cl.GetKernelWorkGroupInfo)(
+                    kernel,
+                    device,
+                    CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+                    size_of::<usize>(),
+                    (&raw mut sg).cast(),
+                    std::ptr::null_mut(),
+                ) == CL_SUCCESS
+            };
+            if !ok {
+                sg = 0;
+            }
+        }
+        if let Some(rel) = cl.ReleaseKernel {
+            unsafe { rel(kernel) };
+        }
+        sg >= 32 && (bpw == 1 || sg == 32)
+    }
+
     fn search_program(&self, variant: Variant, rmax: usize, spec: [i32; 5]) -> Option<usize> {
         let mut programs = self.search_programs.lock().ok()?;
         if let Some(&(_, program)) = programs.iter().find(|(v, _)| *v == (variant, rmax, spec)) {
             return Some(program);
         }
         let fast = fast_defines(variant.fast_flags, variant.satd);
-        let build = |portable: &str| {
+        let build_opts = |extra: &str, opts: &CStr| {
             self.build_with(
                 &format!(
-                    "#define W {}\n#define H {}\n#define CS {}\n#define RMAX {}\n{}#define PELV {}\n#define LOGAV {}\n#define DONTV {}\n#define BLURV {}\n#define BORDERV {}\n{fast}{portable}{SEARCH}",
+                    "#define W {}\n#define H {}\n#define CS {}\n#define RMAX {}\n{}#define PELV {}\n#define LOGAV {}\n#define DONTV {}\n#define BLURV {}\n#define BORDERV {}\n{fast}{extra}{SEARCH}",
                     variant.width,
                     variant.height,
                     variant.shift,
@@ -491,12 +655,67 @@ impl RefineGpu {
                     spec[3],
                     spec[4]
                 ),
-                c"-cl-fp32-correctly-rounded-divide-sqrt",
+                opts,
             )
         };
-        let program = build("")
-            .or_else(|| build("#define NO_REDUX 1\n"))
-            .or_else(|| build("#define NO_NV_ASM 1\n"))?;
+        let base_opts = c"-cl-fp32-correctly-rounded-divide-sqrt";
+        let build = |extra: &str| build_opts(extra, base_opts);
+        let caps = self.caps;
+        let program = if caps.vendor == GpuVendor::Nvidia {
+            build("")
+                .or_else(|| build("#define NO_REDUX 1\n"))
+                .or_else(|| build("#define NO_NV_ASM 1\n"))?
+        } else {
+            let build_sg = |bpw: usize, vendor_defs: &str| {
+                let mut defs = format!("#define USE_SUBGROUPS 1\n#define SUBGROUP_BPW {bpw}\n");
+                if caps.has(SG_KHR) {
+                    defs.push_str("#define USE_KHR_SUBGROUPS 1\n");
+                }
+                if caps.has(SG_SHUFFLE) {
+                    defs.push_str("#define USE_KHR_SHUFFLE 1\n");
+                }
+                if caps.has(SG_BALLOT) {
+                    defs.push_str("#define USE_SUBGROUP_BALLOT 1\n");
+                }
+                defs.push_str(vendor_defs);
+                let sg_opts = match caps.cl_std {
+                    3 => Some(c"-cl-std=CL3.0 -cl-fp32-correctly-rounded-divide-sqrt"),
+                    2 => Some(c"-cl-std=CL2.0 -cl-fp32-correctly-rounded-divide-sqrt"),
+                    _ => None,
+                };
+                let prog = sg_opts
+                    .and_then(|o| build_opts(&defs, o))
+                    .or_else(|| build_opts(&defs, base_opts))?;
+                if self.verify_subgroup_size(prog, bpw) {
+                    Some(prog)
+                } else {
+                    if let Some(rel) = self.cl.ReleaseProgram {
+                        unsafe { rel(prog as Handle) };
+                    }
+                    None
+                }
+            };
+            let subgroups = caps.subgroups();
+            if subgroups && caps.vendor == GpuVendor::Amd {
+                build_sg(2, "#define AMD_GCN 1\n")
+                    .or_else(|| build_sg(1, "#define AMD_GCN 1\n"))
+                    .or_else(|| build_sg(2, ""))
+                    .or_else(|| build_sg(1, ""))
+                    .or_else(|| build("#define AMD_GCN 1\n"))
+                    .or_else(|| build(""))?
+            } else if subgroups && caps.vendor == GpuVendor::Intel && caps.has(SG_INTEL_REQD) {
+                build_sg(2, "#define INTEL_GPU 1\n#define INTEL_REQD_SG32 1\n")
+                    .or_else(|| build(""))?
+            } else if subgroups {
+                build_sg(2, "")
+                    .or_else(|| build_sg(1, ""))
+                    .or_else(|| build(""))?
+            } else if caps.vendor == GpuVendor::Amd {
+                build("#define AMD_GCN 1\n").or_else(|| build(""))?
+            } else {
+                build("")?
+            }
+        };
         programs.push(((variant, rmax, spec), program));
         Some(program)
     }
@@ -552,6 +771,9 @@ impl RefineGpu {
             )
         };
         if built != CL_SUCCESS {
+            if let Some(rel) = cl.ReleaseProgram {
+                unsafe { rel(program) };
+            }
             return None;
         }
         Some(program as usize)
@@ -818,6 +1040,19 @@ impl Session<'_, '_> {
         Some((kernel, size[0]))
     }
 
+    unsafe fn set_args(&self, kernel: Handle, args: &[Arg]) -> bool {
+        let cl = &self.gpu.cl;
+        args.iter().enumerate().all(|(index, arg)| {
+            let (size, value): (usize, *const c_void) = match arg {
+                Arg::Mem(v) => (size_of::<Handle>(), (&raw const *v).cast()),
+                Arg::Int(v) => (4, (&raw const *v).cast()),
+                Arg::V4(v) => (16, v.as_ptr().cast()),
+                Arg::V8(v) => (32, v.as_ptr().cast()),
+            };
+            unsafe { (cl.SetKernelArg)(kernel, index as ClUint, size, value) == CL_SUCCESS }
+        })
+    }
+
     unsafe fn launch(
         &mut self,
         (program, name): (usize, &'static CStr),
@@ -830,16 +1065,7 @@ impl Session<'_, '_> {
         let (kernel, _) = unsafe { self.ckernel(program, name)? };
         let cl = &self.gpu.cl;
         let queue = self.unit.queue as Handle;
-        let set = args.iter().enumerate().all(|(index, arg)| {
-            let (size, value): (usize, *const c_void) = match arg {
-                Arg::Mem(v) => (size_of::<Handle>(), (&raw const *v).cast()),
-                Arg::Int(v) => (4, (&raw const *v).cast()),
-                Arg::Long(v) => (8, (&raw const *v).cast()),
-                Arg::V4(v) => (16, v.as_ptr().cast()),
-                Arg::V8(v) => (32, v.as_ptr().cast()),
-            };
-            unsafe { (cl.SetKernelArg)(kernel, index as ClUint, size, value) == CL_SUCCESS }
-        });
+        let set = unsafe { self.set_args(kernel, args) };
         let global = match local {
             Some(local) => global.next_multiple_of(local),
             None => global.max(1),
@@ -853,6 +1079,44 @@ impl Session<'_, '_> {
                     std::ptr::null(),
                     &raw const global,
                     local.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+                    waits.len() as ClUint,
+                    if waits.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        waits.as_ptr().cast()
+                    },
+                    event.cast(),
+                )
+            } != CL_SUCCESS
+        {
+            unsafe { (cl.Finish)(queue) };
+            return None;
+        }
+        Some(())
+    }
+
+    unsafe fn launch_2d(
+        &mut self,
+        (program, name): (usize, &'static CStr),
+        args: &[Arg],
+        global: [usize; 2],
+        waits: &[Handle],
+        event: *mut Handle,
+    ) -> Option<()> {
+        let (kernel, _) = unsafe { self.ckernel(program, name)? };
+        let cl = &self.gpu.cl;
+        let queue = self.unit.queue as Handle;
+        let set = unsafe { self.set_args(kernel, args) };
+        let global = [global[0].max(1), global[1].max(1)];
+        if !set
+            || unsafe {
+                (cl.EnqueueNDRangeKernel)(
+                    queue,
+                    kernel,
+                    2,
+                    std::ptr::null(),
+                    global.as_ptr(),
+                    std::ptr::null(),
                     waits.len() as ClUint,
                     if waits.is_empty() {
                         std::ptr::null()
@@ -1095,15 +1359,17 @@ impl Session<'_, '_> {
             {
                 failed = region * 4 > lengths[plane]
                     || unsafe {
-                        self.launch(
+                        self.launch_2d(
                             (program, c"expand"),
                             &[
                                 Arg::Mem(mem),
-                                Arg::Long(planes.pitch[plane] as i64),
-                                Arg::Long(i64::from(planes.height[plane])),
+                                Arg::Int(planes.pitch[plane] as i32),
+                                Arg::Int(planes.height[plane]),
                             ],
-                            3 * region,
-                            None,
+                            [
+                                planes.pitch[plane].div_ceil(4),
+                                planes.height[plane].max(0) as usize,
+                            ],
                             &[],
                             if plane == 2 {
                                 &raw mut event
@@ -1736,24 +2002,47 @@ fn bytes<T: Copy>(values: &[T]) -> &[u8] {
 const SEARCH: &str = include_str!("search.cl");
 
 const EXPAND: &str = r"
-__kernel void expand(__global uchar *plane, long pitch, long height) {
-    long size = pitch * height;
-    long item = get_global_id(0);
-    if (item >= 3 * size) return;
-    int k = (int)(item / size) + 1;
-    long i = item % size;
-    long y = i / pitch, x = i % pitch;
+inline uchar exp_p0(__global const uchar *p0, long size, long j) {
+    if (j < size) return p0[j];
+    long k = j - size;
+    return rhadd(p0[k], p0[k + 1]);
+}
+
+__kernel void expand(__global uchar *plane, int pitch, int height) {
+    int x = (int)get_global_id(0) * 4;
+    int y = (int)get_global_id(1);
+    if (x >= pitch || y >= height) return;
+    long p = (long)pitch;
+    long size = p * (long)height;
     __global const uchar *p0 = plane;
-    #define P0(j) ((j) < size ? (int)p0[j] : ((int)p0[(j) - size] + (int)p0[(j) - size + 1] + 1) >> 1)
-    int value;
-    if (k == 1) {
-        value = (P0(i) + P0(i + 1) + 1) >> 1;
-    } else if (k == 2) {
-        value = y == 0 ? (int)p0[x] : (P0(i) + P0(i + pitch) + 1) >> 1;
-    } else {
-        value = y == 0 ? (int)p0[x + 1] : (P0(i) + P0(i + pitch + 1) + 1) >> 1;
+    if (y > 0 && y < height - 1 && x + 4 <= pitch && (y < height - 2 || x + 4 < pitch)) {
+        long i = (long)y * p + x;
+        uchar4 a0 = vload4(0, p0 + i);
+        uchar4 a1 = (uchar4)(a0.yzw, p0[i + 4]);
+        uchar4 b0 = vload4(0, p0 + i + p);
+        uchar4 b1 = (uchar4)(b0.yzw, p0[i + p + 4]);
+        vstore4(rhadd(a0, a1), 0, plane + size + i);
+        vstore4(rhadd(a0, b0), 0, plane + 2 * size + i);
+        vstore4(rhadd(a0, b1), 0, plane + 3 * size + i);
+        return;
     }
-    plane[k * size + i] = (uchar)value;
+    if (y == 0 && height >= 2 && x + 4 <= pitch) {
+        uchar4 a0 = vload4(0, p0 + x);
+        uchar4 a1 = (uchar4)(a0.yzw, p0[x + 4]);
+        vstore4(rhadd(a0, a1), 0, plane + size + x);
+        vstore4(a0, 0, plane + 2 * size + x);
+        vstore4(a1, 0, plane + 3 * size + x);
+        return;
+    }
+    long row = (long)y * p;
+    int end = min(x + 4, pitch);
+    for (int cx = x; cx < end; cx++) {
+        long i = row + cx;
+        uchar c0 = p0[i];
+        plane[size + i] = rhadd(c0, exp_p0(p0, size, i + 1));
+        plane[2 * size + i] = y == 0 ? p0[cx] : rhadd(c0, exp_p0(p0, size, i + p));
+        plane[3 * size + i] = y == 0 ? p0[cx + 1] : rhadd(c0, exp_p0(p0, size, i + p + 1));
+    }
 }
 ";
 
@@ -1786,7 +2075,7 @@ inline long subpel(long base, long pitch, long height, int pel, int x, int y) {
 inline uint had4_row(int4 v) {
     int a0 = v.x + v.y, a1 = v.z + v.w;
     int b0 = v.x - v.y, b1 = v.z - v.w;
-    return (uint)(abs(a0 + a1) + abs(a0 - a1) + abs(b0 + b1) + abs(b0 - b1));
+    return (uint)(max(abs(a0), abs(a1)) + max(abs(b0), abs(b1)));
 }
 
 inline uint tile_cost4(int4 s0, int4 s1, int4 s2, int4 s3, __global const uchar *data, long length, long offset, long pitch) {
@@ -1806,8 +2095,7 @@ inline uint tile_cost4(int4 s0, int4 s1, int4 s2, int4 s3, __global const uchar 
 #if SATD
     int4 a0 = r0 + r1, a1 = r2 + r3;
     int4 b0 = r0 - r1, b1 = r2 - r3;
-    uint total = had4_row(a0 + a1) + had4_row(a0 - a1) + had4_row(b0 + b1) + had4_row(b0 - b1);
-    return total >> 1;
+    return had4_row(a0 + a1) + had4_row(a0 - a1) + had4_row(b0 + b1) + had4_row(b0 - b1);
 #else
     uint4 t = abs(r0) + abs(r1) + abs(r2) + abs(r3);
     return t.x + t.y + t.z + t.w;
@@ -1853,8 +2141,7 @@ inline uint tile_cost4_gated(int4 s0, int4 s1, int4 s2, int4 s3, __global const 
     if (raw * 4u > best_raw * 5u) return 2147483647u;
     int4 a0 = r0 + r1, a1 = r2 + r3;
     int4 b0 = r0 - r1, b1 = r2 - r3;
-    uint total = had4_row(a0 + a1) + had4_row(a0 - a1) + had4_row(b0 + b1) + had4_row(b0 - b1);
-    return total >> 1;
+    return had4_row(a0 + a1) + had4_row(a0 - a1) + had4_row(b0 + b1) + had4_row(b0 - b1);
 }
 #endif
 
@@ -1894,7 +2181,7 @@ inline int outside(int v, int low, int high) {
 __kernel __attribute__((reqd_work_group_size(64, 1, 1)))
 void recalc(__global const uchar *sy, __global const uchar *su, __global const uchar *sv,
             __global const uchar *ry, __global const uchar *ru, __global const uchar *rv,
-            __global const long *p, __global const SEEDT *seed, __global uint2 *out,
+            __constant long *p, __global const SEEDT *seed, __global uint2 *out,
             __global const OVT *overrides
 #ifdef DEV
             , int seed_off, int out_off
@@ -1904,17 +2191,18 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
     seed += seed_off;
     out += out_off;
 #endif
-    long block = get_global_id(0);
-    if (block >= p[17]) return;
+    int block = (int)get_global_id(0);
+    if (block >= (int)p[17]) return;
     int fw = (int)p[18], fh = (int)p[19], blk_x = (int)p[20], step_x = (int)p[21], step_y = (int)p[22];
     int radius = (int)p[23], bad_sad = (int)p[24], lambda = (int)p[25], diagonal = (int)p[26];
     int pnew = (int)p[27], pel = (int)p[28], count = (int)p[29];
     long lsy = p[0], lsu = p[1], lsv = p[2], psy = p[3], psu = p[4], psv = p[5];
     long lry = p[6], lru = p[7], lrv = p[8], pry = p[9], pru = p[10], prv = p[11];
-    int x0 = (int)(block % blk_x) * step_x, y0 = (int)(block / blk_x) * step_y;
+    int bx = block % blk_x, by = block / blk_x;
+    int x0 = bx * step_x, y0 = by * step_y;
     int cx = (int)p[33], cy = (int)p[34], norm = (int)p[35];
     int odd_x = (int)p[36], even_x = (int)p[37], odd_y = (int)p[38], even_y = (int)p[39], flat = (int)p[40];
-    int ki = min((int)(block % blk_x), 2 * cx - 1), kj = min((int)(block / blk_x), 2 * cy - 1);
+    int ki = min(bx, 2 * cx - 1), kj = min(by, 2 * cy - 1);
     int off_x = -1 + 2 * (ki & 1), off_y = -1 + 2 * (kj & 1);
     int edge_x = ki == 0 || ki >= 2 * cx - 1, edge_y = kj == 0 || kj >= 2 * cy - 1;
     int near_x = ki / 2 + off_x, near_y = kj / 2 + off_y;
@@ -2105,7 +2393,7 @@ inline long subpel(long base, long pitch, long height, int pel, int x, int y) {
 inline uint had4_row_k(int4 v) {
     int a0 = v.x + v.y, a1 = v.z + v.w;
     int b0 = v.x - v.y, b1 = v.z - v.w;
-    return (uint)(abs(a0 + a1) + abs(a0 - a1) + abs(b0 + b1) + abs(b0 - b1));
+    return (uint)(max(abs(a0), abs(a1)) + max(abs(b0), abs(b1)));
 }
 
 inline uint tile_cost(__local const uchar *src, int spitch, __global const uchar *data, long length,
@@ -2140,15 +2428,15 @@ inline uint tile_cost(__local const uchar *src, int spitch, __global const uchar
 __kernel __attribute__((reqd_work_group_size(64, 1, 1)))
 void recalc(__global const uchar *sy, __global const uchar *su, __global const uchar *sv,
             __global const uchar *ry, __global const uchar *ru, __global const uchar *rv,
-            __global const long *p, __global const int *records, __global int4 *bests) {
+            __constant long *p, __global const int *records, __global int4 *bests) {
     __local uchar src_luma[W * H];
     __local uchar src_u[(W >> S) * (H >> S)];
     __local uchar src_v[(W >> S) * (H >> S)];
     __local uint acc_luma[MAX_SLOTS], acc_u[MAX_SLOTS], acc_v[MAX_SLOTS];
     __local int sum_average;
-    long block = get_group_id(0);
+    int block = (int)get_group_id(0);
     int lid = get_local_id(0);
-    long slots = p[17];
+    int slots = (int)p[17];
     int pnew = (int)p[19], pel = (int)p[20];
     long lsy = p[0], lsu = p[1], lsv = p[2], psy = p[3], psu = p[4], psv = p[5];
     long lry = p[6], lru = p[7], lrv = p[8], pry = p[9], pru = p[10], prv = p[11];
@@ -2240,13 +2528,8 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
     if (r[4] != NONE_V && bh >= 4) average = sum_average >> (31 - clz(bw * bh));
     int bx = px, by = py, bsad = r[10];
     if (bad) {
-#if SATD
-#define LUMA(s) ((int)(acc_luma[s] / 2))
-#define CHROMA(s) ((int)((acc_u[s] / 2 + acc_v[s] / 2) << (2 * S)))
-#else
 #define LUMA(s) ((int)acc_luma[s])
 #define CHROMA(s) ((int)((acc_u[s] + acc_v[s]) << (2 * S)))
-#endif
         bsad = (int)((uint)LUMA(0) + (uint)CHROMA(0));
         int min_cost = bsad;
         uint lambda = (uint)(r[11] >> 2);

@@ -161,7 +161,8 @@ impl Session<'_, '_> {
                 )
             };
             let (d_y, d_c) = pyramid.offsets(level);
-            let n = (g.width * g.height + 2 * g.chroma_width * g.chroma_height) as usize;
+            let tiles = |w: i32, h: i32| (w.max(0) as usize).div_ceil(16) * (h.max(0) as usize).div_ceil(16);
+            let n = (tiles(g.width, g.height) + 2 * tiles(g.chroma_width, g.chroma_height)).max(1) * 256;
             let args = [
                 Arg::Mem(mems[0]),
                 Arg::Mem(mems[1]),
@@ -183,7 +184,7 @@ impl Session<'_, '_> {
                     (chain, c"reduce"),
                     &args,
                     n,
-                    None,
+                    Some(256),
                     &[],
                     if level + 1 == pyramid.levels {
                         &raw mut last

@@ -18,33 +18,74 @@ inline int vert(__global const uchar *s, int sp, int tw, int th, int y, int c) {
             10 * (tapv(s, sp, r, c) + tapv(s, sp, r + 1, c)) + tapv(s, sp, r + 3, c) + 16) >> 5;
 }
 
-inline uchar reduce_px(__global const uchar *s, int sp, int tw, int th, int x, int y) {
-    if (x == 0) return (uchar)((vert(s, sp, tw, th, y, 0) + vert(s, sp, tw, th, y, 1) + 1) >> 1);
-    if (x == tw - 1) return (uchar)((vert(s, sp, tw, th, y, 2 * x) + vert(s, sp, tw, th, y, 2 * x + 1) + 1) >> 1);
-    int a = x == 1 ? (vert(s, sp, tw, th, y, 0) + vert(s, sp, tw, th, y, 1) + 1) >> 1 : vert(s, sp, tw, th, y, 2 * x - 2);
-    int sum = a + 5 * (vert(s, sp, tw, th, y, 2 * x - 1) + vert(s, sp, tw, th, y, 2 * x + 2)) +
-              10 * (vert(s, sp, tw, th, y, 2 * x) + vert(s, sp, tw, th, y, 2 * x + 1)) + vert(s, sp, tw, th, y, 2 * x + 3);
-    return (uchar)((sum + 16) >> 5);
-}
-
-__kernel void reduce(__global const uchar *s0, __global const uchar *s1, __global const uchar *s2,
-                     __global uchar *d0, __global uchar *d1, __global uchar *d2, int4 geo, int4 dims, int4 offs) {
-    int i = (int)get_global_id(0);
-    int n0 = dims.x * dims.y, n1 = dims.z * dims.w;
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void reduce(__global const uchar *s0, __global const uchar *s1, __global const uchar *s2,
+            __global uchar *d0, __global uchar *d1, __global uchar *d2, int4 geo, int4 dims, int4 offs) {
+    __local uchar st[36][40];
+    __local uchar vt[16][40];
+    int tx0 = (dims.x + 15) >> 4, ty0 = (dims.y + 15) >> 4, nt0 = tx0 * ty0;
+    int tx1 = (dims.z + 15) >> 4, ty1 = (dims.w + 15) >> 4, nt1 = tx1 * ty1;
+    int wg = (int)get_group_id(0);
     __global const uchar *s;
     __global uchar *d;
-    int sp, dp, tw, th;
-    if (i < n0) {
-        s = s0 + offs.x; d = d0 + offs.z; sp = geo.x; dp = geo.z; tw = dims.x; th = dims.y;
+    int sp, dp, tw, th, tx;
+    if (wg < nt0) {
+        s = s0 + offs.x; d = d0 + offs.z; sp = geo.x; dp = geo.z; tw = dims.x; th = dims.y; tx = tx0;
     } else {
-        i -= n0;
-        if (i >= 2 * n1) return;
-        if (i < n1) { s = s1 + offs.y; d = d1 + offs.w; } else { s = s2 + offs.y; d = d2 + offs.w; i -= n1; }
-        sp = geo.y; dp = geo.w; tw = dims.z; th = dims.w;
+        wg -= nt0;
+        if (wg >= 2 * nt1) return;
+        if (wg < nt1) { s = s1 + offs.y; d = d1 + offs.w; } else { s = s2 + offs.y; d = d2 + offs.w; wg -= nt1; }
+        sp = geo.y; dp = geo.w; tw = dims.z; th = dims.w; tx = tx1;
     }
-    int x = i % tw, y = i / tw;
-    d[(long)y * dp + x] = reduce_px(s, sp, tw, th, x, y);
-    if (x == tw - 1) for (int k = tw; k < dp; k++) d[(long)y * dp + k] = 0;
+    int bx = wg % tx, by = wg / tx;
+    int ox0 = bx * 16, oy0 = by * 16;
+    int c0 = 2 * ox0 - 2, r0 = 2 * oy0 - 2;
+    int w2 = 2 * tw, h2 = 2 * th;
+    int lid = (int)get_local_id(0);
+    for (int idx = lid; idx < 36 * 36; idx += 256) {
+        int rv = idx / 36, cu = idx % 36;
+        int r = r0 + rv, c = c0 + cu;
+        st[rv][cu] = (r >= 0 && r < h2 && c >= 0 && c < w2) ? s[(long)r * sp + c] : (uchar)0;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    int odd_tail = (w2 & 7) != 0;
+    int tail_c = w2 >= 8 ? (w2 & ~7) : 0;
+    int max_th = max(th, 2);
+    for (int idx = lid; idx < 16 * 36; idx += 256) {
+        int ly = idx / 36, cu = idx % 36;
+        int y = oy0 + ly, c = c0 + cu;
+        if (y < th && c >= 0 && c < w2) {
+            int val;
+            if (y == 0 || y + 1 >= max_th) {
+                val = ((int)st[2 * ly + 2][cu] + (int)st[2 * ly + 3][cu] + 1) >> 1;
+            } else if (odd_tail && c >= tail_c) {
+                val = vert(s, sp, tw, th, y, c);
+            } else {
+                val = ((int)st[2 * ly][cu] + 5 * ((int)st[2 * ly + 1][cu] + (int)st[2 * ly + 4][cu]) +
+                       10 * ((int)st[2 * ly + 2][cu] + (int)st[2 * ly + 3][cu]) + (int)st[2 * ly + 5][cu] + 16) >> 5;
+            }
+            vt[ly][cu] = (uchar)val;
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    int lx = lid & 15, ly = lid >> 4;
+    int x = ox0 + lx, y = oy0 + ly;
+    if (x < tw && y < th) {
+        int u = 2 * lx + 2;
+        uchar out;
+        if (x == 0) {
+            out = (uchar)(((int)vt[ly][2] + (int)vt[ly][3] + 1) >> 1);
+        } else if (x == tw - 1) {
+            out = (uchar)(((int)vt[ly][u] + (int)vt[ly][u + 1] + 1) >> 1);
+        } else {
+            int a = x == 1 ? (((int)vt[ly][2] + (int)vt[ly][3] + 1) >> 1) : (int)vt[ly][u - 2];
+            int sum = a + 5 * ((int)vt[ly][u - 1] + (int)vt[ly][u + 2]) +
+                      10 * ((int)vt[ly][u] + (int)vt[ly][u + 1]) + (int)vt[ly][u + 3];
+            out = (uchar)((sum + 16) >> 5);
+        }
+        d[(long)y * dp + x] = out;
+        if (x == tw - 1) for (int k = tw; k < dp; k++) d[(long)y * dp + k] = 0;
+    }
 }
 
 inline int comp(int4 v, int c) { return c ? HI(v.x) : LO(v.x); }
