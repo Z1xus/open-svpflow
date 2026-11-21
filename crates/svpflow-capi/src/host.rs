@@ -858,6 +858,18 @@ impl Task {
             };
             return self.complete(produced);
         }
+        let failed = unsafe { &*self.context.get() }
+            .frames
+            .iter()
+            .find_map(|(_, cell)| {
+                let state = cell.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.0.as_ref()?.as_ref().err().map(Arc::clone)
+            });
+        if let Some(error) = failed {
+            self.call(vs3::AR_ERROR);
+            unsafe { &mut *self.context.get() }.frames.clear();
+            return self.complete(Err(error));
+        }
         let frame = self.call(vs3::AR_ALL_FRAMES_READY);
         let context = unsafe { &*self.context.get() };
         // a filter may request more frames in its second call
