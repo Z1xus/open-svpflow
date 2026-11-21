@@ -108,8 +108,15 @@ pub(crate) fn analyse(
             .as_ref()
             .map(|r| [r[0].view(params), r[1].view(params)]);
         let [first, second] = views.as_ref().map_or([first, second], |v| [&v[0], &v[1]]);
+        let exact_dontv_gpu = params.gpu_mode == 1
+            && params.stages[0].settings(params, 0, false).search_param == 0
+            && params.stages[0].settings(params, 0, false).search_type
+                == field::SearchType::Exhaustive
+            && matches!(params.stages[0].layout.width, 8 | 16 | 32)
+            && matches!(params.stages[0].layout.height, 8 | 16 | 32);
         let gpu = (keys.is_some()
             && (params.stages[0].gpu_searchable(params)
+                || exact_dontv_gpu
                 || params.stages.len() > 1
                     && params.stages[1..]
                         .iter()

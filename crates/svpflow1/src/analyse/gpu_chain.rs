@@ -10,8 +10,8 @@ pub(super) const CHAIN: &str = include_str!("chain.cl");
 
 const FREQ: usize = 16384;
 const SORT_SCRATCH: usize = 2 * RANK_BLOCKS as usize;
-const SORT_GROUP: usize = 1024;
-const SORT_LOCAL_BYTES: usize = 4 * (RANK_BLOCKS as usize + SORT_GROUP + 2);
+const SORT_GROUP: usize = 256;
+const SORT_LOCAL_BYTES: usize = 2 * RANK_BLOCKS as usize + 2 * SORT_GROUP * 16 + 4 * SORT_GROUP;
 fn slab(bytes: usize) -> usize {
     bytes.next_multiple_of(256)
 }

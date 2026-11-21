@@ -295,32 +295,76 @@ void srank(__global const int4 *cout, __global int2 *rev, __global int *scratch,
     rev += dir * st.s3;
     scratch += dir * 2 * SR_MAX;
     __global int *rank = (__global int *)(rev + PG_NX * PG_NY);
-    __local int bk[SR_MAX];
+    __local ushort bk[SR_MAX];
+    __local ushort cnt[SR_WG * 16];
     __local int scan[SR_WG];
-    __local int tot[2];
     const int lid = (int)get_local_id(0);
     int nx = PG_NX, ny = PG_NY, cx = PG_CX, cy = PG_CY;
     int n = cx * cy;
     int shift = h.x, buckets = h.y;
     __global int *perm = scratch;
-    __global int *base = scratch + SR_MAX;
+    __global int *alt = scratch + SR_MAX;
     for (int i = lid; i < nx * ny; i += SR_WG) rank[i] = 0;
     for (int i = lid; i < n; i += SR_WG) {
         int sad = cout[i].y;
-        bk[i] = sad < 0 ? buckets - 1 : min(sad >> shift, buckets - 1);
-    }
-    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
-    for (int i = lid; i < n; i += SR_WG) {
-        int b = bk[i], pos = 0;
-        for (int j = 0; j < n; j++) {
-            int o = bk[j];
-            pos += (o < b || (o == b && j < i)) ? 1 : 0;
-        }
-        perm[pos] = i;
+        bk[i] = (ushort)(sad < 0 ? buckets - 1 : min(sad >> shift, buckets - 1));
+        perm[i] = i;
     }
     barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
     int per = (n + SR_WG - 1) / SR_WG;
     int lo = min(lid * per, n), hi = min(lo + per, n);
+    int max_b = max(buckets - 1, 0);
+    int passes = 0;
+    for (int m = max_b; m > 0; m >>= 4) passes++;
+    if (passes < 1) passes = 1;
+    __global int *src_p = perm;
+    __global int *dst_p = alt;
+    for (int p = 0; p < passes; p++) {
+        int sh = p * 4;
+        ushort local_c[16];
+        for (int d = 0; d < 16; d++) local_c[d] = 0;
+        for (int i = lo; i < hi; i++) {
+            int idx = src_p[i];
+            int dig = ((int)bk[idx] >> sh) & 15;
+            local_c[dig]++;
+        }
+        for (int d = 0; d < 16; d++) cnt[d * SR_WG + lid] = local_c[d];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lid < 16) {
+            int sum = 0;
+            for (int t = 0; t < SR_WG; t++) {
+                int v = (int)cnt[lid * SR_WG + t];
+                cnt[lid * SR_WG + t] = (ushort)sum;
+                sum += v;
+            }
+            scan[lid] = sum;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lid == 0) {
+            int sum = 0;
+            for (int d = 0; d < 16; d++) {
+                int v = scan[d];
+                scan[d] = sum;
+                sum += v;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        int off[16];
+        for (int d = 0; d < 16; d++) off[d] = scan[d] + (int)cnt[d * SR_WG + lid];
+        for (int i = lo; i < hi; i++) {
+            int idx = src_p[i];
+            int dig = ((int)bk[idx] >> sh) & 15;
+            dst_p[off[dig]++] = idx;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+        __global int *tmp = src_p;
+        src_p = dst_p;
+        dst_p = tmp;
+    }
+    if (src_p != perm) {
+        for (int i = lid; i < n; i += SR_WG) perm[i] = src_p[i];
+        barrier(CLK_GLOBAL_MEM_FENCE);
+    }
     int ci = 0, cb = 0;
     for (int s = lo; s < hi; s++) {
         int c = perm[s];

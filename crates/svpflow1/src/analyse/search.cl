@@ -942,7 +942,7 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
     const int vx = LO(pv.x), vy = HI(pv.x);
     const int omin_x = -pel * x0, omin_y = -pel * y0;
     const int omax_x = pel * (PW - x0 - W), omax_y = pel * (PH - y0 - H);
-    bool valid = act, shifted = false;
+    bool valid = act && pv.y >= 0, shifted = false;
     Sh t;
     if (!(vx >= omin_x && vx < omax_x && vy >= omin_y && vy < omax_y)) {
         t = make_sh(x0, y0, pel, PW, PH, vx, vy, 0);

@@ -874,6 +874,288 @@ impl Field {
         if !searching && let Some(out) = output.as_deref_mut() {
             self.write_kept(&src.y, settings.bad_sad, diagonal, out);
         }
+        let workers = svpflow_core::threads::workers();
+        let free_cores = super::pyramid::has_spare_cores();
+        if predictor_only && free_cores && self.vectors.len() >= 1024 && workers >= 2 {
+            use rayon::prelude::*;
+            let nb = self.vectors.len();
+            let blk_x = self.blk_x;
+            let need_luma = output.is_some();
+            let mut results = vec![None; nb];
+            let chunk = (nb / (workers * 4)).clamp(64, 512);
+            svpflow_core::threads::run(|| {
+                results
+                    .par_chunks_mut(chunk)
+                    .enumerate()
+                    .for_each(|(ci, slice)| {
+                        let base = ci * chunk;
+                        for (off, slot) in slice.iter_mut().enumerate() {
+                            let i = base + off;
+                            let bx = (i as i32) % blk_x;
+                            let by = (i as i32) / blk_x;
+                            *slot = self.predictor_sad(i, bx, by, src, reference, need_luma);
+                        }
+                    });
+            });
+            let mut misses = false;
+            for (i, res) in results.iter().enumerate() {
+                if let Some((best, luma)) = *res {
+                    self.vectors[i] = best;
+                    if let Some(out) = output.as_deref_mut() {
+                        out[2 * i] = ((i32::from(best.x) << 16) + i32::from(best.y)) as u32;
+                        out[2 * i + 1] = packed_score(best, diagonal, luma);
+                    }
+                } else {
+                    misses = true;
+                }
+            }
+            if !misses && self.order.len() == nb {
+                return;
+            }
+            for position in 0..self.order.len() {
+                let (bx, by) = self.order[position];
+                let (bx, by) = (i32::from(bx), i32::from(by));
+                let is_border = bx == self.blk_x || by == self.blk_y;
+                let index = (!is_border).then(|| (by * self.blk_x + bx) as usize);
+                if let Some(i) = index
+                    && results[i].is_some()
+                {
+                    continue;
+                }
+                let x0 = if bx < self.blk_x {
+                    bx * l.step_x()
+                } else {
+                    w - l.width
+                };
+                let y0 = if by < self.blk_y {
+                    by * l.step_y()
+                } else {
+                    h - l.height
+                };
+                let bounds = Bounds {
+                    min_x: -self.pel * x0,
+                    min_y: -self.pel * y0,
+                    max_x: self.pel * (w - x0 - l.width),
+                    max_y: self.pel * (h - y0 - l.height),
+                };
+                let predictor_index = index.unwrap_or_else(|| {
+                    let px = if bx == self.blk_x { bx - 1 } else { bx };
+                    let py = if by == self.blk_y { by - 1 } else { by };
+                    (px + py * self.blk_x) as usize
+                });
+                let state = BlockState {
+                    index,
+                    origin: [x0, x0 >> ctx.chroma_shift.0, x0 >> ctx.chroma_shift.0],
+                    origin_y: [y0, y0 >> ctx.chroma_shift.1, y0 >> ctx.chroma_shift.1],
+                    pos: [x0, x0 >> ctx.chroma_shift.0, x0 >> ctx.chroma_shift.0],
+                    pos_y: [y0, y0 >> ctx.chroma_shift.1, y0 >> ctx.chroma_shift.1],
+                    bounds0: bounds,
+                    bounds,
+                    best: Mv::default(),
+                    min_cost: 0,
+                    predictor: self.vectors[predictor_index],
+                    lambda,
+                    sad_limit: settings.lsad,
+                    bad_sad: settings.bad_sad,
+                    search_param,
+                    want_luma: need_luma,
+                };
+                ctx.state = state;
+                let count = self.neighbours(bx, by, &processed, &mut neighbours);
+                let reverse = index.map_or(Mv::UNSET, |i| self.reverse[i]);
+                ctx.search_block(false, reverse, &neighbours[..count]);
+                processed[(by * (self.blk_x + 1) + bx) as usize] = true;
+                let best = ctx.state.best;
+                match index {
+                    Some(i) => {
+                        self.vectors[i] = best;
+                        if let Some(out) = output.as_deref_mut() {
+                            out[2 * i] = ((i32::from(best.x) << 16) + i32::from(best.y)) as u32;
+                            out[2 * i + 1] = packed_score(best, diagonal, ctx.block_luma);
+                        }
+                    }
+                    None => self.border[(bx + self.blk_y - by) as usize] = best,
+                }
+            }
+            return;
+        }
+        if !searching && !border_negative && free_cores && self.order.len() >= 256 && workers >= 2 {
+            use rayon::prelude::*;
+            #[derive(Clone, Copy)]
+            struct RecalcTask {
+                bx: i32,
+                by: i32,
+                index: Option<usize>,
+                predictor: Mv,
+                active_in: usize,
+                buf0_origin: Option<(i32, i32)>,
+            }
+            let mut tasks = Vec::new();
+            let mut active = 0usize;
+            let mut buf0_origin: Option<(i32, i32)> = None;
+            let need_luma = output.is_some();
+            for &(bx, by) in &self.order {
+                let (bx, by) = (i32::from(bx), i32::from(by));
+                let is_border = bx == self.blk_x || by == self.blk_y;
+                let index = (!is_border).then(|| (by * self.blk_x + bx) as usize);
+                if let Some(i) = index
+                    && self.vectors[i].sad <= settings.bad_sad
+                {
+                    continue;
+                }
+                let x0 = if bx < self.blk_x {
+                    bx * l.step_x()
+                } else {
+                    w - l.width
+                };
+                let y0 = if by < self.blk_y {
+                    by * l.step_y()
+                } else {
+                    h - l.height
+                };
+                let predictor_index = index.unwrap_or_else(|| {
+                    let px = if bx == self.blk_x { bx - 1 } else { bx };
+                    let py = if by == self.blk_y { by - 1 } else { by };
+                    (px + py * self.blk_x) as usize
+                });
+                let predictor = self.vectors[predictor_index];
+                let bad = predictor.sad > settings.bad_sad;
+                if !bad && !need_luma {
+                    continue;
+                }
+                let entry_active = active;
+                let entry_buf0 = if entry_active == 1 { buf0_origin } else { None };
+                tasks.push(RecalcTask {
+                    bx,
+                    by,
+                    index,
+                    predictor,
+                    active_in: entry_active,
+                    buf0_origin: entry_buf0,
+                });
+                if entry_active == 0 {
+                    buf0_origin = Some((x0, y0));
+                }
+                if bad {
+                    let vx = i32::from(predictor.x);
+                    let vy = i32::from(predictor.y);
+                    let vx2 = if vx < 0 { vx - 2 } else { vx + 2 };
+                    let vy2 = if vy < 0 { vy - 2 } else { vy + 2 };
+                    let min_x = -self.pel * x0;
+                    let min_y = -self.pel * y0;
+                    let max_x = self.pel * (w - x0 - l.width);
+                    let max_y = self.pel * (h - y0 - l.height);
+                    active = usize::from(!(vx2 >= min_x && vx2 < max_x && vy2 >= min_y && vy2 < max_y));
+                }
+            }
+            if !tasks.is_empty() {
+                let mut results = vec![(Mv::default(), 0i32); tasks.len()];
+                let chunk = (tasks.len() / (workers * 4)).clamp(32, 256);
+                let pel = self.pel;
+                let level = self.level;
+                let chroma_shift = self.chroma_shift;
+                let full_kernels = self.full;
+                let fit = planes_fit(reference, pel);
+                let adaptive_radius = search_param > 0 && stp <= 0;
+                svpflow_core::threads::run(|| {
+                    results
+                        .par_chunks_mut(chunk)
+                        .enumerate()
+                        .for_each(|(ci, slice)| {
+                            let base = ci * chunk;
+                            let mut local = BlockSearch {
+                                src: *src,
+                                reference: *reference,
+                                pel,
+                                level,
+                                chroma_shift,
+                                settings: *settings,
+                                adaptive_radius,
+                                global,
+                                kernels: full_kernels,
+                                half: false,
+                                shape: Shape::new(l.width as usize, l.height as usize),
+                                state: BlockState::default(),
+                                buffers: Default::default(),
+                                planes_fit: fit,
+                                active: 0,
+                                block_luma: 0,
+                                scratch: [0; MAX_BLOCK_AREA],
+                                wide_src: Default::default(),
+                                wide_ready: [false; 2],
+                                #[cfg(target_arch = "x86_64")]
+                                stacked_src: [None; 2],
+                                flat: [0; MAX_BLOCK_AREA],
+                                blurred: [0; MAX_BLOCK_AREA],
+                                many: [(Mv::UNSET, 0); MAX_CANDIDATES],
+                                known: [(0, 0, 0, None); MAX_CANDIDATES],
+                                known_count: 0,
+                                cached: None,
+                            };
+                            for (off, out_slot) in slice.iter_mut().enumerate() {
+                                let t = tasks[base + off];
+                                let x0 = if t.bx < self.blk_x {
+                                    t.bx * l.step_x()
+                                } else {
+                                    w - l.width
+                                };
+                                let y0 = if t.by < self.blk_y {
+                                    t.by * l.step_y()
+                                } else {
+                                    h - l.height
+                                };
+                                if t.active_in == 1
+                                    && let Some((bx0, by0)) = t.buf0_origin
+                                {
+                                    local.state.pos = [bx0, bx0 >> chroma_shift.0, bx0 >> chroma_shift.0];
+                                    local.state.pos_y = [by0, by0 >> chroma_shift.1, by0 >> chroma_shift.1];
+                                    local.copy_source(0);
+                                }
+                                local.active = t.active_in;
+                                local.cached = None;
+                                let bounds = Bounds {
+                                    min_x: -pel * x0,
+                                    min_y: -pel * y0,
+                                    max_x: pel * (w - x0 - l.width),
+                                    max_y: pel * (h - y0 - l.height),
+                                };
+                                local.state = BlockState {
+                                    index: t.index,
+                                    origin: [x0, x0 >> chroma_shift.0, x0 >> chroma_shift.0],
+                                    origin_y: [y0, y0 >> chroma_shift.1, y0 >> chroma_shift.1],
+                                    pos: [x0, x0 >> chroma_shift.0, x0 >> chroma_shift.0],
+                                    pos_y: [y0, y0 >> chroma_shift.1, y0 >> chroma_shift.1],
+                                    bounds0: bounds,
+                                    bounds,
+                                    best: Mv::default(),
+                                    min_cost: 0,
+                                    predictor: t.predictor,
+                                    lambda,
+                                    sad_limit: settings.lsad,
+                                    bad_sad: settings.bad_sad,
+                                    search_param,
+                                    want_luma: need_luma,
+                                };
+                                local.recalculate_block(need_luma);
+                                *out_slot = (local.state.best, local.block_luma);
+                            }
+                        });
+                });
+                for (t, (best, luma)) in tasks.iter().zip(results) {
+                    match t.index {
+                        Some(i) => {
+                            self.vectors[i] = best;
+                            if let Some(out) = output.as_deref_mut() {
+                                out[2 * i] = ((i32::from(best.x) << 16) + i32::from(best.y)) as u32;
+                                out[2 * i + 1] = packed_score(best, diagonal, luma);
+                            }
+                        }
+                        None => self.border[(t.bx + self.blk_y - t.by) as usize] = best,
+                    }
+                }
+            }
+            return;
+        }
         for position in 0..self.order.len() {
             let (bx, by) = self.order[position];
             let (bx, by) = (i32::from(bx), i32::from(by));

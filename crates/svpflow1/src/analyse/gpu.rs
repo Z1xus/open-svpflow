@@ -1758,37 +1758,44 @@ inline long subpel(long base, long pitch, long height, int pel, int x, int y) {
     return base + (long)(y >> bits) * pitch + (x >> bits) + index * pitch * height;
 }
 
-inline uint tile_cost(const int *src, __global const uchar *data, long length, long offset, long pitch) {
-    int d[4][4];
-    for (int y = 0; y < 4; y++) {
-        long row = offset + (long)y * pitch;
-        if (row >= 0 && row + 4 <= length) {
-            int4 r = convert_int4(vload4(0, data + row));
-            d[y][0] = r.x; d[y][1] = r.y; d[y][2] = r.z; d[y][3] = r.w;
-        } else {
-            for (int x = 0; x < 4; x++) d[y][x] = fetch(data, length, row + x);
-        }
-        for (int x = 0; x < 4; x++) d[y][x] = src[y * 4 + x] - d[y][x];
+inline uint had4_row(int4 v) {
+    int a0 = v.x + v.y, a1 = v.z + v.w;
+    int b0 = v.x - v.y, b1 = v.z - v.w;
+    return (uint)(abs(a0 + a1) + abs(a0 - a1) + abs(b0 + b1) + abs(b0 - b1));
+}
+
+inline uint tile_cost4(int4 s0, int4 s1, int4 s2, int4 s3, __global const uchar *data, long length, long offset, long pitch) {
+    int4 r0, r1, r2, r3;
+    if (offset >= 0 && offset + 3 * pitch + 4 <= length) {
+        r0 = s0 - convert_int4(vload4(0, data + offset));
+        r1 = s1 - convert_int4(vload4(0, data + offset + pitch));
+        r2 = s2 - convert_int4(vload4(0, data + offset + 2 * pitch));
+        r3 = s3 - convert_int4(vload4(0, data + offset + 3 * pitch));
+    } else {
+        long o0 = offset, o1 = offset + pitch, o2 = offset + 2 * pitch, o3 = offset + 3 * pitch;
+        r0 = s0 - (int4)(fetch(data, length, o0), fetch(data, length, o0 + 1), fetch(data, length, o0 + 2), fetch(data, length, o0 + 3));
+        r1 = s1 - (int4)(fetch(data, length, o1), fetch(data, length, o1 + 1), fetch(data, length, o1 + 2), fetch(data, length, o1 + 3));
+        r2 = s2 - (int4)(fetch(data, length, o2), fetch(data, length, o2 + 1), fetch(data, length, o2 + 2), fetch(data, length, o2 + 3));
+        r3 = s3 - (int4)(fetch(data, length, o3), fetch(data, length, o3 + 1), fetch(data, length, o3 + 2), fetch(data, length, o3 + 3));
     }
 #if SATD
-    for (int y = 0; y < 4; y++) {
-        int s0 = d[y][0] + d[y][1], s1 = d[y][2] + d[y][3];
-        int d0 = d[y][0] - d[y][1], d1 = d[y][2] - d[y][3];
-        d[y][0] = s0 + s1; d[y][1] = s0 - s1; d[y][2] = d0 + d1; d[y][3] = d0 - d1;
-    }
-    uint total = 0;
-    for (int x = 0; x < 4; x++) {
-        int s0 = d[0][x] + d[1][x], s1 = d[2][x] + d[3][x];
-        int d0 = d[0][x] - d[1][x], d1 = d[2][x] - d[3][x];
-        total += abs(s0 + s1) + abs(s0 - s1) + abs(d0 + d1) + abs(d0 - d1);
-    }
-    return total / 2;
+    int4 a0 = r0 + r1, a1 = r2 + r3;
+    int4 b0 = r0 - r1, b1 = r2 - r3;
+    uint total = had4_row(a0 + a1) + had4_row(a0 - a1) + had4_row(b0 + b1) + had4_row(b0 - b1);
+    return total >> 1;
 #else
-    uint total = 0;
-    for (int y = 0; y < 4; y++)
-        for (int x = 0; x < 4; x++) total += abs(d[y][x]);
-    return total;
+    uint4 t = abs(r0) + abs(r1) + abs(r2) + abs(r3);
+    return t.x + t.y + t.z + t.w;
 #endif
+}
+
+inline uint tile_cost(const int *src, __global const uchar *data, long length, long offset, long pitch) {
+    return tile_cost4(
+        (int4)(src[0], src[1], src[2], src[3]),
+        (int4)(src[4], src[5], src[6], src[7]),
+        (int4)(src[8], src[9], src[10], src[11]),
+        (int4)(src[12], src[13], src[14], src[15]),
+        data, length, offset, pitch);
 }
 
 #if S
@@ -1871,8 +1878,17 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
     py = (int)(short)py;
     vsad >>= 6;
     int sum = 0;
-    for (int y = 0; y < 4; y++)
-        for (int x = 0; x < 4; x++) sum += fetch(sy, lsy, p[30] + (long)(y0 + y) * psy + x0 + x);
+    long avg_at = p[30] + (long)y0 * psy + x0;
+    if (avg_at >= 0 && avg_at + 3 * psy + 4 <= lsy) {
+        int4 a = convert_int4(vload4(0, sy + avg_at))
+               + convert_int4(vload4(0, sy + avg_at + psy))
+               + convert_int4(vload4(0, sy + avg_at + 2 * psy))
+               + convert_int4(vload4(0, sy + avg_at + 3 * psy));
+        sum = a.x + a.y + a.z + a.w;
+    } else {
+        for (int y = 0; y < 4; y++)
+            for (int x = 0; x < 4; x++) sum += fetch(sy, lsy, avg_at + (long)y * psy + x);
+    }
     int average = sum >> 4;
     int best_x = px, best_y = py, bsad = vsad;
     if (bsad > bad_sad) {
@@ -1912,16 +1928,28 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
                 csrc_y = src_y >> S;
             }
         }
-        int src_luma[16], src_u[CW * CW], src_v[CW * CW];
+        int4 sy0, sy1, sy2, sy3;
         long luma_at = p[30] + (long)src_y * psy + src_x;
-        for (int b = 0; b < 16; b++) src_luma[b] = fetch(sy, lsy, luma_at + (long)(b >> 2) * psy + (b & 3));
+        if (luma_at >= 0 && luma_at + 3 * psy + 4 <= lsy) {
+            sy0 = convert_int4(vload4(0, sy + luma_at));
+            sy1 = convert_int4(vload4(0, sy + luma_at + psy));
+            sy2 = convert_int4(vload4(0, sy + luma_at + 2 * psy));
+            sy3 = convert_int4(vload4(0, sy + luma_at + 3 * psy));
+        } else {
+            sy0 = (int4)(fetch(sy, lsy, luma_at), fetch(sy, lsy, luma_at + 1), fetch(sy, lsy, luma_at + 2), fetch(sy, lsy, luma_at + 3));
+            long o1 = luma_at + psy, o2 = luma_at + 2 * psy, o3 = luma_at + 3 * psy;
+            sy1 = (int4)(fetch(sy, lsy, o1), fetch(sy, lsy, o1 + 1), fetch(sy, lsy, o1 + 2), fetch(sy, lsy, o1 + 3));
+            sy2 = (int4)(fetch(sy, lsy, o2), fetch(sy, lsy, o2 + 1), fetch(sy, lsy, o2 + 2), fetch(sy, lsy, o2 + 3));
+            sy3 = (int4)(fetch(sy, lsy, o3), fetch(sy, lsy, o3 + 1), fetch(sy, lsy, o3 + 2), fetch(sy, lsy, o3 + 3));
+        }
+        int src_u[CW * CW], src_v[CW * CW];
         long u_at = p[31] + (long)csrc_y * psu + csrc_x, v_at = p[32] + (long)csrc_y * psv + csrc_x;
         for (int b = 0; b < CW * CW; b++) {
             src_u[b] = fetch(su, lsu, u_at + (long)(b / CW) * psu + b % CW);
             src_v[b] = fetch(sv, lsv, v_at + (long)(b / CW) * psv + b % CW);
         }
         int ref_x = pos_x * pel, ref_y = pos_y * pel, cref_x = cpos_x * pel, cref_y = cpos_y * pel;
-#define LUMA(vx, vy) ((int)tile_cost(src_luma, ry, lry, subpel(p[12], pry, p[14], pel, ref_x + (vx), ref_y + (vy)), pry))
+#define LUMA(vx, vy) ((int)tile_cost4(sy0, sy1, sy2, sy3, ry, lry, subpel(p[12], pry, p[14], pel, ref_x + (vx), ref_y + (vy)), pry))
 #define CHROMA(vx, vy) chroma_value(src_u, src_v, ru, rv, lru, lrv, pru, prv, subpel(p[13], pru, p[15], pel, cref_x + ((vx) >> S), cref_y + ((vy) >> S)))
         bsad = LUMA(px, py) + CHROMA(px, py);
         int min_cost = bsad;
@@ -1982,42 +2010,38 @@ inline long subpel(long base, long pitch, long height, int pel, int x, int y) {
     return base + (long)(y >> bits) * pitch + (x >> bits) + index * pitch * height;
 }
 
+inline uint had4_row_k(int4 v) {
+    int a0 = v.x + v.y, a1 = v.z + v.w;
+    int b0 = v.x - v.y, b1 = v.z - v.w;
+    return (uint)(abs(a0 + a1) + abs(a0 - a1) + abs(b0 + b1) + abs(b0 - b1));
+}
+
 inline uint tile_cost(__local const uchar *src, int spitch, __global const uchar *data, long length,
                       long offset, long pitch) {
-    int d[4][4];
-    for (int y = 0; y < 4; y++) {
-        long row = offset + (long)y * pitch;
-        int4 r;
-        if (row >= 0 && row + 4 <= length) {
-            r = convert_int4(vload4(0, data + row));
-        } else {
-            r = (int4)(fetch(data, length, row), fetch(data, length, row + 1),
-                       fetch(data, length, row + 2), fetch(data, length, row + 3));
-        }
-        __local const uchar *s = src + y * spitch;
-        d[y][0] = (int)s[0] - r.x;
-        d[y][1] = (int)s[1] - r.y;
-        d[y][2] = (int)s[2] - r.z;
-        d[y][3] = (int)s[3] - r.w;
+    int4 r0, r1, r2, r3;
+    int4 s0 = (int4)(src[0], src[1], src[2], src[3]);
+    int4 s1 = (int4)(src[spitch], src[spitch + 1], src[spitch + 2], src[spitch + 3]);
+    int4 s2 = (int4)(src[2 * spitch], src[2 * spitch + 1], src[2 * spitch + 2], src[2 * spitch + 3]);
+    int4 s3 = (int4)(src[3 * spitch], src[3 * spitch + 1], src[3 * spitch + 2], src[3 * spitch + 3]);
+    if (offset >= 0 && offset + 3 * pitch + 4 <= length) {
+        r0 = s0 - convert_int4(vload4(0, data + offset));
+        r1 = s1 - convert_int4(vload4(0, data + offset + pitch));
+        r2 = s2 - convert_int4(vload4(0, data + offset + 2 * pitch));
+        r3 = s3 - convert_int4(vload4(0, data + offset + 3 * pitch));
+    } else {
+        long o0 = offset, o1 = offset + pitch, o2 = offset + 2 * pitch, o3 = offset + 3 * pitch;
+        r0 = s0 - (int4)(fetch(data, length, o0), fetch(data, length, o0 + 1), fetch(data, length, o0 + 2), fetch(data, length, o0 + 3));
+        r1 = s1 - (int4)(fetch(data, length, o1), fetch(data, length, o1 + 1), fetch(data, length, o1 + 2), fetch(data, length, o1 + 3));
+        r2 = s2 - (int4)(fetch(data, length, o2), fetch(data, length, o2 + 1), fetch(data, length, o2 + 2), fetch(data, length, o2 + 3));
+        r3 = s3 - (int4)(fetch(data, length, o3), fetch(data, length, o3 + 1), fetch(data, length, o3 + 2), fetch(data, length, o3 + 3));
     }
 #if SATD
-    for (int y = 0; y < 4; y++) {
-        int s0 = d[y][0] + d[y][1], s1 = d[y][2] + d[y][3];
-        int d0 = d[y][0] - d[y][1], d1 = d[y][2] - d[y][3];
-        d[y][0] = s0 + s1; d[y][1] = s0 - s1; d[y][2] = d0 + d1; d[y][3] = d0 - d1;
-    }
-    uint total = 0;
-    for (int x = 0; x < 4; x++) {
-        int s0 = d[0][x] + d[1][x], s1 = d[2][x] + d[3][x];
-        int d0 = d[0][x] - d[1][x], d1 = d[2][x] - d[3][x];
-        total += abs(s0 + s1) + abs(s0 - s1) + abs(d0 + d1) + abs(d0 - d1);
-    }
-    return total;
+    int4 a0 = r0 + r1, a1 = r2 + r3;
+    int4 b0 = r0 - r1, b1 = r2 - r3;
+    return had4_row_k(a0 + a1) + had4_row_k(a0 - a1) + had4_row_k(b0 + b1) + had4_row_k(b0 - b1);
 #else
-    uint total = 0;
-    for (int y = 0; y < 4; y++)
-        for (int x = 0; x < 4; x++) total += abs(d[y][x]);
-    return total;
+    uint4 t = abs(r0) + abs(r1) + abs(r2) + abs(r3);
+    return t.x + t.y + t.z + t.w;
 #endif
 }
 

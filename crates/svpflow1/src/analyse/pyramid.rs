@@ -1,9 +1,34 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use super::field::recalc::{CompactPlan, RecalcPlan};
 use super::field::{Field, Mv, VectorOutput};
 use super::gpu::Session;
 use super::params::{AnalyseParams, Stage};
 use super::planes::LevelFrame;
 use super::planes::{LevelSource, SuperFrameView};
+
+static ACTIVE_ANALYSES: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn has_spare_cores() -> bool {
+    let workers = svpflow_core::threads::workers();
+    let active = ACTIVE_ANALYSES.load(Ordering::Relaxed);
+    active.saturating_mul(2) <= workers
+}
+
+struct ActiveGuard;
+
+impl ActiveGuard {
+    fn enter() -> Self {
+        ACTIVE_ANALYSES.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        ACTIVE_ANALYSES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 pub(crate) struct Pyramid {
     forward: Vec<Option<Field>>,
@@ -60,6 +85,7 @@ impl Pyramid {
         mut session: Option<&mut Session<'_, '_>>,
         min_level: i32,
     ) {
+        let _active = ActiveGuard::enter();
         let [mut out_forward, mut out_backward] = outputs;
         let top = stage.levels - 1;
         let (mut global_forward, mut global_backward) = (Mv::UNSET, Mv::UNSET);
@@ -168,8 +194,13 @@ impl Pyramid {
             }
             let (mut out_f, mut out_b) = (out_f, out_b);
             let mut on_gpu = [false, false];
-            if stage.gpu_searchable(params)
-                && stage.gpu_level(level)
+            let exact_dontv_gpu = level == 0
+                && settings.search_param == 0
+                && params.gpu_mode == 1
+                && settings.search_type == super::field::SearchType::Exhaustive
+                && matches!(stage.layout.width, 8 | 16 | 32)
+                && matches!(stage.layout.height, 8 | 16 | 32);
+            if ((stage.gpu_searchable(params) && stage.gpu_level(level)) || exact_dontv_gpu)
                 && let Some(session) = session.as_deref_mut()
             {
                 let pf = f.gpu_search_params(
@@ -211,19 +242,56 @@ impl Pyramid {
                     }
                 }
             }
-            if !on_gpu[0] {
+            if !on_gpu[0] && !on_gpu[1] && has_spare_cores() && (!finest || session.is_none()) {
+                let settings = &settings;
+                let (src_ref, reference_ref) = (&src, &reference);
+                let b_ref = b.as_deref_mut();
                 let lambda = Some(&mut *lambda_out);
-                f.search(&src, &reference, &settings, global_forward, lambda, out_f);
-            }
-            if finest {
-                on_finest(0, f, *lambda_out, session.as_deref_mut());
-            }
-            if let Some(b) = b {
-                if !on_gpu[1] {
-                    b.search(&reference, &src, &settings, global_backward, None, out_b);
+                both(
+                    || {
+                        f.search(
+                            src_ref,
+                            reference_ref,
+                            settings,
+                            global_forward,
+                            lambda,
+                            out_f,
+                        );
+                    },
+                    || {
+                        if let Some(b) = b_ref {
+                            b.search(
+                                reference_ref,
+                                src_ref,
+                                settings,
+                                global_backward,
+                                None,
+                                out_b,
+                            );
+                        }
+                    },
+                );
+                if finest {
+                    on_finest(0, f, *lambda_out, session.as_deref_mut());
+                    if let Some(b) = b {
+                        on_finest(1, b, *lambda_out, session.as_deref_mut());
+                    }
+                }
+            } else {
+                if !on_gpu[0] {
+                    let lambda = Some(&mut *lambda_out);
+                    f.search(&src, &reference, &settings, global_forward, lambda, out_f);
                 }
                 if finest {
-                    on_finest(1, b, *lambda_out, session.as_deref_mut());
+                    on_finest(0, f, *lambda_out, session.as_deref_mut());
+                }
+                if let Some(b) = b {
+                    if !on_gpu[1] {
+                        b.search(&reference, &src, &settings, global_backward, None, out_b);
+                    }
+                    if finest {
+                        on_finest(1, b, *lambda_out, session.as_deref_mut());
+                    }
                 }
             }
         }
@@ -240,6 +308,7 @@ impl Pyramid {
         outputs: [Option<VectorOutput<'_>>; 2],
         session: Option<&mut Session<'_, '_>>,
     ) {
+        let _active = ActiveGuard::enter();
         let [mut out_forward, mut out_backward] = outputs;
         let mut settings = stage.settings(params, 0, true);
         settings.lambda = *lambda_out;
