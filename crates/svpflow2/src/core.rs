@@ -3667,6 +3667,7 @@ fn gpu_render_frame(
         None,
         None,
         None,
+        (0, false),
     )
     .is_some()
 }

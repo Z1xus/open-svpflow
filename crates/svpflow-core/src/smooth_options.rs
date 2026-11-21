@@ -66,6 +66,8 @@ pub struct RenderOptions {
     pub dither: bool,
     pub dedup: f64,
     pub adaptive: bool,
+    pub fast: u8,
+    pub fast_flags: u8,
 }
 
 #[allow(dead_code)]
@@ -82,6 +84,9 @@ pub struct HdrOptions {
 pub struct NvofOptions {
     pub q: i64,
     pub gpuid: i64,
+    pub fast: u8,
+    pub scale: i32,
+    pub mirror: bool,
 }
 
 #[allow(dead_code)]
@@ -155,6 +160,22 @@ pub struct ReferenceParams {
     pub cubic: i64,
     pub block: bool,
     pub sad: Option<(f64, f64)>,
+    pub fast: u8,
+    pub fast_flags: u8,
+}
+
+impl ReferenceParams {
+    pub const fn fast_gpu(&self) -> bool {
+        self.fast_flags & 1 != 0
+    }
+
+    pub const fn fast_blend(&self) -> bool {
+        self.fast_flags & 2 != 0
+    }
+
+    pub const fn fast_cpu(&self) -> bool {
+        self.fast_flags & 4 != 0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -250,6 +271,22 @@ impl Options {
 
     pub const fn adaptive_blend(&self) -> bool {
         self.render.adaptive
+    }
+
+    pub const fn fast(&self) -> u8 {
+        self.render.fast
+    }
+
+    pub const fn fast_gpu(&self) -> bool {
+        self.render.fast_flags & 1 != 0
+    }
+
+    pub const fn fast_blend(&self) -> bool {
+        self.render.fast_flags & 2 != 0
+    }
+
+    pub const fn fast_cpu(&self) -> bool {
+        self.render.fast_flags & 4 != 0
     }
 
     pub fn dedup(&self) -> Option<f64> {
@@ -375,6 +412,8 @@ impl Options {
                 let area = i32::try_from(self.mask.area).unwrap_or(i32::MAX);
                 (f64::from(area) / 15000.0, self.mask.area_sharp)
             }),
+            fast: self.render.fast,
+            fast_flags: self.render.fast_flags,
         }
     }
 
@@ -411,7 +450,7 @@ impl Options {
 
     pub fn apply_cubic_default(&mut self, enabled: bool) {
         if self.cubic.is_none() {
-            self.cubic = Some(i64::from(enabled));
+            self.cubic = Some(i64::from(enabled && self.render.fast == 0));
         }
     }
 
@@ -497,6 +536,18 @@ impl Options {
 
     pub const fn nvof_gpu_id(&self) -> i64 {
         self.nvof.gpuid
+    }
+
+    pub const fn nvof_fast(&self) -> u8 {
+        self.nvof.fast
+    }
+
+    pub const fn nvof_mirror(&self) -> bool {
+        self.nvof.mirror
+    }
+
+    pub const fn nvof_scale(&self) -> i32 {
+        self.nvof.scale
     }
 
     pub const fn mask_area_scale(&self) -> f64 {
@@ -607,6 +658,8 @@ impl Default for RenderOptions {
             dither: false,
             dedup: 0.0,
             adaptive: false,
+            fast: 0,
+            fast_flags: 0,
         }
     }
 }
@@ -624,7 +677,13 @@ impl Default for HdrOptions {
 
 impl Default for NvofOptions {
     fn default() -> Self {
-        Self { q: 2, gpuid: 0 }
+        Self {
+            q: 2,
+            gpuid: 0,
+            fast: 0,
+            scale: 1,
+            mirror: false,
+        }
     }
 }
 
@@ -729,11 +788,19 @@ impl DebugOptions {
 
 impl RenderOptions {
     fn from_value(value: &Value) -> Self {
+        let fast = u8::try_from(value.int_at(&["fast"]).unwrap_or(0).clamp(0, 3)).unwrap_or(0);
+        let fast_gpu = value.bool_at(&["fast_gpu"]).unwrap_or(fast >= 2);
+        let fast_blend = value.bool_at(&["fast_blend"]).unwrap_or(fast >= 2);
+        let fast_cpu = value.bool_at(&["fast_cpu"]).unwrap_or(fast >= 2);
+        let fast_flags =
+            u8::from(fast_gpu) | (u8::from(fast_blend) << 1) | (u8::from(fast_cpu) << 2);
         Self {
-            linear: value.bool_at(&["linear"]).unwrap_or(true),
+            linear: value.bool_at(&["linear"]).unwrap_or(fast == 0),
             dither: value.bool_at(&["dither"]).unwrap_or(false),
             dedup: value.float_at(&["dedup"]).unwrap_or(0.0),
-            adaptive: value.bool_at(&["adaptive"]).unwrap_or(false),
+            adaptive: value.bool_at(&["adaptive"]).unwrap_or(fast >= 1),
+            fast,
+            fast_flags,
         }
     }
 }
@@ -761,9 +828,21 @@ impl HdrOptions {
 
 impl NvofOptions {
     fn from_value(value: &Value) -> Self {
+        let top_fast = u8::try_from(value.int_at(&["fast"]).unwrap_or(0).clamp(0, 3)).unwrap_or(0);
+        let fast = value.int_at(&["nvof", "fast"]).map_or(top_fast, |v| {
+            u8::try_from(v.clamp(0, 3)).unwrap_or(0)
+        });
+        let mirror = value.bool_at(&["nvof", "mirror"]).unwrap_or(fast >= 1);
+        let scale = value.int_at(&["nvof", "scale"]).map_or(
+            if fast >= 2 { 2 } else { 1 },
+            |v| if v >= 2 { 2 } else { 1 },
+        );
         Self {
             q: value.int_at(&["nvof", "q"]).unwrap_or(2).min(2),
             gpuid: value.int_at(&["nvof", "gpuid"]).unwrap_or(0),
+            fast,
+            scale,
+            mirror,
         }
     }
 }

@@ -506,8 +506,9 @@ pub fn gpu_params(
     } else {
         fraction * blend
     };
-    let cubic = params.cubic & 1 != 0;
-    let cubic_ref = params.cubic & 2 != 0;
+    let cubic = params.cubic & 1 != 0 && params.fast == 0;
+    let luma_cubic_ref = params.cubic & 2 != 0 && params.fast < 3;
+    let chroma_cubic_ref = params.cubic & 2 != 0 && params.fast == 0;
     let linear = gpu_linear(params, width);
     let block = data.effective_block();
     let make = |chroma: bool, offset_x: i32, offset_y: i32| GpuParams {
@@ -533,7 +534,11 @@ pub fn gpu_params(
         has_sad: i32::from(has_sad),
         linear_luma: i32::from(!chroma && linear),
         cubic: i32::from(cubic),
-        cubic_ref: i32::from(cubic_ref),
+        cubic_ref: i32::from(if chroma {
+            chroma_cubic_ref
+        } else {
+            luma_cubic_ref
+        }),
         offset_x,
         offset_y,
         sad_blend,
@@ -716,6 +721,7 @@ impl Engine {
         let sad = merged_sad(planned.selected, planned.masks.sad.as_ref());
         let mut renderer = Renderer::new(self.render);
         renderer.set_time(planned.time);
+        renderer.set_fast(self.params.fast, self.params.fast_cpu());
         Output::Render(Box::new(Job {
             renderer,
             algo: kind(planned.selected, sad.is_some()),

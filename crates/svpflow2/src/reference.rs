@@ -552,6 +552,7 @@ impl FilterState {
             still,
             layer.map(|layer| &**layer),
             cover,
+            (self.options.fast(), self.options.fast_gpu()),
         );
         if done.is_none() {
             unsafe { api.free(output.cast_const()) };
@@ -866,6 +867,26 @@ impl FilterState {
             return std::ptr::null();
         }
         let copy = engine::copy_choice(&params, phase, class, self.options.debug_vectors());
+        let loaded_field = if copy.is_none()
+            && params.fast >= 1
+            && blend.is_none()
+            && self.image.is_none()
+            && self.options.mask_still().is_none()
+            && self.options.mask_peel().is_none()
+            && !self.options.debug_qmap()
+            && !self.options.debug_qmode()
+            && !self.options.debug_tt()
+        {
+            Some(field())
+        } else {
+            None
+        };
+        let copy = copy.or_else(|| {
+            loaded_field
+                .as_ref()
+                .filter(|loaded| class != 3 && loaded.is_static())
+                .map(|_| phase > 127)
+        });
         if let Some(use_next) = copy {
             let (selected, other) = if use_next {
                 (next_source, source)
@@ -889,7 +910,7 @@ impl FilterState {
             }
             fetch.drop(other);
             if !output.is_null() && engine::needs_vectors(phase) {
-                let field = field();
+                let field = loaded_field.unwrap_or_else(field);
                 unsafe {
                     self.reference_overlays(
                         &api,
@@ -907,7 +928,7 @@ impl FilterState {
             return output;
         }
         let (use_fwd, use_bwd, force13) = engine::directions(&params, phase, class);
-        let field = field();
+        let field = loaded_field.unwrap_or_else(field);
         let gpu_failed = std::cell::Cell::new(false);
         let calculate = |cpu| unsafe {
             self.reference_calculate(
@@ -1074,6 +1095,7 @@ impl FilterState {
             )
         });
         renderer.set_time(time);
+        renderer.set_fast(params.fast, params.fast_cpu());
         if self.render_mode == 2
             && !cpu
             && let Some(gpu) = self.gpu.as_ref()

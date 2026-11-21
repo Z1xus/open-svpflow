@@ -1373,8 +1373,18 @@ impl GpuContext {
             if let Some(&(_, program)) = variants.iter().find(|(key, _)| *key == variant) {
                 program
             } else {
+                let extra = if variant >> 19 != 0 {
+                    format!(
+                        "#define FAST_OCC {}\n#define FAST_GPU {}\n#define FAST_BLEND {}\n",
+                        (variant >> 19) & 1,
+                        (variant >> 20) & 1,
+                        (variant >> 21) & 3,
+                    )
+                } else {
+                    String::new()
+                };
                 let source = format!(
-                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define STILL {}\n#define LAYER {}\n#define HOLD {}\n#define FUSE {}\n#define ADAPTIVE {}\n#define DEPTH {}\n{}",
+                    "#define ALGO {}\n#define CUBIC {}\n#define CUBIC_REF {}\n#define HAS_SAD {}\n#define LINEAR_LUMA {}\n#define DITHER {}\n#define BLEND {}\n#define STILL {}\n#define LAYER {}\n#define HOLD {}\n#define FUSE {}\n#define ADAPTIVE {}\n{extra}#define DEPTH {}\n{}",
                     variant & 0xFF,
                     (variant >> 8) & 1,
                     (variant >> 9) & 1,
@@ -1625,6 +1635,7 @@ impl GpuContext {
         s1: GpuBuf,
         waits: &[ClEvent],
         event: *mut ClEvent,
+        quad: bool,
     ) -> Option<()> {
         unsafe {
             (self.cl.SetKernelArg)(k, 0, size_of::<ClMem>(), (&raw const dmem).cast());
@@ -1636,10 +1647,13 @@ impl GpuContext {
             {
                 return None;
             }
-            let global = [
-                usize::try_from(p.width).ok()?,
-                usize::try_from(p.height).ok()?,
-            ];
+            let width = usize::try_from(p.width).ok()?;
+            let height = usize::try_from(p.height).ok()?;
+            let global = if quad {
+                [width.div_ceil(4), height.div_ceil(2)]
+            } else {
+                [width, height]
+            };
             if self.note((self.cl.EnqueueNDRangeKernel)(
                 q,
                 k,
@@ -1904,9 +1918,13 @@ impl GpuContext {
         still: Option<StillMask>,
         layer: Option<&Layer>,
         cover: Option<&Cover<'_>>,
+        fast: (u8, bool),
     ) -> Option<()> {
         let _readback = self.readbacks.take()?;
         let mut unit = self.acquire();
+        let use_quad = fast.1 && self.depth == 8 && still.is_none() && layer.is_none();
+        let fast_bits = if fast.0 >= 1 { 1 << 19 } else { 0 }
+            | if use_quad { 1 << 20 } else { 0 };
         unsafe {
             let k = self.bind_fields(
                 &mut unit,
@@ -1916,7 +1934,8 @@ impl GpuContext {
                         layer::LAYER_VARIANT
                     } else {
                         0
-                    },
+                    }
+                    | fast_bits,
                 &py,
                 motion_key,
                 motion_width,
@@ -1978,6 +1997,7 @@ impl GpuContext {
                     src1[0],
                     &waits,
                     std::ptr::null_mut(),
+                    use_quad,
                 )
                 .and_then(|()| {
                     self.enqueue_plane(
@@ -1990,6 +2010,7 @@ impl GpuContext {
                         src1[1],
                         &[],
                         std::ptr::null_mut(),
+                        use_quad,
                     )
                 })
                 .and_then(|()| {
@@ -2003,6 +2024,7 @@ impl GpuContext {
                         src1[2],
                         &[],
                         &raw mut kernel_done,
+                        use_quad,
                     )
                 });
             if queued.is_none() {
@@ -2325,6 +2347,15 @@ pub(crate) const KERNEL_SRC: &str = r"
 #ifndef ADAPTIVE
 #define ADAPTIVE 0
 #endif
+#ifndef FAST_OCC
+#define FAST_OCC 0
+#endif
+#ifndef FAST_GPU
+#define FAST_GPU 0
+#endif
+#ifndef FAST_BLEND
+#define FAST_BLEND 0
+#endif
 #define LAYER_MIN 0.2f
 #define LAYER_GROUP 3
 #define LAYER_FILL 4.0f
@@ -2413,7 +2444,10 @@ inline float source_sample(
 {
     float2 position = ((float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f))
         + moved(p, vx, vy, time);
-#if CUBIC_REF
+#if CUBIC_REF && FAST_OCC
+    if (p->cubic_ref) return REF_SCALE(p) * cubic_sample(source, position).x;
+    return REF_SCALE(p) * read_imagef(source, linear_sampler, position).x;
+#elif CUBIC_REF
     return REF_SCALE(p) * cubic_sample(source, position).x;
 #else
     return REF_SCALE(p) * read_imagef(source, linear_sampler, position).x;
@@ -2428,6 +2462,53 @@ inline float linear_source_sample(
     return REF_SCALE(p) * read_imagef(source, linear_sampler, position).x;
 }
 
+#if FAST_GPU && DEPTH == 8 && !LAYER && !STILL && !HOLD
+inline float2 moved_step(const Params *p, float vx, float vy, int time) {
+    return native_divide(
+        (float2)(vx*65535.0f-1024.0f, vy*65535.0f-1024.0f) * time,
+        (float2)((float)(p->x_ratio*p->pel), (float)(p->y_ratio*p->pel)) * 256.0f);
+}
+
+inline float source_at(read_only image2d_t source, const Params *p, float2 pos) {
+    float2 clamped = clamp(pos, (float2)(0.0f, 0.0f), (float2)(p->width - 1, p->height - 1));
+    float2 position = (float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f) + clamped;
+#if CUBIC_REF && FAST_OCC
+    if (p->cubic_ref) return REF_SCALE(p) * cubic_sample(source, position).x;
+    return REF_SCALE(p) * read_imagef(source, linear_sampler, position).x;
+#elif CUBIC_REF
+    return REF_SCALE(p) * cubic_sample(source, position).x;
+#else
+    return REF_SCALE(p) * read_imagef(source, linear_sampler, position).x;
+#endif
+}
+
+inline float linear_at(read_only image2d_t source, const Params *p, float2 pos) {
+    float2 clamped = clamp(pos, (float2)(0.0f, 0.0f), (float2)(p->width - 1, p->height - 1));
+    float2 position = (float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f) + clamped;
+    return REF_SCALE(p) * read_imagef(source, linear_sampler, position).x;
+}
+#endif
+
+#if FAST_BLEND
+inline float ign_noise(int x, int y) {
+    float v = 0.06711056f * (float)x + 0.00583715f * (float)y;
+    float f = 52.9829189f * (v - floor(v));
+    return f - floor(f);
+}
+
+inline float linear_source_sample_f(
+    read_only image2d_t source, const Params *p, float vx, float vy, float time_f)
+{
+    float2 step = native_divide(
+        (float2)(vx*65535.0f-1024.0f, vy*65535.0f-1024.0f) * time_f,
+        (float2)((float)(p->x_ratio*p->pel), (float)(p->y_ratio*p->pel)) * 256.0f);
+    float2 moved_pos = clamp((float2)(get_global_id(0), get_global_id(1)) + step,
+        (float2)(0.0f, 0.0f), (float2)(p->width-1, p->height-1));
+    float2 position = ((float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f)) + moved_pos;
+    return REF_SCALE(p) * read_imagef(source, linear_sampler, position).x;
+}
+#endif
+
 const sampler_t cell_sampler = CLK_NORMALIZED_COORDS_FALSE |
     CLK_ADDRESS_CLAMP_TO_EDGE | CLK_FILTER_NEAREST;
 
@@ -2437,7 +2518,14 @@ inline float cell_sample(read_only image2d_t source, const Params *p) {
 }
 
 inline float base_sample(read_only image2d_t source, const Params *p) {
-#if CUBIC_REF
+#if CUBIC_REF && FAST_OCC
+    if (p->cubic_ref) {
+        float2 position = ((float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f))
+            + (float2)(get_global_id(0), get_global_id(1));
+        return REF_SCALE(p) * cubic_sample(source, position).x;
+    }
+    return cell_sample(source, p);
+#elif CUBIC_REF
     float2 position = ((float2)(p->offset_x, p->offset_y) + (float2)(0.5f, 0.5f))
         + (float2)(get_global_id(0), get_global_id(1));
     return REF_SCALE(p) * cubic_sample(source, position).x;
@@ -2445,6 +2533,23 @@ inline float base_sample(read_only image2d_t source, const Params *p) {
     return cell_sample(source, p);
 #endif
 }
+
+#if FAST_GPU && DEPTH == 8 && !LAYER && !STILL && !HOLD
+inline float base_at(read_only image2d_t source, const Params *p, int px, int py) {
+#if CUBIC_REF && FAST_OCC
+    if (p->cubic_ref) {
+        float2 position = (float2)(p->offset_x + px, p->offset_y + py) + (float2)(0.5f, 0.5f);
+        return REF_SCALE(p) * cubic_sample(source, position).x;
+    }
+    return REF_SCALE(p) * read_imagef(source, cell_sampler, (int2)(p->offset_x + px, p->offset_y + py)).x;
+#elif CUBIC_REF
+    float2 position = (float2)(p->offset_x + px, p->offset_y + py) + (float2)(0.5f, 0.5f);
+    return REF_SCALE(p) * cubic_sample(source, position).x;
+#else
+    return REF_SCALE(p) * read_imagef(source, cell_sampler, (int2)(p->offset_x + px, p->offset_y + py)).x;
+#endif
+}
+#endif
 
 #if HOLD
 inline float held_value(read_only image2d_t source, const Params *p) {
@@ -2568,6 +2673,145 @@ kernel void render_frame(
 #endif
     )
 {
+#if FAST_GPU && DEPTH == 8 && !LAYER && !STILL && !HOLD
+    int x0 = get_global_id(0) * 4, y0 = get_global_id(1) * 2;
+    if (x0 >= p.width || y0 >= p.height) return;
+    float time = native_divide((float)p.phase, 256.0f);
+    uchar out0[4], out1[4];
+    int has_y1 = y0 + 1 < p.height;
+    for (int q = 0; q < 2; q++) {
+        int qx = x0 + q * 2;
+        if (qx >= p.width) {
+            out0[q * 2] = 0; out0[q * 2 + 1] = 0;
+            out1[q * 2] = 0; out1[q * 2 + 1] = 0;
+            continue;
+        }
+        float2 field_position = native_divide(
+            (float2)(((float)qx + 0.5f) * p.x_ratio - p.origin_x, ((float)y0 + 0.5f) * p.y_ratio - p.origin_y),
+            (float2)(p.block_w, p.block_h));
+        float4 vector = field_sample(vectors, field_position, CUBIC);
+#if ALGO >= 21 || HAS_SAD
+        float4 mask = field_sample(masks, field_position, CUBIC);
+#endif
+        float2 step_b = moved_step(&p, vector.z, vector.y, 256 - p.phase);
+        float2 step_f = moved_step(&p, vector.x, vector.w, p.phase);
+#if ALGO == 23
+# if FAST_OCC
+        int occ_y = mask.y > 0.01f;
+        int occ_z = mask.z > 0.01f;
+        float2 step_bb = (float2)(0.0f);
+        float2 step_ff = (float2)(0.0f);
+        if (occ_y || occ_z) {
+            float4 ext = field_sample(vectors_ext, field_position, CUBIC);
+            if (occ_y) step_bb = moved_step(&p, ext.z, ext.y, 256 - p.phase);
+            if (occ_z) step_ff = moved_step(&p, ext.x, ext.w, p.phase);
+        }
+# else
+        float4 ext = field_sample(vectors_ext, field_position, CUBIC);
+        float2 step_bb = moved_step(&p, ext.z, ext.y, 256 - p.phase);
+        float2 step_ff = moved_step(&p, ext.x, ext.w, p.phase);
+# endif
+#endif
+        for (int dy = 0; dy < 2; dy++) {
+            int py = y0 + dy;
+            if (dy == 1 && !has_y1) {
+                out1[q * 2] = 0; out1[q * 2 + 1] = 0;
+                continue;
+            }
+            for (int dx = 0; dx < 2; dx++) {
+                int px = qx + dx;
+                if (px >= p.width) {
+                    if (dy == 0) out0[q * 2 + dx] = 0;
+                    else out1[q * 2 + dx] = 0;
+                    continue;
+                }
+                float2 base_xy = (float2)(px, py);
+                float ref_b = source_at(source_b, &p, base_xy + step_b);
+                float ref_f = source_at(source_f, &p, base_xy + step_f);
+#if ALGO == 13 || ALGO == 22 || HAS_SAD
+                float ref_b0 = base_at(source_b, &p, px, py);
+                float ref_f0 = base_at(source_f, &p, px, py);
+#endif
+                float result;
+#if ALGO == 1
+                result = ref_b + ref_f*0.00001f;
+#elif ALGO == 2
+                result = ref_f + ref_b*0.00001f;
+#elif ALGO == 11
+                result = mix(ref_f, ref_b, time);
+#elif ALGO == 13
+                result = median3(ref_f, ref_b, mix(ref_f0, ref_b0, p.sad_blend));
+#elif ALGO == 21
+                result = mix(mix(ref_f, ref_b, mask.y), mix(ref_b, ref_f, mask.z), time);
+#elif ALGO == 22
+                result = median3(
+                    mix(ref_f, ref_b, mask.y),
+                    mix(ref_b, ref_f, mask.z),
+                    mix(ref_f0, ref_b0, time));
+#else
+# if FAST_OCC
+                float r_lo = ref_f, r_hi = ref_b;
+                if (occ_y) {
+                    float ref_bb = linear_at(source_b, &p, base_xy + step_bb);
+                    r_lo = mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y);
+                }
+                if (occ_z) {
+                    float ref_ff = linear_at(source_f, &p, base_xy + step_ff);
+                    r_hi = mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z);
+                }
+                result = mix(r_lo, r_hi, time);
+# else
+                float ref_bb = linear_at(source_b, &p, base_xy + step_bb);
+                float ref_ff = linear_at(source_f, &p, base_xy + step_ff);
+                result = mix(
+                    mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y),
+                    mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z),
+                    time);
+# endif
+#endif
+#if HAS_SAD
+# if ALGO == 1
+                result = mix(result, ref_b0, mask.x);
+# elif ALGO == 2
+                result = mix(result, ref_f0, mask.w);
+# else
+                result = mix(result, mix(ref_f0, ref_b0, p.sad_blend), fmax(mask.w, mask.x));
+# endif
+#endif
+#if LINEAR_LUMA
+                if (p.linear_luma) {
+                    result = native_divide(result, 255.0f);
+                    if (result < 0.018f) result *= 4.5f;
+                    else result = 1.099f*native_powr(result, 0.45f)-0.099f;
+                    result *= 255.0f;
+                }
+#endif
+#if DITHER
+                result += native_divide((float)(bayer[px%8][py%8]-32), 65.0f);
+#endif
+                uchar val = (uchar)clamp(round(result), 0.0f, 255.0f);
+                if (dy == 0) out0[q * 2 + dx] = val;
+                else out1[q * 2 + dx] = val;
+            }
+        }
+    }
+    if (x0 + 4 <= p.width && ((destination_stride & 3) == 0)) {
+        *((global uchar4 *)(destination + y0 * destination_stride + x0)) =
+            (uchar4)(out0[0], out0[1], out0[2], out0[3]);
+        if (has_y1) {
+            *((global uchar4 *)(destination + (y0 + 1) * destination_stride + x0)) =
+                (uchar4)(out1[0], out1[1], out1[2], out1[3]);
+        }
+    } else {
+        for (int dx = 0; dx < 4 && x0 + dx < p.width; dx++) {
+            destination[y0 * destination_stride + x0 + dx] = out0[dx];
+            if (has_y1) {
+                destination[(y0 + 1) * destination_stride + x0 + dx] = out1[dx];
+            }
+        }
+    }
+    return;
+#endif
     int x = get_global_id(0), y = get_global_id(1);
     if (x >= p.width || y >= p.height) return;
 
@@ -2620,7 +2864,7 @@ kernel void render_frame(
     float ref_b0 = base_sample(source_b, &p);
     float ref_f0 = base_sample(source_f, &p);
 #endif
-#if ALGO == 23
+#if ALGO == 23 && !FAST_OCC
     float4 ext = field_sample(vectors_ext, field_position, CUBIC);
     float ref_bb = linear_source_sample(source_b, &p, ext.z, ext.y, 256-p.phase);
     float ref_ff = linear_source_sample(source_f, &p, ext.x, ext.w, p.phase);
@@ -2642,10 +2886,26 @@ kernel void render_frame(
         mix(ref_b, ref_f, mask.z),
         mix(ref_f0, ref_b0, time));
 #else
+# if FAST_OCC
+    float r_lo = ref_f, r_hi = ref_b;
+    if (mask.y > 0.01f || mask.z > 0.01f) {
+        float4 ext = field_sample(vectors_ext, field_position, CUBIC);
+        if (mask.y > 0.01f) {
+            float ref_bb = linear_source_sample(source_b, &p, ext.z, ext.y, 256-p.phase);
+            r_lo = mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y);
+        }
+        if (mask.z > 0.01f) {
+            float ref_ff = linear_source_sample(source_f, &p, ext.x, ext.w, p.phase);
+            r_hi = mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z);
+        }
+    }
+    result = mix(r_lo, r_hi, time);
+# else
     result = mix(
         mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y),
         mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z),
         time);
+# endif
 #endif
 
 #if HAS_SAD
@@ -2741,7 +3001,7 @@ inline float blend_value(
     float result;
     float ref_b = source_sample(source_b, p, vector.z, vector.y, 256-p->phase);
     float ref_f = source_sample(source_f, p, vector.x, vector.w, p->phase);
-#if ALGO == 23
+#if ALGO == 23 && !FAST_OCC
     float ref_bb = linear_source_sample(source_b, p, ext.z, ext.y, 256-p->phase);
     float ref_ff = linear_source_sample(source_f, p, ext.x, ext.w, p->phase);
 #endif
@@ -2762,10 +3022,23 @@ inline float blend_value(
         mix(ref_b, ref_f, mask.z),
         mix(ref_f0, ref_b0, time));
 #else
+# if FAST_OCC
+    float r_lo = ref_f, r_hi = ref_b;
+    if (mask.y > 0.01f) {
+        float ref_bb = linear_source_sample(source_b, p, ext.z, ext.y, 256-p->phase);
+        r_lo = mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y);
+    }
+    if (mask.z > 0.01f) {
+        float ref_ff = linear_source_sample(source_f, p, ext.x, ext.w, p->phase);
+        r_hi = mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z);
+    }
+    result = mix(r_lo, r_hi, time);
+# else
     result = mix(
         mix(ref_f, median3(ref_b, ref_bb, ref_f), mask.y),
         mix(ref_b, median3(ref_b, ref_ff, ref_f), mask.z),
         time);
+# endif
 #endif
 
 #if HAS_SAD
@@ -2779,6 +3052,33 @@ inline float blend_value(
 #endif
     return result;
 }
+
+#if FAST_BLEND
+inline float fast_blend_tap(
+    read_only image2d_t source_f, read_only image2d_t source_b, const Params *p,
+    float4 vector, float4 mask, float pf, int is_chroma)
+{
+    float time = pf * 0.00390625f;
+#if FAST_BLEND >= 2
+    if (is_chroma) {
+        return pf <= 128.0f
+            ? linear_source_sample_f(source_f, p, vector.x, vector.w, pf)
+            : linear_source_sample_f(source_b, p, vector.z, vector.y, 256.0f - pf);
+    }
+#endif
+    float ref_f = linear_source_sample_f(source_f, p, vector.x, vector.w, pf);
+    float ref_b = linear_source_sample_f(source_b, p, vector.z, vector.y, 256.0f - pf);
+#if ALGO == 1
+    return ref_b;
+#elif ALGO == 2
+    return ref_f;
+#elif ALGO >= 21
+    return mix(mix(ref_f, ref_b, mask.y), mix(ref_b, ref_f, mask.z), time);
+#else
+    return mix(ref_f, ref_b, time);
+#endif
+}
+#endif
 
 inline float blend_round(float result, const Params *p, int layered, int x, int y)
 {
@@ -2800,10 +3100,10 @@ inline float blend_round(float result, const Params *p, int layered, int x, int 
 inline float fuse_slot(
     read_only image2d_t source, read_only image2d_t source_f, read_only image2d_t source_b,
     read_only image2d_t vectors,
-#if ADAPTIVE && ALGO == 23
+#if ADAPTIVE && ALGO == 23 && !FAST_BLEND
     read_only image2d_t vectors_ext,
 #endif
-    Params p, Steps steps, float total, int x, int y)
+    Params p, Steps steps, float total, int x, int y, int slot_id)
 {
     if (steps.source != 0.0f) {
 #pragma OPENCL FP_CONTRACT OFF
@@ -2817,18 +3117,85 @@ inline float fuse_slot(
         (float2)(x*p.x_ratio-p.origin_x, y*p.y_ratio-p.origin_y),
         (float2)(p.block_w, p.block_h));
     float4 vector = field_sample(vectors, field_position, CUBIC);
+    float2 sf = full_step(&p, vector.x, vector.w);
+    float2 sb = full_step(&p, vector.z, vector.y);
+#if FAST_BLEND
+    float4 mask = (float4)(0.0f);
+# if ALGO >= 21
+    float2 dv = sf + sb;
+    float occ = clamp(native_sqrt(dv.x * dv.x + dv.y * dv.y) * 0.25f, 0.0f, 1.0f);
+    mask = (float4)(0.0f, occ, occ, 0.0f);
+# endif
+    int zero_mv = sf.x == 0.0f && sf.y == 0.0f && sb.x == 0.0f && sb.y == 0.0f;
+    if (zero_mv && ALGO != 1 && ALGO != 2) {
+        float rf = linear_source_sample_f(source_f, &p, vector.x, vector.w, 0.0f);
+        float rb = linear_source_sample_f(source_b, &p, vector.z, vector.y, 0.0f);
+        if (rf == rb) {
+            float value = blend_round(rf, &p, 0, x, y);
+            float wsum = 0.0f;
+            for (int step = 0; step < steps.count; step++) wsum += steps.weight[step];
+            return total + wsum * value;
+        }
+    }
+    int is_chroma = p.x_ratio > 1 || p.y_ratio > 1;
+    int cap = (FAST_BLEND >= 2 || is_chroma) ? 1 : 2;
+    float travel = fmax(fmax(fabs(sf.x), fabs(sf.y)), fmax(fabs(sb.x), fabs(sb.y)));
+    int want = travel < 0.5f ? 1 : cap;
+    int buckets = min(want, steps.count);
+    if (steps.count == 2) {
+        float p0 = (float)steps.phase[0];
+        float p1 = (float)steps.phase[1];
+        float dp = (p1 - p0) * 0.5f;
+        if (buckets == 1) {
+            float lo = clamp(p0 - dp, 0.0f, 256.0f);
+            float hi = clamp(p1 + dp, 0.0f, 256.0f);
+            float j = ign_noise(x + slot_id * 17, y + slot_id * 31);
+            float pf = mix(lo, hi, j);
+            float result = fast_blend_tap(source_f, source_b, &p, vector, mask, pf, is_chroma);
+            float value = blend_round(result, &p, 0, x, y);
+            total += (steps.weight[0] + steps.weight[1]) * value;
+        } else {
+            float j0 = ign_noise(x + slot_id * 17, y + slot_id * 31);
+            float pf0 = mix(clamp(p0 - dp, 0.0f, 256.0f), clamp(p0 + dp, 0.0f, 256.0f), j0);
+            float r0 = fast_blend_tap(source_f, source_b, &p, vector, mask, pf0, is_chroma);
+            total += steps.weight[0] * blend_round(r0, &p, 0, x, y);
+            float j1 = ign_noise(x + slot_id * 17 + 7, y + slot_id * 31 + 13);
+            float pf1 = mix(clamp(p1 - dp, 0.0f, 256.0f), clamp(p1 + dp, 0.0f, 256.0f), j1);
+            float r1 = fast_blend_tap(source_f, source_b, &p, vector, mask, pf1, is_chroma);
+            total += steps.weight[1] * blend_round(r1, &p, 0, x, y);
+        }
+        return total;
+    }
+    for (int b = 0; b < buckets; b++) {
+        int s0 = (b * steps.count) / buckets;
+        int s1 = ((b + 1) * steps.count) / buckets;
+        float wsum = 0.0f;
+        for (int s = s0; s < s1; s++) wsum += steps.weight[s];
+        float j = ign_noise(x + slot_id * 17 + b * 7, y + slot_id * 31 + b * 13);
+        float pf = s1 - s0 > 1
+            ? mix((float)steps.phase[s0], (float)steps.phase[s1 - 1], j)
+            : (float)steps.phase[s0];
+        float result = fast_blend_tap(source_f, source_b, &p, vector, mask, pf, is_chroma);
+        total += wsum * blend_round(result, &p, 0, x, y);
+    }
+    return total;
+#else
 #if ADAPTIVE && ALGO == 23
+# if FAST_OCC
+    float2 dv_occ = sf + sb;
+    float occ_val = clamp(native_sqrt(dv_occ.x * dv_occ.x + dv_occ.y * dv_occ.y) * 0.25f, 0.0f, 1.0f);
+    float4 ext = occ_val > 0.01f ? field_sample(vectors_ext, field_position, CUBIC) : (float4)(0.0f);
+# else
     float4 ext = field_sample(vectors_ext, field_position, CUBIC);
+# endif
 #else
     float4 ext = (float4)(0.0f);
 #endif
     int has_base = ALGO == 13 || ALGO == 22;
     float ref_b0 = has_base ? base_sample(source_b, &p) : 0.0f;
     float ref_f0 = has_base ? base_sample(source_f, &p) : 0.0f;
-    float2 sf = full_step(&p, vector.x, vector.w);
-    float2 sb = full_step(&p, vector.z, vector.y);
     int zero_mv = sf.x == 0.0f && sf.y == 0.0f && sb.x == 0.0f && sb.y == 0.0f;
-#if ADAPTIVE && ALGO == 23
+#if ADAPTIVE && ALGO == 23 && !FAST_OCC
     float2 ef = full_step(&p, ext.x, ext.w);
     float2 eb = full_step(&p, ext.z, ext.y);
     zero_mv = zero_mv && ef.x == 0.0f && ef.y == 0.0f && eb.x == 0.0f && eb.y == 0.0f;
@@ -2836,7 +3203,7 @@ inline float fuse_slot(
     if (zero_mv) {
         float rf = source_sample(source_f, &p, vector.x, vector.w, 0);
         float rb = source_sample(source_b, &p, vector.z, vector.y, 0);
-#if ADAPTIVE && ALGO == 23
+#if ADAPTIVE && ALGO == 23 && !FAST_OCC
         float rff = linear_source_sample(source_f, &p, ext.x, ext.w, 0);
         float rbb = linear_source_sample(source_b, &p, ext.z, ext.y, 0);
         int same = rf == rb && rff == rf && rbb == rb;
@@ -2897,6 +3264,7 @@ inline float fuse_slot(
     }
     return total;
 #endif
+#endif
 }
 
 kernel void blend_frame(
@@ -2910,7 +3278,7 @@ kernel void blend_frame(
     read_only image2d_t source3, read_only image2d_t forward3, read_only image2d_t backward3,
     read_only image2d_t vectors3,
     Params p, Steps steps0, Steps steps1, Steps steps2, Steps steps3
-#if ADAPTIVE && ALGO == 23
+#if ADAPTIVE && ALGO == 23 && !FAST_BLEND
     , read_only image2d_t ext0, read_only image2d_t ext1,
     read_only image2d_t ext2, read_only image2d_t ext3
 #endif
@@ -2922,16 +3290,16 @@ kernel void blend_frame(
     stride = abs(stride);
     global float *sum = sums + (p.offset_y+y)*stride + p.offset_x + x;
     float total = overwrite ? 0.0f : *sum;
-#if ADAPTIVE && ALGO == 23
-    total = fuse_slot(source0, forward0, backward0, vectors0, ext0, p, steps0, total, x, y);
-    total = fuse_slot(source1, forward1, backward1, vectors1, ext1, p, steps1, total, x, y);
-    total = fuse_slot(source2, forward2, backward2, vectors2, ext2, p, steps2, total, x, y);
-    total = fuse_slot(source3, forward3, backward3, vectors3, ext3, p, steps3, total, x, y);
+#if ADAPTIVE && ALGO == 23 && !FAST_BLEND
+    total = fuse_slot(source0, forward0, backward0, vectors0, ext0, p, steps0, total, x, y, 0);
+    total = fuse_slot(source1, forward1, backward1, vectors1, ext1, p, steps1, total, x, y, 1);
+    total = fuse_slot(source2, forward2, backward2, vectors2, ext2, p, steps2, total, x, y, 2);
+    total = fuse_slot(source3, forward3, backward3, vectors3, ext3, p, steps3, total, x, y, 3);
 #else
-    total = fuse_slot(source0, forward0, backward0, vectors0, p, steps0, total, x, y);
-    total = fuse_slot(source1, forward1, backward1, vectors1, p, steps1, total, x, y);
-    total = fuse_slot(source2, forward2, backward2, vectors2, p, steps2, total, x, y);
-    total = fuse_slot(source3, forward3, backward3, vectors3, p, steps3, total, x, y);
+    total = fuse_slot(source0, forward0, backward0, vectors0, p, steps0, total, x, y, 0);
+    total = fuse_slot(source1, forward1, backward1, vectors1, p, steps1, total, x, y, 1);
+    total = fuse_slot(source2, forward2, backward2, vectors2, p, steps2, total, x, y, 2);
+    total = fuse_slot(source3, forward3, backward3, vectors3, p, steps3, total, x, y, 3);
 #endif
     *sum = total;
 }
@@ -2969,7 +3337,8 @@ kernel void blend_frame(
     int has_base = ALGO == 13 || ALGO == 22 || HAS_SAD;
     float ref_b0 = has_base ? base_sample(source_b, &p) : 0.0f;
     float ref_f0 = has_base ? base_sample(source_f, &p) : 0.0f;
-    float4 ext = ALGO == 23 ? field_sample(vectors_ext, field_position, CUBIC) : (float4)(0.0f);
+    float4 ext = (ALGO == 23 && !(FAST_BLEND && !LAYER && !STILL))
+        ? field_sample(vectors_ext, field_position, CUBIC) : (float4)(0.0f);
     global float *sum = sums + (p.offset_y+y)*stride + p.offset_x + x;
     float total = overwrite ? 0.0f : *sum;
 #if STILL
@@ -2995,7 +3364,7 @@ kernel void blend_frame(
     float2 zsf = full_step(&p, vector.x, vector.w);
     float2 zsb = full_step(&p, vector.z, vector.y);
     int zero_mv = zsf.x == 0.0f && zsf.y == 0.0f && zsb.x == 0.0f && zsb.y == 0.0f;
-#if ALGO == 23
+#if ALGO == 23 && !FAST_BLEND
     float2 zef = full_step(&p, ext.x, ext.w);
     float2 zeb = full_step(&p, ext.z, ext.y);
     zero_mv = zero_mv && zef.x == 0.0f && zef.y == 0.0f && zeb.x == 0.0f && zeb.y == 0.0f;
@@ -3003,7 +3372,7 @@ kernel void blend_frame(
     if (zero_mv && ALGO != 1 && ALGO != 2) {
         float rf = source_sample(source_f, &p, vector.x, vector.w, 0);
         float rb = source_sample(source_b, &p, vector.z, vector.y, 0);
-#if ALGO == 23
+#if ALGO == 23 && !FAST_BLEND
         float rff = linear_source_sample(source_f, &p, ext.x, ext.w, 0);
         float rbb = linear_source_sample(source_b, &p, ext.z, ext.y, 0);
         int same = rf == rb && rff == rf && rbb == rb && (!HAS_SAD || (ref_f0 == rf && ref_b0 == rb));
@@ -3025,6 +3394,70 @@ kernel void blend_frame(
             return;
         }
     }
+#endif
+
+#if FAST_BLEND && !LAYER && !STILL
+    int fb_chroma = p.x_ratio > 1 || p.y_ratio > 1;
+    int fb_cap = (FAST_BLEND >= 2 || fb_chroma) ? 1 : 2;
+    float fb_travel = fmax(fmax(fabs(zsf.x), fabs(zsf.y)), fmax(fabs(zsb.x), fabs(zsb.y)));
+    int fb_want = fb_travel < 0.5f ? 1 : fb_cap;
+    int fb_buckets = min(fb_want, steps.count);
+    float4 fb_mask = (float4)(0.0f);
+#if ALGO >= 21
+    float2 fb_dv = zsf + zsb;
+    float fb_occ = clamp(native_sqrt(fb_dv.x * fb_dv.x + fb_dv.y * fb_dv.y) * 0.25f, 0.0f, 1.0f);
+    fb_mask = (float4)(0.0f, fb_occ, fb_occ, 0.0f);
+#endif
+    if (steps.count == 2) {
+        float p0 = (float)steps.phase[0];
+        float p1 = (float)steps.phase[1];
+        float dp = (p1 - p0) * 0.5f;
+        for (int b = 0; b < fb_buckets; b++) {
+            float lo = fb_buckets == 1 ? clamp(p0 - dp, 0.0f, 256.0f)
+                : clamp((b == 0 ? p0 : p1) - dp, 0.0f, 256.0f);
+            float hi = fb_buckets == 1 ? clamp(p1 + dp, 0.0f, 256.0f)
+                : clamp((b == 0 ? p0 : p1) + dp, 0.0f, 256.0f);
+            float wsum = fb_buckets == 1 ? (steps.weight[0] + steps.weight[1]) : steps.weight[b];
+            float j = ign_noise(x + b * 7, y + b * 13);
+            float pf = mix(lo, hi, j);
+            float result = fast_blend_tap(source_f, source_b, &p, vector, fb_mask, pf, fb_chroma);
+#if HAS_SAD
+            float4 m = layer_sample(masks, field_position, b);
+            result = mix(result, mix(ref_f0, ref_b0, steps.sad_blend[b]), fmax(m.w, m.x));
+#endif
+            float value = blend_round(result, &p, 0, x, y);
+#if HOLD
+            if (weight < 1.0f) value = round(mix(held, value, weight));
+#endif
+            if (steps.gamma != 1.0f) value = curve[(int)value];
+            total += wsum * value;
+        }
+    } else {
+        for (int b = 0; b < fb_buckets; b++) {
+            int s0 = (b * steps.count) / fb_buckets;
+            int s1 = ((b + 1) * steps.count) / fb_buckets;
+            int mid = (s0 + s1 - 1) >> 1;
+            float wsum = 0.0f;
+            for (int s = s0; s < s1; s++) wsum += steps.weight[s];
+            float j = ign_noise(x + b * 7, y + b * 13);
+            float pf = s1 - s0 > 1
+                ? mix((float)steps.phase[s0], (float)steps.phase[s1 - 1], j)
+                : (float)steps.phase[s0];
+            float result = fast_blend_tap(source_f, source_b, &p, vector, fb_mask, pf, fb_chroma);
+#if HAS_SAD
+            float4 m = layer_sample(masks, field_position, mid);
+            result = mix(result, mix(ref_f0, ref_b0, steps.sad_blend[mid]), fmax(m.w, m.x));
+#endif
+            float value = blend_round(result, &p, 0, x, y);
+#if HOLD
+            if (weight < 1.0f) value = round(mix(held, value, weight));
+#endif
+            if (steps.gamma != 1.0f) value = curve[(int)value];
+            total += wsum * value;
+        }
+    }
+    *sum = total;
+    return;
 #endif
 
 #if ADAPTIVE && !LAYER && !STILL

@@ -158,6 +158,103 @@ impl Plan {
 }
 
 impl BlendState {
+    fn fast_blend_level(&self) -> u8 {
+        if !self.inner.options.fast_blend() {
+            0
+        } else if self.inner.options.fast() >= 3 {
+            2
+        } else {
+            1
+        }
+    }
+
+    fn window_entries(&self, n: i32, single_per_run: bool) -> Vec<(i32, f32)> {
+        if !self.inner.options.fast_blend()
+            || self.plan.weights.len() <= 5
+            || self.inner.options.dedup().is_some()
+            || self.inner.options.mask_still().is_some()
+            || self.inner.options.mask_peel().is_some()
+        {
+            return self.plan.window(n).collect();
+        }
+        let params = self.inner.options.reference();
+        let rates = svpflow_core::smooth_engine::Rates::new(
+            &params,
+            &vs::Source::source(&self.inner.video_info),
+        );
+        let centroid = |slice: &[(i32, f32)], total: f32| -> i32 {
+            let target = total * 0.5;
+            let mut acc = 0.0f32;
+            for &(frame, weight) in slice {
+                acc += weight;
+                if acc >= target {
+                    return frame;
+                }
+            }
+            slice[slice.len() / 2].0
+        };
+        let mut out = Vec::with_capacity(8);
+        let mut run: Vec<(i32, f32)> = Vec::new();
+        let mut run_key: Option<(i32, bool)> = None;
+        let flush = |out: &mut Vec<(i32, f32)>, run: &mut Vec<(i32, f32)>| {
+            if run.is_empty() {
+                return;
+            }
+            let total: f32 = run.iter().map(|&(_, w)| w).sum();
+            if total <= 0.0 || (!single_per_run && run.len() <= 2) {
+                out.extend_from_slice(run);
+                run.clear();
+                return;
+            }
+            if single_per_run {
+                out.push((centroid(run, total), total));
+                run.clear();
+                return;
+            }
+            let half_total = total * 0.5;
+            let mut acc = 0.0f32;
+            let mut split = 1;
+            for (idx, &(_, weight)) in run.iter().enumerate() {
+                acc += weight;
+                if acc >= half_total {
+                    split = (idx + 1).clamp(1, run.len() - 1);
+                    break;
+                }
+            }
+            let left = &run[..split];
+            let right = &run[split..];
+            let w0: f32 = left.iter().map(|&(_, w)| w).sum();
+            let w1 = total - w0;
+            let f0 = centroid(left, w0);
+            let f1 = centroid(right, w1);
+            if f0 == f1 {
+                out.push((f0, total));
+            } else {
+                out.push((f0, w0));
+                out.push((f1, w1));
+            }
+            run.clear();
+        };
+        for (frame, weight) in self.plan.window(n) {
+            let step = rates.step(&params, frame);
+            let key = (step.phase != 0 && step.phase != 256).then_some((step.n, step.phase > 127));
+            if key.is_some() && key == run_key {
+                run.push((frame, weight));
+            } else {
+                flush(&mut out, &mut run);
+                if key.is_some() {
+                    run_key = key;
+                    run.push((frame, weight));
+                } else {
+                    run_key = None;
+                    out.push((frame, weight));
+                }
+            }
+        }
+        flush(&mut out, &mut run);
+        out
+    }
+
     unsafe fn render(
         &self,
         n: i32,
@@ -178,8 +275,10 @@ impl BlendState {
             chroma.1,
             self.plan.gamma,
             self.inner.options.adaptive_blend(),
+            self.inner.options.fast() >= 1,
+            self.fast_blend_level(),
         )?;
-        for (frame, weight) in self.plan.window(n) {
+        for (frame, weight) in self.window_entries(n, false) {
             job.start(weight);
             let rendered = unsafe {
                 self.inner
@@ -280,9 +379,11 @@ impl BlendState {
         let Plan { gamma, divisor, .. } = self.plan;
         let curved = |plane| plane == 0 && gamma.to_bits() != 1.0_f32.to_bits();
         let mut sums = sizes.map(|(width, height)| vec![0.0f32; width * height]);
-        let entries: Vec<(i32, f32)> = if self.inner.options.adaptive_blend()
-            && self.plan.weights.len() > 7
+        let entries: Vec<(i32, f32)> = if self.inner.options.fast_blend()
+            && self.plan.weights.len() > 5
         {
+            self.window_entries(n, self.inner.options.fast() >= 3)
+        } else if self.inner.options.adaptive_blend() && self.plan.weights.len() > 7 {
             let stride = if self.plan.weights.len() > 31 { 3 } else { 2 };
             let raw: Vec<(i32, f32)> = self.plan.window(n).collect();
             raw.chunks(stride)
