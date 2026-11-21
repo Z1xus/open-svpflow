@@ -5,7 +5,37 @@
     clippy::cast_sign_loss
 )]
 
+use std::cell::RefCell;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::metadata::VectorData;
+
+#[cfg(not(target_arch = "wasm32"))]
+static ACTIVE_RENDERS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(not(target_arch = "wasm32"))]
+struct RenderGuard;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for RenderGuard {
+    fn drop(&mut self) {
+        ACTIVE_RENDERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+type BlockEntry = (i32, usize, [i16; 32], [i16; 32]);
+
+#[derive(Default)]
+struct RenderScratch {
+    channels: [Vec<i16>; 11],
+    lanes: Vec<i32>,
+    blocks: Vec<BlockEntry>,
+}
+
+thread_local! {
+    static SCRATCH: RefCell<RenderScratch> = RefCell::new(RenderScratch::default());
+}
 
 const LOG2_STEP: [i8; 32] = [
     0, 1, 2, 2, -1, 3, 3, 3, -1, -1, -1, 4, -1, 4, -1, 4, -1, -1, -1, -1, -1, -1, -1, 5, -1, -1,
@@ -24,7 +54,7 @@ mod sealed {
 }
 
 pub trait Sample:
-    sealed::Sealed + Copy + Default + PartialOrd + Into<i32> + Into<u32> + 'static
+    sealed::Sealed + Copy + Default + PartialOrd + Into<i32> + Into<u32> + Send + Sync + 'static
 {
     fn new(value: i32) -> Self;
 }
@@ -985,6 +1015,7 @@ impl Renderer {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn draw<T: Sample>(
         &self,
         algo: Algo,
@@ -996,6 +1027,88 @@ impl Renderer {
     ) {
         let blocks = -1..self.shape.grid_h;
         if !self.split() {
+            #[cfg(not(target_arch = "wasm32"))]
+            if algo != Algo::Fill && self.shape.grid_h >= 16 {
+                let active = ACTIVE_RENDERS.fetch_add(1, Ordering::Relaxed) + 1;
+                let _guard = RenderGuard;
+                let workers = crate::threads::workers();
+                let bands = if active * 2 <= workers && workers >= 4 {
+                    (workers / active.max(1))
+                        .min(4)
+                        .min((self.shape.grid_h as usize) / 8)
+                } else {
+                    1
+                };
+                if bands >= 2 {
+                    let grid_h = self.shape.grid_h;
+                    let (yp, up, vp) = (dst.y.pitch, dst.u.pitch, dst.v.pitch);
+                    let mut y_rem = &mut *dst.y.data;
+                    let mut u_rem = &mut *dst.u.data;
+                    let mut v_rem = &mut *dst.v.data;
+                    let mut items = Vec::with_capacity(bands);
+                    for band in 0..bands {
+                        let b0 = if band == 0 {
+                            -1
+                        } else {
+                            (band as i32 * grid_h) / bands as i32
+                        };
+                        let b1 = if band + 1 == bands {
+                            grid_h
+                        } else {
+                            ((band as i32 + 1) * grid_h) / bands as i32
+                        };
+                        let range = b0..b1;
+                        let [y_rows, uv_rows] = self.band_rows(interp, range.clone());
+                        let (y_slice, u_slice, v_slice) = if band + 1 == bands {
+                            (
+                                std::mem::take(&mut y_rem),
+                                std::mem::take(&mut u_rem),
+                                std::mem::take(&mut v_rem),
+                            )
+                        } else {
+                            let y_take = (y_rows.len() * yp).min(y_rem.len());
+                            let u_take = (uv_rows.len() * up).min(u_rem.len());
+                            let v_take = (uv_rows.len() * vp).min(v_rem.len());
+                            let (ys, yr) = y_rem.split_at_mut(y_take);
+                            let (us, ur) = u_rem.split_at_mut(u_take);
+                            let (vs, vr) = v_rem.split_at_mut(v_take);
+                            y_rem = yr;
+                            u_rem = ur;
+                            v_rem = vr;
+                            (ys, us, vs)
+                        };
+                        items.push((
+                            range,
+                            FrameMut {
+                                y: PlaneMut {
+                                    data: y_slice,
+                                    pitch: yp,
+                                },
+                                u: PlaneMut {
+                                    data: u_slice,
+                                    pitch: up,
+                                },
+                                v: PlaneMut {
+                                    data: v_slice,
+                                    pitch: vp,
+                                },
+                            },
+                        ));
+                    }
+                    crate::threads::scope(|scope| {
+                        for (range, mut band) in items {
+                            scope.spawn(move |_| {
+                                self.render_band(
+                                    algo, interp, &mut band, next, current, vectors, range,
+                                );
+                            });
+                        }
+                    });
+                    return;
+                }
+                self.render_band(algo, interp, dst, next, current, vectors, blocks);
+                return;
+            }
             self.render_band(algo, interp, dst, next, current, vectors, blocks);
             return;
         }
@@ -1105,29 +1218,51 @@ impl Renderer {
         for chroma in [false, true] {
             let pitch = if chroma { next.u.pitch } else { next.y.pitch };
             let pass = self.pass(chroma, interp, pitch, blocks.clone());
-            let mut planes: Vec<(&mut PlaneMut<'_, T>, Plane<'_, T>, Plane<'_, T>)> = if chroma {
-                vec![
+            if chroma {
+                let mut planes = [
                     (&mut dst.u, next.u, current.u),
                     (&mut dst.v, next.v, current.v),
-                ]
+                ];
+                self.render_algo(
+                    algo,
+                    interp,
+                    &pass,
+                    &mut planes,
+                    vectors,
+                    Some((next.y, current.y)),
+                );
             } else {
-                vec![(&mut dst.y, next.y, current.y)]
-            };
-            let aux = chroma.then_some((next.y, current.y));
-            self.render_algo(algo, interp, &pass, &mut planes, vectors, aux);
+                let mut planes = [(&mut dst.y, next.y, current.y)];
+                self.render_algo(algo, interp, &pass, &mut planes, vectors, None);
+            }
         }
     }
 
-    fn channel(raw: &[u16], time: i32, div: i32) -> Vec<i16> {
-        let map = |div: i32| {
-            raw.iter()
-                .map(|&value| ((i32::from(value) - VECTOR_BIAS) * time / 256 / div) as i16)
-                .collect()
-        };
+    fn fill_channel(out: &mut Vec<i16>, raw: &[u16], time: i32, div: i32) {
+        out.resize(raw.len(), 0);
         match div {
-            1 => map(1),
-            2 => map(2),
-            _ => map(div),
+            1 => {
+                for (dst, &value) in out.iter_mut().zip(raw) {
+                    *dst = ((i32::from(value) - VECTOR_BIAS) * time / 256) as i16;
+                }
+            }
+            2 => {
+                for (dst, &value) in out.iter_mut().zip(raw) {
+                    *dst = ((i32::from(value) - VECTOR_BIAS) * time / 256 / 2) as i16;
+                }
+            }
+            _ => {
+                for (dst, &value) in out.iter_mut().zip(raw) {
+                    *dst = ((i32::from(value) - VECTOR_BIAS) * time / 256 / div) as i16;
+                }
+            }
+        }
+    }
+
+    fn fill_mask(out: &mut Vec<i16>, raw: &[u8]) {
+        out.resize(raw.len(), 0);
+        for (dst, &value) in out.iter_mut().zip(raw) {
+            *dst = i16::from(value);
         }
     }
 
@@ -1146,13 +1281,6 @@ impl Renderer {
         let tb = self.time_blend;
         let rtb = 256 - tb;
         let (fwd, rev) = (t, rt);
-        let vec2 = |x: &[u16], y: &[u16], time: i32| {
-            (
-                Self::channel(x, time, pass.div_x),
-                Self::channel(y, time, pass.div_y),
-            )
-        };
-        let mask = |m: &[u8]| m.iter().map(|&x| i16::from(x)).collect::<Vec<i16>>();
         let weights = row::Weights {
             t,
             rt,
@@ -1160,178 +1288,271 @@ impl Renderer {
             rtb,
             wrap: (256 << self.shape.depth) - 1,
         };
-        match algo {
-            Algo::Fast { next } => {
-                let (x, y) = if next {
-                    vec2(v.fwd_x, v.fwd_y, fwd)
-                } else {
-                    vec2(v.bwd_x, v.bwd_y, fwd)
-                };
-                self.walk(
-                    pass,
-                    interp,
-                    [&x, &y],
-                    [None; 2],
-                    false,
-                    aux,
-                    planes,
-                    |out, p, base, n, l| {
-                        row::fast(out, p, next, base, n, l);
-                    },
-                );
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let RenderScratch {
+                channels,
+                lanes,
+                blocks,
+            } = &mut *scratch;
+            let [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10] = channels;
+            match algo {
+                Algo::Fast { next } => {
+                    if next {
+                        Self::fill_channel(c0, v.fwd_x, fwd, pass.div_x);
+                        Self::fill_channel(c1, v.fwd_y, fwd, pass.div_y);
+                    } else {
+                        Self::fill_channel(c0, v.bwd_x, fwd, pass.div_x);
+                        Self::fill_channel(c1, v.bwd_y, fwd, pass.div_y);
+                    }
+                    self.walk(
+                        pass,
+                        interp,
+                        [c0.as_slice(), c1.as_slice()],
+                        [None; 2],
+                        false,
+                        aux,
+                        planes,
+                        lanes,
+                        blocks,
+                        |out, p, base, n, l| {
+                            row::fast(out, p, next, base, n, l);
+                        },
+                    );
+                }
+                Algo::NoMask { median } => {
+                    Self::fill_channel(c0, v.bwd_x, fwd, pass.div_x);
+                    Self::fill_channel(c1, v.bwd_y, fwd, pass.div_y);
+                    Self::fill_channel(c2, v.fwd_x, rev, pass.div_x);
+                    Self::fill_channel(c3, v.fwd_y, rev, pass.div_y);
+                    self.walk(
+                        pass,
+                        interp,
+                        [c0.as_slice(), c1.as_slice(), c2.as_slice(), c3.as_slice()],
+                        [None; 4],
+                        false,
+                        aux,
+                        planes,
+                        lanes,
+                        blocks,
+                        |out, p, base, n, l| {
+                            row::no_mask(out, p, base, n, l, &weights, median);
+                        },
+                    );
+                }
+                Algo::FastSad { next } => {
+                    if next {
+                        Self::fill_channel(c0, v.fwd_x, fwd, pass.div_x);
+                        Self::fill_channel(c1, v.fwd_y, fwd, pass.div_y);
+                    } else {
+                        Self::fill_channel(c0, v.bwd_x, fwd, pass.div_x);
+                        Self::fill_channel(c1, v.bwd_y, fwd, pass.div_y);
+                    }
+                    Self::fill_mask(c2, v.sad);
+                    self.walk(
+                        pass,
+                        interp,
+                        [c0.as_slice(), c1.as_slice(), c2.as_slice()],
+                        [None, None, Some(v.sad)],
+                        true,
+                        aux,
+                        planes,
+                        lanes,
+                        blocks,
+                        |out, p, base, n, l| {
+                            row::fast_sad(out, p, next, base, n, l);
+                        },
+                    );
+                }
+                Algo::NoMaskSad { median } => {
+                    Self::fill_channel(c0, v.bwd_x, fwd, pass.div_x);
+                    Self::fill_channel(c1, v.bwd_y, fwd, pass.div_y);
+                    Self::fill_channel(c2, v.fwd_x, rev, pass.div_x);
+                    Self::fill_channel(c3, v.fwd_y, rev, pass.div_y);
+                    Self::fill_mask(c4, v.sad);
+                    self.walk(
+                        pass,
+                        interp,
+                        [
+                            c0.as_slice(),
+                            c1.as_slice(),
+                            c2.as_slice(),
+                            c3.as_slice(),
+                            c4.as_slice(),
+                        ],
+                        [None, None, None, None, Some(v.sad)],
+                        false,
+                        aux,
+                        planes,
+                        lanes,
+                        blocks,
+                        |out, p, base, n, l| {
+                            row::no_mask_sad(out, p, base, n, l, &weights, median);
+                        },
+                    );
+                }
+                Algo::NormalSad { simple } => {
+                    Self::fill_channel(c0, v.bwd_x, fwd, pass.div_x);
+                    Self::fill_channel(c1, v.bwd_y, fwd, pass.div_y);
+                    Self::fill_channel(c2, v.fwd_x, rev, pass.div_x);
+                    Self::fill_channel(c3, v.fwd_y, rev, pass.div_y);
+                    Self::fill_mask(c4, v.cover_fwd);
+                    Self::fill_mask(c5, v.cover_bwd);
+                    Self::fill_mask(c6, v.sad);
+                    self.walk(
+                        pass,
+                        interp,
+                        [
+                            c0.as_slice(),
+                            c1.as_slice(),
+                            c2.as_slice(),
+                            c3.as_slice(),
+                            c4.as_slice(),
+                            c5.as_slice(),
+                            c6.as_slice(),
+                        ],
+                        [
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(v.cover_fwd),
+                            Some(v.cover_bwd),
+                            Some(v.sad),
+                        ],
+                        false,
+                        aux,
+                        planes,
+                        lanes,
+                        blocks,
+                        |out, p, base, n, l| row::normal_sad(out, p, base, n, l, &weights, simple),
+                    );
+                }
+                Algo::Normal { simple } => {
+                    Self::fill_channel(c0, v.bwd_x, fwd, pass.div_x);
+                    Self::fill_channel(c1, v.bwd_y, fwd, pass.div_y);
+                    Self::fill_channel(c2, v.fwd_x, rev, pass.div_x);
+                    Self::fill_channel(c3, v.fwd_y, rev, pass.div_y);
+                    Self::fill_mask(c4, v.cover_fwd);
+                    Self::fill_mask(c5, v.cover_bwd);
+                    self.walk(
+                        pass,
+                        interp,
+                        [
+                            c0.as_slice(),
+                            c1.as_slice(),
+                            c2.as_slice(),
+                            c3.as_slice(),
+                            c4.as_slice(),
+                            c5.as_slice(),
+                        ],
+                        [None, None, None, None, Some(v.cover_fwd), Some(v.cover_bwd)],
+                        false,
+                        aux,
+                        planes,
+                        lanes,
+                        blocks,
+                        |out, p, base, n, l| row::normal(out, p, base, n, l, &weights, simple),
+                    );
+                }
+                Algo::Extended => {
+                    Self::fill_channel(c0, v.bwd_x, fwd, pass.div_x);
+                    Self::fill_channel(c1, v.bwd_y, fwd, pass.div_y);
+                    Self::fill_channel(c2, v.fwd_x, rev, pass.div_x);
+                    Self::fill_channel(c3, v.fwd_y, rev, pass.div_y);
+                    Self::fill_channel(c4, v.prev_bwd_x, fwd, pass.div_x);
+                    Self::fill_channel(c5, v.prev_bwd_y, fwd, pass.div_y);
+                    Self::fill_channel(c6, v.next_fwd_x, rev, pass.div_x);
+                    Self::fill_channel(c7, v.next_fwd_y, rev, pass.div_y);
+                    Self::fill_mask(c8, v.cover_fwd);
+                    Self::fill_mask(c9, v.cover_bwd);
+                    self.walk(
+                        pass,
+                        interp,
+                        [
+                            c0.as_slice(),
+                            c1.as_slice(),
+                            c2.as_slice(),
+                            c3.as_slice(),
+                            c4.as_slice(),
+                            c5.as_slice(),
+                            c6.as_slice(),
+                            c7.as_slice(),
+                            c8.as_slice(),
+                            c9.as_slice(),
+                        ],
+                        [
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(v.cover_fwd),
+                            Some(v.cover_bwd),
+                        ],
+                        false,
+                        aux,
+                        planes,
+                        lanes,
+                        blocks,
+                        |out, p, base, n, l| row::extended(out, p, base, n, l, &weights),
+                    );
+                }
+                Algo::ExtendedSad => {
+                    Self::fill_channel(c0, v.bwd_x, fwd, pass.div_x);
+                    Self::fill_channel(c1, v.bwd_y, fwd, pass.div_y);
+                    Self::fill_channel(c2, v.fwd_x, rev, pass.div_x);
+                    Self::fill_channel(c3, v.fwd_y, rev, pass.div_y);
+                    Self::fill_channel(c4, v.prev_bwd_x, fwd, pass.div_x);
+                    Self::fill_channel(c5, v.prev_bwd_y, fwd, pass.div_y);
+                    Self::fill_channel(c6, v.next_fwd_x, rev, pass.div_x);
+                    Self::fill_channel(c7, v.next_fwd_y, rev, pass.div_y);
+                    Self::fill_mask(c8, v.cover_fwd);
+                    Self::fill_mask(c9, v.cover_bwd);
+                    Self::fill_mask(c10, v.sad);
+                    self.walk(
+                        pass,
+                        interp,
+                        [
+                            c0.as_slice(),
+                            c1.as_slice(),
+                            c2.as_slice(),
+                            c3.as_slice(),
+                            c4.as_slice(),
+                            c5.as_slice(),
+                            c6.as_slice(),
+                            c7.as_slice(),
+                            c8.as_slice(),
+                            c9.as_slice(),
+                            c10.as_slice(),
+                        ],
+                        [
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(v.cover_fwd),
+                            Some(v.cover_bwd),
+                            Some(v.sad),
+                        ],
+                        false,
+                        aux,
+                        planes,
+                        lanes,
+                        blocks,
+                        |out, p, base, n, l| row::extended_sad(out, p, base, n, l, &weights),
+                    );
+                }
+                Algo::Fill => {}
             }
-            Algo::NoMask { median } => {
-                let (bx, by) = vec2(v.bwd_x, v.bwd_y, fwd);
-                let (fx, fy) = vec2(v.fwd_x, v.fwd_y, rev);
-                self.walk(
-                    pass,
-                    interp,
-                    [&bx, &by, &fx, &fy],
-                    [None; 4],
-                    false,
-                    aux,
-                    planes,
-                    |out, p, base, n, l| {
-                        row::no_mask(out, p, base, n, l, &weights, median);
-                    },
-                );
-            }
-            Algo::FastSad { next } => {
-                let (x, y) = if next {
-                    vec2(v.fwd_x, v.fwd_y, fwd)
-                } else {
-                    vec2(v.bwd_x, v.bwd_y, fwd)
-                };
-                let sad = mask(v.sad);
-                self.walk(
-                    pass,
-                    interp,
-                    [&x, &y, &sad],
-                    [None, None, Some(v.sad)],
-                    true,
-                    aux,
-                    planes,
-                    |out, p, base, n, l| {
-                        row::fast_sad(out, p, next, base, n, l);
-                    },
-                );
-            }
-            Algo::NoMaskSad { median } => {
-                let (bx, by) = vec2(v.bwd_x, v.bwd_y, fwd);
-                let (fx, fy) = vec2(v.fwd_x, v.fwd_y, rev);
-                let sad = mask(v.sad);
-                self.walk(
-                    pass,
-                    interp,
-                    [&bx, &by, &fx, &fy, &sad],
-                    [None, None, None, None, Some(v.sad)],
-                    false,
-                    aux,
-                    planes,
-                    |out, p, base, n, l| {
-                        row::no_mask_sad(out, p, base, n, l, &weights, median);
-                    },
-                );
-            }
-            Algo::NormalSad { simple } => {
-                let (bx, by) = vec2(v.bwd_x, v.bwd_y, fwd);
-                let (fx, fy) = vec2(v.fwd_x, v.fwd_y, rev);
-                let (m9, m8) = (mask(v.cover_fwd), mask(v.cover_bwd));
-                let sad = mask(v.sad);
-                self.walk(
-                    pass,
-                    interp,
-                    [&bx, &by, &fx, &fy, &m9, &m8, &sad],
-                    [
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(v.cover_fwd),
-                        Some(v.cover_bwd),
-                        Some(v.sad),
-                    ],
-                    false,
-                    aux,
-                    planes,
-                    |out, p, base, n, l| row::normal_sad(out, p, base, n, l, &weights, simple),
-                );
-            }
-            Algo::Normal { simple } => {
-                let (bx, by) = vec2(v.bwd_x, v.bwd_y, fwd);
-                let (fx, fy) = vec2(v.fwd_x, v.fwd_y, rev);
-                let (m9, m8) = (mask(v.cover_fwd), mask(v.cover_bwd));
-                self.walk(
-                    pass,
-                    interp,
-                    [&bx, &by, &fx, &fy, &m9, &m8],
-                    [None, None, None, None, Some(v.cover_fwd), Some(v.cover_bwd)],
-                    false,
-                    aux,
-                    planes,
-                    |out, p, base, n, l| row::normal(out, p, base, n, l, &weights, simple),
-                );
-            }
-            Algo::Extended => {
-                let (bx, by) = vec2(v.bwd_x, v.bwd_y, fwd);
-                let (fx, fy) = vec2(v.fwd_x, v.fwd_y, rev);
-                let (px, py) = vec2(v.prev_bwd_x, v.prev_bwd_y, fwd);
-                let (nx, ny) = vec2(v.next_fwd_x, v.next_fwd_y, rev);
-                let (m9, m8) = (mask(v.cover_fwd), mask(v.cover_bwd));
-                self.walk(
-                    pass,
-                    interp,
-                    [&bx, &by, &fx, &fy, &px, &py, &nx, &ny, &m9, &m8],
-                    [
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(v.cover_fwd),
-                        Some(v.cover_bwd),
-                    ],
-                    false,
-                    aux,
-                    planes,
-                    |out, p, base, n, l| row::extended(out, p, base, n, l, &weights),
-                );
-            }
-            Algo::ExtendedSad => {
-                let (bx, by) = vec2(v.bwd_x, v.bwd_y, fwd);
-                let (fx, fy) = vec2(v.fwd_x, v.fwd_y, rev);
-                let (px, py) = vec2(v.prev_bwd_x, v.prev_bwd_y, fwd);
-                let (nx, ny) = vec2(v.next_fwd_x, v.next_fwd_y, rev);
-                let (m9, m8) = (mask(v.cover_fwd), mask(v.cover_bwd));
-                let sad = mask(v.sad);
-                self.walk(
-                    pass,
-                    interp,
-                    [&bx, &by, &fx, &fy, &px, &py, &nx, &ny, &m9, &m8, &sad],
-                    [
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(v.cover_fwd),
-                        Some(v.cover_bwd),
-                        Some(v.sad),
-                    ],
-                    false,
-                    aux,
-                    planes,
-                    |out, p, base, n, l| row::extended_sad(out, p, base, n, l, &weights),
-                );
-            }
-            Algo::Fill => {}
-        }
+        });
     }
 
     fn bilinear(&self, buf: &[u8], skip: i32, x: i32, y: i32, pass: &Pass<'_>) -> u8 {
@@ -1386,6 +1607,8 @@ impl Renderer {
         skip_rows: bool,
         aux: Option<(Plane<'_, T>, Plane<'_, T>)>,
         planes: &mut [(&mut PlaneMut<'_, T>, Plane<'_, T>, Plane<'_, T>)],
+        lanes_buf: &mut Vec<i32>,
+        blocks: &mut Vec<BlockEntry>,
         kernel: K,
     ) where
         K: Fn(&mut [T], &row::Prepared<'_, T>, i32, usize, &[&[i32]; N]),
@@ -1412,19 +1635,19 @@ impl Renderer {
             vector_weights,
             vector_shift,
         };
-        let sources: Vec<(Plane<'_, T>, Plane<'_, T>)> =
-            planes.iter().map(|(_, a, b)| (*a, *b)).collect();
-        let prepared: Vec<row::Prepared<'_, T>> = sources
-            .iter()
-            .enumerate()
-            .map(|(index, (a, b))| row::Prepared::new(&setup, a, b, aux, index))
-            .collect();
+        assert!(planes.len() <= 2);
+        let mut prepared: [Option<row::Prepared<'_, T>>; 2] = [None, None];
+        for (index, (_, a, b)) in planes.iter().enumerate() {
+            prepared[index] = Some(row::Prepared::new(&setup, a, b, aux, index));
+        }
         const { assert!(N <= 16) };
         let width = usize::try_from(pass.width).unwrap_or(0);
-        let span = width + MAX_STEP + 8;
-        let mut lanes = vec![0i32; N * span];
-        let mut blocks: Vec<(i32, usize, [i16; 32], [i16; 32])> =
-            Vec::with_capacity(usize::try_from(grid_w).unwrap_or(0) + 1);
+        let span = width + MAX_STEP + 16;
+        let need = N * span;
+        if lanes_buf.len() < need {
+            lanes_buf.resize(need, 0);
+        }
+        let lanes = &mut lanes_buf[..need];
         let mut pairs = [0i32; N];
         for by in pass.blocks.start.max(-1)..pass.blocks.end.min(grid_h) {
             let (py0, rows) = pass.block_rows(interp, grid_h, by);
@@ -1491,11 +1714,11 @@ impl Renderer {
                 let wt = pass.y_weights[(pass.step_y - ry) as usize];
                 let wb = pass.y_weights[ry as usize];
                 let shift_y = pass.shift_y.min(15);
-                for (px0, cols, top, bottom) in &blocks {
+                for (px0, cols, top, bottom) in blocks.iter() {
                     if interp {
                         row::fill_block::<N>(
                             &setup,
-                            &mut lanes,
+                            lanes,
                             (span, *px0 as usize, *cols),
                             (top, bottom),
                             (wt, wb, shift_y),
@@ -1528,9 +1751,11 @@ impl Renderer {
                 let view: [&[i32]; N] = std::array::from_fn(|k| &lanes[k * span..(k + 1) * span]);
                 let base = pel * py * pitch;
                 for ((dst, _, _), prepared) in planes.iter_mut().zip(&prepared) {
-                    let row_start = (py - pass.row_base) as usize * dst.pitch;
-                    let end = (row_start + width).min(dst.data.len());
-                    kernel(&mut dst.data[row_start..end], prepared, base, width, &view);
+                    if let Some(prepared) = prepared {
+                        let row_start = (py - pass.row_base) as usize * dst.pitch;
+                        let end = (row_start + width).min(dst.data.len());
+                        kernel(&mut dst.data[row_start..end], prepared, base, width, &view);
+                    }
                 }
             }
         }
@@ -1561,6 +1786,7 @@ mod row {
     #[allow(
         unsafe_code,
         unused_unsafe,
+        unsafe_op_in_unsafe_fn,
         clippy::cast_ptr_alignment,
         clippy::inline_always,
         clippy::many_single_char_names,
@@ -1568,21 +1794,40 @@ mod row {
     )]
     mod imp {
         use std::arch::x86_64::{
-            __m128i, __m256i, _mm_cvtsi32_si128, _mm_loadl_epi64, _mm_loadu_si128, _mm_packs_epi32,
-            _mm_packus_epi16, _mm_packus_epi32, _mm_storel_epi64, _mm_storeu_si128,
-            _mm256_add_epi16, _mm256_add_epi32, _mm256_and_si256, _mm256_castsi256_si128,
-            _mm256_cmpeq_epi32, _mm256_cvtepu8_epi32, _mm256_cvtepu16_epi32, _mm256_cvtsi256_si32,
+            __m128i, __m256i, __m512i, _mm_cvtsi32_si128, _mm_cvtsi128_si32, _mm_loadl_epi64,
+            _mm_loadu_si128, _mm_packs_epi32, _mm_packus_epi16, _mm_packus_epi32, _mm_storel_epi64,
+            _mm_storeu_si128, _mm256_add_epi16, _mm256_add_epi32, _mm256_and_si256,
+            _mm256_broadcastsi128_si256, _mm256_castsi256_si128, _mm256_cmpeq_epi32,
+            _mm256_cvtepu8_epi32, _mm256_cvtepu16_epi32, _mm256_cvtsi256_si32,
             _mm256_extracti128_si256, _mm256_i32gather_epi32, _mm256_loadu_si256,
             _mm256_madd_epi16, _mm256_max_epi32, _mm256_min_epi32, _mm256_movemask_epi8,
-            _mm256_mullo_epi16, _mm256_mullo_epi32, _mm256_permutevar8x32_epi32, _mm256_set1_epi16,
-            _mm256_set1_epi32, _mm256_setr_epi32, _mm256_shuffle_epi8, _mm256_sll_epi32,
-            _mm256_slli_epi32, _mm256_sra_epi16, _mm256_sra_epi32, _mm256_srai_epi32,
-            _mm256_srli_epi32, _mm256_storeu_si256, _mm256_sub_epi32,
+            _mm256_mullo_epi16, _mm256_mullo_epi32, _mm256_or_si256, _mm256_permutevar8x32_epi32,
+            _mm256_set1_epi16, _mm256_set1_epi32, _mm256_setr_epi32, _mm256_shuffle_epi8,
+            _mm256_sll_epi32, _mm256_slli_epi32, _mm256_sra_epi16, _mm256_sra_epi32,
+            _mm256_srai_epi32, _mm256_srli_epi32, _mm256_storeu_si256, _mm256_sub_epi32,
+            _mm256_testz_si256, _mm512_add_epi32, _mm512_and_si512, _mm512_castsi512_si128,
+            _mm512_cmpeq_epi32_mask, _mm512_cvtepu8_epi32, _mm512_cvtepu16_epi32,
+            _mm512_cvtusepi32_epi8, _mm512_cvtusepi32_epi16, _mm512_i32gather_epi32,
+            _mm512_loadu_si512, _mm512_max_epi32, _mm512_min_epi32, _mm512_mullo_epi32,
+            _mm512_permutexvar_epi8, _mm512_permutexvar_epi16, _mm512_set1_epi32,
+            _mm512_setr_epi32, _mm512_setzero_si512, _mm512_slli_epi32, _mm512_srai_epi32,
+            _mm512_srli_epi32, _mm512_srlv_epi32, _mm512_sub_epi32, _mm512_test_epi32_mask,
         };
         use std::marker::PhantomData;
+        use std::sync::OnceLock;
 
         use super::super::{Plane, Sample};
         use super::{MAX_STEP, Setup, Weights};
+
+        fn has_avx512() -> bool {
+            static FLAG: OnceLock<bool> = OnceLock::new();
+            *FLAG.get_or_init(|| {
+                std::arch::is_x86_feature_detected!("avx512f")
+                    && std::arch::is_x86_feature_detected!("avx512bw")
+                    && std::arch::is_x86_feature_detected!("avx512vl")
+                    && std::arch::is_x86_feature_detected!("avx512vbmi")
+            })
+        }
 
         #[derive(Clone, Copy)]
         struct Source<T> {
@@ -1591,6 +1836,7 @@ mod row {
             last: __m256i,
             safe: __m256i,
             offsets: __m256i,
+            len: i32,
             valid: bool,
             padded: bool,
             readable: usize,
@@ -1615,6 +1861,7 @@ mod row {
                             _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
                             _mm256_set1_epi32(pel),
                         ),
+                        len,
                         valid: len >= Self::WORD,
                         padded: plane.slack + 1 >= Self::WORD as usize,
                         readable: plane.data.len() + plane.slack,
@@ -1639,6 +1886,22 @@ mod row {
                         return value;
                     }
                     let index = _mm256_min_epi32(_mm256_max_epi32(index, zero), self.last);
+                    if Self::SIZE == 1 && self.pel == 1 {
+                        let cfirst = _mm256_cvtsi256_si32(index);
+                        let win_base = (cfirst - 2).max(0);
+                        let rel = _mm256_sub_epi32(index, _mm256_set1_epi32(win_base));
+                        if _mm256_testz_si256(rel, _mm256_set1_epi32(!15)) != 0
+                            && (win_base as usize) + 16 <= self.readable
+                        {
+                            let win = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                                self.data.add(win_base as usize).cast::<__m128i>(),
+                            ));
+                            return _mm256_shuffle_epi8(
+                                win,
+                                _mm256_or_si256(rel, _mm256_set1_epi32(0x8080_8000u32 as i32)),
+                            );
+                        }
+                    }
                     if self.padded {
                         let words = self.gather(index);
                         return _mm256_and_si256(words, _mm256_set1_epi32(Self::MASK));
@@ -1733,6 +1996,8 @@ mod row {
             step: __m256i,
             pel: i32,
             pitch: __m256i,
+            pitch_i32: i32,
+            avx512: bool,
             aux_a: Source<T>,
             aux_b: Source<T>,
             pub(in super::super) index: usize,
@@ -1769,6 +2034,8 @@ mod row {
                         step: _mm256_set1_epi32(8 * pel),
                         pel,
                         pitch: _mm256_set1_epi32(setup.pitch),
+                        pitch_i32: setup.pitch,
+                        avx512: has_avx512(),
                         _life: PhantomData,
                     }
                 }
@@ -1949,6 +2216,1217 @@ mod row {
             unsafe { _mm256_srli_epi32::<8>(a) }
         }
 
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        #[inline]
+        unsafe fn load512<T: Sample>(src: &Source<T>, start: i32) -> Option<__m512i> {
+            let start = start as usize;
+            let span = 16 * src.pel as usize;
+            if start + span.max(16 / Source::<T>::SIZE) > src.readable {
+                return None;
+            }
+            let at = src.data.add(start);
+            if Source::<T>::SIZE == 2 {
+                return match src.pel {
+                    1 => Some(_mm512_cvtepu16_epi32(_mm256_loadu_si256(
+                        at.cast::<__m256i>(),
+                    ))),
+                    2 => Some(_mm512_and_si512(
+                        _mm512_loadu_si512(at.cast::<__m512i>()),
+                        _mm512_set1_epi32(0xFFFF),
+                    )),
+                    _ => None,
+                };
+            }
+            match src.pel {
+                1 => Some(_mm512_cvtepu8_epi32(_mm_loadu_si128(at.cast::<__m128i>()))),
+                2 => Some(_mm512_and_si512(
+                    _mm512_cvtepu16_epi32(_mm256_loadu_si256(at.cast::<__m256i>())),
+                    _mm512_set1_epi32(0xFF),
+                )),
+                4 => Some(_mm512_and_si512(
+                    _mm512_loadu_si512(at.cast::<__m512i>()),
+                    _mm512_set1_epi32(0xFF),
+                )),
+                _ => None,
+            }
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        #[inline]
+        unsafe fn gather512<T: Sample>(src: &Source<T>, index: __m512i) -> __m512i {
+            if Source::<T>::SIZE == 1 {
+                _mm512_i32gather_epi32::<1>(index, src.ptr)
+            } else {
+                _mm512_i32gather_epi32::<2>(index, src.ptr)
+            }
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        #[inline]
+        unsafe fn fetch512<T: Sample>(src: &Source<T>, index: __m512i, offsets: __m512i) -> __m512i {
+            let zero = _mm512_setzero_si512();
+            if !src.valid {
+                return zero;
+            }
+            let first = _mm_cvtsi128_si32(_mm512_castsi512_si128(index));
+            let run = _mm512_add_epi32(_mm512_set1_epi32(first), offsets);
+            if first >= 0
+                && _mm512_cmpeq_epi32_mask(index, run) == 0xFFFF
+                && let Some(value) = load512(src, first)
+            {
+                return value;
+            }
+            let last = _mm512_set1_epi32(src.len - 1);
+            let index = _mm512_min_epi32(_mm512_max_epi32(index, zero), last);
+            let cfirst = _mm_cvtsi128_si32(_mm512_castsi512_si128(index));
+            if Source::<T>::SIZE == 1 {
+                let win_base = if src.pel == 4 {
+                    cfirst.max(0)
+                } else {
+                    (cfirst - 4).max(0)
+                };
+                let rel = _mm512_sub_epi32(index, _mm512_set1_epi32(win_base));
+                if _mm512_test_epi32_mask(rel, _mm512_set1_epi32(!63)) == 0
+                    && (win_base as usize) + 64 <= src.readable
+                {
+                    let win = _mm512_loadu_si512(src.data.add(win_base as usize).cast::<__m512i>());
+                    return _mm512_and_si512(
+                        _mm512_permutexvar_epi8(rel, win),
+                        _mm512_set1_epi32(0xFF),
+                    );
+                }
+            } else {
+                let win_base = (cfirst - 2).max(0);
+                let rel = _mm512_sub_epi32(index, _mm512_set1_epi32(win_base));
+                if _mm512_test_epi32_mask(rel, _mm512_set1_epi32(!31)) == 0
+                    && (win_base as usize) + 32 <= src.readable
+                {
+                    let win = _mm512_loadu_si512(src.data.add(win_base as usize).cast::<__m512i>());
+                    return _mm512_and_si512(
+                        _mm512_permutexvar_epi16(rel, win),
+                        _mm512_set1_epi32(0xFFFF),
+                    );
+                }
+            }
+            if src.padded {
+                return _mm512_and_si512(
+                    gather512(src, index),
+                    _mm512_set1_epi32(Source::<T>::MASK),
+                );
+            }
+            let safe = _mm512_set1_epi32(src.len - Source::<T>::WORD);
+            let base = _mm512_min_epi32(index, safe);
+            let offset = _mm512_sub_epi32(index, base);
+            let shift = if Source::<T>::SIZE == 1 {
+                _mm512_slli_epi32::<3>(offset)
+            } else {
+                _mm512_slli_epi32::<4>(offset)
+            };
+            _mm512_and_si512(
+                _mm512_srlv_epi32(gather512(src, base), shift),
+                _mm512_set1_epi32(Source::<T>::MASK),
+            )
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        #[inline]
+        unsafe fn still512<T: Sample>(
+            src: &Source<T>,
+            start: i32,
+            chunk: __m512i,
+            offsets: __m512i,
+        ) -> __m512i {
+            load512(src, start).unwrap_or_else(|| fetch512(src, chunk, offsets))
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        #[inline]
+        unsafe fn lane512(values: &[i32], c: usize) -> __m512i {
+            assert!(c + 16 <= values.len());
+            _mm512_loadu_si512(values.as_ptr().add(c).cast::<__m512i>())
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        #[inline]
+        unsafe fn at512(
+            chunk: __m512i,
+            pitch: __m512i,
+            x: &[i32],
+            y: &[i32],
+            c: usize,
+        ) -> __m512i {
+            let xv = lane512(x, c);
+            let yv = lane512(y, c);
+            _mm512_add_epi32(_mm512_add_epi32(chunk, xv), _mm512_mullo_epi32(yv, pitch))
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        #[inline]
+        unsafe fn offsets512(pel: i32) -> __m512i {
+            _mm512_mullo_epi32(
+                _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+                _mm512_set1_epi32(pel),
+            )
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        #[inline]
+        unsafe fn store512<T: Sample>(out: &mut [T], c: usize, n: usize, value: __m512i) {
+            let clamped = _mm512_max_epi32(value, _mm512_setzero_si512());
+            if c + 16 <= out.len() {
+                let ptr = out.as_mut_ptr().add(c);
+                if size_of::<T>() == 1 {
+                    _mm_storeu_si128(ptr.cast::<__m128i>(), _mm512_cvtusepi32_epi8(clamped));
+                } else {
+                    _mm256_storeu_si256(ptr.cast::<__m256i>(), _mm512_cvtusepi32_epi16(clamped));
+                }
+            } else {
+                let mut tmp = [T::default(); 16];
+                if size_of::<T>() == 1 {
+                    _mm_storeu_si128(
+                        tmp.as_mut_ptr().cast::<__m128i>(),
+                        _mm512_cvtusepi32_epi8(clamped),
+                    );
+                } else {
+                    _mm256_storeu_si256(
+                        tmp.as_mut_ptr().cast::<__m256i>(),
+                        _mm512_cvtusepi32_epi16(clamped),
+                    );
+                }
+                let take = (n - c).min(out.len().saturating_sub(c)).min(16);
+                out[c..c + take].copy_from_slice(&tmp[..take]);
+            }
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        unsafe fn fast_512<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            next: bool,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 2],
+        ) {
+            let src = if next { &p.a } else { &p.b };
+            let offsets = offsets512(p.pel);
+            let step = _mm512_set1_epi32(16 * p.pel);
+            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let mut chunk = _mm512_add_epi32(_mm512_set1_epi32(base), offsets);
+            let mut c = 0;
+            while c < n {
+                let value = fetch512(src, at512(chunk, pitch, l[0], l[1], c), offsets);
+                store512(out, c, n, value);
+                chunk = _mm512_add_epi32(chunk, step);
+                c += 16;
+            }
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        unsafe fn no_mask_512<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 4],
+            w: &Weights,
+            median: bool,
+        ) {
+            let offsets = offsets512(p.pel);
+            let step = _mm512_set1_epi32(16 * p.pel);
+            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let (t, rt, tb, rtb) = (
+                _mm512_set1_epi32(w.t),
+                _mm512_set1_epi32(w.rt),
+                _mm512_set1_epi32(w.tb),
+                _mm512_set1_epi32(w.rtb),
+            );
+            let mut chunk = _mm512_add_epi32(_mm512_set1_epi32(base), offsets);
+            let mut start = base;
+            let mut c = 0;
+            while c < n {
+                let pb = fetch512(&p.b, at512(chunk, pitch, l[0], l[1], c), offsets);
+                let pa = fetch512(&p.a, at512(chunk, pitch, l[2], l[3], c), offsets);
+                let value = if median {
+                    let b0 = still512(&p.b, start, chunk, offsets);
+                    let a0 = still512(&p.a, start, chunk, offsets);
+                    let mid = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                        _mm512_mullo_epi32(rtb, b0),
+                        _mm512_mullo_epi32(tb, a0),
+                    ));
+                    _mm512_max_epi32(
+                        _mm512_min_epi32(mid, _mm512_max_epi32(pb, pa)),
+                        _mm512_min_epi32(pb, pa),
+                    )
+                } else {
+                    _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                        _mm512_mullo_epi32(rt, pb),
+                        _mm512_mullo_epi32(t, pa),
+                    ))
+                };
+                store512(out, c, n, value);
+                start += 16 * p.pel;
+                chunk = _mm512_add_epi32(chunk, step);
+                c += 16;
+            }
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        unsafe fn normal_512<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 6],
+            w: &Weights,
+            simple: bool,
+        ) {
+            let offsets = offsets512(p.pel);
+            let step = _mm512_set1_epi32(16 * p.pel);
+            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let (t, rt, full) = (
+                _mm512_set1_epi32(w.t),
+                _mm512_set1_epi32(w.rt),
+                _mm512_set1_epi32(255),
+            );
+            let mut chunk = _mm512_add_epi32(_mm512_set1_epi32(base), offsets);
+            let mut start = base;
+            let mut c = 0;
+            while c < n {
+                let pb = fetch512(&p.b, at512(chunk, pitch, l[0], l[1], c), offsets);
+                let pa = fetch512(&p.a, at512(chunk, pitch, l[2], l[3], c), offsets);
+                let m9 = lane512(l[4], c);
+                let m8 = lane512(l[5], c);
+                let (first, second) = if simple {
+                    let f = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                        _mm512_add_epi32(
+                            _mm512_mullo_epi32(_mm512_sub_epi32(full, m9), pb),
+                            _mm512_mullo_epi32(m9, pa),
+                        ),
+                        full,
+                    ));
+                    let s = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                        _mm512_add_epi32(
+                            _mm512_mullo_epi32(_mm512_sub_epi32(full, m8), pa),
+                            _mm512_mullo_epi32(m8, pb),
+                        ),
+                        full,
+                    ));
+                    (f, s)
+                } else {
+                    let bb = _mm512_mullo_epi32(_mm512_sub_epi32(full, m9), pb);
+                    let aa = _mm512_mullo_epi32(_mm512_sub_epi32(full, m8), pa);
+                    let b0 = still512(&p.b, start, chunk, offsets);
+                    let a0 = still512(&p.a, start, chunk, offsets);
+                    let inner1 = _mm512_srli_epi32::<8>(_mm512_add_epi32(
+                        _mm512_mullo_epi32(m9, _mm512_add_epi32(aa, _mm512_mullo_epi32(m8, b0))),
+                        full,
+                    ));
+                    let first = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                        _mm512_add_epi32(bb, inner1),
+                        full,
+                    ));
+                    let inner2 = _mm512_srli_epi32::<8>(_mm512_add_epi32(
+                        _mm512_mullo_epi32(_mm512_add_epi32(bb, _mm512_mullo_epi32(a0, m9)), m8),
+                        full,
+                    ));
+                    let second = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                        _mm512_add_epi32(aa, inner2),
+                        full,
+                    ));
+                    (first, second)
+                };
+                let value = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_mullo_epi32(rt, first),
+                    _mm512_mullo_epi32(t, second),
+                ));
+                store512(out, c, n, value);
+                start += 16 * p.pel;
+                chunk = _mm512_add_epi32(chunk, step);
+                c += 16;
+            }
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        unsafe fn extended_512<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 10],
+            w: &Weights,
+        ) {
+            let offsets = offsets512(p.pel);
+            let step = _mm512_set1_epi32(16 * p.pel);
+            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let (t, full) = (_mm512_set1_epi32(w.t), _mm512_set1_epi32(255));
+            let mut chunk = _mm512_add_epi32(_mm512_set1_epi32(base), offsets);
+            let mut c = 0;
+            while c < n {
+                let c0 = fetch512(&p.b, at512(chunk, pitch, l[0], l[1], c), offsets);
+                let n0 = fetch512(&p.a, at512(chunk, pitch, l[2], l[3], c), offsets);
+                let c1 = fetch512(&p.b, at512(chunk, pitch, l[4], l[5], c), offsets);
+                let n1 = fetch512(&p.a, at512(chunk, pitch, l[6], l[7], c), offsets);
+                let m9 = lane512(l[8], c);
+                let m8 = lane512(l[9], c);
+                let lo = _mm512_min_epi32(c0, n0);
+                let hi = _mm512_max_epi32(c0, n0);
+                let cn = _mm512_max_epi32(lo, _mm512_min_epi32(n1, hi));
+                let cc = _mm512_max_epi32(lo, _mm512_min_epi32(c1, hi));
+                let c0_255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(c0), c0);
+                let first = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_add_epi32(c0_255, _mm512_mullo_epi32(m9, _mm512_sub_epi32(cn, c0))),
+                    full,
+                ));
+                let n0_255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(n0), n0);
+                let second = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_add_epi32(n0_255, _mm512_mullo_epi32(m8, _mm512_sub_epi32(cc, n0))),
+                    full,
+                ));
+                let value = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_slli_epi32::<8>(first),
+                    _mm512_mullo_epi32(t, _mm512_sub_epi32(second, first)),
+                ));
+                store512(out, c, n, value);
+                chunk = _mm512_add_epi32(chunk, step);
+                c += 16;
+            }
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        unsafe fn fast_sad_512<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            next: bool,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 3],
+        ) {
+            let src = if next { &p.a } else { &p.b };
+            let offsets = offsets512(p.pel);
+            let step = _mm512_set1_epi32(16 * p.pel);
+            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let full = _mm512_set1_epi32(255);
+            let mut chunk = _mm512_add_epi32(_mm512_set1_epi32(base), offsets);
+            let mut start = base;
+            let mut c = 0;
+            while c < n {
+                let moved = fetch512(src, at512(chunk, pitch, l[0], l[1], c), offsets);
+                let still = still512(src, start, chunk, offsets);
+                let s = lane512(l[2], c);
+                let value = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_add_epi32(
+                        _mm512_mullo_epi32(_mm512_sub_epi32(full, s), moved),
+                        _mm512_mullo_epi32(s, still),
+                    ),
+                    full,
+                ));
+                store512(out, c, n, value);
+                start += 16 * p.pel;
+                chunk = _mm512_add_epi32(chunk, step);
+                c += 16;
+            }
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        unsafe fn no_mask_sad_512<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 5],
+            w: &Weights,
+            median: bool,
+        ) {
+            let offsets = offsets512(p.pel);
+            let step = _mm512_set1_epi32(16 * p.pel);
+            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let (t, rt, tb, rtb, full) = (
+                _mm512_set1_epi32(w.t),
+                _mm512_set1_epi32(w.rt),
+                _mm512_set1_epi32(w.tb),
+                _mm512_set1_epi32(w.rtb),
+                _mm512_set1_epi32(255),
+            );
+            let mut chunk = _mm512_add_epi32(_mm512_set1_epi32(base), offsets);
+            let mut start = base;
+            let mut c = 0;
+            while c < n {
+                let pb = fetch512(&p.b, at512(chunk, pitch, l[0], l[1], c), offsets);
+                let pa = fetch512(&p.a, at512(chunk, pitch, l[2], l[3], c), offsets);
+                let s = lane512(l[4], c);
+                let b0 = still512(&p.b, start, chunk, offsets);
+                let a0 = still512(&p.a, start, chunk, offsets);
+                let mid = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_mullo_epi32(rtb, b0),
+                    _mm512_mullo_epi32(tb, a0),
+                ));
+                let value = if median {
+                    _mm512_max_epi32(
+                        _mm512_min_epi32(mid, _mm512_max_epi32(pb, pa)),
+                        _mm512_min_epi32(pb, pa),
+                    )
+                } else {
+                    _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                        _mm512_mullo_epi32(rt, pb),
+                        _mm512_mullo_epi32(t, pa),
+                    ))
+                };
+                let res = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_add_epi32(
+                        _mm512_mullo_epi32(_mm512_sub_epi32(full, s), value),
+                        _mm512_mullo_epi32(s, mid),
+                    ),
+                    full,
+                ));
+                store512(out, c, n, res);
+                start += 16 * p.pel;
+                chunk = _mm512_add_epi32(chunk, step);
+                c += 16;
+            }
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        unsafe fn normal_sad_512<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 7],
+            w: &Weights,
+            simple: bool,
+        ) {
+            let offsets = offsets512(p.pel);
+            let step = _mm512_set1_epi32(16 * p.pel);
+            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let (t, rt, tb, rtb, full, wrap) = (
+                _mm512_set1_epi32(w.t),
+                _mm512_set1_epi32(w.rt),
+                _mm512_set1_epi32(w.tb),
+                _mm512_set1_epi32(w.rtb),
+                _mm512_set1_epi32(255),
+                _mm512_set1_epi32(w.wrap),
+            );
+            let odd = _mm512_set1_epi32(265 - w.tb);
+            let mut chunk = _mm512_add_epi32(_mm512_set1_epi32(base), offsets);
+            let mut start = base;
+            let mut c = 0;
+            while c < n {
+                let pb = fetch512(&p.b, at512(chunk, pitch, l[0], l[1], c), offsets);
+                let pa = fetch512(&p.a, at512(chunk, pitch, l[2], l[3], c), offsets);
+                let m9 = lane512(l[4], c);
+                let m8 = lane512(l[5], c);
+                let s = lane512(l[6], c);
+                let first = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_add_epi32(
+                        _mm512_mullo_epi32(_mm512_sub_epi32(full, m9), pb),
+                        _mm512_mullo_epi32(m9, pa),
+                    ),
+                    full,
+                ));
+                let second = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_add_epi32(
+                        _mm512_mullo_epi32(_mm512_sub_epi32(full, m8), pa),
+                        _mm512_mullo_epi32(m8, pb),
+                    ),
+                    full,
+                ));
+                let b0 = still512(&p.b, start, chunk, offsets);
+                let a0 = still512(&p.a, start, chunk, offsets);
+                let (value, mid) = if simple {
+                    let value = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                        _mm512_mullo_epi32(rt, first),
+                        _mm512_mullo_epi32(t, second),
+                    ));
+                    let weight = if p.index == 1 { odd } else { rtb };
+                    let mixed = _mm512_and_si512(
+                        _mm512_add_epi32(
+                            _mm512_mullo_epi32(weight, b0),
+                            _mm512_mullo_epi32(tb, a0),
+                        ),
+                        wrap,
+                    );
+                    (value, _mm512_srai_epi32::<8>(mixed))
+                } else {
+                    let ab0 = still512(&p.aux_b, start, chunk, offsets);
+                    let aa0 = still512(&p.aux_a, start, chunk, offsets);
+                    let time = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                        _mm512_mullo_epi32(rt, ab0),
+                        _mm512_mullo_epi32(t, aa0),
+                    ));
+                    let value = _mm512_max_epi32(
+                        _mm512_min_epi32(time, _mm512_max_epi32(first, second)),
+                        _mm512_min_epi32(first, second),
+                    );
+                    let mid = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                        _mm512_mullo_epi32(rtb, b0),
+                        _mm512_mullo_epi32(tb, a0),
+                    ));
+                    (value, mid)
+                };
+                let res = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_add_epi32(
+                        _mm512_mullo_epi32(_mm512_sub_epi32(full, s), value),
+                        _mm512_mullo_epi32(s, mid),
+                    ),
+                    full,
+                ));
+                store512(out, c, n, res);
+                start += 16 * p.pel;
+                chunk = _mm512_add_epi32(chunk, step);
+                c += 16;
+            }
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+        unsafe fn extended_sad_512<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 11],
+            w: &Weights,
+        ) {
+            let offsets = offsets512(p.pel);
+            let step = _mm512_set1_epi32(16 * p.pel);
+            let pitch = _mm512_set1_epi32(p.pitch_i32);
+            let (t, tb, rtb, full) = (
+                _mm512_set1_epi32(w.t),
+                _mm512_set1_epi32(w.tb),
+                _mm512_set1_epi32(w.rtb),
+                _mm512_set1_epi32(255),
+            );
+            let mut chunk = _mm512_add_epi32(_mm512_set1_epi32(base), offsets);
+            let mut start = base;
+            let mut c = 0;
+            while c < n {
+                let c0 = fetch512(&p.b, at512(chunk, pitch, l[0], l[1], c), offsets);
+                let n0 = fetch512(&p.a, at512(chunk, pitch, l[2], l[3], c), offsets);
+                let c1 = fetch512(&p.b, at512(chunk, pitch, l[4], l[5], c), offsets);
+                let n1 = fetch512(&p.a, at512(chunk, pitch, l[6], l[7], c), offsets);
+                let m9 = lane512(l[8], c);
+                let m8 = lane512(l[9], c);
+                let s = lane512(l[10], c);
+                let lo = _mm512_min_epi32(c0, n0);
+                let hi = _mm512_max_epi32(c0, n0);
+                let cn = _mm512_max_epi32(lo, _mm512_min_epi32(n1, hi));
+                let cc = _mm512_max_epi32(lo, _mm512_min_epi32(c1, hi));
+                let c0_255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(c0), c0);
+                let first = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_add_epi32(c0_255, _mm512_mullo_epi32(m9, _mm512_sub_epi32(cn, c0))),
+                    full,
+                ));
+                let n0_255 = _mm512_sub_epi32(_mm512_slli_epi32::<8>(n0), n0);
+                let second = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_add_epi32(n0_255, _mm512_mullo_epi32(m8, _mm512_sub_epi32(cc, n0))),
+                    full,
+                ));
+                let value = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_slli_epi32::<8>(first),
+                    _mm512_mullo_epi32(t, _mm512_sub_epi32(second, first)),
+                ));
+                let b0 = still512(&p.b, start, chunk, offsets);
+                let a0 = still512(&p.a, start, chunk, offsets);
+                let mid = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_mullo_epi32(rtb, b0),
+                    _mm512_mullo_epi32(tb, a0),
+                ));
+                let res = _mm512_srai_epi32::<8>(_mm512_add_epi32(
+                    _mm512_add_epi32(
+                        _mm512_mullo_epi32(_mm512_sub_epi32(full, s), value),
+                        _mm512_mullo_epi32(s, mid),
+                    ),
+                    full,
+                ));
+                store512(out, c, n, res);
+                start += 16 * p.pel;
+                chunk = _mm512_add_epi32(chunk, step);
+                c += 16;
+            }
+        }
+
+        pub(in super::super) fn fast<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            next: bool,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 2],
+        ) {
+            if p.avx512 {
+                unsafe { fast_512(out, p, next, base, n, l) };
+                return;
+            }
+            let src = if next { p.a } else { p.b };
+            p.run(out, base, n, |c, chunk, _| {
+                src.fetch(p.at(chunk, l[0], l[1], c))
+            });
+        }
+
+        pub(in super::super) fn no_mask<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 4],
+            w: &Weights,
+            median: bool,
+        ) {
+            if p.avx512 {
+                unsafe { no_mask_512(out, p, base, n, l, w, median) };
+                return;
+            }
+            let (t, rt, tb, rtb) = (splat(w.t), splat(w.rt), splat(w.tb), splat(w.rtb));
+            p.run(out, base, n, |c, chunk, start| {
+                let pb = p.b.fetch(p.at(chunk, l[0], l[1], c));
+                let pa = p.a.fetch(p.at(chunk, l[2], l[3], c));
+                if median {
+                    let b0 = p.b.still(start, chunk);
+                    let a0 = p.a.still(start, chunk);
+                    let mid = shr8(add(mul(rtb, b0), mul(tb, a0)));
+                    max(min(mid, max(pb, pa)), min(pb, pa))
+                } else {
+                    shr8(add(mul(rt, pb), mul(t, pa)))
+                }
+            });
+        }
+
+        pub(in super::super) fn normal<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 6],
+            w: &Weights,
+            simple: bool,
+        ) {
+            if p.avx512 {
+                unsafe { normal_512(out, p, base, n, l, w, simple) };
+                return;
+            }
+            let (t, rt, full) = (splat(w.t), splat(w.rt), splat(255));
+            p.run(out, base, n, |c, chunk, start| {
+                let pb = p.b.fetch(p.at(chunk, l[0], l[1], c));
+                let pa = p.a.fetch(p.at(chunk, l[2], l[3], c));
+                let m9 = p.lane(l[4], c);
+                let m8 = p.lane(l[5], c);
+                let (first, second) = if simple {
+                    (
+                        shr8(add(add(mul(sub(full, m9), pb), mul(m9, pa)), full)),
+                        shr8(add(add(mul(sub(full, m8), pa), mul(m8, pb)), full)),
+                    )
+                } else {
+                    let bb = mul(sub(full, m9), pb);
+                    let aa = mul(sub(full, m8), pa);
+                    let b0 = p.b.still(start, chunk);
+                    let a0 = p.a.still(start, chunk);
+                    let inner = shr8u(add(mul(m9, add(aa, mul(m8, b0))), full));
+                    let first = shr8(add(add(bb, inner), full));
+                    let inner = shr8u(add(mul(add(bb, mul(a0, m9)), m8), full));
+                    (first, shr8(add(add(aa, inner), full)))
+                };
+                shr8(add(mul(rt, first), mul(t, second)))
+            });
+        }
+
+        pub(in super::super) fn extended<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 10],
+            w: &Weights,
+        ) {
+            if p.avx512 {
+                unsafe { extended_512(out, p, base, n, l, w) };
+                return;
+            }
+            let (t, full) = (splat(w.t), splat(255));
+            p.run(out, base, n, |c, chunk, _| {
+                let c0 = p.b.fetch(p.at(chunk, l[0], l[1], c));
+                let n0 = p.a.fetch(p.at(chunk, l[2], l[3], c));
+                let c1 = p.b.fetch(p.at(chunk, l[4], l[5], c));
+                let n1 = p.a.fetch(p.at(chunk, l[6], l[7], c));
+                let m9 = p.lane(l[8], c);
+                let m8 = p.lane(l[9], c);
+                let lo = min(c0, n0);
+                let hi = max(c0, n0);
+                let cn = max(lo, min(n1, hi));
+                let cc = max(lo, min(c1, hi));
+                let c0_255 = sub(unsafe { _mm256_slli_epi32::<8>(c0) }, c0);
+                let first = shr8(add(add(c0_255, mul(m9, sub(cn, c0))), full));
+                let n0_255 = sub(unsafe { _mm256_slli_epi32::<8>(n0) }, n0);
+                let second = shr8(add(add(n0_255, mul(m8, sub(cc, n0))), full));
+                shr8(add(
+                    unsafe { _mm256_slli_epi32::<8>(first) },
+                    mul(t, sub(second, first)),
+                ))
+            });
+        }
+
+        pub(in super::super) fn fast_sad<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            next: bool,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 3],
+        ) {
+            if p.avx512 {
+                unsafe { fast_sad_512(out, p, next, base, n, l) };
+                return;
+            }
+            let src = if next { p.a } else { p.b };
+            let full = splat(255);
+            p.run(out, base, n, |c, chunk, start| {
+                let moved = src.fetch(p.at(chunk, l[0], l[1], c));
+                let still = src.still(start, chunk);
+                let s = p.lane(l[2], c);
+                shr8(add(add(mul(sub(full, s), moved), mul(s, still)), full))
+            });
+        }
+
+        pub(in super::super) fn no_mask_sad<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 5],
+            w: &Weights,
+            median: bool,
+        ) {
+            if p.avx512 {
+                unsafe { no_mask_sad_512(out, p, base, n, l, w, median) };
+                return;
+            }
+            let (t, rt, tb, rtb, full) = (
+                splat(w.t),
+                splat(w.rt),
+                splat(w.tb),
+                splat(w.rtb),
+                splat(255),
+            );
+            p.run(out, base, n, |c, chunk, start| {
+                let pb = p.b.fetch(p.at(chunk, l[0], l[1], c));
+                let pa = p.a.fetch(p.at(chunk, l[2], l[3], c));
+                let s = p.lane(l[4], c);
+                let b0 = p.b.still(start, chunk);
+                let a0 = p.a.still(start, chunk);
+                let mid = shr8(add(mul(rtb, b0), mul(tb, a0)));
+                let value = if median {
+                    max(min(mid, max(pb, pa)), min(pb, pa))
+                } else {
+                    shr8(add(mul(rt, pb), mul(t, pa)))
+                };
+                shr8(add(add(mul(sub(full, s), value), mul(s, mid)), full))
+            });
+        }
+
+        pub(in super::super) fn normal_sad<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 7],
+            w: &Weights,
+            simple: bool,
+        ) {
+            if p.avx512 {
+                unsafe { normal_sad_512(out, p, base, n, l, w, simple) };
+                return;
+            }
+            let (t, rt, tb, rtb, full) = (
+                splat(w.t),
+                splat(w.rt),
+                splat(w.tb),
+                splat(w.rtb),
+                splat(255),
+            );
+            let odd = splat(265 - w.tb);
+            p.run(out, base, n, |c, chunk, start| {
+                let pb = p.b.fetch(p.at(chunk, l[0], l[1], c));
+                let pa = p.a.fetch(p.at(chunk, l[2], l[3], c));
+                let m9 = p.lane(l[4], c);
+                let m8 = p.lane(l[5], c);
+                let s = p.lane(l[6], c);
+                let first = shr8(add(add(mul(sub(full, m9), pb), mul(m9, pa)), full));
+                let second = shr8(add(add(mul(sub(full, m8), pa), mul(m8, pb)), full));
+                let b0 = p.b.still(start, chunk);
+                let a0 = p.a.still(start, chunk);
+                let (value, mid) = if simple {
+                    let value = shr8(add(mul(rt, first), mul(t, second)));
+                    let weight = if p.index == 1 { odd } else { rtb };
+                    let mixed = add(mul(weight, b0), mul(tb, a0));
+                    let mixed = unsafe { _mm256_and_si256(mixed, splat(w.wrap)) };
+                    (value, shr8(mixed))
+                } else {
+                    let ab0 = p.aux_b.still(start, chunk);
+                    let aa0 = p.aux_a.still(start, chunk);
+                    let time = shr8(add(mul(rt, ab0), mul(t, aa0)));
+                    let value = max(min(time, max(first, second)), min(first, second));
+                    (value, shr8(add(mul(rtb, b0), mul(tb, a0))))
+                };
+                shr8(add(add(mul(sub(full, s), value), mul(s, mid)), full))
+            });
+        }
+
+        pub(in super::super) fn extended_sad<T: Sample>(
+            out: &mut [T],
+            p: &Prepared<'_, T>,
+            base: i32,
+            n: usize,
+            l: &[&[i32]; 11],
+            w: &Weights,
+        ) {
+            if p.avx512 {
+                unsafe { extended_sad_512(out, p, base, n, l, w) };
+                return;
+            }
+            let (t, rt, tb, rtb, full) = (
+                splat(w.t),
+                splat(w.rt),
+                splat(w.tb),
+                splat(w.rtb),
+                splat(255),
+            );
+            p.run(out, base, n, |c, chunk, start| {
+                let c0 = p.b.fetch(p.at(chunk, l[0], l[1], c));
+                let n0 = p.a.fetch(p.at(chunk, l[2], l[3], c));
+                let c1 = p.b.fetch(p.at(chunk, l[4], l[5], c));
+                let n1 = p.a.fetch(p.at(chunk, l[6], l[7], c));
+                let m9 = p.lane(l[8], c);
+                let m8 = p.lane(l[9], c);
+                let s = p.lane(l[10], c);
+                let lo = min(c0, n0);
+                let hi = max(c0, n0);
+                let cn = max(lo, min(n1, hi));
+                let cc = max(lo, min(c1, hi));
+                let first = shr8(add(add(mul(m9, cn), mul(c0, sub(full, m9))), full));
+                let second = shr8(add(add(mul(m8, cc), mul(n0, sub(full, m8))), full));
+                let value = shr8(add(mul(rt, first), mul(t, second)));
+                let b0 = p.b.still(start, chunk);
+                let a0 = p.a.still(start, chunk);
+                let mid = shr8(add(mul(rtb, b0), mul(tb, a0)));
+                shr8(add(add(mul(sub(full, s), value), mul(s, mid)), full))
+            });
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[allow(
+        unsafe_code,
+        unused_unsafe,
+        clippy::cast_ptr_alignment,
+        clippy::inline_always,
+        clippy::many_single_char_names,
+        clippy::trivially_copy_pass_by_ref
+    )]
+    mod imp {
+        use std::arch::aarch64::{
+            int32x4_t, vaddq_s32, vandq_s32, vceqq_s32, vcombine_s16, vdupq_n_s32, vget_low_u16,
+            vgetq_lane_s32, vld1_u8, vld1_u16, vld1q_s32, vld1q_u8_x4, vmaxq_s32, vmaxvq_u32,
+            vminq_s32, vminvq_u32, vmovl_u8, vmovl_u16, vmulq_s32, vqmovn_s32, vqmovun_s16,
+            vqmovun_s32, vqtbl4q_u8, vreinterpretq_s32_u8, vreinterpretq_s32_u32,
+            vreinterpretq_u8_s32, vreinterpretq_u32_s32, vshlq_n_s32, vshrq_n_s32, vshrq_n_u32,
+            vst1_u16, vsubq_s32,
+        };
+        use std::marker::PhantomData;
+
+        use super::super::{Plane, Sample};
+        use super::{Setup, Weights};
+
+        #[derive(Clone, Copy)]
+        struct Source<T> {
+            data: *const T,
+            last: int32x4_t,
+            offsets: int32x4_t,
+            len: usize,
+            readable: usize,
+            pel: i32,
+        }
+
+        impl<T: Sample> Source<T> {
+            const SIZE: usize = size_of::<T>();
+
+            #[inline(always)]
+            fn new(plane: &Plane<'_, T>, pel: i32) -> Self {
+                unsafe {
+                    let len = plane.data.len();
+                    let last = i32::try_from(len.saturating_sub(1)).unwrap_or(i32::MAX);
+                    let offs = [0, pel, 2 * pel, 3 * pel];
+                    Self {
+                        data: plane.data.as_ptr(),
+                        last: vdupq_n_s32(last),
+                        offsets: vld1q_s32(offs.as_ptr()),
+                        len,
+                        readable: len + plane.slack,
+                        pel,
+                    }
+                }
+            }
+
+            #[inline(always)]
+            fn load(&self, start: i32) -> Option<int32x4_t> {
+                unsafe {
+                    let start = start as usize;
+                    let span = 4 * self.pel as usize;
+                    if start + span.max(8 / Self::SIZE) > self.readable {
+                        return None;
+                    }
+                    let at = self.data.add(start);
+                    if Self::SIZE == 2 {
+                        return match self.pel {
+                            1 => {
+                                let w = vld1_u16(at.cast::<u16>());
+                                Some(vreinterpretq_s32_u32(vmovl_u16(w)))
+                            }
+                            _ => None,
+                        };
+                    }
+                    match self.pel {
+                        1 => {
+                            let bytes = vld1_u8(at.cast::<u8>());
+                            let words = vget_low_u16(vmovl_u8(bytes));
+                            Some(vreinterpretq_s32_u32(vmovl_u16(words)))
+                        }
+                        2 => {
+                            let words = vld1_u16(at.cast::<u16>());
+                            Some(vandq_s32(
+                                vreinterpretq_s32_u32(vmovl_u16(words)),
+                                vdupq_n_s32(0xFF),
+                            ))
+                        }
+                        _ => None,
+                    }
+                }
+            }
+
+            #[inline(always)]
+            fn fetch(&self, index: int32x4_t) -> int32x4_t {
+                unsafe {
+                    let zero = vdupq_n_s32(0);
+                    if self.len == 0 {
+                        return zero;
+                    }
+                    let first = vgetq_lane_s32::<0>(index);
+                    let run = vaddq_s32(vdupq_n_s32(first), self.offsets);
+                    if first >= 0
+                        && vminvq_u32(vceqq_s32(index, run)) == u32::MAX
+                        && let Some(value) = self.load(first)
+                    {
+                        return value;
+                    }
+                    let index = vminq_s32(vmaxq_s32(index, zero), self.last);
+                    if Self::SIZE == 1 {
+                        let cfirst = vgetq_lane_s32::<0>(index);
+                        let win_base = (cfirst - 4).max(0);
+                        let rel = vsubq_s32(index, vdupq_n_s32(win_base));
+                        if vmaxvq_u32(vreinterpretq_u32_s32(rel)) < 64
+                            && (win_base as usize) + 64 <= self.readable
+                        {
+                            let tbl = vld1q_u8_x4(self.data.add(win_base as usize).cast::<u8>());
+                            let picked = vqtbl4q_u8(tbl, vreinterpretq_u8_s32(rel));
+                            return vandq_s32(vreinterpretq_s32_u8(picked), vdupq_n_s32(0xFF));
+                        }
+                    }
+                    let i0 = vgetq_lane_s32::<0>(index) as usize;
+                    let i1 = vgetq_lane_s32::<1>(index) as usize;
+                    let i2 = vgetq_lane_s32::<2>(index) as usize;
+                    let i3 = vgetq_lane_s32::<3>(index) as usize;
+                    let vals = [
+                        (*self.data.add(i0)).into(),
+                        (*self.data.add(i1)).into(),
+                        (*self.data.add(i2)).into(),
+                        (*self.data.add(i3)).into(),
+                    ];
+                    vld1q_s32(vals.as_ptr())
+                }
+            }
+
+            #[inline(always)]
+            fn still(&self, start: i32, chunk: int32x4_t) -> int32x4_t {
+                self.load(start).unwrap_or_else(|| self.fetch(chunk))
+            }
+        }
+
+        pub(in super::super) struct Prepared<'a, T> {
+            a: Source<T>,
+            b: Source<T>,
+            offsets: int32x4_t,
+            step: int32x4_t,
+            pel: i32,
+            pitch: int32x4_t,
+            aux_a: Source<T>,
+            aux_b: Source<T>,
+            pub(in super::super) index: usize,
+            _life: PhantomData<&'a [T]>,
+        }
+
+        impl<'a, T: Sample> Prepared<'a, T> {
+            pub(in super::super) fn new(
+                setup: &Setup<'a>,
+                a: &Plane<'a, T>,
+                b: &Plane<'a, T>,
+                aux: Option<(Plane<'a, T>, Plane<'a, T>)>,
+                index: usize,
+            ) -> Self {
+                unsafe {
+                    let pel = setup.pel;
+                    let (aux_a, aux_b) = aux.unwrap_or((*a, *b));
+                    let offs = [0, pel, 2 * pel, 3 * pel];
+                    Self {
+                        a: Source::new(a, pel),
+                        b: Source::new(b, pel),
+                        aux_a: Source::new(&aux_a, pel),
+                        aux_b: Source::new(&aux_b, pel),
+                        index,
+                        offsets: vld1q_s32(offs.as_ptr()),
+                        step: vdupq_n_s32(4 * pel),
+                        pel,
+                        pitch: vdupq_n_s32(setup.pitch),
+                        _life: PhantomData,
+                    }
+                }
+            }
+
+            #[allow(clippy::unused_self)]
+            #[inline(always)]
+            fn lane(&self, values: &[i32], c: usize) -> int32x4_t {
+                assert!(c + 4 <= values.len());
+                unsafe { vld1q_s32(values.as_ptr().add(c)) }
+            }
+
+            #[inline(always)]
+            fn at(&self, chunk: int32x4_t, x: &[i32], y: &[i32], c: usize) -> int32x4_t {
+                unsafe {
+                    let xv = self.lane(x, c);
+                    let yv = self.lane(y, c);
+                    vaddq_s32(vaddq_s32(chunk, xv), vmulq_s32(yv, self.pitch))
+                }
+            }
+
+            #[inline(always)]
+            fn run(
+                &self,
+                out: &mut [T],
+                base: i32,
+                n: usize,
+                mut body: impl FnMut(usize, int32x4_t, i32) -> int32x4_t,
+            ) {
+                unsafe {
+                    let mut chunk = vaddq_s32(vdupq_n_s32(base), self.offsets);
+                    let mut start = base;
+                    let mut c = 0;
+                    while c < n {
+                        let value = body(c, chunk, start);
+                        start += 4 * self.pel;
+                        if c + 4 <= out.len() {
+                            let ptr = out.as_mut_ptr().add(c);
+                            if size_of::<T>() == 1 {
+                                let s16 = vqmovn_s32(value);
+                                let bytes = vqmovun_s16(vcombine_s16(s16, s16));
+                                let packed = std::mem::transmute::<_, u64>(bytes) as u32;
+                                std::ptr::write_unaligned(ptr.cast::<u32>(), packed);
+                            } else {
+                                vst1_u16(ptr.cast::<u16>(), vqmovun_s32(value));
+                            }
+                        } else {
+                            let mut tmp = [T::default(); 4];
+                            if size_of::<T>() == 1 {
+                                let s16 = vqmovn_s32(value);
+                                let bytes = vqmovun_s16(vcombine_s16(s16, s16));
+                                let packed = std::mem::transmute::<_, u64>(bytes) as u32;
+                                std::ptr::write_unaligned(tmp.as_mut_ptr().cast::<u32>(), packed);
+                            } else {
+                                vst1_u16(tmp.as_mut_ptr().cast::<u16>(), vqmovun_s32(value));
+                            }
+                            let take = (n - c).min(out.len().saturating_sub(c)).min(4);
+                            out[c..c + take].copy_from_slice(&tmp[..take]);
+                        }
+                        chunk = vaddq_s32(chunk, self.step);
+                        c += 4;
+                    }
+                }
+            }
+        }
+
+        #[inline(always)]
+        fn splat(v: i32) -> int32x4_t {
+            unsafe { vdupq_n_s32(v) }
+        }
+
+        #[inline(always)]
+        fn mul(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+            unsafe { vmulq_s32(a, b) }
+        }
+
+        #[inline(always)]
+        fn add(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+            unsafe { vaddq_s32(a, b) }
+        }
+
+        #[inline(always)]
+        fn sub(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+            unsafe { vsubq_s32(a, b) }
+        }
+
+        #[inline(always)]
+        fn min(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+            unsafe { vminq_s32(a, b) }
+        }
+
+        #[inline(always)]
+        fn max(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+            unsafe { vmaxq_s32(a, b) }
+        }
+
+        #[inline(always)]
+        fn shr8(a: int32x4_t) -> int32x4_t {
+            unsafe { vshrq_n_s32::<8>(a) }
+        }
+
+        #[inline(always)]
+        fn shr8u(a: int32x4_t) -> int32x4_t {
+            unsafe { vreinterpretq_s32_u32(vshrq_n_u32::<8>(vreinterpretq_u32_s32(a))) }
+        }
+
+        pub(in super::super) fn fill(
+            setup: &Setup<'_>,
+            out: &mut [i32],
+            pair: i32,
+            cols: usize,
+            vector: bool,
+        ) {
+            let (weights, shift) = if vector {
+                (setup.vector_weights, setup.vector_shift)
+            } else {
+                (setup.weights, setup.shift)
+            };
+            let count = cols.next_multiple_of(8);
+            let (lo, hi, shift) = (i32::from(pair as i16), pair >> 16, shift.min(31));
+            for (value, &w) in out[..count].iter_mut().zip(&weights[..count]) {
+                let sum = lo * i32::from(w as i16) + hi * (w >> 16);
+                *value = i32::from((sum >> shift) as i16);
+            }
+        }
+
+        pub(in super::super) fn fill_block<const N: usize>(
+            setup: &Setup<'_>,
+            lanes: &mut [i32],
+            (span, at, cols): (usize, usize, usize),
+            (top, bottom): (&[i16; 32], &[i16; 32]),
+            (wt, wb, shift_y): (i16, i16, u32),
+        ) {
+            let mix = |i: usize| {
+                wt.wrapping_mul(top[i])
+                    .wrapping_add(wb.wrapping_mul(bottom[i]))
+                    >> shift_y
+            };
+            for (k, lane) in lanes.chunks_exact_mut(span).take(N).enumerate() {
+                let pair = i32::from(mix(2 * k) as u16) | (i32::from(mix(2 * k + 1) as u16) << 16);
+                fill(setup, &mut lane[at..], pair, cols, false);
+            }
+        }
+
         pub(in super::super) fn fast<T: Sample>(
             out: &mut [T],
             p: &Prepared<'_, T>,
@@ -2029,7 +3507,7 @@ mod row {
             l: &[&[i32]; 10],
             w: &Weights,
         ) {
-            let (t, rt, full) = (splat(w.t), splat(w.rt), splat(255));
+            let (t, full) = (splat(w.t), splat(255));
             p.run(out, base, n, |c, chunk, _| {
                 let c0 = p.b.fetch(p.at(chunk, l[0], l[1], c));
                 let n0 = p.a.fetch(p.at(chunk, l[2], l[3], c));
@@ -2041,9 +3519,14 @@ mod row {
                 let hi = max(c0, n0);
                 let cn = max(lo, min(n1, hi));
                 let cc = max(lo, min(c1, hi));
-                let first = shr8(add(add(mul(m9, cn), mul(c0, sub(full, m9))), full));
-                let second = shr8(add(add(mul(m8, cc), mul(n0, sub(full, m8))), full));
-                shr8(add(mul(rt, first), mul(t, second)))
+                let c0_255 = sub(unsafe { vshlq_n_s32::<8>(c0) }, c0);
+                let first = shr8(add(add(c0_255, mul(m9, sub(cn, c0))), full));
+                let n0_255 = sub(unsafe { vshlq_n_s32::<8>(n0) }, n0);
+                let second = shr8(add(add(n0_255, mul(m8, sub(cc, n0))), full));
+                shr8(add(
+                    unsafe { vshlq_n_s32::<8>(first) },
+                    mul(t, sub(second, first)),
+                ))
             });
         }
 
@@ -2127,8 +3610,7 @@ mod row {
                 let (value, mid) = if simple {
                     let value = shr8(add(mul(rt, first), mul(t, second)));
                     let weight = if p.index == 1 { odd } else { rtb };
-                    let mixed = add(mul(weight, b0), mul(tb, a0));
-                    let mixed = unsafe { _mm256_and_si256(mixed, splat(w.wrap)) };
+                    let mixed = unsafe { vandq_s32(add(mul(weight, b0), mul(tb, a0)), splat(w.wrap)) };
                     (value, shr8(mixed))
                 } else {
                     let ab0 = p.aux_b.still(start, chunk);
@@ -2179,7 +3661,10 @@ mod row {
         }
     }
 
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        target_arch = "aarch64"
+    )))]
     #[allow(
         clippy::inline_always,
         clippy::many_single_char_names,

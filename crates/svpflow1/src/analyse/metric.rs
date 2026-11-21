@@ -125,6 +125,11 @@ pub(crate) fn block_average(block: &[u8], pitch: usize, shape: Shape) -> i32 {
         let sum = unsafe { contiguous_sum(&block[..shape.area()]) };
         return (sum >> shape.area().trailing_zeros()) as i32;
     }
+    #[cfg(target_arch = "aarch64")]
+    if pitch == shape.width && shape.area().is_multiple_of(16) {
+        let sum = neon::contiguous_sum(&block[..shape.area()]);
+        return (sum >> shape.area().trailing_zeros()) as i32;
+    }
     let sum = match shape.width {
         2 => rows_sum::<2>(block, pitch, shape.height),
         4 => rows_sum::<4>(block, pitch, shape.height),
@@ -167,6 +172,10 @@ fn sad<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usiz
         assert!(src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
         return unsafe { sad_rows_pitched::<W>(src.as_ptr(), W, reference.as_ptr(), pitch, H) };
     }
+    #[cfg(target_arch = "aarch64")]
+    if W >= 4 {
+        return neon::sad(src, W, reference, pitch, W, H);
+    }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     if W >= 4 {
         return simd128::sad(src, W, reference, pitch, W, H);
@@ -176,6 +185,10 @@ fn sad<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usiz
 
 pub(crate) fn sad_pitched(shape: Shape, a: &[u8], a_pitch: usize, b: &[u8], b_pitch: usize) -> u32 {
     assert!(a.len() >= shape.span(a_pitch) && b.len() >= shape.span(b_pitch));
+    #[cfg(target_arch = "aarch64")]
+    if shape.width >= 4 && shape.width.is_multiple_of(4) {
+        return neon::sad(a, a_pitch, b, b_pitch, shape.width, shape.height);
+    }
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let (a, b) = (a.as_ptr(), b.as_ptr());
@@ -286,6 +299,10 @@ fn sad_rows_swapped(src: &[u8], reference: &[u8], pitch: usize, width: usize) ->
 }
 
 fn satd<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    if W.is_multiple_of(4) && H.is_multiple_of(4) {
+        return neon::satd(src, W, reference, pitch, W, H);
+    }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     if W.is_multiple_of(4) && H.is_multiple_of(4) {
         return simd128::satd(src, W, reference, pitch, W, H);
@@ -347,6 +364,19 @@ fn hadamard4x4_abs_sum(mut d: [[i32; 4]; 4]) -> u32 {
 }
 
 fn satd_rows32<const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    return (0..H)
+        .map(|row| {
+            neon::satd(
+                &src[row * 32..][..32],
+                8,
+                &reference[row * pitch..][..32],
+                8,
+                8,
+                4,
+            )
+        })
+        .sum();
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     return (0..H)
         .map(|row| {
@@ -1267,5 +1297,178 @@ mod simd128 {
             }
         }
         total(i32x4_add(wide, u32x4_extadd_pairwise_u16x8(acc)))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code, clippy::many_single_char_names)]
+mod neon {
+    use core::arch::aarch64::{
+        int16x8_t, uint16x4_t, vabd_u8, vabdq_u8, vabsq_s16, vadd_u16, vaddlv_u16, vaddlvq_u8,
+        vaddq_s16, vaddvq_u32, vcombine_s16, vdup_n_u16, vdupq_n_u16, vdupq_n_u32, vget_low_s16,
+        vld1_u8, vld1q_u8, vpadal_u8, vpadalq_u8, vpadalq_u16, vreinterpret_u16_s16,
+        vreinterpretq_s16_u16, vsubl_u8, vsubq_s16, vuzp1q_s16, vuzp2q_s16,
+    };
+
+    fn span(width: usize, height: usize, pitch: usize) -> usize {
+        (height - 1) * pitch + width
+    }
+
+    pub(super) fn contiguous_sum(block: &[u8]) -> u32 {
+        unsafe {
+            let mut acc32 = vdupq_n_u32(0);
+            let mut acc16 = vdupq_n_u16(0);
+            for (index, chunk) in block.as_chunks::<16>().0.iter().enumerate() {
+                acc16 = vpadalq_u8(acc16, vld1q_u8(chunk.as_ptr()));
+                if index & 31 == 31 {
+                    acc32 = vpadalq_u16(acc32, acc16);
+                    acc16 = vdupq_n_u16(0);
+                }
+            }
+            vaddvq_u32(vpadalq_u16(acc32, acc16))
+        }
+    }
+
+    pub(super) fn sad(
+        src: &[u8],
+        sp: usize,
+        reference: &[u8],
+        rp: usize,
+        width: usize,
+        height: usize,
+    ) -> u32 {
+        assert!(src.len() >= span(width, height, sp) && reference.len() >= span(width, height, rp));
+        let (s, r) = (src.as_ptr(), reference.as_ptr());
+        unsafe {
+            if width == 4 && height == 4 {
+                let mut a = [0u8; 16];
+                let mut b = [0u8; 16];
+                for y in 0..4 {
+                    std::ptr::copy_nonoverlapping(s.add(y * sp), a.as_mut_ptr().add(y * 4), 4);
+                    std::ptr::copy_nonoverlapping(r.add(y * rp), b.as_mut_ptr().add(y * 4), 4);
+                }
+                return u32::from(vaddlvq_u8(vabdq_u8(
+                    vld1q_u8(a.as_ptr()),
+                    vld1q_u8(b.as_ptr()),
+                )));
+            }
+            if width == 8 {
+                let mut acc = vdup_n_u16(0);
+                for y in 0..height {
+                    let a = vld1_u8(s.add(y * sp));
+                    let b = vld1_u8(r.add(y * rp));
+                    acc = vpadal_u8(acc, vabd_u8(a, b));
+                }
+                return vaddlv_u16(acc);
+            }
+            if width >= 16 {
+                let mut acc = vdupq_n_u16(0);
+                let mut wide = vdupq_n_u32(0);
+                for y in 0..height {
+                    let mut x = 0;
+                    while x + 16 <= width {
+                        let a = vld1q_u8(s.add(y * sp + x));
+                        let b = vld1q_u8(r.add(y * rp + x));
+                        acc = vpadalq_u8(acc, vabdq_u8(a, b));
+                        x += 16;
+                    }
+                    if y & 31 == 31 {
+                        wide = vpadalq_u16(wide, acc);
+                        acc = vdupq_n_u16(0);
+                    }
+                }
+                return vaddvq_u32(vpadalq_u16(wide, acc));
+            }
+            let mut total = 0u32;
+            for y in 0..height {
+                for x in 0..width {
+                    total += u32::from((*s.add(y * sp + x)).abs_diff(*r.add(y * rp + x)));
+                }
+            }
+            total
+        }
+    }
+
+    #[inline]
+    unsafe fn row8(src: *const u8, reference: *const u8) -> int16x8_t {
+        unsafe { vreinterpretq_s16_u16(vsubl_u8(vld1_u8(src), vld1_u8(reference))) }
+    }
+
+    #[inline]
+    unsafe fn horizontal_pair(v: int16x8_t) -> uint16x4_t {
+        unsafe {
+            let even = vuzp1q_s16(v, v);
+            let odd = vuzp2q_s16(v, v);
+            let sums = vaddq_s16(even, odd);
+            let diffs = vsubq_s16(even, odd);
+            let u = vcombine_s16(vget_low_s16(sums), vget_low_s16(diffs));
+            let e2 = vuzp1q_s16(u, u);
+            let o2 = vuzp2q_s16(u, u);
+            let p = vabsq_s16(vaddq_s16(e2, o2));
+            let m = vabsq_s16(vsubq_s16(e2, o2));
+            vadd_u16(
+                vreinterpret_u16_s16(vget_low_s16(p)),
+                vreinterpret_u16_s16(vget_low_s16(m)),
+            )
+        }
+    }
+
+    pub(super) fn satd(
+        src: &[u8],
+        sp: usize,
+        reference: &[u8],
+        rp: usize,
+        width: usize,
+        height: usize,
+    ) -> u32 {
+        assert!(src.len() >= span(width, height, sp) && reference.len() >= span(width, height, rp));
+        let (s, r) = (src.as_ptr(), reference.as_ptr());
+        unsafe {
+            let mut total = 0u32;
+            if width == 4 {
+                for ty in (0..height).step_by(4) {
+                    let mut d = [vdupq_n_u16(0); 4];
+                    for k in 0..4 {
+                        let mut a = [0u8; 8];
+                        let mut b = [0u8; 8];
+                        std::ptr::copy_nonoverlapping(s.add((ty + k) * sp), a.as_mut_ptr(), 4);
+                        std::ptr::copy_nonoverlapping(r.add((ty + k) * rp), b.as_mut_ptr(), 4);
+                        d[k] = vsubl_u8(vld1_u8(a.as_ptr()), vld1_u8(b.as_ptr()));
+                    }
+                    let d = d.map(|v| vreinterpretq_s16_u16(v));
+                    let (a, b) = (vaddq_s16(d[0], d[1]), vaddq_s16(d[2], d[3]));
+                    let (c, e) = (vsubq_s16(d[0], d[1]), vsubq_s16(d[2], d[3]));
+                    let sum0 = vadd_u16(
+                        horizontal_pair(vaddq_s16(a, b)),
+                        horizontal_pair(vsubq_s16(a, b)),
+                    );
+                    let sum1 = vadd_u16(
+                        horizontal_pair(vaddq_s16(c, e)),
+                        horizontal_pair(vsubq_s16(c, e)),
+                    );
+                    total += vaddlv_u16(vadd_u16(sum0, sum1));
+                }
+                return total / 2;
+            }
+            for ty in (0..height).step_by(4) {
+                for tx in (0..width).step_by(8) {
+                    let d: [int16x8_t; 4] = std::array::from_fn(|k| {
+                        row8(s.add((ty + k) * sp + tx), r.add((ty + k) * rp + tx))
+                    });
+                    let (a, b) = (vaddq_s16(d[0], d[1]), vaddq_s16(d[2], d[3]));
+                    let (c, e) = (vsubq_s16(d[0], d[1]), vsubq_s16(d[2], d[3]));
+                    let sum0 = vadd_u16(
+                        horizontal_pair(vaddq_s16(a, b)),
+                        horizontal_pair(vsubq_s16(a, b)),
+                    );
+                    let sum1 = vadd_u16(
+                        horizontal_pair(vaddq_s16(c, e)),
+                        horizontal_pair(vsubq_s16(c, e)),
+                    );
+                    total += vaddlv_u16(vadd_u16(sum0, sum1));
+                }
+            }
+            total / 2
+        }
     }
 }
