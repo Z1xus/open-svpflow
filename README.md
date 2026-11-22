@@ -6,7 +6,7 @@
 <a href="https://github.com/Z1xus/open-svpflow/releases"><picture><source media="(prefers-color-scheme: dark)" srcset="https://www.shieldcn.dev/github/downloads/Z1xus/open-svpflow.svg?variant=secondary&amp;size=xs&amp;mode=dark"><img alt="Total downloads" src="https://www.shieldcn.dev/github/downloads/Z1xus/open-svpflow.svg?variant=secondary&amp;size=xs&amp;mode=light"></picture></a>
 <a href="https://github.com/Z1xus/open-svpflow/commits/main"><picture><source media="(prefers-color-scheme: dark)" srcset="https://www.shieldcn.dev/github/last-commit/Z1xus/open-svpflow.svg?variant=secondary&amp;size=xs&amp;mode=dark"><img alt="Last commit" src="https://www.shieldcn.dev/github/last-commit/Z1xus/open-svpflow.svg?variant=secondary&amp;size=xs&amp;mode=light"></picture></a>
 
-open-svpflow is a drop-in open-source replacement for [SVPFlow](https://www.svp-team.com/wiki/Plugins:_SVPflow)'s VapourSynth plugins in Rust, reverse engineered from version 4.3.0.168. It runs up to 3x faster on CPU and up to 2.6x faster on GPU, adds [a few things](#on-top-of-svpflow) the original doesn't have, and works in places where the original doesn't.
+open-svpflow is a drop-in open-source replacement for [SVPFlow](https://www.svp-team.com/wiki/Plugins:_SVPflow)'s VapourSynth plugins in Rust, reverse engineered from version 4.3.0.168. It runs up to 3.6x faster on CPU and up to 3.8x faster on GPU (up to 4.9x / 5.7x with opt-in fast modes), adds [a few things](#on-top-of-svpflow) the original doesn't have, and works in places where the original doesn't.
 
 It started as a side project, mostly to see if I could get couleur's [smoothie-rs](https://github.com/couleur-tweak-tips/smoothie-rs) running in a browser. That became the [demo](https://smoothie.z1x.us), which runs open-svpflow client-side as WASM with WebGPU (about 2-3x slower than native, since WASM can't use AVX2). It was only meant as a proof of concept, but it grew into another project, [interpolini](https://github.com/Z1xus/interpolini), which is meant as a showcase of how much faster you can get without VapourSynth and Python in the way.
 
@@ -20,14 +20,14 @@ Output matches the original byte for byte in everything I've tested, on both CPU
 
 Benchmarked on a 1080p 200 fps Counter-Strike 2 clip interpolated to 1920 fps with [smoothie's](https://github.com/couleur-tweak-tips/smoothie-rs) settings (Ryzen 5 7600X, RTX 4060, Linux). You can run it yourself with [scripts/bench.py](scripts/bench.py):
 
-| Preset | Path | Original | open-svpflow | Speed vs original |
-| --- | --- | ---: | ---: | ---: |
-| faster | CPU | 304.2 fps | 901.4 fps | 2.96x |
-| faster | GPU | 1262.9 fps | 2597.5 fps | 2.06x |
-| medium (default) | CPU | 224.6 fps | 620.9 fps | 2.76x |
-| medium (default) | GPU | 324.1 fps | 848.6 fps | 2.62x |
+| Preset | Path | Original | open-svpflow (exact) | fast:1 | fast:2 | fast:3 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| faster | CPU | 320.0 fps | 1162.6 fps (3.63x) | 1288.0 fps (4.03x) | 1420.6 fps (4.44x) | 1566.6 fps (4.90x) |
+| faster | GPU | 1209.9 fps | 2520.3 fps (2.08x) | 2808.5 fps (2.32x) | 3043.4 fps (2.52x) | 3197.5 fps (2.64x) |
+| medium (default) | CPU | 233.9 fps | 723.0 fps (3.09x) | 733.2 fps (3.13x) | 813.9 fps (3.48x) | 868.5 fps (3.71x) |
+| medium (default) | GPU | 327.7 fps | 1249.1 fps (3.81x) | 1699.5 fps (5.19x) | 1820.3 fps (5.56x) | 1878.7 fps (5.73x) |
 
-The speedup mainly comes from AVX2/AVX-512 motion search, running part of that search on the GPU (when using GPU mode), and caching work the original redoes for every frame.
+The speedup mainly comes from AVX2/AVX-512 motion search, running part of that search on the GPU (when using GPU mode), and caching work the original redoes for every frame. fast:1–3 passes fast:N to SVSuper, SVAnalyse, and SVSmoothFps.
 
 ## On top of SVPFlow
 
@@ -38,12 +38,16 @@ The speedup mainly comes from AVX2/AVX-512 motion search, running part of that s
 - Halve and DoubleVectors, which let the motion search run on a half-size frame, a lot faster for a small quality loss.
 - SVAnalyse("{exact:false}") lets the motion search take shortcuts and run on the GPU with gpu:1, which makes it about 2x faster again. The vectors differ slightly from SVPFlow (within 0.2 dB PSNR) and it needs more VRAM, so it's opt-in.
 - SVSuper("{pel:2,gpu:1,lean:true}") (pel 1 or 2) skips the subpel and reduced levels when the GPU analyse chain builds them itself with exact:false, which frees a lot of CPU and memory. Only SVAnalyse and the SmoothFps filters here can use such a super clip.
+- fast:1–3 (opt-in across SVSuper, SVAnalyse, SVSmoothFps, SmoothFpsBlend, and SVSmoothFps_NVOF) trades exact parity for extra speed, progressively enabling faster pyramids, luma-only/strided search, mirrored backward flow, coarse-level starts, faster warps, and adaptive blend sampling. fast:0 stays bit-exact, and individual flags can also be set on their own.
 - A [C API](crates/svpflow-capi/include/open_svpflow.h) for running it without VapourSynth or AviSynth (cargo build --release -p svpflow-capi).
 
 ### SmoothFps options
 
 All of these are off by default.
 
+- fast:1–3 trades exact parity for speed (fast:1: bilinear warp and adaptive blending; fast:2: fast warp, motion-adaptive blend sampling, and strided peel; fast:3: fewer blend samples).
+- adaptive:true (SmoothFpsBlend) picks how many sub-frames to blend per pixel based on how much it moves (also turned on by fast:1+).
+- nvof:{mirror:true,scale:2} (SmoothFps_NVOF) mirrors forward flow instead of running a backward pass and runs NVOF at half scale (turned on by fast:1 / fast:2+).
 - mask:{peel:true} learns the HUD and its opacity for each pixel from how the scene moves behind it, takes it off before the warp and puts it back after. Tune it with mask:{peel:{limit:6}}.
 - mask:{still:true} finds text, logos and other things that stay in place and keeps them from smearing. Tune it with mask:{still:{limit:4.5,edge:5,tolerance:30}}. svp2.Still(clip, source) does the same for frames from any other interpolator.
 - mask:{image:id} keeps the source frame where a mask from osvp_mask_create is black. osvp_hold does the same for frames from any other interpolator.

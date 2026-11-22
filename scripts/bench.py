@@ -55,6 +55,12 @@ def decode(core, vs, path, count):
     return core.std.ModifyFrame(blank, blank, lambda n, f: frames[n])
 
 
+def with_fast(options, level):
+    if not level:
+        return options
+    return f"{options[:-1]},fast:{level}}}"
+
+
 def measure(args):
     import vapoursynth as vs
 
@@ -67,6 +73,9 @@ def measure(args):
     clip = decode(core, vs, args.clip, args.frames) * args.loops
     preset, path = args.run
     super_options, analyse_options = PRESETS[preset, path]
+    super_options = with_fast(super_options, args.fast_level)
+    analyse_options = with_fast(analyse_options, args.fast_level)
+    smooth_options = with_fast(SMOOTH.format(fps=args.fps), args.fast_level)
     sup = core.svp1.Super(clip, super_options)
     vectors = core.svp1.Analyse(sup["clip"], sup["data"], clip, analyse_options)
     out = core.svp2.SmoothFps(
@@ -75,7 +84,7 @@ def measure(args):
         sup["data"],
         vectors["clip"],
         vectors["data"],
-        SMOOTH.format(fps=args.fps),
+        smooth_options,
     )
     begin = mark = now = time.perf_counter()
     count = 0
@@ -110,6 +119,14 @@ def main():
     parser.add_argument(
         "--prefetch", type=int, default=48, help="frames requested at once"
     )
+    parser.add_argument(
+        "--fast",
+        type=int,
+        nargs="*",
+        default=[],
+        help="fast levels to run on the last plugin directory",
+    )
+    parser.add_argument("--fast-level", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--run", nargs=2, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.run:
@@ -118,10 +135,13 @@ def main():
         f"--{name}={getattr(args, name)}"
         for name in ("fps", "frames", "loops", "seconds", "warmup", "prefetch")
     ]
+    targets = [(plugins, 0) for plugins in args.plugins] + [
+        (args.plugins[-1], level) for level in args.fast
+    ]
     best = {}
     for _ in range(args.rounds):
         for run in PRESETS:
-            for plugins in args.plugins:
+            for plugins, level in targets:
                 command = [
                     sys.executable,
                     __file__,
@@ -129,20 +149,36 @@ def main():
                     plugins,
                     "--run",
                     *run,
+                    f"--fast-level={level}",
                     *passed,
                 ]
                 fps = float(subprocess.check_output(command, text=True).split()[-1])
-                best[run, plugins] = max(best.get((run, plugins), 0), fps)
-                print(*run, plugins, f"{fps:.1f}", file=sys.stderr)
-    names = [Path(p).resolve().name for p in args.plugins]
-    print("| Preset | Path |", " | ".join(names), "| Speed |")
-    print("| --- | --- |", " | ".join("---:" for _ in names), "| ---: |")
-    for run in PRESETS:
-        speeds = [best[run, plugins] for plugins in args.plugins]
-        cells = " | ".join(f"{fps:.1f} fps" for fps in speeds)
-        print(
-            f"| {run[0]} | {run[1].upper()} | {cells} | {speeds[-1] / speeds[0]:.2f}x |"
-        )
+                best[run, plugins, level] = max(best.get((run, plugins, level), 0), fps)
+                tag = f"fast:{level}" if level else Path(plugins).resolve().name
+                print(*run, tag, f"{fps:.1f}", file=sys.stderr)
+    names = [
+        f"fast:{level}" if level else Path(plugins).resolve().name
+        for plugins, level in targets
+    ]
+    if args.fast:
+        print("| Preset | Path |", " | ".join(names), "|")
+        print("| --- | --- |", " | ".join("---:" for _ in names), "|")
+        for run in PRESETS:
+            speeds = [best[run, plugins, level] for plugins, level in targets]
+            base = speeds[0]
+            cells = [f"{base:.1f} fps"] + [
+                f"{fps:.1f} fps ({fps / base:.2f}x)" for fps in speeds[1:]
+            ]
+            print(f"| {run[0]} | {run[1].upper()} |", " | ".join(cells), "|")
+    else:
+        print("| Preset | Path |", " | ".join(names), "| Speed |")
+        print("| --- | --- |", " | ".join("---:" for _ in names), "| ---: |")
+        for run in PRESETS:
+            speeds = [best[run, plugins, level] for plugins, level in targets]
+            cells = " | ".join(f"{fps:.1f} fps" for fps in speeds)
+            print(
+                f"| {run[0]} | {run[1].upper()} | {cells} | {speeds[-1] / speeds[0]:.2f}x |"
+            )
 
 
 if __name__ == "__main__":
