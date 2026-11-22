@@ -1025,8 +1025,13 @@ impl GpuContext {
                     return None;
                 }
             }
-            if !write_done.is_null() && !self.wait_event(resources.queue, write_done) {
-                return None;
+            if !write_done.is_null() {
+                if !self.linear {
+                    (self.cl.Flush)(resources.queue);
+                }
+                if !self.wait_event(resources.queue, write_done) {
+                    return None;
+                }
             }
         }
         Some(entry)
@@ -2632,8 +2637,10 @@ inline float2 layer_scene(
     if (!moved) return (float2)(value, 0.0f);
     float2 top = (float2)(p->width-1, p->height-1);
     float total = 0.0f, weight = 0.0f;
+    #pragma unroll 1
     for (int ring = 1; ring <= 3 && weight == 0.0f; ring++) {
         float radius = LAYER_FILL*ring / p->x_ratio;
+        #pragma unroll 1
         for (int turn = 0; turn < 8; turn++) {
             float2 side = (float2)(
                 (turn == 0 || turn == 1 || turn == 7) - (turn >= 3 && turn <= 5),

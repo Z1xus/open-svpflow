@@ -417,6 +417,37 @@ impl GpuContext {
         } else {
             (3, 2)
         };
+        let step = step.max(1);
+        let keys = [chunk - step, chunk, chunk + step];
+        let missing = {
+            let mut state = self.layer.lock().ok()?;
+            if let Some(pos) = state.fits.iter().position(|(key, _)| *key == chunk) {
+                let entry = state.fits.remove(pos);
+                let fit = Arc::clone(&entry.1);
+                state.fits.push(entry);
+                return Some(fit);
+            }
+            let gone = state.held.iter().find(|(key, _)| *key == chunk);
+            if let Some(fit) = gone.and_then(|(_, fit)| fit.upgrade()) {
+                state.keep(chunk, &fit, fit_cap);
+                return Some(fit);
+            }
+            keys.map(|key| {
+                key >= 0
+                    && key <= last
+                    && !held
+                        .stats
+                        .iter()
+                        .chain(&state.stats)
+                        .any(|(k, _, _)| *k == key)
+            })
+        };
+        let mut prepared = [None, None, None];
+        for (slot, (key, need)) in prepared.iter_mut().zip(keys.into_iter().zip(missing)) {
+            if need {
+                *slot = Some(pairs(key)?);
+            }
+        }
         let mut state = self.layer.lock().ok()?;
         if let Some(pos) = state.fits.iter().position(|(key, _)| *key == chunk) {
             let entry = state.fits.remove(pos);
@@ -430,11 +461,9 @@ impl GpuContext {
             return Some(fit);
         }
         unsafe { self.layer_setup(&mut state) }?;
-        let step = step.max(1);
-        let keys = [chunk - step, chunk, chunk + step];
         let mut parts = [None, None, None];
         let mut kept_pairs = Vec::new();
-        for (slot, key) in parts.iter_mut().zip(keys) {
+        for ((slot, key), pre) in parts.iter_mut().zip(keys).zip(prepared) {
             if key < 0 || key > last {
                 continue;
             }
@@ -447,7 +476,10 @@ impl GpuContext {
                 *slot = Some((Arc::clone(&found.1), found.2));
                 continue;
             }
-            let pairs = pairs(key)?;
+            let pairs = match pre {
+                Some(pairs) => pairs,
+                None => pairs(key)?,
+            };
             let reused = (state.stats.len() >= stats_cap)
                 .then(|| {
                     state

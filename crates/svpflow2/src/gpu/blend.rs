@@ -1317,6 +1317,7 @@ impl GpuContext {
                         return None;
                     }
                 }
+                (self.cl.Flush)(queue);
                 Some(())
             })
         };
