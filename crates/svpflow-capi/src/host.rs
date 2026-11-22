@@ -262,11 +262,45 @@ struct Reader {
     ahead: Vec<(i32, Arc<Frame>)>,
 }
 
+struct SourceJob {
+    order: Reverse<(i32, i32, u64)>,
+    task: Arc<Task>,
+}
+
+impl PartialEq for SourceJob {
+    fn eq(&self, other: &Self) -> bool {
+        self.order == other.order
+    }
+}
+
+impl Eq for SourceJob {}
+
+impl PartialOrd for SourceJob {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SourceJob {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order.cmp(&other.order)
+    }
+}
+
+#[derive(Default)]
+struct SourceQueue {
+    running: bool,
+    queued: Option<i32>,
+    count: u64,
+    jobs: BinaryHeap<SourceJob>,
+}
+
 struct Source {
     read: Read,
     release: Option<Release>,
     user: *mut c_void,
     state: Mutex<Reader>,
+    pending: Mutex<SourceQueue>,
 }
 
 struct Mapped {
@@ -622,12 +656,77 @@ impl Node {
                 passthrough: false,
             }),
         });
-        if matches!(self.kind, Kind::Source(_)) {
-            pool().spawn(priority, move || task.begin());
+        if let Kind::Source(source) = &self.kind {
+            let mut pending = source
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            pending.count += 1;
+            let order = Reverse((priority, n, pending.count));
+            pending.jobs.push(SourceJob {
+                order,
+                task: Arc::clone(&task),
+            });
+            let launch = !pending.running && pending.queued.is_none_or(|queued| priority < queued);
+            if launch {
+                pending.queued = Some(priority);
+            }
+            drop(pending);
+            if launch {
+                let node = Arc::clone(self);
+                pool().spawn(priority, move || node.drain_source());
+            }
         } else {
             task.begin();
         }
         cell
+    }
+
+    fn drain_source(self: Arc<Self>) {
+        let Kind::Source(source) = &self.kind else {
+            return;
+        };
+        let mut pending = source
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if pending.running {
+            return;
+        }
+        pending.running = true;
+        pending.queued = None;
+        loop {
+            let Some(job) = pending.jobs.pop() else {
+                pending.running = false;
+                return;
+            };
+            drop(pending);
+            let task = job.task;
+            if task.dropped() {
+                pending = source
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            }
+            let produced = self.read(source, task.n);
+            task.complete(produced);
+            let mut pending = source
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            pending.running = false;
+            let next = pending.jobs.peek().map(|job| job.order.0.0);
+            if let Some(priority) = next {
+                pending.queued = Some(priority);
+            }
+            drop(pending);
+            if let Some(priority) = next {
+                let node = Arc::clone(&self);
+                pool().spawn(priority, move || node.drain_source());
+            }
+            return;
+        }
     }
 
     pub fn get(self: &Arc<Self>, n: i32) -> Produced {
@@ -1073,6 +1172,7 @@ impl Host {
                 release,
                 user,
                 state: Mutex::default(),
+                pending: Mutex::default(),
             }),
         })
     }
