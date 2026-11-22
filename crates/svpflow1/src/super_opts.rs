@@ -26,6 +26,10 @@ impl SuperOpts {
         self.fast_flags & 0x04 != 0
     }
 
+    pub(crate) const fn luma_only(self) -> bool {
+        self.fast() >= 2 && self.gpu != 0
+    }
+
     pub(crate) fn from_opt(opt: Option<&Value>, width: i32, height: i32) -> Result<Self, String> {
         let fast = opt
             .and_then(|v| v.int_at(&["fast"]))
@@ -109,7 +113,9 @@ impl SuperOpts {
     }
 
     fn level_flags(&self) -> u8 {
-        (u8::from(self.scale_down != DEFAULT_SCALE_DOWN) << 6) | (u8::from(self.lean) << 7)
+        (u8::from(self.luma_only()) << 5)
+            | (u8::from(self.scale_down != DEFAULT_SCALE_DOWN) << 6)
+            | (u8::from(self.lean) << 7)
     }
 
     pub(crate) fn super_height(&self) -> i32 {

@@ -243,7 +243,8 @@ unsafe extern "system" fn get_frame_super(
     }
 
     let _busy = svpflow_core::threads::enter_busy();
-    for plane in 0..3 {
+    let planes = if state.opts.luma_only() { 1 } else { 3 };
+    for plane in 0..planes {
         let stride = unsafe { get_stride(out.cast_const(), plane) } as usize;
         let ptr = unsafe { get_write(out, plane) };
         let (x_div, y_div) = if plane == 0 {
@@ -277,7 +278,7 @@ unsafe extern "system" fn get_frame_super(
     let src_w = state.opts.width as usize;
     let src_h = state.opts.height as usize;
 
-    for plane in 0..3i32 {
+    for plane in 0..planes {
         let (x_div, y_div) = if plane == 0 {
             (1, 1)
         } else {

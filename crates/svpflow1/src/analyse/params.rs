@@ -81,6 +81,7 @@ pub(crate) struct SuperParams {
     pub(crate) flags: u8,
     pub(crate) lean: bool,
     pub(crate) custom_scale: bool,
+    pub(crate) luma_only: bool,
 }
 
 impl SuperParams {
@@ -90,11 +91,12 @@ impl SuperParams {
             height: i32::from(u16::from_le_bytes([raw[0], raw[1]])),
             width: i32::from(u16::from_le_bytes([raw[2], raw[3]])),
             pel: i32::from(raw[4]),
-            levels: i32::from(raw[5] & 0x3F),
+            levels: i32::from(raw[5] & 0x1F),
             gpu: i32::from(raw[6]),
             flags: raw[7],
             lean: raw[5] & 0x80 != 0,
             custom_scale: raw[5] & 0x40 != 0,
+            luma_only: raw[5] & 0x20 != 0,
         };
         if params.height <= 0 || !(1..=4).contains(&params.pel) || params.levels < 1 {
             return Err("SVAnalyse: wrong super clip (pseudoaudio) parameters".into());
@@ -427,7 +429,7 @@ impl AnalyseParams {
         }
 
         let fast_level = int(&["fast"], 0).clamp(0, 3) as u8;
-        let chroma_sad = flag(&["chroma_sad"], fast_level < 2);
+        let chroma_sad = !sp.luma_only && flag(&["chroma_sad"], fast_level < 2);
         let stride_sad = if int(&["stride_sad"], if fast_level >= 2 { 2 } else { 1 }) >= 2 {
             2u8
         } else {

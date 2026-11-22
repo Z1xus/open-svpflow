@@ -137,6 +137,10 @@ impl SuperData {
         self.levels & 0x80 != 0
     }
 
+    pub const fn luma_only(&self) -> bool {
+        self.levels & 0x20 != 0
+    }
+
     pub const fn scale(&self) -> i32 {
         self.marker
     }

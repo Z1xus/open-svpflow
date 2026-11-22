@@ -1271,7 +1271,8 @@ impl FilterState {
             unsafe { self.draw(api, frames, draw, expand, core) }.map(|(output, _)| (output, None))
         } else {
             let expand = |k: i32, planes| {
-                if metadata::super_data(self.sdata).lean() {
+                let super_data = metadata::super_data(self.sdata);
+                if super_data.lean() || super_data.luma_only() {
                     return self.cached_lean_expand(i64::from(k), planes);
                 }
                 let sup = fetch.get(self.clips.super_clip, k);

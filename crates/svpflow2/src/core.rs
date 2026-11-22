@@ -1764,7 +1764,9 @@ impl FilterState {
                 phase,
             );
         }
-        let lean_pel = metadata::super_data(self.sdata).lean() && !vector_data.marker_is_one();
+        let super_data = metadata::super_data(self.sdata);
+        let lean_pel =
+            (super_data.lean() || super_data.luma_only()) && !vector_data.marker_is_one();
         let source_step = if lean_pel || super0.is_some() || super1.is_some() {
             metadata::super_data(self.sdata).scale().max(1)
         } else {
@@ -3705,7 +3707,8 @@ pub(crate) unsafe fn super_frame_planes(
     super_info: Option<&vs::VideoInfo>,
     sdata: i64,
 ) -> Option<renderer::FramePlanes<'static>> {
-    if !metadata::super_data(sdata).full() || metadata::super_data(sdata).lean() {
+    let super_data = metadata::super_data(sdata);
+    if !super_data.full() || super_data.lean() || super_data.luma_only() {
         return None;
     }
     let lane = usize::try_from(metadata::super_data(sdata).scale()).ok()?;
