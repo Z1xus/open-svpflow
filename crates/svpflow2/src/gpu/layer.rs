@@ -83,6 +83,22 @@ impl LayerState {
         self.fits.push((chunk, Arc::clone(fit)));
     }
 
+    fn cached(&mut self, chunk: i64, cap: usize) -> Option<Arc<Layer>> {
+        if let Some(pos) = self.fits.iter().position(|(key, _)| *key == chunk) {
+            let entry = self.fits.remove(pos);
+            let fit = Arc::clone(&entry.1);
+            self.fits.push(entry);
+            return Some(fit);
+        }
+        let fit = self
+            .held
+            .iter()
+            .find(|(key, _)| *key == chunk)
+            .and_then(|(_, fit)| fit.upgrade())?;
+        self.keep(chunk, &fit, cap);
+        Some(fit)
+    }
+
     pub(super) const fn new() -> Self {
         Self {
             queue: std::ptr::null_mut(),
@@ -421,15 +437,7 @@ impl GpuContext {
         let keys = [chunk - step, chunk, chunk + step];
         let missing = {
             let mut state = self.layer.lock().ok()?;
-            if let Some(pos) = state.fits.iter().position(|(key, _)| *key == chunk) {
-                let entry = state.fits.remove(pos);
-                let fit = Arc::clone(&entry.1);
-                state.fits.push(entry);
-                return Some(fit);
-            }
-            let gone = state.held.iter().find(|(key, _)| *key == chunk);
-            if let Some(fit) = gone.and_then(|(_, fit)| fit.upgrade()) {
-                state.keep(chunk, &fit, fit_cap);
+            if let Some(fit) = state.cached(chunk, fit_cap) {
                 return Some(fit);
             }
             keys.map(|key| {
@@ -449,15 +457,7 @@ impl GpuContext {
             }
         }
         let mut state = self.layer.lock().ok()?;
-        if let Some(pos) = state.fits.iter().position(|(key, _)| *key == chunk) {
-            let entry = state.fits.remove(pos);
-            let fit = Arc::clone(&entry.1);
-            state.fits.push(entry);
-            return Some(fit);
-        }
-        let gone = state.held.iter().find(|(key, _)| *key == chunk);
-        if let Some(fit) = gone.and_then(|(_, fit)| fit.upgrade()) {
-            state.keep(chunk, &fit, fit_cap);
+        if let Some(fit) = state.cached(chunk, fit_cap) {
             return Some(fit);
         }
         unsafe { self.layer_setup(&mut state) }?;

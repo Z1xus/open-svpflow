@@ -52,7 +52,7 @@ pub unsafe extern "system" fn VapourSynthPluginInit(
         #[cfg(feature = "half")]
         register(
             c"Halve".as_ptr(),
-            c"clip:clip;luma:int:opt".as_ptr(),
+            c"clip:clip;opt:data:opt".as_ptr(),
             crate::half::create_halve,
             std::ptr::null_mut(),
             plugin,
@@ -92,7 +92,7 @@ pub unsafe extern "system" fn VapourSynthPluginInit2(plugin: vs::Raw, api: vs::C
         #[cfg(feature = "half")]
         svpflow_host::vs4::Function {
             name: c"Halve",
-            args: c"clip:clip;luma:int:opt",
+            args: c"clip:clip;opt:data:opt",
             returns: c"clip:vnode;",
             create: crate::half::create_halve,
         },

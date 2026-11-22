@@ -118,7 +118,7 @@ unsafe fn create_super_inner(
     0
 }
 
-unsafe fn read_opt(input: vs::ConstRaw, vsapi: vs::ConstRaw) -> Option<params::Value> {
+pub(crate) unsafe fn read_opt(input: vs::ConstRaw, vsapi: vs::ConstRaw) -> Option<params::Value> {
     let get_data = unsafe { vs::table_fn::<vs::PropGetData>(vsapi, vs::PROP_GET_DATA)? };
     let get_size = unsafe { vs::table_fn::<vs::PropGetDataSize>(vsapi, vs::PROP_GET_DATA_SIZE)? };
     let mut err = 0;

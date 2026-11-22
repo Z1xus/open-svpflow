@@ -110,12 +110,9 @@ pub(crate) unsafe extern "system" fn create_halve(
     }
     vi.width /= 2;
     vi.height /= 2;
-    let luma_only = unsafe { vs::table_fn::<vs::PropGetInt>(vsapi, vs::PROP_GET_INT) }.is_some_and(
-        |get_int| {
-            let mut luma_err = 0;
-            unsafe { get_int(input, c"luma".as_ptr(), 0, &raw mut luma_err) != 0 && luma_err == 0 }
-        },
-    );
+    let opt = unsafe { crate::super_filter::read_opt(input, vsapi) };
+    let luma_only = crate::super_opts::SuperOpts::from_opt(opt.as_ref(), vi.width, vi.height)
+        .is_ok_and(crate::super_opts::SuperOpts::luma_only);
     let state = State {
         node,
         vi,

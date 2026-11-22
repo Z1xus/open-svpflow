@@ -202,21 +202,6 @@ pub unsafe extern "C" fn osvp_map_pass(
     unsafe { osvp_map(context, info, input, need, render, release, user) }
 }
 
-fn luma_only_half(super_opt: &CStr, analyse_opt: &CStr) -> bool {
-    let strip = |value: &CStr| -> String {
-        value
-            .to_string_lossy()
-            .chars()
-            .filter(|ch| !ch.is_ascii_whitespace())
-            .collect()
-    };
-    let sup = strip(super_opt);
-    let ana = strip(analyse_opt);
-    (sup.contains("fast:2") || sup.contains("fast:3"))
-        && !sup.contains("gpu:0")
-        && !ana.contains("chroma_sad:true")
-}
-
 unsafe fn vectors(
     host: &Arc<Host>,
     source: &Arc<Node>,
@@ -238,11 +223,15 @@ unsafe fn vectors(
     let super_text = unsafe { text(super_opt) };
     let analyse_text = unsafe { text(analyse_opt) };
     let analysed = if half {
-        let mut args = vec![(c"clip", clip(source))];
-        if luma_only_half(&super_text, &analyse_text) {
-            args.push((c"luma", Value::Int(1)));
-        }
-        call(c"Halve", args)?.node(c"clip").ok_or_else(missing)?
+        call(
+            c"Halve",
+            vec![
+                (c"clip", clip(source)),
+                (c"opt", Value::Data(super_text.clone())),
+            ],
+        )?
+        .node(c"clip")
+        .ok_or_else(missing)?
     } else {
         Arc::clone(source)
     };
