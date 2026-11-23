@@ -898,8 +898,8 @@ impl FilterState {
             && !self.options.request_hdr_vectors()
     }
 
-    pub(crate) const fn requires_cpu_source(&self) -> bool {
-        self.render_mode <= 1
+    pub(crate) fn requires_cpu_source(&self) -> bool {
+        self.render_mode <= 1 && !self.passthrough()
     }
 
     #[allow(clippy::too_many_arguments)]
