@@ -75,8 +75,10 @@ unsafe fn create_super_inner(
     }
     let chroma_divisors = video_format::chroma_divisors(&vi);
 
-    let opt_val = unsafe { read_opt(input, vsapi) };
-    let opts = match SuperOpts::from_opt(opt_val.as_ref(), vi.width, vi.height) {
+    let opts = match unsafe { read_opt(input, vsapi) }
+        .map_err(|e| format!("SVSuper: invalid 'params' syntax: {e}"))
+        .and_then(|opt| SuperOpts::from_opt(opt.as_ref(), vi.width, vi.height))
+    {
         Ok(o) => o,
         Err(msg) => {
             unsafe { vs::free_node(node, vsapi) };
@@ -118,20 +120,29 @@ unsafe fn create_super_inner(
     0
 }
 
-pub(crate) unsafe fn read_opt(input: vs::ConstRaw, vsapi: vs::ConstRaw) -> Option<params::Value> {
-    let get_data = unsafe { vs::table_fn::<vs::PropGetData>(vsapi, vs::PROP_GET_DATA)? };
-    let get_size = unsafe { vs::table_fn::<vs::PropGetDataSize>(vsapi, vs::PROP_GET_DATA_SIZE)? };
+pub(crate) unsafe fn read_opt(
+    input: vs::ConstRaw,
+    vsapi: vs::ConstRaw,
+) -> Result<Option<params::Value>, String> {
+    let (Some(get_data), Some(get_size)) = (unsafe {
+        (
+            vs::table_fn::<vs::PropGetData>(vsapi, vs::PROP_GET_DATA),
+            vs::table_fn::<vs::PropGetDataSize>(vsapi, vs::PROP_GET_DATA_SIZE),
+        )
+    }) else {
+        return Ok(None);
+    };
     let mut err = 0;
     let ptr = unsafe { get_data(input, c"opt".as_ptr(), 0, &raw mut err) };
     if ptr.is_null() || err != 0 {
-        return None;
+        return Ok(None);
     }
     let size = unsafe { get_size(input, c"opt".as_ptr(), 0, &raw mut err) };
     if size <= 0 || err != 0 {
-        return None;
+        return Ok(None);
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size as usize) };
-    params::parse(bytes).ok()
+    params::parse(bytes).map(Some)
 }
 
 unsafe extern "system" fn init_super(

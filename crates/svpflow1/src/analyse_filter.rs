@@ -273,7 +273,9 @@ unsafe fn create_analyse_inner(
         let options = unsafe { read_opt_bytes(input, vsapi) };
         let options = options
             .as_deref()
-            .and_then(|bytes| params::parse(bytes).ok());
+            .map(params::parse)
+            .transpose()
+            .map_err(|e| format!("SVAnalyse: invalid 'params' syntax: {e}"))?;
         let super_params = SuperParams::unpack(sdata)?;
         let params = AnalyseParams::new(options.as_ref(), super_params, chroma_shift)?;
 

@@ -110,7 +110,9 @@ pub(crate) unsafe extern "system" fn create_halve(
     }
     vi.width /= 2;
     vi.height /= 2;
-    let opt = unsafe { crate::super_filter::read_opt(input, vsapi) };
+    let opt = unsafe { crate::super_filter::read_opt(input, vsapi) }
+        .ok()
+        .flatten();
     let luma_only = crate::super_opts::SuperOpts::from_opt(opt.as_ref(), vi.width, vi.height)
         .is_ok_and(crate::super_opts::SuperOpts::luma_only);
     let state = State {
